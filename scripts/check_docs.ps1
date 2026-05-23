@@ -64,6 +64,31 @@ function Get-RelativePathCompat {
     return [System.Uri]::UnescapeDataString($BaseUri.MakeRelativeUri($TargetUri).ToString()).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
 }
 
+function Test-ActTypeDynamicsDefault {
+    param([string]$RepoRoot)
+
+    $ToolSurfacePath = Join-Path $RepoRoot "docs/computergames/05_mcp_tool_surface.md"
+    if (-not (Test-Path -LiteralPath $ToolSurfacePath -PathType Leaf)) {
+        $Failures.Add("docs/computergames/05_mcp_tool_surface.md: missing MCP tool surface doc")
+        return
+    }
+
+    $Text = Get-Content -LiteralPath $ToolSurfacePath -Raw
+    $BlockMatch = [regex]::Match($Text, '(?s)### 3\.12 `act_type`.*?### 3\.13 `act_press`')
+    if (-not $BlockMatch.Success) {
+        $Failures.Add("docs/computergames/05_mcp_tool_surface.md: act_type schema block missing")
+        return
+    }
+
+    $Block = $BlockMatch.Value
+    if ($Block -match '"dynamics"\s*:\s*\{[^}]*"default"\s*:\s*"burst"') {
+        $Failures.Add('docs/computergames/05_mcp_tool_surface.md: act_type.dynamics default regressed to "burst"; expected "natural"')
+    }
+    if ($Block -notmatch '"dynamics"\s*:\s*\{[^}]*"default"\s*:\s*"natural"') {
+        $Failures.Add('docs/computergames/05_mcp_tool_surface.md: act_type.dynamics default must be "natural"')
+    }
+}
+
 $Files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
 $RootReadme = Join-Path $RepoRoot "README.md"
 if (Test-Path -LiteralPath $RootReadme) {
@@ -76,6 +101,8 @@ if (Test-Path -LiteralPath $DocsRoot) {
         $Files.Add($_)
     }
 }
+
+Test-ActTypeDynamicsDefault $RepoRoot
 
 foreach ($File in $Files) {
     $Lines = Get-Content -LiteralPath $File.FullName
