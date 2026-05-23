@@ -65,7 +65,7 @@ Two separate products would duplicate ~90% of engineering. **Synapse ships them 
 | 05 | [`05_mcp_tool_surface.md`](05_mcp_tool_surface.md) | Public API. Every tool, parameter, return, error. |
 | 06 | [`06_data_schemas.md`](06_data_schemas.md) | Rust structs, JSON envelopes, event types, error codes. |
 | 07 | [`07_storage_and_profiles.md`](07_storage_and_profiles.md) | RocksDB schema, runtime files, profile system. |
-| 08 | Supported use policy | What we will/won't ship, supported contexts, operator acknowledgments. |
+| 08 | [`08_supported_use_policy.md`](08_supported_use_policy.md) | What we will/won't ship, supported contexts, operator acknowledgments. |
 | 09 | [`09_hardware_hid_gateway.md`](09_hardware_hid_gateway.md) | Pi Pico HID firmware + serial protocol + host driver. |
 | 10 | [`10_performance_budget.md`](10_performance_budget.md) | Latency targets, profiling, optimization rules. |
 | 11 | [`11_security_and_safety.md`](11_security_and_safety.md) | Threat model, permissions, redaction, kill switches. |
