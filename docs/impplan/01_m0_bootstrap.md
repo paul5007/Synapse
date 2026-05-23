@@ -2,9 +2,19 @@
 
 **Status:** Closed 2026-05-23 by release tag `v0.1.0-m0` (commit `f04b429`).
 **Evidence:** `crates/synapse-mcp/tests/m0_demo_gate.rs` exercises the full
-`tools/list` → `tools/call health {}` round-trip end-to-end. CI green on Ubuntu
-+ Windows (`.github/workflows/ci.yml`). M0 work-items and acceptance gates
-below are preserved for archival and onboarding.
+`tools/list` → `tools/call health {}` round-trip end-to-end via
+`synapse_test_utils::stdio_mcp_client::StdioMcpClient`. CI green on Ubuntu +
+Windows (`.github/workflows/ci.yml`). M0 work-items and acceptance gates below
+are preserved for archival and onboarding.
+
+**Source-of-truth verification example (already wired):** the M0 gate test
+spawns `synapse-mcp --mode stdio`, calls `tools/list`, asserts `health` is
+present, calls `tools/call health {}`, decodes the response into
+`synapse_core::Health`, then reads the rotating JSONL file at the configured
+`SYNAPSE_LOG_DIR` and asserts the line `tool.invocation kind=health` appears.
+M2 follows the same pattern: every test reads back the actual side effect from
+its source of truth (UIA, file system, RecordingBackend log, ViGEm device
+state) before declaring success.
 
 PRD: `15_roadmap_and_milestones.md` §2.
 

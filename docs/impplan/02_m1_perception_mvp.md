@@ -1,20 +1,32 @@
-# 02 — M1: Perception MVP (2-3 weeks) — ACTIVE
+# 02 — M1: Perception MVP (2-3 weeks) — DONE locally
 
 **Status (2026-05-23):** local implementation complete under the WSL/global
-install constraint. M0 closed at `v0.1.0-m0`. M1 now has the six MCP tools
-registered, structured observation assembly, capture target state, perception
-mode override, UIA foreground snapshots, WinRT OCR over real Windows screen
-regions, model-loader error surfaces, and local manual FSV evidence. GitHub
-Actions/self-hosted runner work is explicitly out of scope for this local pass.
+install constraint. M0 closed at `v0.1.0-m0`. M1 ships the six MCP tools below
+(commits `b8ad120`, `75176b6`, `8d141c6`, `3d53f22`, `de4c5b9`, `42d6278`,
+`977a4c8`, `3e177f7`, `79a9428`, `6373932`, `920c664`, `01ea9e1`, `defa76d`,
+`97c16db`, `57cd8b1`, `b4066bd`, `403b5f8`) and is verified by local FSV
+tests. GitHub Actions / self-hosted runner work is explicitly out of scope for
+this local pass; the next phase (M2) must keep CI green on the existing matrix
+(`.github/workflows/ci.yml`).
 
-**Pre-existing assets available for M1:**
+**Shipped M1 surface (consume from M2 — do not re-implement):**
 
-- All M1 error codes already declared as `pub const` in
-  `crates/synapse-core/src/error_codes.rs` (asserted by `tests/error_codes_literal.rs`).
-- `synapse-test-utils::stdio_mcp_client::StdioMcpClient` available for E2E tests.
-- `synapse-telemetry::init_tracing()` available; instrument every M1 fn.
-- `Backend`, `PerceptionMode`, `Point`, `Rect`, `Size`, `SCHEMA_VERSION` exist
-  in `synapse-core::types` — extend, do not redefine.
+| Asset | Path | Used by M2 |
+|---|---|---|
+| All 80+ error codes (M0-M5) as `pub const` | `crates/synapse-core/src/error_codes.rs` | M2 imports `error_codes::ACTION_*` + `SAFETY_*` directly |
+| `Backend`, `PerceptionMode`, `Point`, `Rect`, `Size`, `ElementId` (`<hwnd_hex>:<runtime_id_hex>` composite), `SCHEMA_VERSION = 1` | `crates/synapse-core/src/types.rs` + `defaults.rs` | M2 extends `synapse-core` with `Action` enum + sub-types (`AimCurve`, `AimNaturalParams`, `AimStyle`, `KeystrokeDynamics`, `Key`, `KeyCode`, `MouseButton`, `MouseTarget`, `ButtonAction`, `PadId`, `PadButton`, `Stick`, `Trigger`, `GamepadReport`, `ComboStep`, `ComboInput`, `AimTarget`) per `06 §4` |
+| `ElementId::parts() -> ElementIdParts { hwnd, runtime_id_hex }` | `crates/synapse-core/src/types.rs:103` | M2 uses for InvokePattern resolution and HWND-targeting |
+| `synapse_a11y::re_resolve(&ElementId)` (Windows) | `crates/synapse-a11y/src/lib.rs:329` | M2 calls before every element-targeted click to refresh UIA pointer |
+| `synapse_a11y::focused_window()`, `foreground_context(hwnd)`, `snapshot(root, depth)` | `crates/synapse-a11y/src/lib.rs` | M2 uses to record focused element state for FSV before/after |
+| `uiautomation = "0.25.0"` re-exported as `synapse_a11y::UIElement` | `crates/synapse-a11y/src/lib.rs:15` | M2 invokes `IUIAutomationInvokePattern::Invoke` via the same crate's pattern API |
+| `synapse_capture::screen_to_window(point, hwnd)` / `window_to_screen(...)` | `crates/synapse-capture/src/lib.rs:449` | M2 uses for element-center coordinate clicks when InvokePattern is unsupported |
+| `synapse_test_utils::stdio_mcp_client::StdioMcpClient::launch_and_init_with_env(log_dir, envs)` | `crates/synapse-test-utils/src/stdio_mcp_client.rs:36` | M2 E2E tests reuse for every tool round-trip |
+| `synapse_telemetry::init_tracing(TelemetryConfig)` + `TelemetryGuard` | `crates/synapse-telemetry/src/lib.rs:124` | M2 must NOT call init in lib code — `synapse-mcp::main` already wires it |
+| Synthetic fixture flag `SYNAPSE_MCP_SYNTHETIC_FIXTURE=notepad` | `crates/synapse-mcp/src/m1/sources.rs:13` (`synthetic_notepad_input`) | M2 adds a `SYNAPSE_MCP_RECORDING_BACKEND=1` flag that swaps `SoftwareBackend` for `RecordingBackend` so E2E asserts the exact INPUT sequence emitted |
+| Forced-error flags `SYNAPSE_MCP_FORCE_NO_PERCEPTION`, `SYNAPSE_MCP_FORCE_OBSERVE_INTERNAL` | `crates/synapse-mcp/src/m1.rs:39-49` | M2 adds parallel flags `SYNAPSE_MCP_FORCE_ACTION_*` to drive every error-code path |
+
+The M1 codebase is the contract. **Do not redefine these types or rename these
+exports.** Extend `synapse-core::types` and `synapse-action::*` only.
 
 PRD: `15_roadmap_and_milestones.md` §3. Subsystem detail: `02_perception.md`. Schemas: `06_data_schemas.md` §2.
 
@@ -42,10 +54,10 @@ Notepad open with cursor in editor → agent calls `observe()` → reply has `fo
 
 | Crate | M1 contents |
 |---|---|
-| `synapse-capture` | Wraps `windows-capture = "2.0"`; `CapturedFrame { texture, w, h, format, captured_at, frame_seq, dirty_region }`; DXGI Output Duplication fallback; capture thread @ `THREAD_PRIORITY_TIME_CRITICAL`; bounded channel cap 2, drop-oldest |
-| `synapse-a11y` | `uiautomation = "0.24"` tree walker; `IUIAutomationCacheRequest` batched property fetch; `SetWinEventHook` on COM apartment thread (events from `02 §3b`); `chromiumoxide = "0.7"` CDP client (attaches when foreground process is Chromium + debug port reachable); coordinate transforms `screen_to_window` / `window_to_screen` |
+| `synapse-capture` | Wraps `windows-capture = "2.0.0"`; `CapturedFrame { texture, w, h, format, captured_at, frame_seq, dirty_region }`; DXGI Output Duplication fallback; capture thread @ `THREAD_PRIORITY_TIME_CRITICAL`; bounded channel cap 2, drop-oldest |
+| `synapse-a11y` | `uiautomation = "0.25.0"` tree walker; `IUIAutomationCacheRequest` batched property fetch; `SetWinEventHook` on COM apartment thread (events from `02 §3b`); `chromiumoxide = "0.9.1"` CDP client (attaches when foreground process is Chromium + debug port reachable); coordinate transforms `screen_to_window` / `window_to_screen` |
 | `synapse-perception` | `Observation` assembler; fuses UIA + capture + (stub) detection + (stub) audio into one `Observation`; perception-mode auto-select per `02 §9` |
-| `synapse-models` | Minimum `ort = "2.0"` loader; YOLOv10n loadable when present in `%LOCALAPPDATA%\synapse\models\`; CUDA → DirectML → CPU EP order per `02 §4`; sha256 verification on load |
+| `synapse-models` | Minimum `ort = "2.0.0-rc.12"` loader; YOLOv10n loadable when present in `%LOCALAPPDATA%\synapse\models\`; CUDA → DirectML → CPU EP order per `02 §4`; sha256 verification on load |
 | `synapse-core` (extensions) | `Observation`, `ForegroundContext`, `FocusedElement`, `AccessibleNode`, `DetectedEntity`, `HudReadings`, `AudioContext`, `ObservationDiagnostics`, `EventSummary`, `Event`, `EventSource`, `EventFilter` + `DataPredicate` per `06 §1-3` |
 | `synapse-mcp` (add tools) | `observe`, `find`, `read_text`, `set_capture_target`, `set_perception_mode` per `05 §3.1-3.4, §3.9-3.10` |
 
@@ -87,7 +99,7 @@ CAPTURE_TARGET_INVALID
 
 | # | Title | Acceptance |
 |---|---|---|
-| 1 | `feat(core): Observation + Event + EventFilter types` | round-trip serde JSON + maintained binary codec; `insta` snapshot of sample observation |
+| 1 | `feat(core): Observation + Event + EventFilter types` | round-trip serde JSON (no binary codec at v1 — `bincode` excluded by RUSTSEC-2025-0141 per ADR-0001); `insta` snapshot of sample observation |
 | 2 | `feat(capture): windows-capture wrap + CapturedFrame` | bench: 60 fps capture loop on primary monitor stays ≤ 2% CPU steady-state idle |
 | 3 | `feat(capture): DXGI Output Duplication fallback` | env var `SYNAPSE_CAPTURE_FORCE_DXGI=1` selects fallback; same frame shape emitted |
 | 4 | `feat(capture): coordinate transforms + DPI awareness` | `screen_to_window(window_to_screen(p, h), h) == p` proptest |
@@ -148,4 +160,9 @@ CAPTURE_TARGET_INVALID
 
 ## Definition of Done
 
-M1 closed when demo passes + all acceptance gates green + `git tag v0.1.0-m1` cuts archival build. Open next: `03_m2_action_mvp.md`.
+M1 closed locally (commits listed in Status). Tag `v0.1.0-m1` will be cut once
+the Windows self-hosted runner is back online and the bench/E2E suite has been
+re-run against the live OS. For M2 purposes M1 is the "shipped" baseline:
+M2 work begins against the current `main` without waiting on the tag.
+
+Open next: `03_m2_action_mvp.md`.

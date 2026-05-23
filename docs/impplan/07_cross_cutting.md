@@ -189,15 +189,16 @@ Per `13_testing_strategy.md` §14. Repeated for forcing function:
 
 | Job | OS | Trigger |
 |---|---|---|
-| `cargo fmt --check` | ubuntu | every PR |
-| `cargo clippy --workspace --all-targets -- -D warnings` | windows | every PR |
-| `cargo test --workspace` | windows | every PR |
-| `cargo test --workspace --no-default-features` | windows | every PR |
-| `cargo build --release --workspace` | windows | every PR |
-| `cargo deny check` | ubuntu | every PR |
+| `cargo fmt --all --check` | ubuntu | every PR (`.github/workflows/ci.yml` `rust-ubuntu` job) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ubuntu + windows | every PR (both `rust-ubuntu` and `rust-windows`) |
+| `cargo test --workspace` | ubuntu + windows | every PR |
+| `cargo test --workspace --no-default-features` | ubuntu + windows | every PR |
+| `cargo build --release --workspace` | ubuntu + windows | every PR |
+| `bash scripts/check_dep_graph.sh` | ubuntu | every PR (`rust-ubuntu` job) |
+| `cargo deny check` | ubuntu | every PR (`security-ubuntu` job) |
 | `cargo audit` | ubuntu | every PR + daily cron |
 | `insta review --check` | ubuntu | every PR |
-| `scripts/check_docs.ps1` | ubuntu | every PR |
+| `scripts/check_docs.ps1` | windows (powershell) | every PR (currently invoked manually pre-PR; CI integration TBD) |
 | `e2e-real-windows` | self-hosted windows | nightly |
 | `bench-regression` | self-hosted windows | weekly + PR delta gate |
 | `hardware-in-loop` | self-hosted w/ Pico | weekly |

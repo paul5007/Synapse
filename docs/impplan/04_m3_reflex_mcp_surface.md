@@ -15,8 +15,10 @@ Notepad open → agent: `reflex_register(on_event, when={kind:"element-appeared"
 ## Inputs
 
 - M2 demo gate passed
-- `rocksdb = "0.22"` builds clean on Win11 (`bzip2`/`zlib` C deps OK)
-- `wasapi = "0.16"` available; system has default render device
+- `rocksdb = "0.24.0"` builds clean on Win11 (`bzip2`/`zlib` C deps OK; workspace already pins this in `Cargo.toml`)
+- `wasapi = "0.23.0"` available; system has default render device
+- `notify = "9.0.0-rc.4"` for profile hot-reload (workspace pin already in place)
+- `axum = "0.8.9"` for HTTP transport (workspace pin); `rmcp = "1.7.0"` with `transport-streamable-http-server` feature already enabled
 - Test runner has > 4 GB free disk for storage tests; 1 GB tmpfs volume available for disk-pressure tests
 
 ---
@@ -28,11 +30,11 @@ Notepad open → agent: `reflex_register(on_event, when={kind:"element-appeared"
 | Crate | M3 contents |
 |---|---|
 | `synapse-reflex` | Event bus (in-process broadcast via `arc-swap::ArcSwap<Vec<Subscriber>>` + per-subscriber `crossbeam` bounded ch); reflex scheduler on dedicated `THREAD_PRIORITY_TIME_CRITICAL` thread; 1 ms tick via `CreateWaitableTimerEx` high-resolution; `aim_track`, `hold_move`, `hold_button`, `combo`, `on_event` controllers; conflict resolution (priority + newer-wins); `ReflexLifetime` (`OneShot`/`UntilCancelled`/`UntilEvent`/`Duration`); audit log to `CF_REFLEX_AUDIT`; reflex cap 32/session; recursion guard ≤ 4 firings/tick (`OQ-022`); panic hotkey `Ctrl+Alt+Shift+P` clears all reflexes + `ReleaseAll` ≤ 50 ms |
-| `synapse-storage` | RocksDB open w/ CFs from `07 §4` (`CF_EVENTS`, `CF_OBSERVATIONS`, `CF_PROFILES`, `CF_MODEL_CACHE`, `CF_SESSIONS`, `CF_REFLEX_AUDIT`, `CF_OCR_CACHE`, `CF_TELEMETRY`, `CF_ACTION_LOG`, `CF_PROCESS_HISTORY`, `CF_KV`); per-CF compaction filter w/ TTL from runtime config; write batcher flush 100 ms / 64 KB / explicit; GC task @ 5 min checking soft caps; disk-pressure responder 4 levels (`07 §6.3`); `--feature sled-backend` opt-in fallback |
-| `synapse-profiles` | TOML parser → `Profile` struct (`06 §6`); `notify = "6.1"` watcher on profile dir(s); precedence: `--profile-dir` > `%APPDATA%\synapse\profiles\` > bundled `profiles/`; match by `exe` + `title_regex` + `steam_appid`; bundled profiles: `notepad`, `vscode`, `chrome`, `terminal` |
+| `synapse-storage` | RocksDB open w/ CFs from `07 §4` (`CF_EVENTS`, `CF_OBSERVATIONS`, `CF_PROFILES`, `CF_MODEL_CACHE`, `CF_SESSIONS`, `CF_REFLEX_AUDIT`, `CF_OCR_CACHE`, `CF_TELEMETRY`, `CF_ACTION_LOG`, `CF_PROCESS_HISTORY`, `CF_KV`); per-CF compaction filter w/ TTL from runtime config; write batcher flush 100 ms / 64 KB / explicit; GC task @ 5 min checking soft caps; disk-pressure responder 4 levels (`07 §6.3`); `--feature sled-backend` opt-in fallback. M3 starts from the empty stub at `crates/synapse-storage/src/lib.rs` |
+| `synapse-profiles` | TOML parser → `Profile` struct (`06 §6`); `notify = "9.0.0-rc.4"` watcher on profile dir(s); precedence: `--profile-dir` > `%APPDATA%\synapse\profiles\` > bundled `profiles/`; match by `exe` + `title_regex` + `steam_appid`; bundled profiles: `notepad`, `vscode`, `chrome`, `terminal`. M3 starts from the empty stub at `crates/synapse-profiles/src/lib.rs` |
 | `synapse-audio` | WASAPI loopback ring 5 s; STT via Whisper-tiny-int8 ONNX (~40 MB; lazy load); naive direction estimate (L/R energy ratio + GCC-PHAT lag); audio event detectors: `loud_transient`, `speech_started`/`ended`, `music_started`/`ended`; Silero VAD ONNX ~2 MB |
 | `synapse-core` (extensions) | `Profile`, `ProfileMatch`, `ProfileCapture`, `ProfileDetection`, `ProfileOcr`, `HudFieldSpec`, `HudExtractor`, `HudParser`, `HudRegion`, `WindowEdge`, `ProfileBackends`, `EventExtension`, `ReflexRegistration`, `ReflexKind`, `ReflexLifetime`, `ReflexState`, `ReflexStatus`, `StoredEvent`, `StoredObservation`, `StoredReflexAudit`, `StoredSession`, `OcrResult`, `OcrWord` |
-| `synapse-mcp` (add tools) | `subscribe`, `reflex_register`, `reflex_cancel`, `reflex_list`, `reflex_history`, `profile_list`, `profile_activate`, `replay_record`, `audio_tail`, `audio_transcribe` per `05 §3.5-3.8, §3.22-3.28, §3.30`; Streamable HTTP transport via `axum = "0.7"` + `Mcp-Session-Id` header; SSE push (per-event, no batching at v1 per `OQ-029`); bearer-token auth + Host/Origin check (`11 §3.2`) |
+| `synapse-mcp` (add tools) | `subscribe`, `reflex_register`, `reflex_cancel`, `reflex_list`, `reflex_history`, `profile_list`, `profile_activate`, `replay_record`, `audio_tail`, `audio_transcribe` per `05 §3.5-3.8, §3.22-3.28, §3.30`; Streamable HTTP transport via `axum = "0.8.9"` + `Mcp-Session-Id` header (replaces the `--mode http` placeholder that currently exits with `NOT_YET_IMPLEMENTED` from `crates/synapse-mcp/src/main.rs:62`); SSE push (per-event, no batching at v1 per `OQ-029`); bearer-token auth + Host/Origin check (`11 §3.2`) |
 
 ### Bundled profiles (`profiles/`)
 

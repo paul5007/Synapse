@@ -81,6 +81,16 @@ Test pyramid: `13_testing_strategy.md` §2.
 
 **No mocks gate completion.** Integration tests use real `windows-capture` frames (or `MockCaptureSource` for unit), real RocksDB (`tempfile::TempDir`), real `SendInput` (or `RecordingBackend` for unit). Unit fakes never substitute for integration coverage of the OS-bound path.
 
+**Full-state verification (FSV) — mandatory for every M2+ test:**
+
+1. **Identify the source of truth** for the work the test is meant to perform (UIA `ValuePattern.value` for a typed string, file bytes on disk for a saved file, `RecordingBackend::events()` for the emitted `INPUT` sequence, `vigem-client` device state for a pad report, the daemon's tracing log line for an audit event, the `held_keys` BitSet for stuck-key state, etc.).
+2. **Print `before` state**, execute the action, **print `after` state**. Use the M1-established `println!("source_of_truth=<name> edge=<edge> before=<...> after=<...>")` convention.
+3. **Read back from the source of truth** with a separate operation. Never trust the return value of the operation under test as evidence that the side effect landed.
+4. **Three edge cases minimum** per primary path (empty input / boundary value / structurally invalid input). Each edge case prints its own `before`/`after` and asserts on the source of truth.
+5. **Evidence of success in the log.** The test must emit a line containing the actual post-state of the source of truth. A grep against the test stdout shows what landed.
+
+A test that asserts only on return values is **not done**; review fails the PR.
+
 ---
 
 ## 6. Performance gates
@@ -132,7 +142,7 @@ Per `12_observability.md`:
 Per `07_storage_and_profiles.md` §6 (data lifecycle):
 
 - Every new CF declares TTL + soft cap + hard cap in `synapse-core::retention::DEFAULTS`. No "decide later."
-- Binary codec for hot/binary CFs, JSON for human-readable/audit CFs. `bincode` is disallowed after RUSTSEC-2025-0141; pick a maintained codec before M3 storage.
+- Binary codec for hot/binary CFs, JSON for human-readable/audit CFs. `bincode` is disallowed after RUSTSEC-2025-0141 (ADR-0001); pick a maintained codec before M3 storage. M0-M2 use JSON only.
 - Per-frame writes forbidden — aggregate, batch every 100 ms or 64 KB
 - Three cleanup layers: compaction filter, periodic GC (5 min), disk-pressure responder
 - Test with 1 GB tmpfs DB volume in CI to verify pressure levels (`07_storage_and_profiles.md` §6.3)

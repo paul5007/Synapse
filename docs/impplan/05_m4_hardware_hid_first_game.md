@@ -20,7 +20,8 @@ RP2040 firmware (Rust + `embassy-rp`) + serial driver (`synapse-hid-host`) + `ac
 - Hardware: 1× Raspberry Pi Pico (RP2040), USB-A cable, host PC with free USB port
 - Rust toolchain extension: `rustup target add thumbv6m-none-eabi`; `cargo install elf2uf2-rs`
 - Minecraft Java Edition installed (single-player creative/survival world for testing)
-- `embassy-rp` + `embassy-usb` resolvable; `serialport = "4.5"` available
+- `embassy-rp` + `embassy-usb` resolvable; `serialport = "4.9.0"` available (workspace pin)
+- `firmware/pico-hid/` directory does **not yet exist** (excluded from workspace per root `Cargo.toml:21`). M4 work-item 1 creates it from scratch.
 
 ---
 
