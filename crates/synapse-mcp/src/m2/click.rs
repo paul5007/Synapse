@@ -4,8 +4,8 @@ use rmcp::ErrorData;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use synapse_action::{
-    ActionBackend, ActionError, ActionHandle, DoubleClickTiming, EmitState, RecordedInput,
-    RecordingBackend, cached_double_click_timing,
+    ActionBackend, ActionError, ActionHandle, DoubleClickTiming, ElementClickOutcome, EmitState,
+    RecordedInput, RecordingBackend, cached_double_click_timing, click_element_or_fallback,
 };
 use synapse_core::{
     Action, AimCurve, AimNaturalParams, Backend, ButtonAction, ElementId, MouseButton, MouseTarget,
@@ -99,7 +99,18 @@ pub async fn act_click_with_handle(
     validate_click_params(&params)?;
     let started = Instant::now();
     let double_click_timing = cached_double_click_timing();
-    let target = mouse_target(&params)?;
+    if let ActClickTarget::Element(element) = &params.target {
+        return execute_element_click(
+            &params,
+            element,
+            recording.as_deref(),
+            double_click_timing,
+            started,
+        )
+        .await;
+    }
+
+    let target = point_mouse_target(&params.target)?;
     let mut actions = Vec::with_capacity(usize::from(params.clicks) + 1);
     actions.push(Action::MouseMove {
         to: target,
@@ -128,6 +139,62 @@ pub async fn act_click_with_handle(
         backend_used: backend_used_name(params.backend).to_owned(),
         double_click_window_ms: double_click_timing.window_ms,
         inter_click_delay_ms: double_click_timing.inter_click_delay_ms,
+        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    })
+}
+
+async fn execute_element_click(
+    params: &ActClickParams,
+    element: &ActClickElementTarget,
+    recording: Option<&RecordingBackend>,
+    timing: DoubleClickTiming,
+    started: Instant,
+) -> Result<ActClickResponse, ErrorData> {
+    if !params.use_invoke_pattern {
+        return Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+            detail: format!(
+                "act_click element target {} requires the dedicated coordinate fallback wiring issue when use_invoke_pattern=false",
+                element.element_id
+            ),
+        }));
+    }
+
+    let mut state = EmitState::new();
+    let mut used_invoke_pattern = false;
+    let mut backend_used = "software";
+    for click_index in 0..params.clicks {
+        let outcome = if let Some(recording) = recording {
+            click_element_or_fallback(&element.element_id, recording, &mut state, params.button)
+        } else {
+            let backend = synapse_action::backend::software::SoftwareBackend::new();
+            click_element_or_fallback(&element.element_id, &backend, &mut state, params.button)
+        }
+        .map_err(|error| action_error_to_mcp(&error))?;
+
+        match outcome {
+            ElementClickOutcome::Invoked => {
+                used_invoke_pattern = true;
+                backend_used = "uia";
+            }
+            ElementClickOutcome::CoordinateFallback(_) => {
+                backend_used = "software";
+            }
+        }
+
+        if click_index + 1 < params.clicks {
+            sleep(Duration::from_millis(u64::from(
+                timing.inter_click_delay_ms,
+            )))
+            .await;
+        }
+    }
+
+    Ok(ActClickResponse {
+        ok: true,
+        used_invoke_pattern,
+        backend_used: backend_used.to_owned(),
+        double_click_window_ms: timing.window_ms,
+        inter_click_delay_ms: timing.inter_click_delay_ms,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
 }
@@ -293,27 +360,20 @@ fn validate_click_params(params: &ActClickParams) -> Result<(), ErrorData> {
     Ok(())
 }
 
-fn mouse_target(params: &ActClickParams) -> Result<MouseTarget, ErrorData> {
-    match &params.target {
+fn point_mouse_target(target: &ActClickTarget) -> Result<MouseTarget, ErrorData> {
+    match target {
         ActClickTarget::Point(point) => Ok(MouseTarget::Screen {
             point: Point {
                 x: point.x,
                 y: point.y,
             },
         }),
-        ActClickTarget::Element(element) => {
-            let mode = if params.use_invoke_pattern {
-                "InvokePattern"
-            } else {
-                "coordinate fallback"
-            };
-            Err(action_error_to_mcp(&ActionError::BackendUnavailable {
-                detail: format!(
-                    "act_click element target {} requires the dedicated {mode} wiring issue",
-                    element.element_id
-                ),
-            }))
-        }
+        ActClickTarget::Element(element) => Err(action_error_to_mcp(&ActionError::TargetInvalid {
+            detail: format!(
+                "act_click element target {} reached the point-target path unexpectedly",
+                element.element_id
+            ),
+        })),
     }
 }
 

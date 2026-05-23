@@ -2,6 +2,8 @@ use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use synapse_core::error_codes;
+#[cfg(windows)]
+use synapse_test_utils::fixtures::launch_notepad;
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 use tempfile::TempDir;
 
@@ -201,6 +203,55 @@ async fn act_click_default_unset_uses_actor_path_without_recording_log_fsv() -> 
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires an interactive Windows desktop with Notepad and UIA"]
+async fn act_click_stale_notepad_element_returns_element_not_resolved_fsv() -> anyhow::Result<()> {
+    let log_dir = TempDir::new()?;
+    let handle = launch_notepad()?;
+    let hwnd = handle.hwnd();
+    let pid = handle.pid();
+    let window = synapse_a11y::window_from_hwnd(hwnd)
+        .with_context(|| format!("resolve launched Notepad hwnd 0x{hwnd:x}"))?;
+    let subtree = synapse_a11y::snapshot(&window, 1)
+        .with_context(|| format!("snapshot launched Notepad hwnd 0x{hwnd:x}"))?;
+    let element_id = subtree.root.clone();
+    println!(
+        "source_of_truth=synapse_a11y::snapshot edge=stale_element before=pid:{pid} hwnd:0x{hwnd:x} root:{} node_count:{}",
+        element_id,
+        subtree.nodes.len()
+    );
+
+    handle.close()?;
+    match synapse_a11y::window_from_hwnd(hwnd) {
+        Ok(_window) => anyhow::bail!("Notepad hwnd 0x{hwnd:x} still resolved after close"),
+        Err(error) => println!(
+            "source_of_truth=synapse_a11y::window_from_hwnd edge=stale_element after_close=Err({error})"
+        ),
+    }
+
+    let mut client = StdioMcpClient::launch_and_init_with_log_dir(Some(log_dir.path())).await?;
+    println!("source_of_truth=mcp_act_click edge=stale_element before=element_id:{element_id}");
+    let stale_error = client
+        .tools_call_error("act_click", json!({"target": {"element_id": element_id}}))
+        .await?;
+    println!("source_of_truth=mcp_act_click edge=stale_element after={stale_error}");
+    assert_eq!(
+        error_code(&stale_error),
+        Some(error_codes::ACTION_ELEMENT_NOT_RESOLVED)
+    );
+
+    assert!(client.shutdown().await?.success());
+    let logs = read_logs(log_dir.path())?;
+    let log_contains_code = logs.contains(error_codes::ACTION_ELEMENT_NOT_RESOLVED);
+    println!(
+        "source_of_truth=daemon_log edge=stale_element bytes={} contains_code={log_contains_code}",
+        logs.len()
+    );
+    assert!(log_contains_code);
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 struct ActClickWireResponse {
     ok: bool,
@@ -278,6 +329,25 @@ async fn assert_malformed_element_id_rejected(client: &mut StdioMcpClient) -> an
         error_codes::TOOL_PARAMS_INVALID,
         "current rejection layer is MCP parameter deserialization after ElementId parse validation"
     );
+
+    println!(
+        "source_of_truth=mcp_act_click edge=valid_unresolvable_element_id before=element_id:0x1234:0000002a00000001"
+    );
+    let valid_unresolvable = client
+        .tools_call_error(
+            "act_click",
+            json!({"target": {"element_id": "0x1234:0000002a00000001"}}),
+        )
+        .await?;
+    println!(
+        "source_of_truth=mcp_act_click edge=valid_unresolvable_element_id after={valid_unresolvable}"
+    );
+    let expected_code = if cfg!(windows) {
+        error_codes::ACTION_ELEMENT_NOT_RESOLVED
+    } else {
+        error_codes::ACTION_BACKEND_UNAVAILABLE
+    };
+    assert_eq!(error_code(&valid_unresolvable), Some(expected_code));
     Ok(())
 }
 
