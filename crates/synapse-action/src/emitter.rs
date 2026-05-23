@@ -581,17 +581,15 @@ impl ActionEmitter {
     /// timer is scheduled even though the combo contained a `KeyDown` step.
     fn schedule_timers_for_held_keys(&mut self, action: &Action) {
         match action {
-            Action::KeyDown { key, .. } => {
-                if self.state.is_key_held(key) {
-                    self.schedule_held_key_auto_release(key.clone());
-                }
+            Action::KeyDown { key, .. } if self.state.is_key_held(key) => {
+                self.schedule_held_key_auto_release(key.clone());
             }
             Action::Combo { steps, .. } => {
                 for step in steps {
-                    if let ComboInput::KeyDown { key } = &step.input {
-                        if self.state.is_key_held(key) {
-                            self.schedule_held_key_auto_release(key.clone());
-                        }
+                    if let ComboInput::KeyDown { key } = &step.input
+                        && self.state.is_key_held(key)
+                    {
+                        self.schedule_held_key_auto_release(key.clone());
                     }
                 }
             }
@@ -1100,8 +1098,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn actor_loop_processes_auto_release_timer_message() {
-        let (handle, snapshot_handle, emitter) =
-            ActionEmitter::channel_with_rate_limits(generous_limits());
+        let recording = Arc::new(RecordingBackend::new());
+        let backend: Arc<dyn ActionBackend> = recording.clone();
+        let (handle, snapshot_handle, emitter) = ActionEmitter::channel_with_backend(backend);
         let cancel = CancellationToken::new();
         let join = tokio::spawn(emitter.run(cancel.clone()));
         let key = key_named("actor-auto-release");
@@ -1118,24 +1117,39 @@ mod tests {
             "actor KeyDown should be accepted: {key_down_result:?}"
         );
         let after_key_down = snapshot_or_panic(&snapshot_handle).await;
+        let after_key_down_events = recording.events();
 
         tokio::task::yield_now().await;
         time::advance(Duration::from_millis(HELD_KEY_MAX_DURATION_MS)).await;
         tokio::task::yield_now().await;
         let after_auto_release = snapshot_until_empty(&snapshot_handle).await;
+        let after_auto_release_events = recording.events();
 
         cancel.cancel();
         let after_cancel = join_actor_or_panic(join).await;
 
         assert!(before.held_keys.is_empty());
-        assert_eq!(after_key_down.held_keys, vec![key]);
+        assert_eq!(after_key_down.held_keys, vec![key.clone()]);
         assert_eq!(after_key_down.held_key_timer_count, 1);
         assert!(after_auto_release.held_keys.is_empty());
         assert_eq!(after_auto_release.held_key_timer_count, 0);
+        assert_eq!(
+            after_key_down_events,
+            vec![RecordedInput::KeyDown { key: key.clone() }],
+            "source_of_truth=RecordingBackend::events after KeyDown"
+        );
+        assert_eq!(
+            after_auto_release_events,
+            vec![
+                RecordedInput::KeyDown { key: key.clone() },
+                RecordedInput::KeyUp { key: key.clone() },
+            ],
+            "source_of_truth=RecordingBackend::events after auto release"
+        );
         assert!(after_cancel.held_keys.is_empty());
         assert_eq!(after_cancel.held_key_timer_count, 0);
         println!(
-            "source_of_truth=actor_snapshot_held_keys_bitset_and_timer_hashmap edge=actor_loop_auto_release before={before:?} after_key_down={after_key_down:?} after_auto_release={after_auto_release:?} after_cancel={after_cancel:?}"
+            "source_of_truth=actor_snapshot_and_recording_backend edge=actor_loop_auto_release before={before:?} after_key_down={after_key_down:?} after_key_down_events={after_key_down_events:?} after_auto_release={after_auto_release:?} after_auto_release_events={after_auto_release_events:?} after_cancel={after_cancel:?}"
         );
     }
 
