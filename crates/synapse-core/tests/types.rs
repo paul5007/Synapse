@@ -517,6 +517,7 @@ fn sample_observation() -> Result<Observation, chrono::ParseError> {
         }],
         diagnostics: ObservationDiagnostics {
             assembled_in_ms: 4.5,
+            sensor_latency_ms: BTreeMap::new(),
             a11y_enabled: true,
             pixel_enabled: true,
             audio_enabled: false,
@@ -629,6 +630,7 @@ fn observation_strategy() -> impl Strategy<Value = Observation> {
                 fs_recent: Vec::new(),
                 diagnostics: ObservationDiagnostics {
                     assembled_in_ms: 1.0,
+                    sensor_latency_ms: BTreeMap::new(),
                     a11y_enabled: true,
                     pixel_enabled: false,
                     audio_enabled: false,

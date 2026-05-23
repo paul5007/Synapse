@@ -1,0 +1,312 @@
+use std::collections::BTreeMap;
+
+use chrono::Utc;
+use synapse_core::{
+    AccessibleNode, AudioContext, DetectedEntity, FocusedElement, ForegroundContext, HudReadings,
+    PerceptionMode, Rect, SensorStatus, UiaPattern, element_id, entity_id, error_codes,
+};
+use synapse_perception::{
+    A11yTreeSummary, ObservationAssembler, ObservationInput, ObserveInclude, auto_mode_with_a11y,
+    parse_perception_mode, read_text,
+};
+
+fn notepad_input() -> ObservationInput {
+    let at = Utc::now();
+    let focused_id = element_id(0x1234, "0000002a00001234");
+    let elements = vec![
+        node(0, "Notepad", "Window", false),
+        node(1, "Document", "Edit", true),
+        node(1, "File", "MenuItem", false),
+        node(1, "Edit", "MenuItem", false),
+        node(1, "View", "MenuItem", false),
+        node(1, "Status", "Text", false),
+    ];
+    let mut latency = BTreeMap::new();
+    latency.insert("a11y".to_owned(), 1.25);
+    latency.insert("capture".to_owned(), 0.50);
+    latency.insert("detection".to_owned(), 0.0);
+    latency.insert("audio".to_owned(), 0.0);
+    ObservationInput {
+        foreground: ForegroundContext {
+            hwnd: 0x1234,
+            pid: 44,
+            process_name: "notepad.exe".to_owned(),
+            process_path: "C:\\Windows\\System32\\notepad.exe".to_owned(),
+            window_title: "manual-fsv.txt - Notepad".to_owned(),
+            window_bounds: Rect {
+                x: 10,
+                y: 20,
+                w: 800,
+                h: 600,
+            },
+            monitor_index: 0,
+            dpi_scale: 1.0,
+            profile_id: None,
+            steam_appid: None,
+            is_fullscreen: false,
+            is_dwm_composed: true,
+        },
+        focused: Some(FocusedElement {
+            element_id: focused_id,
+            name: "Document".to_owned(),
+            role: "Edit".to_owned(),
+            automation_id: Some("15".to_owned()),
+            bbox: Rect {
+                x: 12,
+                y: 80,
+                w: 760,
+                h: 480,
+            },
+            enabled: true,
+            patterns: vec![UiaPattern::Text, UiaPattern::Value],
+            value: Some("synthetic notepad text".to_owned()),
+            selected_text: None,
+        }),
+        elements,
+        entities: vec![DetectedEntity {
+            entity_id: entity_id(9),
+            track_id: 9,
+            class_label: "cursor".to_owned(),
+            bbox: Rect {
+                x: 40,
+                y: 90,
+                w: 8,
+                h: 20,
+            },
+            confidence: 0.80,
+            first_seen_at: at,
+            last_seen_at: at,
+            velocity_px_per_s: None,
+        }],
+        hud: HudReadings::default(),
+        audio: AudioContext::default(),
+        recent_events: Vec::new(),
+        clipboard_summary: None,
+        fs_recent: Vec::new(),
+        sensor_latency_ms: latency,
+        a11y_status: SensorStatus::Healthy,
+        capture_status: SensorStatus::Healthy,
+        detection_status: SensorStatus::Disabled,
+        audio_status: SensorStatus::Disabled,
+        mode_override: None,
+    }
+}
+
+fn node(depth: u32, name: &str, role: &str, focused: bool) -> AccessibleNode {
+    let depth_i32 = i32::try_from(depth).unwrap_or(0);
+    AccessibleNode {
+        element_id: element_id(0x1234, &format!("0000002a{depth:08x}")),
+        parent: (depth > 0).then(|| element_id(0x1234, "0000002a00000000")),
+        name: name.to_owned(),
+        role: role.to_owned(),
+        automation_id: None,
+        bbox: Rect {
+            x: 10 + depth_i32,
+            y: 20 + depth_i32,
+            w: 100,
+            h: 30,
+        },
+        enabled: true,
+        focused,
+        patterns: Vec::new(),
+        children_count: 0,
+        depth,
+    }
+}
+
+#[test]
+fn assemble_default_notepad_under_6kb_with_latency_readback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let input = notepad_input();
+    println!(
+        "source_of_truth=observation edge=notepad_default before=process:{} nodes:{}",
+        input.foreground.process_name,
+        input.elements.len()
+    );
+    let observation = ObservationAssembler::new().assemble(ObserveInclude::default(), input)?;
+    let bytes = serde_json::to_vec(&observation)?;
+    println!(
+        "source_of_truth=observation edge=notepad_default after=bytes:{} mode:{:?} process:{} focused_role:{} a11y_latency:{:?}",
+        bytes.len(),
+        observation.mode,
+        observation.foreground.process_name,
+        observation
+            .focused
+            .as_ref()
+            .map_or("", |item| item.role.as_str()),
+        observation.diagnostics.sensor_latency_ms.get("a11y")
+    );
+    assert!(bytes.len() <= 6 * 1024);
+    assert_eq!(observation.mode, PerceptionMode::A11yOnly);
+    assert_eq!(observation.foreground.process_name, "notepad.exe");
+    assert_eq!(
+        observation.focused.as_ref().map(|item| item.role.as_str()),
+        Some("Edit")
+    );
+    assert!(
+        observation
+            .diagnostics
+            .sensor_latency_ms
+            .contains_key("capture")
+    );
+    assert_eq!(
+        observation.diagnostics.size_bytes,
+        u32::try_from(bytes.len())?
+    );
+    Ok(())
+}
+
+#[test]
+fn include_flags_are_independently_testable() -> Result<(), Box<dyn std::error::Error>> {
+    let assembler = ObservationAssembler::new();
+    let no_subtree = assembler.assemble(
+        ObserveInclude {
+            elements: false,
+            ..ObserveInclude::default()
+        },
+        notepad_input(),
+    )?;
+    println!(
+        "source_of_truth=observe_include edge=no_subtree after=focused:{} elements:{} truncated:{}",
+        no_subtree.focused.is_some(),
+        no_subtree.elements.len(),
+        no_subtree.diagnostics.elements_truncated
+    );
+    assert!(no_subtree.focused.is_some());
+    assert!(no_subtree.elements.is_empty());
+    assert!(no_subtree.diagnostics.elements_truncated);
+
+    let no_focus = assembler.assemble(
+        ObserveInclude {
+            focused: false,
+            ..ObserveInclude::default()
+        },
+        notepad_input(),
+    )?;
+    println!(
+        "source_of_truth=observe_include edge=no_focused after=focused:{} elements:{}",
+        no_focus.focused.is_some(),
+        no_focus.elements.len()
+    );
+    assert!(no_focus.focused.is_none());
+    assert!(!no_focus.elements.is_empty());
+
+    let limited_detection = assembler.assemble(
+        ObserveInclude {
+            entities: true,
+            max_entities: 0,
+            ..ObserveInclude::default()
+        },
+        notepad_input(),
+    )?;
+    println!(
+        "source_of_truth=observe_include edge=detections_limited after=entities:{} truncated:{}",
+        limited_detection.entities.len(),
+        limited_detection.diagnostics.entities_truncated
+    );
+    assert!(limited_detection.entities.is_empty());
+    assert!(limited_detection.diagnostics.entities_truncated);
+    Ok(())
+}
+
+#[test]
+fn auto_mode_edges_and_invalid_manual_override() {
+    let notepad = notepad_input().foreground;
+    let notepad_mode = auto_mode_with_a11y(
+        &notepad,
+        &A11yTreeSummary {
+            node_count: 6,
+            max_depth: 1,
+        },
+    );
+    println!("source_of_truth=perception_mode edge=notepad after={notepad_mode:?}");
+    assert_eq!(notepad_mode, PerceptionMode::A11yOnly);
+
+    let mut game = notepad.clone();
+    game.process_name = "starfield.exe".to_owned();
+    let game_mode = auto_mode_with_a11y(
+        &game,
+        &A11yTreeSummary {
+            node_count: 20,
+            max_depth: 3,
+        },
+    );
+    println!("source_of_truth=perception_mode edge=game after={game_mode:?}");
+    assert_eq!(game_mode, PerceptionMode::Hybrid);
+
+    let sparse_mode = auto_mode_with_a11y(
+        &notepad,
+        &A11yTreeSummary {
+            node_count: 1,
+            max_depth: 0,
+        },
+    );
+    println!("source_of_truth=perception_mode edge=sparse_a11y after={sparse_mode:?}");
+    assert_eq!(sparse_mode, PerceptionMode::Hybrid);
+
+    let invalid = parse_perception_mode("telepathy");
+    println!("source_of_truth=perception_mode edge=invalid after={invalid:?}");
+    assert_eq!(
+        invalid.err().map(|err| err.code()),
+        Some(error_codes::PERCEPTION_MODE_INVALID)
+    );
+}
+
+#[test]
+fn ocr_empty_region_and_backend_unavailable_are_fail_closed() {
+    let empty = Rect {
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 64,
+    };
+    println!("source_of_truth=ocr edge=empty_region before=region:{empty:?}");
+    let empty_after = read_text(empty);
+    println!("source_of_truth=ocr edge=empty_region after={empty_after:?}");
+    assert_eq!(
+        empty_after.err().map(|err| err.code()),
+        Some(error_codes::OCR_NO_TEXT)
+    );
+
+    let region = Rect {
+        x: 0,
+        y: 0,
+        w: 256,
+        h: 64,
+    };
+    println!("source_of_truth=ocr edge=backend before=region:{region:?}");
+    let backend_after = read_text(region);
+    println!("source_of_truth=ocr edge=backend after={backend_after:?}");
+    assert_eq!(
+        backend_after.err().map(|err| err.code()),
+        Some(error_codes::OCR_BACKEND_UNAVAILABLE)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn winrt_blank_bitmap_returns_no_text_or_backend_unavailable() {
+    use synapse_perception::read_text_from_software_bitmap;
+    use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
+
+    let region = Rect {
+        x: 0,
+        y: 0,
+        w: 256,
+        h: 64,
+    };
+    println!("source_of_truth=ocr edge=winrt_blank before=region:{region:?} bitmap=256x64");
+    let Ok(bitmap) = SoftwareBitmap::Create(BitmapPixelFormat::Bgra8, region.w, region.h) else {
+        println!(
+            "source_of_truth=ocr edge=winrt_blank after=backend_unavailable:software_bitmap_activation"
+        );
+        return;
+    };
+    let after = read_text_from_software_bitmap(region, &bitmap);
+    println!("source_of_truth=ocr edge=winrt_blank after={after:?}");
+    let code = after.err().map(|err| err.code());
+    assert!(matches!(
+        code,
+        Some(error_codes::OCR_NO_TEXT | error_codes::OCR_BACKEND_UNAVAILABLE)
+    ));
+}

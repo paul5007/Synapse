@@ -487,6 +487,8 @@ pub enum FsEventKind {
 #[allow(clippy::struct_excessive_bools)]
 pub struct ObservationDiagnostics {
     pub assembled_in_ms: f32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sensor_latency_ms: BTreeMap<String, f32>,
     pub a11y_enabled: bool,
     pub pixel_enabled: bool,
     pub audio_enabled: bool,
@@ -513,6 +515,34 @@ pub enum SensorStatus {
     Disabled,
     #[default]
     Unavailable,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrBackend {
+    Winrt,
+    Crnn,
+    #[default]
+    Auto,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OcrResult {
+    pub text: String,
+    #[serde(default)]
+    pub words: Vec<OcrWord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub backend: OcrBackend,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OcrWord {
+    pub text: String,
+    pub bbox: Rect,
+    pub confidence: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

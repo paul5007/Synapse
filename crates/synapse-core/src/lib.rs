@@ -10,7 +10,7 @@ pub use types::{
     DetectionBatch, DirectionEstimate, ElementId, ElementIdParseError, ElementIdParts, EntityId,
     Event, EventFilter, EventRef, EventSource, EventSummary, FocusedElement, ForegroundContext,
     FsEvent, FsEventKind, Health, HudField, HudReading, HudReadings, HudValue, Observation,
-    ObservationDiagnostics, PerceptionMode, Point, ProfileId, Rect, ReflexId, SensorStatus,
-    SessionId, Size, SubscriptionId, SubsystemHealth, UiaPattern, element_id, entity_id,
-    new_reflex_id, new_session_id, new_subscription_id,
+    ObservationDiagnostics, OcrBackend, OcrResult, OcrWord, PerceptionMode, Point, ProfileId, Rect,
+    ReflexId, SensorStatus, SessionId, Size, SubscriptionId, SubsystemHealth, UiaPattern,
+    element_id, entity_id, new_reflex_id, new_session_id, new_subscription_id,
 };

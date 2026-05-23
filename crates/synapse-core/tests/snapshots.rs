@@ -206,6 +206,7 @@ fn sample_observation() -> Observation {
         fs_recent: Vec::new(),
         diagnostics: ObservationDiagnostics {
             assembled_in_ms: 4.5,
+            sensor_latency_ms: BTreeMap::new(),
             a11y_enabled: true,
             pixel_enabled: true,
             audio_enabled: false,

@@ -7,11 +7,24 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "ocr_read_text"
+harness = false
 
 [lints]
 workspace = true

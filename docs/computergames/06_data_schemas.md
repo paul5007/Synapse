@@ -245,6 +245,7 @@ pub enum FsEventKind { Created, Modified, Deleted, Renamed }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObservationDiagnostics {
     pub assembled_in_ms: f32,
+    pub sensor_latency_ms: std::collections::BTreeMap<String, f32>, // bounded keys: a11y/capture/detection/ocr/audio
     pub a11y_enabled: bool,
     pub pixel_enabled: bool,
     pub audio_enabled: bool,
