@@ -1,0 +1,28 @@
+[package]
+name = "synapse-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+synapse-core = { path = "../synapse-core" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-capture.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+unused = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = "deny"
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"

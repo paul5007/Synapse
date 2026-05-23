@@ -1,0 +1,23 @@
+[package]
+name = "synapse-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+cuda = ["ort"]
+directml = ["ort"]
+
+[dependencies]
+ort = { workspace = true, optional = true, default-features = false }
+serde.workspace = true
+sha2.workspace = true
+synapse-core = { path = "../synapse-core" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "synapse-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "synapse-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rmcp.workspace = true
+synapse-core = { path = "../synapse-core" }
+synapse-telemetry = { path = "../synapse-telemetry" }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+synapse-test-utils = { path = "../synapse-test-utils" }
+
+[lints]
+workspace = true

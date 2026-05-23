@@ -30,57 +30,59 @@ exclude = ["firmware/pico-hid"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.83"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 authors = ["Synapse contributors"]
-repository = "https://github.com/<your-org>/synapse"
+repository = "https://github.com/ChrisRoyse/Synapse"
 ```
 
 Firmware (`firmware/pico-hid`) is excluded because it targets `thumbv6m-none-eabi`. Separate Cargo project.
 
 ---
 
-## 2. Workspace dependencies (pinned)
+## 2. Workspace dependencies
 
-Pinned in `[workspace.dependencies]` so every crate uses the same version:
+Declared in `[workspace.dependencies]` so every crate uses the same version.
+Per ADR-0001, M0 tracks the current compatible crates for the installed stable
+Rust toolchain rather than the older planning-time examples.
 
 ```toml
 [workspace.dependencies]
 # Async / IO
-tokio = { version = "1.41", features = ["full"] }
-tokio-util = { version = "0.7", features = ["sync"] }
-crossbeam = "0.8"
-arc-swap = "1.7"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["full"] }
+crossbeam = "0.8.4"
+arc-swap = "1.9.1"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
-toml = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+bincode = "2.0.1"
+toml = "1.1.2"
 
 # Errors / logging
-thiserror = "1.0"
-anyhow = "1.0"                        # binary crates only
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
+thiserror = "2.0.18"
+anyhow = "1.0.102"                    # binary crates only
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing-appender = "0.2.5"
 
 # Metrics
-metrics = "0.23"
-metrics-exporter-prometheus = "0.16"
-opentelemetry = "0.27"
-opentelemetry-otlp = "0.27"
+metrics = "0.24.6"
+metrics-exporter-prometheus = "0.18.3"
+opentelemetry = "0.32.0"
+opentelemetry-otlp = "0.32.0"
 
 # MCP
-rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "schemars"] }
+rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "schemars"] }
 
 # HTTP
-axum = "0.7"
-hyper = "1.5"
-tower = "0.5"
+axum = "0.8.9"
+hyper = "1.9.0"
+tower = "0.5.3"
 
 # Windows specific
-windows = { version = "0.58", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Threading",
@@ -92,41 +94,41 @@ windows = { version = "0.58", features = [
     "Media_Ocr",
     "Storage_Streams",
 ] }
-windows-capture = "2.0"
-uiautomation = { version = "0.24", features = ["pattern", "control", "event"] }
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
+windows-capture = "2.0.0"
+uiautomation = { version = "0.25.0", features = ["pattern", "control", "event"] }
+chromiumoxide = "0.9.1"
 
 # Audio
-wasapi = "0.16"
+wasapi = "0.23.0"
 
 # Input
-enigo = "0.6"
-vigem-client = "0.1"
-serialport = "4.5"
+enigo = "0.6.1"
+vigem-client = "0.1.4"
+serialport = "4.9.0"
 
 # ML
-ort = { version = "2.0", features = ["cuda", "directml"] }
+ort = { version = "2.0.0-rc.12", default-features = false }
 
 # Storage
-rocksdb = { version = "0.22", default-features = false, features = ["lz4", "zstd", "multi-threaded-cf"] }
-sled = { version = "0.34", optional = true }
+rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "zstd", "multi-threaded-cf"] }
+sled = "1.0.0-alpha.124"
 
 # Utility
-clap = { version = "4.5", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
-schemars = "0.8"
-regex = "1.11"
-sha2 = "0.10"
+clap = { version = "4.6.1", features = ["derive"] }
+chrono = { version = "0.4.44", features = ["serde"] }
+uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
+schemars = { version = "1.2.1", features = ["derive"] }
+regex = "1.12.3"
+sha2 = "0.11.0"
 crc16 = "0.4"
-notify = "6.1"
+notify = "9.0.0-rc.4"
 
 # Dev / test
-proptest = "1.5"
-criterion = "0.5"
-insta = "1.40"
-tempfile = "3.13"
-mockall = "0.13"
+proptest = "1.11.0"
+criterion = "0.8.2"
+insta = "1.47.2"
+tempfile = "3.27.0"
+mockall = "0.14.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"                # overridden per-crate where needed
@@ -227,8 +229,8 @@ Default ship build: `rocksdb-backend + directml + overlay`. Operators wanting CU
 ### 6.1 Via cargo
 
 ```powershell
-cargo install --git https://github.com/<your-org>/synapse synapse-mcp --features directml
-cargo install --git https://github.com/<your-org>/synapse synapse-overlay --features overlay
+cargo install --git https://github.com/ChrisRoyse/Synapse synapse-mcp --features directml
+cargo install --git https://github.com/ChrisRoyse/Synapse synapse-overlay --features overlay
 ```
 
 For users with the Rust toolchain. Builds from source.
@@ -465,7 +467,7 @@ Maintainer signs off per manual test plan in `13_testing_strategy.md` §15.
 
 Goal: a given commit hash produces byte-identical binaries on any contributor's machine.
 
-- Pin Rust toolchain via `rust-toolchain.toml`
+- Use the installed stable Rust toolchain recorded in `docs/adr/0001-current-rust-and-dependencies.md`
 - `cargo build --frozen --locked`
 - Pin all deps in `Cargo.lock` (committed)
 - Avoid build.rs that touches network or system clock

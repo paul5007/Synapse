@@ -1,7 +1,7 @@
 # Synapse — Real-Time Computer-Use & Game-Control MCP for AI Agents
 
 **Project codename:** Synapse ("the nerve connection between AI brain and computer body"; rename freely).
-**Language:** Rust, edition 2024, MSRV 1.83. All Rust end-to-end; no Python, no C/C++ glue beyond unavoidable FFI to Windows SDK / RocksDB / WASAPI / RP2040 SDK.
+**Language:** Rust, edition 2024, using the current installed stable toolchain for M0 (see `docs/adr/0001-current-rust-and-dependencies.md`). All Rust end-to-end; no Python, no C/C++ glue beyond unavoidable FFI to Windows SDK / RocksDB / WASAPI / RP2040 SDK.
 **Target host:** Windows 11 x64 (primary), Windows 10 x64 (best-effort). Linux/macOS deferred to v2.
 **License:** MIT or Apache-2.0 dual.
 **Repo:** fresh, independent. Clean-room, no upstream vendor dependencies.
@@ -159,7 +159,7 @@ Detailed budget and profiling discipline: `10_performance_budget.md`.
 winget install Nefarius.ViGEmBus       # virtual controller driver (~30s GUI installer)
 
 # Install Synapse
-cargo install --git https://github.com/<your-org>/synapse synapse-mcp
+cargo install --git https://github.com/ChrisRoyse/Synapse synapse-mcp
 
 # Stdio mode (for Claude Desktop / Codex CLI etc.)
 synapse-mcp --mode stdio

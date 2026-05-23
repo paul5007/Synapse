@@ -42,7 +42,7 @@ Claude Desktop calls `health` via Synapse MCP, sees `{"ok": true}`.
 ### Files created
 
 ```
-Cargo.toml, rust-toolchain.toml, deny.toml, .gitignore
+Cargo.toml, deny.toml, .gitignore
 LICENSE-MIT, LICENSE-APACHE
 README.md
 docs/                                  (this PRD)

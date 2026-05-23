@@ -96,7 +96,7 @@ Blocked: `GPL-*`, `AGPL-*`, `SSPL-*`, vendored deps w/o SPDX id.
 
 Adding a dep requires:
 
-1. Pin version in `[workspace.dependencies]`
+1. Declare the current compatible version in `[workspace.dependencies]`
 2. Justification in PR description (what it replaces / why no smaller alt)
 3. License field in dep's manifest matches allowed list
 4. Update `THIRD-PARTY-LICENSES.md` via `cargo about`

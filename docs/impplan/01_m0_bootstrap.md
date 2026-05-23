@@ -15,7 +15,7 @@ Claude Desktop configured with `synapse-mcp` as MCP server → user asks Claude 
 ## Inputs
 
 - Fresh repo (or clean branch)
-- Rust toolchain ≥ 1.83 (workspace MSRV)
+- Installed stable Rust toolchain (M0 currently verified with rustc/cargo 1.95.0; see `docs/adr/0001-current-rust-and-dependencies.md`)
 - Windows 11 dev box (primary) or Linux (CI-only checks; OS-bound code stubbed)
 - Claude Desktop (or any MCP-stdio client) for demo
 
@@ -27,7 +27,6 @@ Claude Desktop configured with `synapse-mcp` as MCP server → user asks Claude 
 
 ```
 Cargo.toml                                 (workspace manifest, 14_build_and_packaging §1-2)
-rust-toolchain.toml                        (pin 1.83)
 deny.toml                                  (cargo-deny config, 14 §14)
 .gitignore
 LICENSE-MIT, LICENSE-APACHE
@@ -62,7 +61,7 @@ scripts/check_docs.ps1                     (cross-doc CI)
 | # | Title | Acceptance |
 |---|---|---|
 | 1 | `chore: workspace scaffold` | `Cargo.toml` + 15 crate stubs + `cargo build --workspace` green |
-| 2 | `chore: rust-toolchain + deny + clippy + fmt` | CI matrix passes on a no-op PR |
+| 2 | `chore: deny + clippy + fmt` | CI matrix passes on a no-op PR using the installed stable toolchain |
 | 3 | `feat(core): geometry + ids + Backend + PerceptionMode + SCHEMA_VERSION` | `synapse_core::types` snapshot test (`insta`) baseline |
 | 4 | `feat(core): error_codes module stub` | every code from `06 §8` declared as `pub const NAME: &str = "NAME";`; test asserts `NAME == "NAME"` |
 | 5 | `feat(telemetry): tracing JSON + console + rolling appender` | running binary produces `%LOCALAPPDATA%\synapse\logs\synapse.log` JSONL |
@@ -95,7 +94,7 @@ scripts/check_docs.ps1                     (cross-doc CI)
 | Risk | Mitigation |
 |---|---|
 | `rmcp` API churn | Pin `rmcp = "1.7"` exact; do not bump without manual test |
-| Workspace deps version conflicts | All deps in `[workspace.dependencies]`; per-crate uses `dep.workspace = true` |
+| Workspace deps version conflicts | All deps in `[workspace.dependencies]`; per-crate uses `dep.workspace = true`; current compatible versions are resolved against the installed stable toolchain |
 | Win11-only paths in stub crates | All OS calls behind `#[cfg(windows)]`; Linux build sets stub functions to `unimplemented!()` (never called on Linux CI which only runs Linux-portable tests) |
 
 ---
