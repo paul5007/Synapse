@@ -245,7 +245,8 @@ For users without Rust. Signed Windows MSI from `wix-installer`:
 - Bundled profiles
 - Bundled RP2040 firmware `.uf2`
 - Visual C++ runtime redistributable (RocksDB dep)
-- Optional checkbox: install ViGEmBus driver (calls Nefarius signed installer)
+- Optional checkbox: launch the Nefarius signed ViGEmBus installer for an
+  operator-completed GUI install
 
 MSI signed with project's code-signing cert (community-trusted; operator sees "Verified Publisher" SmartScreen prompt first time).
 
@@ -273,7 +274,8 @@ Air-gapped installs: `.zip` with binaries + bundled models + profiles. Extract a
 
 1. **Permissions check.** Confirm user can write to `%LOCALAPPDATA%\synapse\`.
 2. **Supported-use acknowledgment.** (Per `08` §5.)
-3. **ViGEmBus check.** Detect; if missing, offer to download and run Nefarius installer.
+3. **ViGEmBus check.** Detect; if missing, offer to download and launch the
+   Nefarius installer for operator GUI clickthrough.
 4. **Model selection.** Show detection / OCR / STT models with sizes. Operator picks which to download.
 5. **Profile selection.** Show profiles; default = enable all bundled.
 6. **Bearer token generation.** For HTTP mode; store in `%APPDATA%\synapse\token.txt`.
@@ -281,7 +283,11 @@ Air-gapped installs: `.zip` with binaries + bundled models + profiles. Extract a
 8. **Start configuration.** Write `%APPDATA%\synapse\config.toml`.
 9. **First server start.** Launches `synapse-mcp --mode stdio` and prompts operator to configure their agent client.
 
-Supports `--non-interactive --accept-defaults` for headless installs.
+Supports `--non-interactive --accept-defaults` for headless installs except
+for ViGEmBus provisioning on current Win11. The Nefarius 1.22.0 installer is
+known to fail with silent/extraction flags, so non-interactive setup must skip
+ViGEmBus and leave `act_pad`/ViGEm FSV gates pending until an operator runs the
+GUI installer.
 
 ---
 

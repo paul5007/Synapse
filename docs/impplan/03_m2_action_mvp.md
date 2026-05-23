@@ -119,9 +119,13 @@ module.
   `SendInput` is gated `#[cfg(windows)]` and only runs in the `rust-windows`
   job.** A test that depends on `RecordingBackend` runs on both.
 - ViGEmBus is **required** for any test using `vigem-client`. Install via
-  `winget install Nefarius.ViGEmBus` on Win11 once. If absent at runtime,
-  `VigemBackend::ensure_ready()` must surface `ACTION_VIGEM_NOT_INSTALLED`
-  and the affected tests must skip with that exact error, never panic.
+  `winget install Nefarius.ViGEmBus` on Win11 once, then complete the
+  Nefarius installer GUI clickthrough. Current Win11 FSV showed the 1.22.0
+  installer fails under `/SILENT`, `/VERYSILENT`, and extraction flags before
+  writing a driver install or log, so M2 does not depend on unattended
+  ViGEmBus bootstrap. If absent at runtime, `VigemBackend::ensure_ready()`
+  must surface `ACTION_VIGEM_NOT_INSTALLED` and the affected tests must skip
+  with that exact error, never panic.
 
 ### 1.5 Things that are NOT done yet (you will not touch any of these at M2)
 

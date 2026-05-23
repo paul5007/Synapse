@@ -156,7 +156,7 @@ Detailed budget and profiling discipline: `10_performance_budget.md`.
 
 ```powershell
 # One-time prerequisites
-winget install Nefarius.ViGEmBus       # virtual controller driver (~30s GUI installer)
+winget install Nefarius.ViGEmBus       # virtual controller driver; use the GUI installer on Win11
 
 # Install Synapse
 cargo install --git https://github.com/ChrisRoyse/Synapse synapse-mcp
@@ -170,6 +170,12 @@ synapse-mcp --mode http --bind 127.0.0.1:7700
 # Optional: flash an RP2040 board for hardware HID
 cargo run -p synapse-hid-host -- flash --device COM7
 ```
+
+Win11 ViGEmBus note: the Nefarius 1.22.0 installer works by operator GUI
+clickthrough on the developer machine. Do not rely on `/SILENT`,
+`/VERYSILENT`, or installer extraction flags for current M2 setup; the Windows
+FSV finding in issue #229 showed those unattended paths exit before producing a
+driver install or log.
 
 Configure your agent client to launch `synapse-mcp` as an MCP server. Agent gains every tool in `05_mcp_tool_surface.md`.
 
