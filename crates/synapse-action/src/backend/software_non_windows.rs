@@ -1,4 +1,4 @@
-use synapse_core::Action;
+use synapse_core::{Action, Point};
 
 use crate::{ActionBackend, ActionError, EmitState};
 
@@ -11,6 +11,17 @@ impl SoftwareBackend {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// Reads the current software cursor position from the OS cursor backend.
+///
+/// # Errors
+///
+/// Always returns `ActionError::BackendUnavailable` on non-Windows targets.
+pub fn cursor_position() -> Result<Point, ActionError> {
+    Err(ActionError::BackendUnavailable {
+        detail: "software cursor position requires Windows".to_owned(),
+    })
 }
 
 impl ActionBackend for SoftwareBackend {

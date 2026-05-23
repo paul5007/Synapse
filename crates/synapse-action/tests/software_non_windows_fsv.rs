@@ -1,6 +1,9 @@
 #![cfg(not(windows))]
 
-use synapse_action::{ActionBackend, ActionError, EmitState, backend::software::SoftwareBackend};
+use synapse_action::{
+    ActionBackend, ActionError, EmitState,
+    backend::software::{SoftwareBackend, cursor_position},
+};
 use synapse_core::{
     Action, AimCurve, AimStyle, AimTarget, Backend, ButtonAction, ComboInput, ComboStep,
     GamepadReport, Key, KeyCode, KeystrokeDynamics, KeystrokeNaturalParams, MouseButton,
@@ -29,6 +32,22 @@ fn software_backend_returns_unavailable_for_every_action_variant_on_non_windows(
             error.code()
         );
     }
+}
+
+#[test]
+fn cursor_position_fails_closed_on_non_windows() {
+    println!("source_of_truth=software_cursor_linux edge=read before=platform:not_windows");
+    let error = match cursor_position() {
+        Ok(point) => panic!("non-Windows cursor_position must fail closed, got {point:?}"),
+        Err(error) => error,
+    };
+    println!(
+        "source_of_truth=software_cursor_linux edge=read after_code={} after_detail={:?}",
+        error.code(),
+        error.detail()
+    );
+    assert_eq!(error.code(), error_codes::ACTION_BACKEND_UNAVAILABLE);
+    assert!(error.detail().contains("requires Windows"));
 }
 
 fn action_cases() -> Vec<(&'static str, Action)> {

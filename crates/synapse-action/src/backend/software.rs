@@ -27,6 +27,20 @@ impl SoftwareBackend {
     }
 }
 
+/// Reads the current software cursor position from the OS cursor backend.
+///
+/// # Errors
+///
+/// Returns `ActionError::BackendUnavailable` when the cursor backend cannot be
+/// initialized or the OS cursor location cannot be read.
+pub fn cursor_position() -> Result<Point, ActionError> {
+    let enigo = enigo()?;
+    let (x, y) = enigo
+        .location()
+        .map_err(enigo_error("read cursor position"))?;
+    Ok(Point { x, y })
+}
+
 impl ActionBackend for SoftwareBackend {
     #[tracing::instrument(skip_all, fields(backend = "software"))]
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {
@@ -131,11 +145,8 @@ fn mouse_move(target: &MouseTarget) -> Result<(), ActionError> {
                 .to_owned(),
         });
     };
-    let enigo = enigo()?;
-    let (x, y) = enigo
-        .location()
-        .map_err(enigo_error("read cursor position"))?;
-    mouse_move_relative_i32(point.x - x, point.y - y)
+    let current = cursor_position()?;
+    mouse_move_relative_i32(point.x - current.x, point.y - current.y)
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_move_relative"))]

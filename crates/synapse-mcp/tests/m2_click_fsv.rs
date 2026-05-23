@@ -3,6 +3,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use synapse_core::error_codes;
 #[cfg(windows)]
+use synapse_core::{AccessibleNode, ElementId, Point, Rect, UiaPattern};
+#[cfg(windows)]
 use synapse_test_utils::fixtures::launch_notepad;
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 use tempfile::TempDir;
@@ -252,6 +254,183 @@ async fn act_click_stale_notepad_element_returns_element_not_resolved_fsv() -> a
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires an interactive Windows desktop with Notepad and UIA"]
+async fn act_click_non_invokable_notepad_element_uses_coordinate_fallback_fsv() -> anyhow::Result<()>
+{
+    let log_dir = TempDir::new()?;
+    let handle = launch_notepad()?;
+    let hwnd = handle.hwnd();
+    let pid = handle.pid();
+    let window = synapse_a11y::window_from_hwnd(hwnd)
+        .with_context(|| format!("resolve launched Notepad hwnd 0x{hwnd:x}"))?;
+    let subtree = synapse_a11y::snapshot(&window, 4)
+        .with_context(|| format!("snapshot launched Notepad hwnd 0x{hwnd:x}"))?;
+    let target = non_invokable_text_target(&subtree.nodes)
+        .context("Notepad snapshot did not contain an enabled non-Invoke text/value element")?;
+    let center = rect_center(target.bbox)?;
+    let before_text = read_element_text(&target.element_id)?;
+    let synthetic_text = format!("synapse-coordinate-fallback-223-{pid}");
+    assert!(!before_text.contains(&synthetic_text));
+
+    let mut client = StdioMcpClient::launch_and_init_with_log_dir(Some(log_dir.path())).await?;
+    let aim_point = Point {
+        x: target.bbox.x + 1,
+        y: target.bbox.y + 1,
+    };
+    let aim = client
+        .tools_call(
+            "act_aim",
+            json!({"target": {"x": aim_point.x, "y": aim_point.y}, "style": "snap"}),
+        )
+        .await?;
+    let aim_response: ActAimWireResponse = structured(&aim)?;
+    assert!(aim_response.ok);
+    let before_cursor = synapse_action::backend::software::cursor_position()?;
+    println!(
+        "source_of_truth=windows_cursor_and_uia edge=coordinate_fallback before=pid:{pid} hwnd:0x{hwnd:x} target:{} role:{:?} name:{:?} bbox:{:?} patterns:{:?} center:{center:?} cursor:{before_cursor:?} before_text_len:{}",
+        target.element_id,
+        target.role,
+        target.name,
+        target.bbox,
+        target.patterns,
+        before_text.chars().count()
+    );
+
+    let click = client
+        .tools_call(
+            "act_click",
+            json!({"target": {"element_id": target.element_id.to_string()}, "use_invoke_pattern": true}),
+        )
+        .await?;
+    let click_response: ActClickWireResponse = structured(&click)?;
+    let after_cursor = synapse_action::backend::software::cursor_position()?;
+    println!(
+        "source_of_truth=windows_cursor edge=coordinate_fallback after=ok:{} used_invoke_pattern:{} backend_used:{} cursor:{after_cursor:?} expected_center:{center:?}",
+        click_response.ok, click_response.used_invoke_pattern, click_response.backend_used
+    );
+    assert!(click_response.ok);
+    assert!(!click_response.used_invoke_pattern);
+    assert_eq!(click_response.backend_used, "software");
+    assert_point_within(
+        after_cursor,
+        center,
+        1,
+        "coordinate fallback cursor landing",
+    )?;
+
+    let typed = client
+        .tools_call(
+            "act_type",
+            json!({"text": synthetic_text, "dynamics": "burst"}),
+        )
+        .await?;
+    let typed_response: ActTypeWireResponse = structured(&typed)?;
+    assert!(typed_response.ok);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let after_text = read_element_text(&target.element_id)?;
+    let contains_synthetic = after_text.contains(&synthetic_text);
+    println!(
+        "source_of_truth=notepad_uia_text edge=coordinate_fallback after_text_len:{} contains_synthetic:{contains_synthetic}",
+        after_text.chars().count()
+    );
+    assert!(contains_synthetic);
+
+    assert!(client.shutdown().await?.success());
+    let logs = read_logs(log_dir.path())?;
+    let contains_backend_readback =
+        logs.contains("M2_ACT_CLICK_ELEMENT_READBACK") && logs.contains("coordinate_fallback");
+    println!(
+        "source_of_truth=daemon_log edge=coordinate_fallback bytes:{} contains_backend_readback:{contains_backend_readback}",
+        logs.len()
+    );
+    assert!(contains_backend_readback);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn non_invokable_text_target(nodes: &[AccessibleNode]) -> Option<AccessibleNode> {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.enabled
+                && node.bbox.w > 4
+                && node.bbox.h > 4
+                && !node.patterns.contains(&UiaPattern::Invoke)
+                && (node.patterns.contains(&UiaPattern::Text)
+                    || node.patterns.contains(&UiaPattern::Value))
+        })
+        .max_by_key(|node| non_invokable_target_score(node))
+        .cloned()
+}
+
+#[cfg(windows)]
+fn non_invokable_target_score(node: &AccessibleNode) -> (bool, bool, bool, u32, i64) {
+    let role = node.role.to_ascii_lowercase();
+    let area = i64::from(node.bbox.w).saturating_mul(i64::from(node.bbox.h));
+    (
+        node.patterns.contains(&UiaPattern::Value),
+        node.patterns.contains(&UiaPattern::Text),
+        role.contains("edit") || role.contains("document") || role.contains("text"),
+        node.depth,
+        area,
+    )
+}
+
+#[cfg(windows)]
+fn rect_center(rect: Rect) -> anyhow::Result<Point> {
+    if rect.w <= 0 || rect.h <= 0 {
+        anyhow::bail!("cannot center empty rectangle {rect:?}");
+    }
+    let x = i64::from(rect.x) + i64::from(rect.w) / 2;
+    let y = i64::from(rect.y) + i64::from(rect.h) / 2;
+    Ok(Point {
+        x: i32::try_from(x).context("rect center x overflowed i32")?,
+        y: i32::try_from(y).context("rect center y overflowed i32")?,
+    })
+}
+
+#[cfg(windows)]
+fn assert_point_within(
+    actual: Point,
+    expected: Point,
+    tolerance_px: i32,
+    label: &str,
+) -> anyhow::Result<()> {
+    let tolerance = i64::from(tolerance_px);
+    let dx = (i64::from(actual.x) - i64::from(expected.x)).abs();
+    let dy = (i64::from(actual.y) - i64::from(expected.y)).abs();
+    if dx > tolerance || dy > tolerance {
+        anyhow::bail!(
+            "{label} outside tolerance: actual={actual:?} expected={expected:?} dx={dx} dy={dy} tolerance={tolerance}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_element_text(element_id: &ElementId) -> anyhow::Result<String> {
+    use synapse_a11y::uiautomation::patterns::{UITextPattern, UIValuePattern};
+
+    let element = synapse_a11y::re_resolve(element_id)
+        .with_context(|| format!("re-resolve {element_id} for text readback"))?;
+    if let Ok(value_pattern) = element.get_pattern::<UIValuePattern>() {
+        return value_pattern
+            .get_value()
+            .with_context(|| format!("read ValuePattern text from {element_id}"));
+    }
+    let text_pattern: UITextPattern = element
+        .get_pattern()
+        .with_context(|| format!("read TextPattern from {element_id}"))?;
+    let range = text_pattern
+        .get_document_range()
+        .with_context(|| format!("read TextPattern document range from {element_id}"))?;
+    range
+        .get_text(-1)
+        .with_context(|| format!("read TextPattern text from {element_id}"))
+}
+
 #[derive(serde::Deserialize)]
 struct ActClickWireResponse {
     ok: bool,
@@ -260,6 +439,18 @@ struct ActClickWireResponse {
     double_click_window_ms: u32,
     inter_click_delay_ms: u32,
     elapsed_ms: u32,
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+struct ActAimWireResponse {
+    ok: bool,
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+struct ActTypeWireResponse {
+    ok: bool,
 }
 
 fn assert_timing_response(response: &ActClickWireResponse, clicks: u8) {

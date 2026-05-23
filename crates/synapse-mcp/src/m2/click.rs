@@ -173,10 +173,17 @@ async fn execute_element_click(
 
         match outcome {
             ElementClickOutcome::Invoked => {
+                trace_element_click_outcome(element, click_index, "invoked", None);
                 used_invoke_pattern = true;
                 backend_used = "uia";
             }
-            ElementClickOutcome::CoordinateFallback(_) => {
+            ElementClickOutcome::CoordinateFallback(plan) => {
+                trace_element_click_outcome(
+                    element,
+                    click_index,
+                    "coordinate_fallback",
+                    Some(plan.screen_point),
+                );
                 backend_used = "software";
             }
         }
@@ -197,6 +204,24 @@ async fn execute_element_click(
         inter_click_delay_ms: timing.inter_click_delay_ms,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
+}
+
+fn trace_element_click_outcome(
+    element: &ActClickElementTarget,
+    click_index: u8,
+    outcome: &'static str,
+    fallback_screen_point: Option<Point>,
+) {
+    tracing::info!(
+        code = "M2_ACT_CLICK_ELEMENT_READBACK",
+        kind = "act_click",
+        element_id = %element.element_id,
+        click_number = u32::from(click_index) + 1,
+        outcome,
+        fallback_screen_x = fallback_screen_point.map(|point| point.x),
+        fallback_screen_y = fallback_screen_point.map(|point| point.y),
+        "source_of_truth=action_backend tool=act_click element_click_after"
+    );
 }
 
 async fn execute_actor_actions(
