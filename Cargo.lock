@@ -3025,6 +3025,7 @@ dependencies = [
  "serde",
  "serde_json",
  "synapse-a11y",
+ "synapse-action",
  "synapse-capture",
  "synapse-core",
  "synapse-perception",

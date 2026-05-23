@@ -11,11 +11,14 @@ use rmcp::{
 };
 use synapse_core::Health;
 
-use crate::m1::{
-    FindParams, FindResponse, M1State, ObserveParams, ReadTextParams, SetCaptureTargetParams,
-    SetCaptureTargetResponse, SetPerceptionModeParams, SetPerceptionModeResponse, SharedM1State,
-    assemble_observation, empty_input_schema, find_in_state, mcp_error, read_text_in_state,
-    set_capture_target_in_state, set_perception_mode_in_state,
+use crate::{
+    m1::{
+        FindParams, FindResponse, M1State, ObserveParams, ReadTextParams, SetCaptureTargetParams,
+        SetCaptureTargetResponse, SetPerceptionModeParams, SetPerceptionModeResponse,
+        SharedM1State, assemble_observation, empty_input_schema, find_in_state, mcp_error,
+        read_text_in_state, set_capture_target_in_state, set_perception_mode_in_state,
+    },
+    m2::{SharedM2State, shared_m2_state_from_env},
 };
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,7 @@ pub struct SynapseService {
     started_at: Instant,
     tool_router: ToolRouter<Self>,
     m1_state: SharedM1State,
+    m2_state: SharedM2State,
 }
 
 impl SynapseService {
@@ -32,6 +36,7 @@ impl SynapseService {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
+            m2_state: shared_m2_state_from_env(),
         }
     }
 
@@ -52,6 +57,18 @@ impl SynapseService {
                 "M1 service state lock poisoned",
             )
         })
+    }
+
+    fn instructions(&self) -> &'static str {
+        if self
+            .m2_state
+            .lock()
+            .is_ok_and(|state| state.recording_enabled())
+        {
+            "Synapse M1 perception MCP server with M2 action scaffold (recording enabled)"
+        } else {
+            "Synapse M1 perception MCP server with M2 action scaffold"
+        }
     }
 }
 
@@ -179,7 +196,7 @@ impl ServerHandler for SynapseService {
                 "synapse-mcp",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions("Synapse M1 perception MCP server")
+            .with_instructions(self.instructions())
     }
 }
 
