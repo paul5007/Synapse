@@ -71,6 +71,58 @@ impl EmitState {
             .filter_map(mouse_button_from_index)
             .collect()
     }
+
+    pub(crate) fn release_all(&mut self) -> (usize, usize, usize) {
+        let released_keys = self.held_keys.count();
+        let released_buttons = self.held_buttons.count();
+        let released_pads = self.pad_state.len();
+        self.held_keys.make_empty();
+        self.held_buttons.make_empty();
+        self.pad_state.clear();
+        (released_keys, released_buttons, released_pads)
+    }
+
+    pub(crate) fn hold_key(&mut self, key: &Key) {
+        let index = self.key_index(key);
+        self.held_keys.insert(index);
+    }
+
+    pub(crate) fn release_key(&mut self, key: &Key) {
+        if let Some(index) = self.key_indices.get(key) {
+            self.held_keys.remove(*index);
+        }
+    }
+
+    pub(crate) fn apply_key_chord(&mut self, keys: &[Key]) {
+        for key in keys {
+            self.hold_key(key);
+        }
+        for key in keys {
+            self.release_key(key);
+        }
+    }
+
+    pub(crate) fn apply_mouse_button(&mut self, button: MouseButton, action: ButtonAction) {
+        let index = mouse_button_index(button);
+        match action {
+            ButtonAction::Down => {
+                self.held_buttons.insert(index);
+            }
+            ButtonAction::Up | ButtonAction::Press => {
+                self.held_buttons.remove(index);
+            }
+        }
+    }
+
+    fn key_index(&mut self, key: &Key) -> usize {
+        if let Some(index) = self.key_indices.get(key) {
+            return *index;
+        }
+        let index = self.keys_by_index.len();
+        self.keys_by_index.push(key.clone());
+        self.key_indices.insert(key.clone(), index);
+        index
+    }
 }
 
 impl Default for EmitState {
@@ -203,19 +255,21 @@ impl ActionEmitter {
     async fn execute(&mut self, action: Action) -> ActionResult<()> {
         match action {
             Action::KeyPress { key, .. } => {
-                self.hold_key(&key);
-                self.release_key(&key);
+                self.state.hold_key(&key);
+                self.state.release_key(&key);
             }
-            Action::KeyDown { key, .. } => self.hold_key(&key),
-            Action::KeyUp { key, .. } => self.release_key(&key),
-            Action::KeyChord { keys, .. } => self.apply_key_chord(&keys),
+            Action::KeyDown { key, .. } => self.state.hold_key(&key),
+            Action::KeyUp { key, .. } => self.state.release_key(&key),
+            Action::KeyChord { keys, .. } => self.state.apply_key_chord(&keys),
             Action::TypeText { .. }
             | Action::MouseMove { .. }
             | Action::MouseMoveRelative { .. }
             | Action::MouseDrag { .. }
             | Action::MouseScroll { .. }
             | Action::AimAt { .. } => {}
-            Action::MouseButton { button, action, .. } => self.apply_mouse_button(button, action),
+            Action::MouseButton { button, action, .. } => {
+                self.state.apply_mouse_button(button, action);
+            }
             Action::PadButton {
                 pad,
                 button,
@@ -237,12 +291,7 @@ impl ActionEmitter {
 
     #[tracing::instrument(skip_all, fields(action_kind = "release_all"))]
     async fn release_all(&mut self) {
-        let released_keys = self.state.held_keys.count();
-        let released_buttons = self.state.held_buttons.count();
-        let released_pads = self.state.pad_state.len();
-        self.state.held_keys.make_empty();
-        self.state.held_buttons.make_empty();
-        self.state.pad_state.clear();
+        let (released_keys, released_buttons, released_pads) = self.state.release_all();
         tracing::warn!(
             code = error_codes::SAFETY_RELEASE_ALL_FIRED,
             released_keys,
@@ -252,24 +301,15 @@ impl ActionEmitter {
         );
     }
 
-    fn apply_key_chord(&mut self, keys: &[Key]) {
-        for key in keys {
-            self.hold_key(key);
-        }
-        for key in keys {
-            self.release_key(key);
-        }
-    }
-
     fn apply_combo(&mut self, steps: Vec<synapse_core::ComboStep>) {
         for step in steps {
             match step.input {
-                ComboInput::KeyDown { key } => self.hold_key(&key),
+                ComboInput::KeyDown { key } => self.state.hold_key(&key),
                 ComboInput::KeyUp { key } | ComboInput::KeyPress { key, .. } => {
-                    self.release_key(&key);
+                    self.state.release_key(&key);
                 }
                 ComboInput::MouseButton { button, action } => {
-                    self.apply_mouse_button(button, action);
+                    self.state.apply_mouse_button(button, action);
                 }
                 ComboInput::MouseMoveRel { .. } => {}
                 ComboInput::PadButton {
@@ -280,39 +320,6 @@ impl ActionEmitter {
                 ComboInput::PadStick { pad, stick, x, y } => {
                     self.apply_pad_stick(pad, stick, x, y);
                 }
-            }
-        }
-    }
-
-    fn hold_key(&mut self, key: &Key) {
-        let index = self.key_index(key);
-        self.state.held_keys.insert(index);
-    }
-
-    fn release_key(&mut self, key: &Key) {
-        if let Some(index) = self.state.key_indices.get(key) {
-            self.state.held_keys.remove(*index);
-        }
-    }
-
-    fn key_index(&mut self, key: &Key) -> usize {
-        if let Some(index) = self.state.key_indices.get(key) {
-            return *index;
-        }
-        let index = self.state.keys_by_index.len();
-        self.state.keys_by_index.push(key.clone());
-        self.state.key_indices.insert(key.clone(), index);
-        index
-    }
-
-    fn apply_mouse_button(&mut self, button: MouseButton, action: ButtonAction) {
-        let index = mouse_button_index(button);
-        match action {
-            ButtonAction::Down => {
-                self.state.held_buttons.insert(index);
-            }
-            ButtonAction::Up | ButtonAction::Press => {
-                self.state.held_buttons.remove(index);
             }
         }
     }

@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 pub mod backend;
 pub mod emitter;
 pub mod error;

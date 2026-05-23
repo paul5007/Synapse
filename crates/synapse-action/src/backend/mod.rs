@@ -2,6 +2,9 @@ use synapse_core::{Action, Backend};
 
 use crate::{ActionError, EmitState};
 
+#[cfg(windows)]
+pub mod software;
+
 pub trait ActionBackend: Send + Sync {
     /// Executes one action against a concrete backend while updating emitter state.
     ///
