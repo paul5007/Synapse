@@ -12,6 +12,10 @@ use tracing_subscriber::{
     registry::LookupSpan, util::SubscriberInitExt,
 };
 
+pub mod metrics {
+    pub use metrics::{counter, describe_counter};
+}
+
 const DEFAULT_MAX_DIR_BYTES: u64 = 500 * 1024 * 1024;
 const DEFAULT_KEEP_DAYS: u32 = 7;
 

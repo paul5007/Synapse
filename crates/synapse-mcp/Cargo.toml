@@ -16,6 +16,7 @@ clap.workspace = true
 rmcp.workspace = true
 serde_json.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
+synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
 tokio-util.workspace = true

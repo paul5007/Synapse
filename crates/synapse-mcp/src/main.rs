@@ -48,7 +48,14 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let telemetry_guard = configure_telemetry(&cli)?;
+    let dpi_awareness = synapse_capture::init_process_dpi_awareness()
+        .context("initialize per-monitor DPI awareness")?;
     tracing::info!(?cli, code = "MCP_CLI_PARSED", "synapse-mcp cli parsed");
+    tracing::info!(
+        ?dpi_awareness,
+        code = "CAPTURE_DPI_AWARENESS_INITIALIZED",
+        "capture dpi awareness initialized"
+    );
 
     match cli.mode {
         Mode::Stdio => run_stdio(telemetry_guard).await,
