@@ -1,0 +1,263 @@
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex, MutexGuard},
+};
+
+use arc_swap::ArcSwap;
+use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
+use synapse_core::{Event, EventFilter, SubscriptionId, error_codes, new_subscription_id};
+use thiserror::Error;
+
+pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 4096;
+pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 64;
+pub const EVENTS_DROPPED_METRIC: &str = "events_dropped_for_subscriber";
+
+pub type EventBusResult<T> = Result<T, EventBusError>;
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum EventBusError {
+    #[error("subscription cap reached: limit {limit}")]
+    SubscriptionCapReached { limit: usize },
+    #[error("event filter invalid: {detail}")]
+    FilterInvalid { detail: String },
+}
+
+impl EventBusError {
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(event_bus_error = ?self))]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SubscriptionCapReached { .. } => error_codes::SUBSCRIPTION_CAP_REACHED,
+            Self::FilterInvalid { .. } => error_codes::REFLEX_FILTER_INVALID,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EventBus {
+    inner: Arc<EventBusInner>,
+}
+
+#[derive(Debug)]
+struct EventBusInner {
+    subscribers: ArcSwap<Vec<Arc<Subscriber>>>,
+    updates: Mutex<()>,
+}
+
+impl Default for EventBusInner {
+    fn default() -> Self {
+        Self {
+            subscribers: ArcSwap::from_pointee(Vec::new()),
+            updates: Mutex::new(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Subscriber {
+    id: SubscriptionId,
+    filter: EventFilter,
+    kinds: BTreeSet<String>,
+    sender: Sender<Event>,
+    receiver: Receiver<Event>,
+    lossy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubscriberHandle {
+    id: SubscriptionId,
+    receiver: Receiver<Event>,
+    lossy: Arc<std::sync::atomic::AtomicBool>,
+    snapshot_first: bool,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PublishReport {
+    pub matched: usize,
+    pub queued: usize,
+    pub dropped: u64,
+}
+
+impl EventBus {
+    /// Subscribes to matching events with a bounded per-subscriber queue.
+    ///
+    /// An empty `kinds` list means all event kinds are allowed, subject to
+    /// `filter`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventBusError::FilterInvalid`] when the filter fails schema
+    /// validation, or [`EventBusError::SubscriptionCapReached`] when 64 active
+    /// subscriptions already exist.
+    #[tracing::instrument(
+        skip_all,
+        fields(kinds_count = kinds.len(), snapshot_first)
+    )]
+    pub fn subscribe(
+        &self,
+        filter: EventFilter,
+        kinds: Vec<String>,
+        snapshot_first: bool,
+    ) -> EventBusResult<SubscriberHandle> {
+        filter
+            .validate()
+            .map_err(|error| EventBusError::FilterInvalid {
+                detail: error.to_string(),
+            })?;
+
+        let _guard = self.lock_updates();
+        let current = self.inner.subscribers.load_full();
+        if current.len() >= DEFAULT_MAX_SUBSCRIPTIONS {
+            return Err(EventBusError::SubscriptionCapReached {
+                limit: DEFAULT_MAX_SUBSCRIPTIONS,
+            });
+        }
+
+        let id = new_subscription_id();
+        let (sender, receiver) = bounded(SUBSCRIBER_QUEUE_CAPACITY);
+        let lossy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let subscriber = Arc::new(Subscriber {
+            id: id.clone(),
+            filter,
+            kinds: kinds.into_iter().collect(),
+            sender,
+            receiver: receiver.clone(),
+            lossy: Arc::clone(&lossy),
+        });
+        let mut next = current.as_ref().clone();
+        next.push(subscriber);
+        self.inner.subscribers.store(Arc::new(next));
+
+        Ok(SubscriberHandle {
+            id,
+            receiver,
+            lossy,
+            snapshot_first,
+        })
+    }
+
+    /// Publishes an event to every matching subscriber without blocking.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(event_kind = %event.kind, event_seq = event.seq))]
+    pub fn publish(&self, event: Event) -> PublishReport {
+        let subscribers = self.inner.subscribers.load();
+        let mut report = PublishReport::default();
+        for subscriber in subscribers.iter() {
+            if !subscriber.matches(&event) {
+                continue;
+            }
+            report.matched = report.matched.saturating_add(1);
+            let dropped = enqueue_drop_oldest(subscriber, event.clone());
+            report.dropped = report.dropped.saturating_add(dropped);
+            report.queued = report.queued.saturating_add(1);
+            if dropped > 0 {
+                subscriber
+                    .lossy
+                    .store(true, std::sync::atomic::Ordering::Release);
+                metrics::counter!(
+                    EVENTS_DROPPED_METRIC,
+                    "subscription_id" => subscriber.id.clone()
+                )
+                .increment(dropped);
+            }
+        }
+        drop(event);
+        report
+    }
+
+    /// Removes a subscriber. Returns `false` if the id was already absent.
+    #[tracing::instrument(skip_all, fields(subscription_id = id))]
+    pub fn unsubscribe(&self, id: &str) -> bool {
+        let _guard = self.lock_updates();
+        let current = self.inner.subscribers.load_full();
+        let next = current
+            .iter()
+            .filter(|subscriber| subscriber.id != id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = next.len() != current.len();
+        if removed {
+            self.inner.subscribers.store(Arc::new(next));
+        }
+        removed
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn subscriber_count(&self) -> usize {
+        self.inner.subscribers.load().len()
+    }
+
+    fn lock_updates(&self) -> MutexGuard<'_, ()> {
+        match self.inner.updates.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl Subscriber {
+    fn matches(&self, event: &Event) -> bool {
+        (self.kinds.is_empty() || self.kinds.contains(&event.kind)) && self.filter.matches(event)
+    }
+}
+
+impl SubscriberHandle {
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn snapshot_first(&self) -> bool {
+        self.snapshot_first
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn len(&self) -> usize {
+        self.receiver.len()
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn take_lossy(&self) -> bool {
+        self.lossy.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn drain(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+}
+
+fn enqueue_drop_oldest(subscriber: &Subscriber, mut event: Event) -> u64 {
+    let mut dropped = 0_u64;
+    loop {
+        match subscriber.sender.try_send(event) {
+            Ok(()) => return dropped,
+            Err(TrySendError::Full(returned)) => {
+                event = returned;
+                match subscriber.receiver.try_recv() {
+                    Ok(_oldest) => dropped = dropped.saturating_add(1),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => return dropped,
+                }
+            }
+            Err(TrySendError::Disconnected(_returned)) => return dropped,
+        }
+    }
+}

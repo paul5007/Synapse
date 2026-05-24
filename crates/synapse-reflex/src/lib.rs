@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod bus;
 pub mod error;
 
 use std::{path::Path, sync::Arc};
@@ -7,11 +8,11 @@ use synapse_action::ActionHandle;
 use synapse_storage::Db;
 
 pub use audit::write_audit;
+pub use bus::{
+    DEFAULT_MAX_SUBSCRIPTIONS, EVENTS_DROPPED_METRIC, EventBus, EventBusError, EventBusResult,
+    PublishReport, SUBSCRIBER_QUEUE_CAPACITY, SubscriberHandle,
+};
 pub use error::{ReflexError, ReflexResult};
-
-/// Minimal event bus handle; expanded by the M3 event-bus work item.
-#[derive(Clone, Debug, Default)]
-pub struct EventBus;
 
 /// Runtime handle for the M3 reflex subsystem.
 #[derive(Debug)]
@@ -99,7 +100,7 @@ mod tests {
             db.schema_version
         );
 
-        let runtime = ReflexRuntime::spawn(Arc::clone(&db), action_handle, EventBus)?;
+        let runtime = ReflexRuntime::spawn(Arc::clone(&db), action_handle, EventBus::default())?;
         runtime.action_handle().try_execute(Action::ReleaseAll)?;
         let (queued_action, _ack) = action_rx.try_recv()?;
 

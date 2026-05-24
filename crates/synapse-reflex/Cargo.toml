@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 arc-swap.workspace = true
 crossbeam.workspace = true
+metrics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 synapse-action = { version = "0.1.0", path = "../synapse-action" }
@@ -23,6 +24,7 @@ uuid.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 tempfile.workspace = true
 
 [lints]
