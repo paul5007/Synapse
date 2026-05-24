@@ -46,7 +46,7 @@ async fn gc_periodic_task_runs_tick_with_fsv() -> Result<(), Box<dyn Error>> {
     fill_rows(&db, 12)?;
     db.flush()?;
     let before = db.scan_cf(cf::CF_EVENTS)?;
-    let config = gc::GcConfig::rows(Duration::from_millis(10), cf::CF_EVENTS, 6, 20);
+    let config = gc::GcConfig::rows_for_fsv(Duration::from_millis(10), cf::CF_EVENTS, 6, 20);
     let task = gc::spawn(Arc::clone(&db.inner), config)?;
     tokio::time::sleep(Duration::from_millis(40)).await;
     let after = db.scan_cf(cf::CF_EVENTS)?;
@@ -102,7 +102,7 @@ fn run_gc_case(recorder: &TestRecorder, case: CaseSpec) -> Result<(), Box<dyn Er
     let before = db.scan_cf(cf::CF_EVENTS)?;
     let before_property = estimated_num_keys(&db)?;
     let before_metric = recorder.counter_value(METRIC_KEY)?;
-    let config = gc::GcConfig::rows(
+    let config = gc::GcConfig::rows_for_fsv(
         Duration::from_mins(5),
         cf::CF_EVENTS,
         case.soft_cap,

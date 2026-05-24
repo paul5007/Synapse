@@ -9,6 +9,7 @@ mod pressure;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, DBCompressionType,
@@ -149,6 +150,34 @@ impl Db {
         gc::run_once(&self.inner, &gc::GcConfig::from_retention_defaults())
     }
 
+    /// Runs one row-count-scaled GC pass for local FSV integration tests.
+    ///
+    /// This keeps FSV deterministic without writing gigabytes to hit production
+    /// byte caps.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when `RocksDB` property reads, deletes, flushes,
+    /// or compactions fail.
+    #[doc(hidden)]
+    #[tracing::instrument(skip_all)]
+    pub fn run_gc_once_for_fsv(
+        &self,
+        cf_name: &'static str,
+        soft_cap_rows: u64,
+        hard_cap_rows: u64,
+    ) -> StorageResult<GcReport> {
+        gc::run_once(
+            &self.inner,
+            &gc::GcConfig::rows_for_fsv(
+                Duration::from_mins(5),
+                cf_name,
+                soft_cap_rows,
+                hard_cap_rows,
+            ),
+        )
+    }
+
     /// Spawns the periodic storage garbage-collection task.
     ///
     /// # Errors
@@ -181,6 +210,28 @@ impl Db {
             &self.pressure,
             &self.path,
             &pressure::PressureConfig::default(),
+        )
+    }
+
+    /// Applies one synthetic free-byte sample for local FSV integration tests.
+    ///
+    /// This uses the production thresholds and responder actions while avoiding
+    /// host-volume manipulation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when pressure-triggered compaction fails.
+    #[doc(hidden)]
+    #[tracing::instrument(skip_all)]
+    pub fn run_pressure_check_with_free_bytes_for_fsv(
+        &self,
+        free_bytes: u64,
+    ) -> StorageResult<PressureReport> {
+        pressure::run_once_with_free_bytes(
+            &self.inner,
+            &self.pressure,
+            &pressure::PressureConfig::default(),
+            free_bytes,
         )
     }
 

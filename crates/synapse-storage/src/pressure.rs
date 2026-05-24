@@ -213,7 +213,6 @@ pub fn run_once(
     apply_free_bytes(db, state, config, free_bytes)
 }
 
-#[cfg(test)]
 pub fn run_once_with_free_bytes(
     db: &DB,
     state: &PressureState,

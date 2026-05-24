@@ -89,9 +89,13 @@ impl GcConfig {
     }
 }
 
-#[cfg(test)]
 impl GcConfig {
-    pub fn rows(interval: Duration, cf_name: &'static str, soft_cap: u64, hard_cap: u64) -> Self {
+    pub(crate) fn rows_for_fsv(
+        interval: Duration,
+        cf_name: &'static str,
+        soft_cap: u64,
+        hard_cap: u64,
+    ) -> Self {
         Self {
             interval,
             budgets: vec![GcBudget {
@@ -115,7 +119,6 @@ struct GcBudget {
 #[derive(Clone, Copy, Debug)]
 enum CapUnit {
     Bytes,
-    #[cfg(test)]
     Rows,
 }
 
@@ -227,12 +230,8 @@ fn evict_oldest(
 }
 
 fn remove_count(budget: GcBudget, key_count: usize, before_value: u64) -> usize {
-    #[cfg(not(test))]
-    let _ = before_value;
-
     let quarter = key_count.div_ceil(4);
     let needed = match budget.unit {
-        #[cfg(test)]
         CapUnit::Rows => {
             usize::try_from(before_value.saturating_sub(budget.soft_cap)).unwrap_or(usize::MAX)
         }
@@ -247,11 +246,7 @@ fn measured_value(
     budget: GcBudget,
     exact_rows: u64,
 ) -> StorageResult<u64> {
-    #[cfg(not(test))]
-    let _ = exact_rows;
-
     match budget.unit {
-        #[cfg(test)]
         CapUnit::Rows => Ok(exact_rows),
         CapUnit::Bytes => cf_property(db, cf, budget.cf_name, ESTIMATE_LIVE_DATA_SIZE)
             .map(Option::unwrap_or_default),
