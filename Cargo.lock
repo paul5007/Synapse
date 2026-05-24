@@ -3519,6 +3519,7 @@ dependencies = [
 name = "synapse-storage"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "fs2",
  "insta",
  "metrics",
