@@ -354,6 +354,12 @@ pub fn element_from_point(point: Point) -> A11yResult<UIElement> {
 
 /// Captures a depth-limited accessible subtree from a UIA root element.
 ///
+/// On Windows this uses UIA `RawView` plus a bounded direct raw lookup for common
+/// top-level menu items that packaged `WinUI` surfaces expose through search but
+/// not through child walking, such as the Win11 Notepad menu bar. `RawView` can
+/// include more structural nodes at a given depth; callers that serialize
+/// results should keep applying their own depth and count budgets.
+///
 /// # Errors
 ///
 /// Returns `A11Y_ELEMENT_STALE` when the root no longer produces a node, a
@@ -371,8 +377,7 @@ pub enum ElementSearchScope {
 }
 
 /// Finds the first enabled element under `root` with the requested UIA name and
-/// pattern availability. This uses direct UIA search rather than the cached
-/// `ControlView` `TreeWalker` used by `snapshot()`.
+/// pattern availability. This uses direct UIA search with a `RawView` cache.
 ///
 /// # Errors
 ///
@@ -566,6 +571,7 @@ pub async fn attach_chromiumoxide(endpoint: &str) -> A11yResult<CdpAttachment> {
 #[cfg(windows)]
 mod platform {
     use std::{
+        collections::HashSet,
         ffi::c_void,
         path::Path,
         sync::{
@@ -583,7 +589,7 @@ mod platform {
     };
     use tokio::sync::mpsc::UnboundedSender;
     use uiautomation::{
-        UIAutomation, UIElement,
+        UIAutomation, UIElement, UITreeWalker,
         core::UICacheRequest,
         patterns::UIExpandCollapsePattern,
         types::{
@@ -602,14 +608,14 @@ mod platform {
                     CoGetApartmentType, CoInitializeEx, CoUninitialize,
                 },
                 Threading::{
-                    GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
+                    AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
                     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
                 },
             },
             UI::{
                 Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
                 WindowsAndMessaging::{
-                    DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+                    BringWindowToTop, DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
                     EVENT_OBJECT_FOCUS, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SELECTION,
                     EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_ALERT, EVENT_SYSTEM_FOREGROUND,
                     EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUSTART, EnumWindows, GetForegroundWindow,
@@ -632,6 +638,11 @@ mod platform {
     static WIN_EVENT_SENDER: Mutex<Option<UnboundedSender<AccessibleEvent>>> = Mutex::new(None);
     static SNAPSHOT_CACHE: Mutex<Option<SnapshotCache>> = Mutex::new(None);
     static SNAPSHOT_DEPTH1_DEGRADED: AtomicBool = AtomicBool::new(false);
+    const RAW_SUPPLEMENT_DEPTH: u32 = 2;
+    const RAW_SUPPLEMENT_NODE_BUDGET: usize = 60;
+    // Packaged Notepad exposes these top-level menu items through raw
+    // name+ExpandCollapse search even when RawView child walking omits them.
+    const RAW_MENU_SUPPLEMENT_NAMES: [&str; 3] = ["File", "Edit", "View"];
 
     #[derive(Clone)]
     struct SnapshotCache {
@@ -644,6 +655,12 @@ mod platform {
     enum TreeView {
         Control,
         Raw,
+    }
+
+    struct SnapshotWalk<'a> {
+        walker: &'a UITreeWalker,
+        cache: &'a UICacheRequest,
+        root_hwnd: i64,
     }
 
     const WIN_EVENT_IDS: [u32; 10] = [
@@ -732,13 +749,44 @@ mod platform {
             });
         }
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-        if unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+        if unsafe { GetForegroundWindow() }.0 == hwnd.0 {
             Ok(())
         } else {
-            Err(A11yError::internal(format!(
-                "SetForegroundWindow returned false for hwnd 0x{:x}",
-                hwnd.0 as isize
-            )))
+            let current_thread = unsafe { GetCurrentThreadId() };
+            let foreground = unsafe { GetForegroundWindow() };
+            let foreground_thread = if foreground.0.is_null() {
+                0
+            } else {
+                unsafe { GetWindowThreadProcessId(foreground, None) }
+            };
+            let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+            let attached_foreground = foreground_thread != 0
+                && foreground_thread != current_thread
+                && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
+            let attached_target = target_thread != 0
+                && target_thread != current_thread
+                && unsafe { AttachThreadInput(current_thread, target_thread, true) }.as_bool();
+
+            let _ = unsafe { BringWindowToTop(hwnd) };
+            let focused = unsafe { SetForegroundWindow(hwnd) }.as_bool()
+                || unsafe { GetForegroundWindow() }.0 == hwnd.0;
+
+            if attached_target {
+                let _ = unsafe { AttachThreadInput(current_thread, target_thread, false) };
+            }
+            if attached_foreground {
+                let _ = unsafe { AttachThreadInput(current_thread, foreground_thread, false) };
+            }
+
+            if focused {
+                Ok(())
+            } else {
+                Err(A11yError::internal(format!(
+                    "SetForegroundWindow returned false for hwnd 0x{:x}",
+                    hwnd.0 as isize
+                )))
+            }
         }
     }
 
@@ -849,6 +897,10 @@ mod platform {
             }
             if requested_depth < depth {
                 tree.truncated = true;
+            }
+            if depth >= RAW_SUPPLEMENT_DEPTH {
+                tree.truncated |= supplement_raw_pattern_nodes(automation, root, &mut tree.nodes)?;
+                tree.max_depth = tree.max_depth.max(RAW_SUPPLEMENT_DEPTH);
             }
             store_snapshot(depth, &tree);
             Ok(tree)
@@ -1056,11 +1108,17 @@ mod platform {
         root: &UIElement,
         depth: u32,
     ) -> A11yResult<AccessibleSubtree> {
-        let cache = create_cache_request(automation, depth, ElementMode::None, TreeView::Control)?;
+        let cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Raw)?;
+        let walker = automation.get_raw_view_walker().map_err(map_uia_error)?;
         let cached_root = root.build_updated_cache(&cache).map_err(map_uia_error)?;
         let root_hwnd = cached_hwnd(&cached_root).unwrap_or(0);
         let mut nodes = Vec::new();
-        collect_nodes(&cached_root, None, 0, depth, root_hwnd, &mut nodes)?;
+        let walk = SnapshotWalk {
+            walker: &walker,
+            cache: &cache,
+            root_hwnd,
+        };
+        collect_nodes(&walk, &cached_root, None, 0, depth, &mut nodes)?;
         let root = nodes
             .first()
             .map(|node| node.element_id.clone())
@@ -1073,6 +1131,68 @@ mod platform {
             max_depth: depth,
             truncated: false,
         })
+    }
+
+    fn supplement_raw_pattern_nodes(
+        automation: &UIAutomation,
+        root: &UIElement,
+        nodes: &mut Vec<AccessibleNode>,
+    ) -> A11yResult<bool> {
+        let Some(root_id) = nodes.first().map(|node| node.element_id.clone()) else {
+            return Ok(false);
+        };
+        let root_hwnd = root_id
+            .parts()
+            .map_err(|err| A11yError::InvalidElementId {
+                detail: err.to_string(),
+            })?
+            .hwnd;
+        let cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Raw)?;
+        let mut seen: HashSet<ElementId> =
+            nodes.iter().map(|node| node.element_id.clone()).collect();
+        let mut truncated = false;
+        for name in RAW_MENU_SUPPLEMENT_NAMES {
+            let name_condition = automation
+                .create_property_condition(
+                    UIProperty::Name,
+                    Variant::from(name),
+                    Some(PropertyConditionFlags::IgnoreCase),
+                )
+                .map_err(map_uia_error)?;
+            let pattern_condition = automation
+                .create_property_condition(
+                    UIProperty::IsExpandCollapsePatternAvailable,
+                    Variant::from(true),
+                    None,
+                )
+                .map_err(map_uia_error)?;
+            let condition = automation
+                .create_and_condition(name_condition, pattern_condition)
+                .map_err(map_uia_error)?;
+            let raw_elements = root
+                .find_all_build_cache(TreeScope::Subtree, &condition, &cache)
+                .map_err(map_uia_error)?;
+            for element in raw_elements {
+                if nodes.len() >= RAW_SUPPLEMENT_NODE_BUDGET {
+                    truncated = true;
+                    break;
+                }
+                let node = node_from_cached_element(
+                    &element,
+                    Some(root_id.clone()),
+                    RAW_SUPPLEMENT_DEPTH,
+                    root_hwnd,
+                    0,
+                )?;
+                if seen.insert(node.element_id.clone()) {
+                    nodes.push(node);
+                }
+            }
+            if truncated {
+                break;
+            }
+        }
+        Ok(truncated)
     }
 
     fn cached_snapshot(depth: u32) -> Option<AccessibleSubtree> {
@@ -1102,28 +1222,31 @@ mod platform {
     }
 
     fn collect_nodes(
+        walk: &SnapshotWalk<'_>,
         element: &UIElement,
         parent: Option<ElementId>,
         depth: u32,
         max_depth: u32,
-        root_hwnd: i64,
         nodes: &mut Vec<AccessibleNode>,
     ) -> A11yResult<ElementId> {
         let children = if depth < max_depth {
-            element.get_cached_children().unwrap_or_default()
+            walk.walker
+                .get_children_build_cache(element, walk.cache)
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
-        let node = node_from_cached_element(element, parent, depth, root_hwnd, children.len())?;
+        let node =
+            node_from_cached_element(element, parent, depth, walk.root_hwnd, children.len())?;
         let node_id = node.element_id.clone();
         nodes.push(node);
         for child in children {
             collect_nodes(
+                walk,
                 &child,
                 Some(node_id.clone()),
                 depth + 1,
                 max_depth,
-                root_hwnd,
                 nodes,
             )?;
         }

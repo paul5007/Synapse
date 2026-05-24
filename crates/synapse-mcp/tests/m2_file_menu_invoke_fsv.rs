@@ -36,10 +36,17 @@ const INVOKE_LATENCY_BUDGET_MS: u32 = 25;
 const NOTEPAD_WAIT: Duration = Duration::from_secs(8);
 #[cfg(windows)]
 const POLL: Duration = Duration::from_millis(75);
+#[cfg(windows)]
+const SNAPSHOT_NODE_BUDGET: usize = 60;
+#[cfg(windows)]
+const SNAPSHOT_LATENCY_BUDGET_MS: f64 = 10.0;
+#[cfg(windows)]
+const SNAPSHOT_LATENCY_SAMPLES: usize = 100;
+#[cfg(windows)]
+const OBSERVE_JSON_BUDGET_BYTES: usize = 6 * 1024;
 
 #[cfg(windows)]
 #[tokio::test]
-#[ignore = "requires an interactive Windows desktop with Notepad and UIA"]
 #[allow(clippy::too_many_lines)] // FSV body intentionally keeps every step in order
 async fn act_click_invoke_pattern_file_menu_expands_without_cursor_motion_fsv() -> anyhow::Result<()>
 {
@@ -68,22 +75,74 @@ async fn act_click_invoke_pattern_file_menu_expands_without_cursor_motion_fsv() 
 
     let window = synapse_a11y::window_from_hwnd(hwnd)
         .with_context(|| format!("resolve Notepad hwnd 0x{hwnd:x}"))?;
-    let control_snapshot = synapse_a11y::snapshot(&window, 6)
-        .with_context(|| format!("control snapshot Notepad hwnd 0x{hwnd:x}"))?;
-    let file_menu_node = find_file_menu_node(&window)?.with_context(|| {
+    if let Err(error) = window.set_focus() {
+        println!(
+            "source_of_truth=synapse_a11y::UIElement::set_focus edge=file_menu_invoke after_error={error}"
+        );
+    } else {
+        println!(
+            "source_of_truth=synapse_a11y::UIElement::set_focus edge=file_menu_invoke after=ok hwnd=0x{hwnd:x}"
+        );
+    }
+    let snapshot_started = Instant::now();
+    let snapshot = synapse_a11y::snapshot(&window, 2)
+        .with_context(|| format!("snapshot Notepad hwnd 0x{hwnd:x} at depth 2"))?;
+    let snapshot_elapsed_ms = snapshot_started.elapsed().as_secs_f64() * 1_000.0;
+    let file_menu_node = file_menu_node_from_snapshot(&snapshot.nodes).with_context(|| {
         format!(
-            "direct UIA search did not find a `File` ExpandCollapse node; control_nodes={}",
-            summarize_nodes(&control_snapshot.nodes)
+            "snapshot(depth=2) missing invokable File menu node; nodes={}",
+            summarize_nodes(&snapshot.nodes)
         )
     })?;
     println!(
-        "source_of_truth=synapse_a11y::find_by_name_and_pattern edge=file_menu_invoke before=pid:{pid} hwnd:0x{hwnd:x} control_node_count:{} target:{} role:{:?} name:{:?} bbox:{:?} patterns:{:?}",
-        control_snapshot.nodes.len(),
+        "source_of_truth=synapse_a11y::snapshot edge=file_menu_invoke before=pid:{pid} hwnd:0x{hwnd:x} depth:{} node_count:{} target:{} role:{:?} name:{:?} bbox:{:?} patterns:{:?} truncated:{} elapsed_ms:{snapshot_elapsed_ms:.3}",
+        snapshot.max_depth,
+        snapshot.nodes.len(),
         file_menu_node.element_id,
         file_menu_node.role,
         file_menu_node.name,
         file_menu_node.bbox,
-        file_menu_node.patterns
+        file_menu_node.patterns,
+        snapshot.truncated,
+    );
+    assert!(
+        snapshot.nodes.len() <= SNAPSHOT_NODE_BUDGET,
+        "snapshot(depth=2) returned {} nodes, exceeding {SNAPSHOT_NODE_BUDGET}",
+        snapshot.nodes.len()
+    );
+
+    let snapshot_p99_ms = snapshot_p99_ms(&window, 2, SNAPSHOT_LATENCY_SAMPLES)?;
+    println!(
+        "source_of_truth=synapse_a11y::snapshot edge=depth2_p99 after=samples:{SNAPSHOT_LATENCY_SAMPLES} p99_ms:{snapshot_p99_ms:.3} budget_ms:{SNAPSHOT_LATENCY_BUDGET_MS}"
+    );
+    assert!(
+        snapshot_p99_ms <= SNAPSHOT_LATENCY_BUDGET_MS,
+        "snapshot(depth=2) p99 {snapshot_p99_ms:.3} ms exceeds {SNAPSHOT_LATENCY_BUDGET_MS} ms"
+    );
+
+    let observe = client.tools_call("observe", json!({})).await?;
+    let observe_structured = observe
+        .get("structuredContent")
+        .context("structuredContent missing on observe response")?;
+    let observe_bytes = serde_json::to_vec(observe_structured)?.len();
+    let observe_process = observe_structured
+        .pointer("/foreground/process_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let observe_elements = observe_structured
+        .get("elements")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    println!(
+        "source_of_truth=mcp_observe edge=file_menu_invoke before=bytes:{observe_bytes} process:{observe_process:?} elements:{observe_elements} budget_bytes:{OBSERVE_JSON_BUDGET_BYTES}"
+    );
+    assert!(
+        observe_bytes <= OBSERVE_JSON_BUDGET_BYTES,
+        "observe JSON was {observe_bytes} bytes, exceeding {OBSERVE_JSON_BUDGET_BYTES}"
+    );
+    assert!(
+        observe_process.eq_ignore_ascii_case("notepad.exe"),
+        "observe process should be Notepad, got {observe_process:?}"
     );
 
     let element_id_str = file_menu_node.element_id.to_string();
@@ -166,7 +225,7 @@ async fn act_click_invoke_pattern_file_menu_expands_without_cursor_motion_fsv() 
 
 #[cfg(windows)]
 #[tokio::test]
-#[ignore = "requires an interactive Windows desktop with Notepad and UIA"]
+#[allow(clippy::too_many_lines)] // FSV body intentionally keeps every edge readback inline
 async fn a11y_find_by_name_and_pattern_file_menu_edges_fsv() -> anyhow::Result<()> {
     let _notepad_lock = WINDOWS_NOTEPAD_FILE_MENU_LOCK.lock().await;
     let (hwnd, pid, launched_child) = find_or_spawn_notepad_window()?;
@@ -185,11 +244,21 @@ async fn a11y_find_by_name_and_pattern_file_menu_edges_fsv() -> anyhow::Result<(
             "source_of_truth=synapse_a11y::focus_window edge=raw_search_edges after=ok hwnd=0x{hwnd:x}"
         );
     }
-    let control_nodes = match synapse_a11y::snapshot(&window, 6) {
+    let snapshot_nodes = match synapse_a11y::snapshot(&window, 2) {
         Ok(snapshot) => {
             let nodes = summarize_nodes(&snapshot.nodes);
             println!(
-                "source_of_truth=synapse_a11y::snapshot edge=raw_search_edges before=control_node_count:{} nodes={nodes}",
+                "source_of_truth=synapse_a11y::snapshot edge=raw_search_edges before=depth:{} node_count:{} truncated:{} nodes={nodes}",
+                snapshot.max_depth,
+                snapshot.nodes.len(),
+                snapshot.truncated
+            );
+            let snapshot_file = file_menu_node_from_snapshot(&snapshot.nodes)
+                .context("snapshot(depth=2) missing invokable File menu node")?;
+            assert_eq!(snapshot_file.name, "File");
+            assert!(
+                snapshot.nodes.len() <= SNAPSHOT_NODE_BUDGET,
+                "snapshot(depth=2) returned {} nodes, exceeding {SNAPSHOT_NODE_BUDGET}",
                 snapshot.nodes.len()
             );
             nodes
@@ -203,7 +272,7 @@ async fn a11y_find_by_name_and_pattern_file_menu_edges_fsv() -> anyhow::Result<(
     };
 
     let happy = find_file_menu_node(&window)?.with_context(|| {
-        format!("direct UIA search did not find a `File` ExpandCollapse node; control_nodes={control_nodes}")
+        format!("direct UIA search did not find a `File` ExpandCollapse node; snapshot_nodes={snapshot_nodes}")
     })?;
     println!(
         "source_of_truth=synapse_a11y::find_by_name_and_pattern edge=happy after_found=true target:{} role:{:?} name:{:?} patterns:{:?}",
@@ -211,6 +280,15 @@ async fn a11y_find_by_name_and_pattern_file_menu_edges_fsv() -> anyhow::Result<(
     );
     assert!(happy.enabled);
     assert!(happy.patterns.contains(&UiaPattern::ExpandCollapse));
+
+    let depth0 = synapse_a11y::snapshot(&window, 0).context("snapshot Notepad at depth 0")?;
+    let depth0_file = file_menu_node_from_snapshot(&depth0.nodes);
+    println!(
+        "source_of_truth=synapse_a11y::snapshot edge=depth0 before_depth:0 after_node_count:{} after_found_file:{}",
+        depth0.nodes.len(),
+        depth0_file.is_some()
+    );
+    assert!(depth0_file.is_none());
 
     let empty_name = synapse_a11y::find_by_name_and_pattern(
         &window,
@@ -305,6 +383,19 @@ fn notepad_exe_path() -> std::path::PathBuf {
 }
 
 #[cfg(windows)]
+fn file_menu_node_from_snapshot(nodes: &[AccessibleNode]) -> Option<AccessibleNode> {
+    nodes
+        .iter()
+        .find(|node| {
+            node.name == "File"
+                && node.enabled
+                && node.patterns.contains(&UiaPattern::Invoke)
+                && node.patterns.contains(&UiaPattern::ExpandCollapse)
+        })
+        .cloned()
+}
+
+#[cfg(windows)]
 fn find_file_menu_node(root: &synapse_a11y::UIElement) -> anyhow::Result<Option<AccessibleNode>> {
     synapse_a11y::find_by_name_and_pattern(
         root,
@@ -313,6 +404,28 @@ fn find_file_menu_node(root: &synapse_a11y::UIElement) -> anyhow::Result<Option<
         ElementSearchScope::Subtree,
     )
     .context("direct UIA name+ExpandCollapse search")
+}
+
+#[cfg(windows)]
+fn snapshot_p99_ms(
+    root: &synapse_a11y::UIElement,
+    depth: u32,
+    samples: usize,
+) -> anyhow::Result<f64> {
+    let mut elapsed_ms = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        let snapshot = synapse_a11y::snapshot(root, depth)?;
+        let _ = file_menu_node_from_snapshot(&snapshot.nodes)
+            .context("snapshot latency sample missing invokable File menu node")?;
+        elapsed_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    elapsed_ms.sort_by(f64::total_cmp);
+    let p99_index = samples.saturating_mul(99).div_ceil(100).saturating_sub(1);
+    elapsed_ms
+        .get(p99_index)
+        .copied()
+        .context("snapshot latency sample set was empty")
 }
 
 #[cfg(windows)]
