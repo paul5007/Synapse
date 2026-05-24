@@ -86,6 +86,7 @@ regex = "1.12.3"
 sha2 = "0.11.0"
 crc16 = "0.4.0"
 notify = "9.0.0-rc.4"
+fs2 = "0.4.3"
 proptest = "1.11.0"
 criterion = "0.8.2"
 insta = { version = "1.47.2", features = ["json"] }

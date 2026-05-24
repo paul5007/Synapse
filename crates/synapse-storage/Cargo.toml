@@ -12,6 +12,7 @@ sled-backend = ["dep:sled"]
 
 [dependencies]
 rocksdb = { workspace = true, features = ["lz4", "zstd", "multi-threaded-cf"] }
+fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

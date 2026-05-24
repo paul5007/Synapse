@@ -4,6 +4,7 @@ pub mod codecs;
 pub mod compaction;
 pub mod error;
 mod gc;
+mod pressure;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use synapse_core::error_codes;
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask};
+pub use pressure::{DiskPressureLevel, PressureReport, PressureTask};
 
 const MIB: usize = 1024 * 1024;
 const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * MIB;
@@ -31,6 +33,7 @@ pub struct Db {
     pub schema_version: u32,
     batcher: batch::Batcher,
     inner: Arc<DB>,
+    pressure: Arc<pressure::PressureState>,
 }
 
 impl fmt::Debug for Db {
@@ -72,12 +75,14 @@ impl Db {
 
         let inner = Arc::new(inner);
         let batcher = batch::Batcher::spawn(Arc::clone(&inner));
+        let pressure = Arc::new(pressure::PressureState::default());
 
         Ok(Self {
             path: path.to_path_buf(),
             schema_version,
             batcher,
             inner,
+            pressure,
         })
     }
 
@@ -107,6 +112,18 @@ impl Db {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect::<Vec<_>>();
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        if !self.pressure.permits_write(cf_name) {
+            tracing::warn!(
+                code = error_codes::STORAGE_WRITE_FAILED,
+                cf = cf_name,
+                pressure_level = ?self.pressure.level(),
+                "storage write dropped under disk pressure"
+            );
+            return Ok(());
+        }
         self.batcher.put_batch(cf_name, kvs)
     }
 
@@ -142,6 +159,43 @@ impl Db {
         gc::spawn(
             Arc::clone(&self.inner),
             gc::GcConfig::from_retention_defaults(),
+        )
+    }
+
+    /// Returns the current DB-volume disk-pressure level.
+    #[must_use]
+    pub fn pressure_level(&self) -> DiskPressureLevel {
+        self.pressure.level()
+    }
+
+    /// Runs one disk-pressure check immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when disk free-space probing or pressure-triggered
+    /// compaction fails.
+    #[tracing::instrument(skip_all)]
+    pub fn run_pressure_check_once(&self) -> StorageResult<PressureReport> {
+        pressure::run_once(
+            &self.inner,
+            &self.pressure,
+            &self.path,
+            &pressure::PressureConfig::default(),
+        )
+    }
+
+    /// Spawns the periodic DB-volume disk-pressure task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when no Tokio runtime is active.
+    #[tracing::instrument(skip_all)]
+    pub fn spawn_pressure_task(&self) -> StorageResult<PressureTask> {
+        pressure::spawn(
+            Arc::clone(&self.inner),
+            Arc::clone(&self.pressure),
+            self.path.clone(),
+            pressure::PressureConfig::default(),
         )
     }
 
@@ -291,3 +345,5 @@ mod compaction_tests;
 mod gc_tests;
 #[cfg(test)]
 mod open_tests;
+#[cfg(test)]
+mod pressure_tests;
