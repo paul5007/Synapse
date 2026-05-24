@@ -20,6 +20,13 @@ pub use kinds::aim_track::{
     DEFAULT_EMA_ALPHA, DEFAULT_MAX_SPEED_PX_PER_TICK, REFLEX_TRACK_LOST_KIND, ResolvedElementBox,
     TRACK_LOST_AFTER,
 };
+pub use kinds::hold_button::{
+    HoldButtonController, HoldButtonOutput, HoldButtonParams, HoldButtonPhase,
+};
+pub use kinds::hold_lifetime::{
+    HoldLifetimeContext, HoldReleaseReason, REFLEX_LIFETIME_EXPIRED_KIND,
+};
+pub use kinds::hold_move::{HoldMoveController, HoldMoveOutput, HoldMoveParams, HoldMovePhase};
 pub use scheduler::{
     MAX_SCHEDULED_REFLEXES, REFLEX_TICK_LATE_KIND, ReflexScheduler, ScheduledReflex,
     SchedulerConfig, SchedulerHandle, SchedulerTrigger, TickSample, p99_jitter_us,
