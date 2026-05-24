@@ -1,0 +1,93 @@
+use rmcp::ErrorData;
+use synapse_action::ActionHandle;
+use synapse_core::{Action, Backend, Key};
+use tokio_util::sync::CancellationToken;
+
+use super::action_error_to_mcp;
+
+pub(in crate::m2::press) async fn execute_live_press_sequence(
+    handle: ActionHandle,
+    keys: Vec<Key>,
+    hold_ms: u32,
+    backend: Backend,
+    connection_closed_cancel: Option<CancellationToken>,
+) -> Result<(), ErrorData> {
+    let mut pressed = Vec::with_capacity(keys.len());
+    for key in &keys {
+        if let Err(error) = handle
+            .execute(Action::KeyDown {
+                key: key.clone(),
+                backend,
+            })
+            .await
+        {
+            release_pressed_keys(&handle, &pressed, backend).await;
+            return Err(action_error_to_mcp(&error));
+        }
+        pressed.push(key.clone());
+        maybe_force_panic_after_keydown();
+    }
+
+    let connection_closed = if let Some(cancel) = connection_closed_cancel {
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))) => false,
+            () = cancel.cancelled() => true,
+        }
+    } else {
+        tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
+        false
+    };
+
+    let mut first_error = None;
+    for key in pressed.iter().rev() {
+        if let Err(error) = handle
+            .execute(Action::KeyUp {
+                key: key.clone(),
+                backend,
+            })
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(action_error_to_mcp(&error));
+    }
+    if connection_closed {
+        tracing::warn!(
+            code = "M2_ACT_PRESS_CONNECTION_CLOSED_RELEASE",
+            released_keys = pressed.len(),
+            "source_of_truth=connection_closed edge=act_press after=pressed_keys_released"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn maybe_force_panic_after_keydown() {
+    if std::env::var("SYNAPSE_MCP_FORCE_PANIC_DURING_ACT").as_deref()
+        == Ok("act_press_after_keydown")
+    {
+        tracing::warn!(
+            code = "M2_ACT_PRESS_FORCE_PANIC_AFTER_KEYDOWN",
+            "source_of_truth=act_press edge=force_panic after=keydown"
+        );
+        tokio::task::block_in_place(|| panic!("forced panic during act_press after keydown"));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+const fn maybe_force_panic_after_keydown() {}
+
+async fn release_pressed_keys(handle: &ActionHandle, pressed: &[Key], backend: Backend) {
+    for key in pressed.iter().rev() {
+        let _ = handle
+            .execute(Action::KeyUp {
+                key: key.clone(),
+                backend,
+            })
+            .await;
+    }
+}
