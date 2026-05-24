@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 macro_rules! assert_literal {
     ($name:ident) => {
         assert_eq!(synapse_core::error_codes::$name, stringify!($name));
@@ -54,6 +56,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(REFLEX_STARVED);
     assert_literal!(REFLEX_DISABLED_BY_OPERATOR);
     assert_literal!(REFLEX_LIFETIME_EXPIRED);
+    assert_literal!(REFLEX_RECURSION_LIMIT);
 
     assert_literal!(PROFILE_NOT_FOUND);
     assert_literal!(PROFILE_PARSE_ERROR);
@@ -70,12 +73,23 @@ fn error_codes_match_literal_names() {
     assert_literal!(TOOL_NOT_FOUND);
     assert_literal!(TOOL_PARAMS_INVALID);
     assert_literal!(TOOL_INTERNAL_ERROR);
+    assert_literal!(HTTP_BIND_NON_LOOPBACK_REFUSED);
+    assert_literal!(HTTP_TOKEN_INVALID);
+    assert_literal!(HTTP_ORIGIN_REFUSED);
+    assert_literal!(HTTP_SESSION_INVALID);
+    assert_literal!(REPLAY_TARGET_INVALID);
+    assert_literal!(REPLAY_FORMAT_INVALID);
 
     assert_literal!(STORAGE_OPEN_FAILED);
     assert_literal!(STORAGE_WRITE_FAILED);
     assert_literal!(STORAGE_READ_FAILED);
     assert_literal!(STORAGE_CORRUPTED);
     assert_literal!(STORAGE_SCHEMA_MISMATCH);
+    assert_literal!(STORAGE_DISK_PRESSURE_LEVEL_1);
+    assert_literal!(STORAGE_DISK_PRESSURE_LEVEL_2);
+    assert_literal!(STORAGE_DISK_PRESSURE_LEVEL_3);
+    assert_literal!(STORAGE_DISK_PRESSURE_LEVEL_4);
+    assert_literal!(STORAGE_CF_HARD_CAP_REACHED);
 
     assert_literal!(MODEL_DOWNLOAD_FAILED);
     assert_literal!(MODEL_HASH_MISMATCH);
@@ -94,4 +108,73 @@ fn error_codes_match_literal_names() {
     assert_literal!(SAFETY_SHELL_DENIED_BY_POLICY);
     assert_literal!(SAFETY_LAUNCH_DENIED_BY_POLICY);
     assert_literal!(SAFETY_SECRET_REDACTED);
+}
+
+#[test]
+fn m3_error_codes_snapshot_with_fsv() {
+    let codes = [
+        (
+            "REFLEX_RECURSION_LIMIT",
+            synapse_core::error_codes::REFLEX_RECURSION_LIMIT,
+        ),
+        (
+            "HTTP_BIND_NON_LOOPBACK_REFUSED",
+            synapse_core::error_codes::HTTP_BIND_NON_LOOPBACK_REFUSED,
+        ),
+        (
+            "HTTP_TOKEN_INVALID",
+            synapse_core::error_codes::HTTP_TOKEN_INVALID,
+        ),
+        (
+            "HTTP_ORIGIN_REFUSED",
+            synapse_core::error_codes::HTTP_ORIGIN_REFUSED,
+        ),
+        (
+            "HTTP_SESSION_INVALID",
+            synapse_core::error_codes::HTTP_SESSION_INVALID,
+        ),
+        (
+            "STORAGE_DISK_PRESSURE_LEVEL_1",
+            synapse_core::error_codes::STORAGE_DISK_PRESSURE_LEVEL_1,
+        ),
+        (
+            "STORAGE_DISK_PRESSURE_LEVEL_2",
+            synapse_core::error_codes::STORAGE_DISK_PRESSURE_LEVEL_2,
+        ),
+        (
+            "STORAGE_DISK_PRESSURE_LEVEL_3",
+            synapse_core::error_codes::STORAGE_DISK_PRESSURE_LEVEL_3,
+        ),
+        (
+            "STORAGE_DISK_PRESSURE_LEVEL_4",
+            synapse_core::error_codes::STORAGE_DISK_PRESSURE_LEVEL_4,
+        ),
+        (
+            "STORAGE_CF_HARD_CAP_REACHED",
+            synapse_core::error_codes::STORAGE_CF_HARD_CAP_REACHED,
+        ),
+        (
+            "REPLAY_TARGET_INVALID",
+            synapse_core::error_codes::REPLAY_TARGET_INVALID,
+        ),
+        (
+            "REPLAY_FORMAT_INVALID",
+            synapse_core::error_codes::REPLAY_FORMAT_INVALID,
+        ),
+    ];
+    let expected = codes.iter().map(|(name, _value)| *name).collect::<Vec<_>>();
+    println!("source_of_truth=m3_error_codes before=expected:{expected:?}");
+
+    let actual = codes
+        .into_iter()
+        .map(|(name, value)| {
+            assert_eq!(value, name);
+            (name, value)
+        })
+        .collect::<BTreeMap<_, _>>();
+    println!(
+        "source_of_truth=m3_error_codes after=actual:{actual:?} final_count:{}",
+        actual.len()
+    );
+    insta::assert_json_snapshot!("m3_error_codes", actual);
 }
