@@ -14,7 +14,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use synapse_action::{ActionStateSnapshot, RecordingBackend};
-use synapse_core::Health;
+use synapse_core::{ForegroundContext, Health, error_codes};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -145,6 +145,66 @@ impl SynapseService {
                 )
             })
     }
+
+    fn last_observed_foreground(&self) -> Result<Option<ForegroundContext>, ErrorData> {
+        self.m1_state
+            .lock()
+            .map(|state| state.last_observed_foreground.clone())
+            .map_err(|_err| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    "M1 service state lock poisoned",
+                )
+            })
+    }
+
+    fn ensure_act_type_foreground(
+        &self,
+        recording: Option<&Arc<RecordingBackend>>,
+    ) -> Result<(), ErrorData> {
+        let Some(expected) = self.last_observed_foreground()? else {
+            return Ok(());
+        };
+        let actual = synapse_a11y::current_foreground_context().map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_FOREGROUND_LOST,
+                format!(
+                    "act_type could not read current foreground for expected hwnd 0x{:x}: {error}",
+                    expected.hwnd
+                ),
+            )
+        })?;
+        if actual.hwnd == expected.hwnd {
+            return Ok(());
+        }
+
+        let recording_event_count_before =
+            recording.map_or(0, |recording| recording.events().len());
+        let recording_event_count_after = recording.map_or(0, |recording| recording.events().len());
+        tracing::warn!(
+            code = "M2_ACT_TYPE_FOREGROUND_LOST",
+            expected_hwnd = expected.hwnd,
+            actual_hwnd = actual.hwnd,
+            expected_pid = expected.pid,
+            actual_pid = actual.pid,
+            expected_title = %expected.window_title,
+            actual_title = %actual.window_title,
+            recording_event_count_before,
+            recording_event_count_after,
+            "source_of_truth=foreground edge=lost before_hwnd=0x{:x} after_hwnd=0x{:x} code=ACTION_FOREGROUND_LOST recording_events_before={} recording_events_after={}",
+            expected.hwnd,
+            actual.hwnd,
+            recording_event_count_before,
+            recording_event_count_after
+        );
+        Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_LOST,
+            format!(
+                "act_type expected foreground hwnd 0x{:x} ({}) but current foreground is hwnd 0x{:x} ({})",
+                expected.hwnd, expected.window_title, actual.hwnd, actual.window_title
+            ),
+        ))
+    }
 }
 
 impl Default for SynapseService {
@@ -185,8 +245,11 @@ impl SynapseService {
             kind = "observe",
             "tool.invocation kind=observe"
         );
-        let state = self.m1_state()?;
-        assemble_observation(&state, &params.0).map(Json)
+        let mut state = self.m1_state()?;
+        let observation = assemble_observation(&state, &params.0)?;
+        state.last_observed_foreground = Some(observation.foreground.clone());
+        drop(state);
+        Ok(Json(observation))
     }
 
     #[tool(description = "Search visible accessibility nodes and detected entities")]
@@ -272,6 +335,7 @@ impl SynapseService {
             "tool.invocation kind=act_type"
         );
         let (handle, recording) = self.m2_action_context()?;
+        self.ensure_act_type_foreground(recording.as_ref())?;
         act_type_with_handle(handle, recording, params.0)
             .await
             .map(Json)

@@ -36,6 +36,9 @@ const INVALID_EDGE_CLEANUP_FILE_NAME: &str = "synapse-m2-invalid-edge-cleanup.tx
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "requires an interactive Windows desktop with Notepad and UIA"]
+// #206 keeps the full disk-save FSV path linear so before/action/after evidence
+// prints in execution order instead of being hidden behind helper indirection.
+#[allow(clippy::too_many_lines)]
 async fn notepad_type_save_writes_byte_correct_file_fsv() -> anyhow::Result<()> {
     let _notepad_lock = WINDOWS_NOTEPAD_FSV_LOCK.lock().await;
     let target_path = std::env::temp_dir().join(DEMO_FILE_NAME);
@@ -78,7 +81,7 @@ async fn notepad_type_save_writes_byte_correct_file_fsv() -> anyhow::Result<()> 
             "source_of_truth=synapse_a11y::focus_window edge=window after=ok hwnd=0x{hwnd:x}"
         ),
         Err(error) => {
-            println!("source_of_truth=synapse_a11y::focus_window edge=window after_error={error}")
+            println!("source_of_truth=synapse_a11y::focus_window edge=window after_error={error}");
         }
     }
     let editor = synapse_a11y::re_resolve(&editor_id)
@@ -261,6 +264,9 @@ async fn notepad_type_save_writes_byte_correct_file_fsv() -> anyhow::Result<()> 
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "requires an interactive Windows desktop with Notepad and UIA"]
+// #207 keeps the invalid-save FSV path linear so the disk/UIA/cleanup evidence
+// remains ordered exactly like the real Windows flow.
+#[allow(clippy::too_many_lines)]
 async fn notepad_save_invalid_dir_shows_dialog_and_writes_no_file_fsv() -> anyhow::Result<()> {
     let _notepad_lock = WINDOWS_NOTEPAD_FSV_LOCK.lock().await;
     let invalid_path = PathBuf::from(INVALID_SAVE_PATH);
@@ -457,6 +463,94 @@ async fn notepad_save_invalid_dir_shows_dialog_and_writes_no_file_fsv() -> anyho
 }
 
 #[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires an interactive Windows desktop with Notepad and UIA"]
+async fn notepad_act_type_foreground_lost_returns_error_without_recording_events_fsv()
+-> anyhow::Result<()> {
+    let _notepad_lock = WINDOWS_NOTEPAD_FSV_LOCK.lock().await;
+    let log_dir = TempDir::new()?;
+    println!("source_of_truth=foreground edge=lost before=target_absent");
+    let target = launch_notepad()?;
+    let target_hwnd = target.hwnd();
+    let target_pid = target.pid();
+    let target_editor_id = editor_from_uia_snapshot(target_hwnd)?;
+    focus_editor(target_hwnd, &target_editor_id)?;
+
+    let mut client = StdioMcpClient::launch_and_init_with_env(
+        Some(log_dir.path()),
+        &[("SYNAPSE_MCP_RECORDING_BACKEND", "1")],
+    )
+    .await?;
+    let observed_target = observe(&mut client).await?;
+    println!(
+        "source_of_truth=foreground edge=lost before_hwnd=0x{:x} before_pid={} before_title={:?}",
+        observed_target.foreground.hwnd,
+        observed_target.foreground.pid,
+        observed_target.foreground.window_title
+    );
+    assert_eq!(observed_target.foreground.hwnd, target_hwnd);
+    assert_eq!(observed_target.foreground.pid, target_pid);
+
+    let distractor = launch_notepad()?;
+    let distractor_hwnd = distractor.hwnd();
+    let distractor_pid = distractor.pid();
+    let distractor_editor_id = editor_from_uia_snapshot(distractor_hwnd)?;
+    focus_editor(distractor_hwnd, &distractor_editor_id)?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let actual_foreground = synapse_a11y::current_foreground_context()
+        .context("read current foreground after focusing distractor Notepad")?;
+    println!(
+        "source_of_truth=foreground edge=lost after_hwnd=0x{:x} after_pid={} after_title={:?} distractor_hwnd=0x{:x}",
+        actual_foreground.hwnd,
+        actual_foreground.pid,
+        actual_foreground.window_title,
+        distractor_hwnd
+    );
+    assert_eq!(actual_foreground.hwnd, distractor_hwnd);
+    assert_eq!(actual_foreground.pid, distractor_pid);
+    assert_ne!(actual_foreground.hwnd, observed_target.foreground.hwnd);
+
+    let error = client
+        .tools_call_error(
+            "act_type",
+            json!({
+                "text": "X",
+                "dynamics": "linear",
+                "linear_ms_per_char": 30
+            }),
+        )
+        .await?;
+    let code = error_code(&error);
+    println!(
+        "source_of_truth=foreground edge=lost before_hwnd=0x{:x} after_hwnd=0x{:x} code={:?} raw_error={error}",
+        observed_target.foreground.hwnd, actual_foreground.hwnd, code
+    );
+    assert_eq!(code, Some("ACTION_FOREGROUND_LOST"));
+
+    assert!(client.shutdown().await?.success());
+    let logs = read_logs(log_dir.path())?;
+    let contains_guard = logs.contains("source_of_truth=foreground edge=lost")
+        && logs.contains("recording_events_before=0")
+        && logs.contains("recording_events_after=0");
+    println!(
+        "source_of_truth=recording_backend edge=foreground_lost after_log_bytes={} contains_zero_event_guard={}",
+        logs.len(),
+        contains_guard
+    );
+    assert!(contains_guard);
+
+    distractor.close()?;
+    println!(
+        "source_of_truth=NotepadHandle::close edge=foreground_lost distractor_after=closed pid={distractor_pid}"
+    );
+    target.close()?;
+    println!(
+        "source_of_truth=NotepadHandle::close edge=foreground_lost target_after=closed pid={target_pid}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
 struct FileCleanup(PathBuf);
 
 #[cfg(windows)]
@@ -479,7 +573,7 @@ fn focus_editor(hwnd: i64, editor_id: &ElementId) -> anyhow::Result<()> {
             "source_of_truth=synapse_a11y::focus_window edge=window after=ok hwnd=0x{hwnd:x}"
         ),
         Err(error) => {
-            println!("source_of_truth=synapse_a11y::focus_window edge=window after_error={error}")
+            println!("source_of_truth=synapse_a11y::focus_window edge=window after_error={error}");
         }
     }
     let editor = synapse_a11y::re_resolve(editor_id)
@@ -670,6 +764,14 @@ fn read_logs(path: &Path) -> anyhow::Result<String> {
 #[cfg(windows)]
 fn structured<T: DeserializeOwned>(resp: &Value) -> anyhow::Result<T> {
     serde_json::from_value(resp["structuredContent"].clone()).context("decode structuredContent")
+}
+
+#[cfg(windows)]
+fn error_code(error: &Value) -> Option<&str> {
+    error
+        .get("data")
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
 }
 
 #[cfg(windows)]

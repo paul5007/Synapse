@@ -8,7 +8,9 @@ use rmcp::{ErrorData, handler::server::common, model::JsonObject, schemars::Json
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use synapse_capture::{CaptureBackend, CaptureConfig, CaptureTarget, resolve_capture_target};
-use synapse_core::{ElementId, Observation, OcrBackend, PerceptionMode, Rect, error_codes};
+use synapse_core::{
+    ElementId, ForegroundContext, Observation, OcrBackend, PerceptionMode, Rect, error_codes,
+};
 use synapse_perception::{
     ObservationAssembler, ObservationInput, ObserveInclude, parse_perception_mode,
 };
@@ -27,6 +29,7 @@ pub struct M1State {
     pub synthetic: Option<ObservationInput>,
     pub force_no_perception: bool,
     pub force_observe_internal: bool,
+    pub last_observed_foreground: Option<ForegroundContext>,
 }
 
 impl M1State {
@@ -47,6 +50,7 @@ impl M1State {
             synthetic,
             force_no_perception,
             force_observe_internal,
+            last_observed_foreground: None,
         }
     }
 }

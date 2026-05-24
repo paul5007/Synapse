@@ -260,6 +260,16 @@ pub fn focused_window() -> A11yResult<UIElement> {
     platform::focused_window()
 }
 
+/// Returns process/title metadata for the current foreground native window.
+///
+/// # Errors
+///
+/// Returns `A11Y_NO_FOREGROUND` when Windows has no foreground HWND, or
+/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn current_foreground_context() -> A11yResult<ForegroundContext> {
+    platform::current_foreground_context()
+}
+
 /// Returns a top-level UIA window for a native HWND.
 ///
 /// # Errors
@@ -631,6 +641,16 @@ mod platform {
         }
 
         element_from_hwnd(hwnd)
+    }
+
+    pub fn current_foreground_context() -> A11yResult<ForegroundContext> {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            return Err(A11yError::NoForeground {
+                detail: "GetForegroundWindow returned null".to_owned(),
+            });
+        }
+        foreground_context(hwnd.0 as isize as i64)
     }
 
     pub fn window_from_hwnd(hwnd: i64) -> A11yResult<UIElement> {
@@ -1449,6 +1469,12 @@ mod platform {
     pub fn focused_window() -> A11yResult<UIElement> {
         Err(A11yError::not_available(
             "UIA foreground window lookup requires Windows",
+        ))
+    }
+
+    pub fn current_foreground_context() -> A11yResult<ForegroundContext> {
+        Err(A11yError::not_available(
+            "foreground context lookup requires Windows",
         ))
     }
 
