@@ -117,6 +117,12 @@ pub enum SseSubscribeError {
     StateUnavailable,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SseCancelError {
+    NotFound,
+    StateUnavailable,
+}
+
 impl SseState {
     pub(crate) fn from_env() -> Self {
         Self {
@@ -149,6 +155,23 @@ impl SseState {
     ) -> Result<String, SseSubscribeError> {
         self.create_subscription_with(filter, kinds, snapshot_first)
             .map(|subscription| subscription.id().to_owned())
+    }
+
+    pub(crate) fn cancel(&self, id: &str) -> Result<(), SseCancelError> {
+        let removed_from_map = {
+            let mut subscriptions = self
+                .inner
+                .subscriptions
+                .lock()
+                .map_err(|_| SseCancelError::StateUnavailable)?;
+            subscriptions.remove(id).is_some()
+        };
+        let removed_from_bus = self.inner.event_bus.unsubscribe(id);
+        if removed_from_map || removed_from_bus {
+            Ok(())
+        } else {
+            Err(SseCancelError::NotFound)
+        }
     }
 
     pub(super) fn publish(&self, request: PublishRequest) -> Response {
@@ -448,6 +471,22 @@ impl SseSubscribeError {
                 format!("subscription cap reached: limit {limit}")
             }
             Self::FilterInvalid { detail } => format!("event filter invalid: {detail}"),
+            Self::StateUnavailable => "subscription state lock poisoned".to_owned(),
+        }
+    }
+}
+
+impl SseCancelError {
+    pub(crate) const fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => synapse_core::error_codes::SUBSCRIPTION_NOT_FOUND,
+            Self::StateUnavailable => synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+        }
+    }
+
+    pub(crate) fn message(&self, subscription_id: &str) -> String {
+        match self {
+            Self::NotFound => format!("subscription not found: {subscription_id}"),
             Self::StateUnavailable => "subscription state lock poisoned".to_owned(),
         }
     }

@@ -44,7 +44,10 @@ use crate::{
         },
         shared_m3_state_from_env, shared_m3_state_from_env_with_shutdown_reason,
         shared_m3_state_from_env_with_shutdown_reason_and_sse_state,
-        subscribe::{SubscribeParams, SubscribeResponse, subscribe_to_events},
+        subscribe::{
+            SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams, SubscribeResponse,
+            cancel_subscription, subscribe_to_events,
+        },
     },
 };
 
@@ -625,6 +628,21 @@ impl SynapseService {
         );
         let sse_state = self.sse_state()?;
         subscribe_to_events(&sse_state, &params.0).map(Json)
+    }
+
+    #[tool(description = "Cancel an event subscription")]
+    pub async fn subscribe_cancel(
+        &self,
+        params: Parameters<SubscribeCancelParams>,
+    ) -> Result<Json<SubscribeCancelResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "subscribe_cancel",
+            subscription_id = %params.0.subscription_id,
+            "tool.invocation kind=subscribe_cancel"
+        );
+        let sse_state = self.sse_state()?;
+        cancel_subscription(&sse_state, &params.0).map(Json)
     }
 
     #[tool(description = "List loaded profiles")]

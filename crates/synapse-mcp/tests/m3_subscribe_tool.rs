@@ -17,16 +17,51 @@ async fn subscribe_schema_defaults_and_edges() -> anyhow::Result<()> {
         .iter()
         .find(|tool| tool["name"] == "subscribe")
         .context("subscribe tool missing")?;
-    assert_subscribe_schema(subscribe_tool);
+    let subscribe_cancel_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "subscribe_cancel")
+        .context("subscribe_cancel tool missing")?;
+    assert_subscribe_schema(subscribe_tool, subscribe_cancel_tool);
 
     let response = client.tools_call("subscribe", json!({})).await?;
     let first = structured(&response)?;
-    assert!(
-        first["subscription_id"]
-            .as_str()
-            .is_some_and(|id| !id.is_empty())
-    );
+    let first_subscription_id = first["subscription_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("subscription_id missing")?
+        .to_owned();
     assert!(first["started_at"].as_str().is_some());
+
+    let cancel = client
+        .tools_call(
+            "subscribe_cancel",
+            json!({"subscription_id": first_subscription_id}),
+        )
+        .await?;
+    let cancel_payload = structured(&cancel)?;
+    assert_eq!(cancel_payload["cancelled"], true);
+    assert_eq!(cancel_payload["reason"], "ok");
+
+    let second_cancel = client
+        .tools_call_error(
+            "subscribe_cancel",
+            json!({"subscription_id": first_subscription_id}),
+        )
+        .await?;
+    assert_eq!(second_cancel["data"]["code"], "SUBSCRIPTION_NOT_FOUND");
+
+    let unknown_cancel = client
+        .tools_call_error(
+            "subscribe_cancel",
+            json!({"subscription_id": "missing-sub"}),
+        )
+        .await?;
+    assert_eq!(unknown_cancel["data"]["code"], "SUBSCRIPTION_NOT_FOUND");
+
+    let empty_cancel = client
+        .tools_call_error("subscribe_cancel", json!({"subscription_id": ""}))
+        .await?;
+    assert_eq!(empty_cancel["data"]["code"], "TOOL_PARAMS_INVALID");
 
     let bad_buffer = client
         .tools_call_error("subscribe", json!({"buffer_size": 4097}))
@@ -38,7 +73,7 @@ async fn subscribe_schema_defaults_and_edges() -> anyhow::Result<()> {
         .await?;
     assert_eq!(bad_filter["data"]["code"], "TOOL_PARAMS_INVALID");
 
-    for _ in 1..64 {
+    for _ in 0..64 {
         let response = client.tools_call("subscribe", json!({})).await?;
         let payload = structured(&response)?;
         assert!(
@@ -70,24 +105,42 @@ fn structured(response: &Value) -> anyhow::Result<Value> {
     serde_json::from_str(text).context("parse text content")
 }
 
-fn assert_subscribe_schema(tool: &Value) {
+fn assert_subscribe_schema(subscribe_tool: &Value, subscribe_cancel_tool: &Value) {
     let shape = json!({
-        "name": tool.get("name").cloned().unwrap_or(Value::Null),
-        "inputSchema": tool.get("inputSchema").cloned().unwrap_or(Value::Null),
-        "outputSchema": tool.get("outputSchema").cloned().unwrap_or(Value::Null),
+        "subscribe": {
+            "name": subscribe_tool.get("name").cloned().unwrap_or(Value::Null),
+            "inputSchema": subscribe_tool.get("inputSchema").cloned().unwrap_or(Value::Null),
+            "outputSchema": subscribe_tool.get("outputSchema").cloned().unwrap_or(Value::Null),
+        },
+        "subscribe_cancel": {
+            "name": subscribe_cancel_tool.get("name").cloned().unwrap_or(Value::Null),
+            "inputSchema": subscribe_cancel_tool.get("inputSchema").cloned().unwrap_or(Value::Null),
+            "outputSchema": subscribe_cancel_tool.get("outputSchema").cloned().unwrap_or(Value::Null),
+        },
     });
-    assert_eq!(shape["inputSchema"]["additionalProperties"], false);
     assert_eq!(
-        shape["inputSchema"]["properties"]["kinds"]["default"],
-        json!([])
-    );
-    assert_eq!(
-        shape["inputSchema"]["properties"]["snapshot_first"]["default"],
+        shape["subscribe"]["inputSchema"]["additionalProperties"],
         false
     );
     assert_eq!(
-        shape["inputSchema"]["properties"]["buffer_size"]["default"],
+        shape["subscribe"]["inputSchema"]["properties"]["kinds"]["default"],
+        json!([])
+    );
+    assert_eq!(
+        shape["subscribe"]["inputSchema"]["properties"]["snapshot_first"]["default"],
+        false
+    );
+    assert_eq!(
+        shape["subscribe"]["inputSchema"]["properties"]["buffer_size"]["default"],
         4096
+    );
+    assert_eq!(
+        shape["subscribe_cancel"]["inputSchema"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        shape["subscribe_cancel"]["inputSchema"]["required"],
+        json!(["subscription_id"])
     );
     insta::assert_json_snapshot!("m3_subscribe_tool", shape);
 }

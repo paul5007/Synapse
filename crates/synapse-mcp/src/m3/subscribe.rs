@@ -49,6 +49,30 @@ pub struct SubscribeResponse {
     pub started_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubscribeCancelParams {
+    pub subscription_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscribeCancelReason {
+    Ok,
+    #[expect(
+        dead_code,
+        reason = "schema advertises not_found while runtime returns SUBSCRIPTION_NOT_FOUND errors"
+    )]
+    NotFound,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubscribeCancelResponse {
+    pub cancelled: bool,
+    pub reason: SubscribeCancelReason,
+}
+
 #[must_use]
 pub const fn subscribe() -> M3ToolStub {
     M3ToolStub::new("subscribe")
@@ -79,5 +103,25 @@ pub fn subscribe_to_events(
     Ok(SubscribeResponse {
         subscription_id,
         started_at: Utc::now(),
+    })
+}
+
+pub fn cancel_subscription(
+    sse_state: &SseState,
+    params: &SubscribeCancelParams,
+) -> Result<SubscribeCancelResponse, ErrorData> {
+    let subscription_id = params.subscription_id.trim();
+    if subscription_id.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "subscribe_cancel subscription_id must not be empty",
+        ));
+    }
+    sse_state
+        .cancel(subscription_id)
+        .map_err(|error| mcp_error(error.code(), error.message(subscription_id)))?;
+    Ok(SubscribeCancelResponse {
+        cancelled: true,
+        reason: SubscribeCancelReason::Ok,
     })
 }
