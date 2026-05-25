@@ -42,9 +42,16 @@ struct SseStateInner {
 #[derive(Debug)]
 struct Subscription {
     handle: SubscriberHandle,
-    ring: Mutex<VecDeque<Event>>,
+    ring: Mutex<VecDeque<BufferedEvent>>,
+    next_stream_seq: AtomicU64,
     dropped_total: AtomicU64,
     lossy_pending: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+struct BufferedEvent {
+    stream_seq: u64,
+    event: Event,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -79,6 +86,8 @@ struct StatsResponse {
     ring_len: usize,
     oldest_seq: Option<u64>,
     latest_seq: Option<u64>,
+    oldest_event_seq: Option<u64>,
+    latest_event_seq: Option<u64>,
     dropped_total: u64,
     events_dropped_for_subscriber: u64,
     lossy_pending: bool,
@@ -92,6 +101,7 @@ enum SseFrame {
     },
     Event {
         subscription_id: String,
+        stream_seq: u64,
         event: Event,
         lossy: bool,
     },
@@ -305,6 +315,7 @@ impl SseState {
         let subscription = Arc::new(Subscription {
             handle,
             ring: Mutex::new(VecDeque::with_capacity(SUBSCRIBER_QUEUE_CAPACITY)),
+            next_stream_seq: AtomicU64::new(1),
             dropped_total: AtomicU64::new(0),
             lossy_pending: AtomicBool::new(false),
         });
@@ -333,33 +344,26 @@ impl SseState {
     }
 
     fn sync_subscription(subscription: &Subscription) {
-        let mut events = subscription.handle.drain();
+        let events = subscription.handle.drain();
         if events.is_empty() {
+            let bus_dropped = subscription.handle.take_dropped_since_read();
+            if bus_dropped > 0 {
+                subscription
+                    .dropped_total
+                    .fetch_add(bus_dropped, Ordering::AcqRel);
+                subscription.lossy_pending.store(true, Ordering::Release);
+            }
             if subscription.handle.take_lossy() {
                 subscription.lossy_pending.store(true, Ordering::Release);
             }
             return;
         }
-        events.sort_by_key(|event| event.seq);
-        let before_latest = subscription.latest_seq();
-        if let (Some(previous), Some(first)) =
-            (before_latest, events.first().map(|event| event.seq))
-        {
-            if first > previous.saturating_add(1) {
-                let dropped = first.saturating_sub(previous).saturating_sub(1);
-                subscription
-                    .dropped_total
-                    .fetch_add(dropped, Ordering::AcqRel);
-                subscription.lossy_pending.store(true, Ordering::Release);
-            }
-        } else if let Some(first) = events.first().map(|event| event.seq) {
-            let dropped = first.saturating_sub(1);
-            if dropped > 0 {
-                subscription
-                    .dropped_total
-                    .fetch_add(dropped, Ordering::AcqRel);
-                subscription.lossy_pending.store(true, Ordering::Release);
-            }
+        let bus_dropped = subscription.handle.take_dropped_since_read();
+        if bus_dropped > 0 {
+            subscription
+                .dropped_total
+                .fetch_add(bus_dropped, Ordering::AcqRel);
+            subscription.lossy_pending.store(true, Ordering::Release);
         }
         if subscription.handle.take_lossy() {
             subscription.lossy_pending.store(true, Ordering::Release);
@@ -380,12 +384,15 @@ impl Subscription {
         for event in events {
             if ring.len() == SUBSCRIBER_QUEUE_CAPACITY {
                 ring.pop_front();
+                self.dropped_total.fetch_add(1, Ordering::AcqRel);
+                self.lossy_pending.store(true, Ordering::Release);
             }
-            ring.push_back(event);
+            let stream_seq = self.next_stream_seq.fetch_add(1, Ordering::AcqRel);
+            ring.push_back(BufferedEvent { stream_seq, event });
         }
     }
 
-    fn events_after(&self, last_event_id: Option<u64>) -> (Vec<Event>, bool) {
+    fn events_after(&self, last_event_id: Option<u64>) -> (Vec<BufferedEvent>, bool) {
         let Ok(ring) = self.ring.lock() else {
             return (Vec::new(), false);
         };
@@ -394,10 +401,10 @@ impl Subscription {
         };
         let gap_lossy = ring
             .front()
-            .is_some_and(|first| last_event_id.saturating_add(1) < first.seq);
+            .is_some_and(|first| last_event_id.saturating_add(1) < first.stream_seq);
         let events = ring
             .iter()
-            .filter(|event| event.seq > last_event_id)
+            .filter(|event| event.stream_seq > last_event_id)
             .cloned()
             .collect();
         (events, gap_lossy)
@@ -407,7 +414,7 @@ impl Subscription {
         self.ring
             .lock()
             .ok()
-            .and_then(|ring| ring.back().map(|event| event.seq))
+            .and_then(|ring| ring.back().map(|event| event.stream_seq))
     }
 
     fn take_lossy_pending(&self) -> bool {
@@ -415,18 +422,25 @@ impl Subscription {
     }
 
     fn stats(&self) -> StatsResponse {
-        let (ring_len, oldest_seq, latest_seq) = self.ring.lock().map_or((0, None, None), |ring| {
-            (
-                ring.len(),
-                ring.front().map(|event| event.seq),
-                ring.back().map(|event| event.seq),
-            )
-        });
+        let (ring_len, oldest_seq, latest_seq, oldest_event_seq, latest_event_seq) = self
+            .ring
+            .lock()
+            .map_or((0, None, None, None, None), |ring| {
+                (
+                    ring.len(),
+                    ring.front().map(|event| event.stream_seq),
+                    ring.back().map(|event| event.stream_seq),
+                    ring.front().map(|event| event.event.seq),
+                    ring.back().map(|event| event.event.seq),
+                )
+            });
         StatsResponse {
             subscription_id: self.id().to_owned(),
             ring_len,
             oldest_seq,
             latest_seq,
+            oldest_event_seq,
+            latest_event_seq,
             dropped_total: self.dropped_total.load(Ordering::Acquire),
             events_dropped_for_subscriber: self.dropped_total.load(Ordering::Acquire),
             lossy_pending: self.lossy_pending.load(Ordering::Acquire),
@@ -544,10 +558,11 @@ impl SseFrame {
         }
     }
 
-    fn event(subscription_id: &str, event: Event, lossy: bool) -> Self {
+    fn event(subscription_id: &str, buffered: BufferedEvent, lossy: bool) -> Self {
         Self::Event {
             subscription_id: subscription_id.to_owned(),
-            event,
+            stream_seq: buffered.stream_seq,
+            event: buffered.event,
             lossy,
         }
     }
@@ -555,7 +570,7 @@ impl SseFrame {
     const fn seq(&self) -> Option<u64> {
         match self {
             Self::SubscriptionStarted { .. } => None,
-            Self::Event { event, .. } => Some(event.seq),
+            Self::Event { stream_seq, .. } => Some(*stream_seq),
         }
     }
 
@@ -569,14 +584,15 @@ impl SseFrame {
                 .data(subscription_started_data(&subscription_id, lossy).to_string()),
             Self::Event {
                 subscription_id,
+                stream_seq,
                 event,
                 lossy,
             } => {
-                let id = event.seq.to_string();
+                let id = stream_seq.to_string();
                 SseEvent::default()
                     .id(id)
                     .event("synapse/event")
-                    .data(event_data(&subscription_id, &event, lossy).to_string())
+                    .data(event_data(&subscription_id, stream_seq, &event, lossy).to_string())
             }
         }
     }
@@ -590,12 +606,18 @@ fn subscription_started_data(subscription_id: &str, lossy: bool) -> serde_json::
     })
 }
 
-fn event_data(subscription_id: &str, event: &Event, lossy: bool) -> serde_json::Value {
+fn event_data(
+    subscription_id: &str,
+    stream_seq: u64,
+    event: &Event,
+    lossy: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "synapse/event",
         "params": {
             "subscription_id": subscription_id,
+            "stream_seq": stream_seq,
             "lossy": lossy,
             "event": event,
         }
@@ -609,24 +631,41 @@ fn manual_routes_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use synapse_core::EventSource;
+    use synapse_core::{Event, EventFilter, EventSource};
 
-    use super::{SseFrame, SseState, event_data};
+    use super::{BufferedEvent, SseFrame, SseState, event_data};
+
+    fn event(seq: u64, kind: &str) -> Event {
+        Event {
+            seq,
+            at: Utc::now(),
+            source: EventSource::System,
+            kind: kind.to_owned(),
+            data: serde_json::json!({"value": seq}),
+            correlations: Vec::new(),
+        }
+    }
 
     #[test]
     fn event_frame_is_stable_for_known_input() {
-        let event = synapse_core::Event {
-            seq: 7,
-            at: Utc::now(),
-            source: EventSource::System,
-            kind: "tick".to_owned(),
-            data: serde_json::json!({"value": 7}),
-            correlations: Vec::new(),
-        };
-        let data = event_data("sub-1", &event, true).to_string();
+        let event = event(7, "tick");
+        let data = event_data("sub-1", 1, &event, true).to_string();
         assert!(data.contains("\"subscription_id\":\"sub-1\""));
+        assert!(data.contains("\"stream_seq\":1"));
+        assert!(data.contains("\"seq\":7"));
         assert!(data.contains("\"lossy\":true"));
-        assert_eq!(SseFrame::event("sub-1", event, true).seq(), Some(7));
+        assert_eq!(
+            SseFrame::event(
+                "sub-1",
+                BufferedEvent {
+                    stream_seq: 1,
+                    event,
+                },
+                true,
+            )
+            .seq(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -634,5 +673,71 @@ mod tests {
         let state = SseState::from_env();
         let response = state.open(&axum::http::HeaderMap::new(), super::EventsQuery::default());
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn sparse_domain_seq_gets_contiguous_stream_seq_without_loss() {
+        let state = SseState::from_env();
+        let subscription = state
+            .create_subscription_with(
+                EventFilter::Kind {
+                    kind: "reflex_fired".to_owned(),
+                },
+                Vec::new(),
+                false,
+            )
+            .expect("subscription should register");
+
+        state.publish_events(vec![event(62_488, "reflex_fired")]);
+        SseState::sync_subscription(&subscription);
+        let stats = subscription.stats();
+        assert_eq!(stats.ring_len, 1);
+        assert_eq!(stats.oldest_seq, Some(1));
+        assert_eq!(stats.latest_seq, Some(1));
+        assert_eq!(stats.oldest_event_seq, Some(62_488));
+        assert_eq!(stats.latest_event_seq, Some(62_488));
+        assert_eq!(stats.dropped_total, 0);
+        assert!(!stats.lossy_pending);
+
+        let frames = SseState::frames_after(&subscription, None);
+        assert_eq!(frames.len(), 1);
+        match frames.front().expect("one event frame") {
+            SseFrame::Event {
+                stream_seq,
+                event,
+                lossy,
+                ..
+            } => {
+                assert_eq!(*stream_seq, 1);
+                assert_eq!(event.seq, 62_488);
+                assert!(!lossy);
+            }
+            other => panic!("expected event frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_event_id_uses_stream_seq_not_domain_event_seq() {
+        let state = SseState::from_env();
+        let subscription = state
+            .create_subscription_with(EventFilter::All, Vec::new(), false)
+            .expect("subscription should register");
+
+        state.publish_events(vec![event(10, "first"), event(1_000, "second")]);
+        let frames = SseState::frames_after(&subscription, Some(1));
+        assert_eq!(frames.len(), 1);
+        match frames.front().expect("second event frame") {
+            SseFrame::Event {
+                stream_seq,
+                event,
+                lossy,
+                ..
+            } => {
+                assert_eq!(*stream_seq, 2);
+                assert_eq!(event.seq, 1_000);
+                assert!(!lossy);
+            }
+            other => panic!("expected event frame, got {other:?}"),
+        }
     }
 }

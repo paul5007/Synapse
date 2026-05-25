@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use arc_swap::ArcSwap;
@@ -61,6 +64,7 @@ struct Subscriber {
     sender: Sender<Event>,
     receiver: Receiver<Event>,
     lossy: Arc<std::sync::atomic::AtomicBool>,
+    dropped_since_read: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +72,7 @@ pub struct SubscriberHandle {
     id: SubscriptionId,
     receiver: Receiver<Event>,
     lossy: Arc<std::sync::atomic::AtomicBool>,
+    dropped_since_read: Arc<AtomicU64>,
     snapshot_first: bool,
 }
 
@@ -116,6 +121,7 @@ impl EventBus {
         let id = new_subscription_id();
         let (sender, receiver) = bounded(SUBSCRIBER_QUEUE_CAPACITY);
         let lossy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_since_read = Arc::new(AtomicU64::new(0));
         let subscriber = Arc::new(Subscriber {
             id: id.clone(),
             filter,
@@ -123,6 +129,7 @@ impl EventBus {
             sender,
             receiver: receiver.clone(),
             lossy: Arc::clone(&lossy),
+            dropped_since_read: Arc::clone(&dropped_since_read),
         });
         let mut next = current.as_ref().clone();
         next.push(subscriber);
@@ -132,6 +139,7 @@ impl EventBus {
             id,
             receiver,
             lossy,
+            dropped_since_read,
             snapshot_first,
         })
     }
@@ -151,6 +159,9 @@ impl EventBus {
             report.dropped = report.dropped.saturating_add(dropped);
             report.queued = report.queued.saturating_add(1);
             if dropped > 0 {
+                subscriber
+                    .dropped_since_read
+                    .fetch_add(dropped, Ordering::AcqRel);
                 subscriber
                     .lossy
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -231,6 +242,12 @@ impl SubscriberHandle {
     #[tracing::instrument(skip_all)]
     pub fn take_lossy(&self) -> bool {
         self.lossy.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all)]
+    pub fn take_dropped_since_read(&self) -> u64 {
+        self.dropped_since_read.swap(0, Ordering::AcqRel)
     }
 
     #[must_use]
