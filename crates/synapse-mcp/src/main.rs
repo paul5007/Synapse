@@ -7,6 +7,7 @@ mod server;
 
 use std::{
     io,
+    num::NonZeroUsize,
     path::PathBuf,
     pin::Pin,
     process::ExitCode,
@@ -47,6 +48,13 @@ struct Cli {
     log_level: String,
     #[arg(long, env = "SYNAPSE_REFLEX_DISABLED")]
     reflex_disabled: bool,
+    #[arg(
+        long,
+        env = "SYNAPSE_MAX_SUBSCRIPTIONS",
+        default_value_t = synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO,
+        value_name = "COUNT"
+    )]
+    max_subscriptions: NonZeroUsize,
 }
 
 impl Cli {
@@ -56,6 +64,7 @@ impl Cli {
             self.profile_dir.clone(),
             self.reflex_disabled,
             self.bind.clone(),
+            self.max_subscriptions,
         )
     }
 }

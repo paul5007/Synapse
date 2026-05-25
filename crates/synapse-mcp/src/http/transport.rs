@@ -64,7 +64,7 @@ pub(super) async fn serve(
         .context("read HTTP listener address")?;
     let shutdown_cancel = CancellationToken::new();
     let connection_closed_cancel = CancellationToken::new();
-    let sse_state = SseState::from_env();
+    let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
     let service = http_service(
         shutdown_cancel.clone(),
         connection_closed_cancel.clone(),

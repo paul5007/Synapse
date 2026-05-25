@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -13,6 +14,11 @@ use thiserror::Error;
 
 pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 4096;
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 64;
+pub const DEFAULT_MAX_SUBSCRIPTIONS_NONZERO: NonZeroUsize =
+    match NonZeroUsize::new(DEFAULT_MAX_SUBSCRIPTIONS) {
+        Some(value) => value,
+        None => NonZeroUsize::MIN,
+    };
 pub const EVENTS_DROPPED_METRIC: &str = "events_dropped_for_subscriber";
 
 pub type EventBusResult<T> = Result<T, EventBusError>;
@@ -45,6 +51,7 @@ pub struct EventBus {
 struct EventBusInner {
     subscribers: ArcSwap<Vec<Arc<Subscriber>>>,
     updates: Mutex<()>,
+    max_subscriptions: NonZeroUsize,
 }
 
 impl Default for EventBusInner {
@@ -52,6 +59,7 @@ impl Default for EventBusInner {
         Self {
             subscribers: ArcSwap::from_pointee(Vec::new()),
             updates: Mutex::new(()),
+            max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS_NONZERO,
         }
     }
 }
@@ -84,6 +92,22 @@ pub struct PublishReport {
 }
 
 impl EventBus {
+    #[must_use]
+    pub fn with_max_subscriptions(max_subscriptions: NonZeroUsize) -> Self {
+        Self {
+            inner: Arc::new(EventBusInner {
+                subscribers: ArcSwap::from_pointee(Vec::new()),
+                updates: Mutex::new(()),
+                max_subscriptions,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn max_subscriptions(&self) -> usize {
+        self.inner.max_subscriptions.get()
+    }
+
     /// Subscribes to matching events with a bounded per-subscriber queue.
     ///
     /// An empty `kinds` list means all event kinds are allowed, subject to
@@ -92,8 +116,8 @@ impl EventBus {
     /// # Errors
     ///
     /// Returns [`EventBusError::FilterInvalid`] when the filter fails schema
-    /// validation, or [`EventBusError::SubscriptionCapReached`] when 64 active
-    /// subscriptions already exist.
+    /// validation, or [`EventBusError::SubscriptionCapReached`] when the
+    /// configured active subscription cap is already reached.
     #[tracing::instrument(
         skip_all,
         fields(kinds_count = kinds.len(), snapshot_first)
@@ -112,9 +136,10 @@ impl EventBus {
 
         let _guard = self.lock_updates();
         let current = self.inner.subscribers.load_full();
-        if current.len() >= DEFAULT_MAX_SUBSCRIPTIONS {
+        let max_subscriptions = self.max_subscriptions();
+        if current.len() >= max_subscriptions {
             return Err(EventBusError::SubscriptionCapReached {
-                limit: DEFAULT_MAX_SUBSCRIPTIONS,
+                limit: max_subscriptions,
             });
         }
 

@@ -87,6 +87,56 @@ async fn subscribe_schema_defaults_and_edges() -> anyhow::Result<()> {
 
     let status = client.shutdown().await?;
     assert!(status.success());
+
+    subscribe_honors_configured_subscription_cap_and_cancel_retry().await?;
+    Ok(())
+}
+
+async fn subscribe_honors_configured_subscription_cap_and_cancel_retry() -> anyhow::Result<()> {
+    let logs = TempDir::new()?;
+    let mut client = StdioMcpClient::launch_and_init_with_env(
+        Some(logs.path()),
+        &[("SYNAPSE_MAX_SUBSCRIPTIONS", "2")],
+    )
+    .await?;
+
+    let first = structured(&client.tools_call("subscribe", json!({})).await?)?;
+    let first_subscription_id = first["subscription_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("first subscription_id missing")?
+        .to_owned();
+    let second = structured(&client.tools_call("subscribe", json!({})).await?)?;
+    let second_subscription_id = second["subscription_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("second subscription_id missing")?
+        .to_owned();
+    assert_ne!(first_subscription_id, second_subscription_id);
+
+    let capped = client.tools_call_error("subscribe", json!({})).await?;
+    assert_eq!(capped["data"]["code"], "SUBSCRIPTION_CAP_REACHED");
+
+    let cancel = structured(
+        &client
+            .tools_call(
+                "subscribe_cancel",
+                json!({"subscription_id": first_subscription_id}),
+            )
+            .await?,
+    )?;
+    assert_eq!(cancel["cancelled"], true);
+    assert_eq!(cancel["reason"], "ok");
+
+    let retry = structured(&client.tools_call("subscribe", json!({})).await?)?;
+    let retry_subscription_id = retry["subscription_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("retry subscription_id missing")?;
+    assert_ne!(retry_subscription_id, second_subscription_id);
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
     Ok(())
 }
 

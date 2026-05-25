@@ -8,6 +8,7 @@ pub mod subscribe;
 mod tests;
 use anyhow::{Result, bail};
 use std::{
+    num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -15,7 +16,7 @@ use synapse_action::ActionHandle;
 use synapse_audio::{AudioConfig, AudioError, AudioRuntime, DEFAULT_RING_SECONDS};
 use synapse_core::SCHEMA_VERSION;
 use synapse_profiles::{ProfileError, ProfileRuntime, bundled_profiles_dir};
-use synapse_reflex::{EventBus, ReflexError, ReflexRuntime};
+use synapse_reflex::{DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime};
 use synapse_storage::Db;
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +29,7 @@ const REFLEX_DISABLED_ENV: &str = "SYNAPSE_REFLEX_DISABLED";
 const BIND_ENV: &str = "SYNAPSE_BIND";
 const BEARER_TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const AUDIO_LOOPBACK_ENV: &str = "SYNAPSE_AUDIO_LOOPBACK";
+const MAX_SUBSCRIPTIONS_ENV: &str = "SYNAPSE_MAX_SUBSCRIPTIONS";
 const DEFAULT_BIND: &str = "127.0.0.1:7700";
 pub type SharedM3State = Arc<Mutex<M3State>>;
 
@@ -38,6 +40,7 @@ pub struct M3ServiceConfig {
     pub reflex_disabled: bool,
     pub bind: String,
     pub bearer_token: Option<String>,
+    pub max_subscriptions: NonZeroUsize,
 }
 
 impl M3ServiceConfig {
@@ -47,6 +50,7 @@ impl M3ServiceConfig {
         profile_dir: Option<PathBuf>,
         reflex_disabled: bool,
         bind: String,
+        max_subscriptions: NonZeroUsize,
     ) -> Self {
         Self {
             db_path,
@@ -54,17 +58,20 @@ impl M3ServiceConfig {
             reflex_disabled,
             bind,
             bearer_token: std::env::var(BEARER_TOKEN_ENV).ok(),
+            max_subscriptions,
         }
     }
 
     pub fn from_env() -> Result<Self> {
         let reflex_disabled_raw = std::env::var(REFLEX_DISABLED_ENV).ok();
+        let max_subscriptions_raw = std::env::var(MAX_SUBSCRIPTIONS_ENV).ok();
         Ok(Self {
             db_path: std::env::var_os(DB_ENV).map(PathBuf::from),
             profile_dir: std::env::var_os(PROFILE_DIR_ENV).map(PathBuf::from),
             reflex_disabled: parse_bool_env(REFLEX_DISABLED_ENV, reflex_disabled_raw.as_deref())?,
             bind: std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
             bearer_token: std::env::var(BEARER_TOKEN_ENV).ok(),
+            max_subscriptions: parse_max_subscriptions_env(max_subscriptions_raw.as_deref())?,
         })
     }
 }
@@ -112,12 +119,13 @@ pub fn shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
 
 impl M3State {
     pub fn from_config(config: M3ServiceConfig) -> Result<Self> {
+        let sse_state = SseState::with_max_subscriptions(config.max_subscriptions);
         Self::from_config_with_shutdown_reason_and_sse_state(
             config,
             CancellationToken::new(),
             "shutdown",
             None,
-            SseState::from_env(),
+            sse_state,
         )
     }
 
@@ -290,6 +298,24 @@ fn parse_bool_env(name: &str, value: Option<&str>) -> Result<bool> {
         Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
         Some(value) => bail!("{name} must be one of 1, 0, true, or false; got {value:?}"),
     }
+}
+
+fn parse_max_subscriptions_env(value: Option<&str>) -> Result<NonZeroUsize> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_SUBSCRIPTIONS_NONZERO);
+    };
+    parse_max_subscriptions_value(MAX_SUBSCRIPTIONS_ENV, value)
+}
+
+fn parse_max_subscriptions_value(name: &str, value: &str) -> Result<NonZeroUsize> {
+    let trimmed = value.trim();
+    let Ok(parsed) = trimmed.parse::<usize>() else {
+        bail!("{name} must be a positive integer; got {value:?}");
+    };
+    let Some(nonzero) = NonZeroUsize::new(parsed) else {
+        bail!("{name} must be >= 1; got {value:?}");
+    };
+    Ok(nonzero)
 }
 
 const fn bool_env_value(value: bool) -> &'static str {

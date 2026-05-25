@@ -100,6 +100,7 @@ impl SynapseService {
         connection_closed_cancel: CancellationToken,
         m3_config: M3ServiceConfig,
     ) -> anyhow::Result<Self> {
+        let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
         Ok(Self {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
@@ -114,7 +115,7 @@ impl SynapseService {
                 shutdown_cancel,
                 shutdown_reason,
                 Some(connection_closed_cancel),
-                SseState::from_env(),
+                sse_state,
             )?,
         })
     }

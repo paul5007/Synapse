@@ -1,6 +1,7 @@
 use super::{M3ServiceConfig, M3State, m3_tool_stubs};
 use crate::http::sse::SseState;
 use std::path::PathBuf;
+use synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO;
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -15,6 +16,7 @@ fn m3_state_from_config_reads_cli_shape() -> anyhow::Result<()> {
             reflex_disabled: true,
             bind: "127.0.0.1:7701".to_owned(),
             bearer_token: Some("token".to_owned()),
+            max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS_NONZERO,
         },
         CancellationToken::new(),
         "sigint",

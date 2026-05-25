@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     error::Error,
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
 
@@ -71,6 +72,9 @@ fn subscription_cap_filter_and_unsubscribe_edges() -> Result<(), Box<dyn Error>>
     assert!(bus.unsubscribe(&first_id));
     assert!(!bus.unsubscribe(&first_id));
     assert_eq!(bus.subscriber_count(), DEFAULT_MAX_SUBSCRIPTIONS - 1);
+    let retry = bus.subscribe(EventFilter::All, Vec::new(), false)?;
+    assert!(!retry.id().is_empty());
+    assert_eq!(bus.subscriber_count(), DEFAULT_MAX_SUBSCRIPTIONS);
     let _report = bus.publish(event(10_000, "tick"));
     assert!(handles[0].is_empty());
 
@@ -106,6 +110,36 @@ fn subscription_cap_filter_and_unsubscribe_edges() -> Result<(), Box<dyn Error>>
             .collect::<Vec<_>>(),
         vec![3]
     );
+    Ok(())
+}
+
+#[test]
+fn custom_subscription_cap_is_enforced_and_reusable() -> Result<(), Box<dyn Error>> {
+    let max = NonZeroUsize::new(2).ok_or("fixture max must be non-zero")?;
+    let bus = EventBus::with_max_subscriptions(max);
+    assert_eq!(bus.max_subscriptions(), 2);
+
+    let first = bus.subscribe(EventFilter::All, Vec::new(), false)?;
+    let second = bus.subscribe(EventFilter::All, Vec::new(), false)?;
+    assert_eq!(bus.subscriber_count(), 2);
+
+    let capped = match bus.subscribe(EventFilter::All, Vec::new(), false) {
+        Ok(_handle) => panic!("third subscription should fail at custom cap 2"),
+        Err(error) => error,
+    };
+    assert_eq!(capped.code(), error_codes::SUBSCRIPTION_CAP_REACHED);
+    assert!(matches!(
+        capped,
+        EventBusError::SubscriptionCapReached { limit: 2 }
+    ));
+    assert_eq!(bus.subscriber_count(), 2);
+
+    assert!(bus.unsubscribe(first.id()));
+    assert_eq!(bus.subscriber_count(), 1);
+    let retry = bus.subscribe(EventFilter::All, Vec::new(), false)?;
+    assert!(!retry.id().is_empty());
+    assert_eq!(bus.subscriber_count(), 2);
+    assert!(bus.unsubscribe(second.id()));
     Ok(())
 }
 

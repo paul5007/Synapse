@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 pub use audit::write_audit;
 pub use bus::{
-    DEFAULT_MAX_SUBSCRIPTIONS, EVENTS_DROPPED_METRIC, EventBus, EventBusError, EventBusResult,
-    PublishReport, SUBSCRIBER_QUEUE_CAPACITY, SubscriberHandle,
+    DEFAULT_MAX_SUBSCRIPTIONS, DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EVENTS_DROPPED_METRIC, EventBus,
+    EventBusError, EventBusResult, PublishReport, SUBSCRIBER_QUEUE_CAPACITY, SubscriberHandle,
 };
 pub use conflict::{REFLEX_STARVED_KIND, STARVATION_AFTER};
 pub use error::{ReflexError, ReflexResult};

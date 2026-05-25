@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -134,10 +135,15 @@ pub enum SseCancelError {
 }
 
 impl SseState {
+    #[cfg(test)]
     pub(crate) fn from_env() -> Self {
+        Self::with_max_subscriptions(synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO)
+    }
+
+    pub(crate) fn with_max_subscriptions(max_subscriptions: NonZeroUsize) -> Self {
         Self {
             inner: Arc::new(SseStateInner {
-                event_bus: EventBus::default(),
+                event_bus: EventBus::with_max_subscriptions(max_subscriptions),
                 subscriptions: Mutex::new(BTreeMap::new()),
                 manual_routes_enabled: manual_routes_enabled(),
             }),

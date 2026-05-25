@@ -1,4 +1,4 @@
-use std::{net::TcpListener, process::Stdio, time::Duration};
+use std::{net::TcpListener, process::Stdio, sync::OnceLock, time::Duration};
 
 use anyhow::Context;
 use tempfile::TempDir;
@@ -10,6 +10,7 @@ use tokio::{
 
 #[tokio::test]
 async fn http_mode_serves_health_until_shutdown() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
     let dir = TempDir::new()?;
     let bind = free_loopback_bind()?;
     let token = "cli-mode-token";
@@ -41,6 +42,7 @@ async fn http_mode_serves_health_until_shutdown() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn http_mode_refuses_non_loopback_without_flag() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
     let dir = TempDir::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
         .args(["--mode", "http", "--bind", "0.0.0.0:0"])
@@ -59,6 +61,7 @@ async fn http_mode_refuses_non_loopback_without_flag() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn http_mode_allows_non_loopback_with_explicit_flag() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
     let dir = TempDir::new()?;
     let port = free_loopback_port()?;
     let bind = format!("0.0.0.0:{port}");
@@ -88,6 +91,7 @@ async fn http_mode_allows_non_loopback_with_explicit_flag() -> anyhow::Result<()
 
 #[tokio::test]
 async fn stdio_mode_reaches_transport_path_on_closed_stdin() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
     let dir = TempDir::new()?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
         .args(["--mode", "stdio"])
@@ -109,6 +113,7 @@ async fn stdio_mode_reaches_transport_path_on_closed_stdin() -> anyhow::Result<(
 
 #[tokio::test]
 async fn invalid_env_mode_exits_with_clap_error() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
     let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
         .env("SYNAPSE_MODE", "garbage")
         .stderr(Stdio::piped())
@@ -120,6 +125,31 @@ async fn invalid_env_mode_exits_with_clap_error() -> anyhow::Result<()> {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("invalid value") || stderr.contains("garbage"));
     Ok(())
+}
+
+#[tokio::test]
+async fn invalid_max_subscriptions_env_exits_with_clap_error() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
+    let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
+        .env("SYNAPSE_MAX_SUBSCRIPTIONS", "0")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output()
+        .await?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("max-subscriptions") || stderr.contains("SYNAPSE_MAX_SUBSCRIPTIONS"),
+        "{stderr}"
+    );
+    assert!(stderr.contains('0'), "{stderr}");
+    Ok(())
+}
+
+fn cli_mode_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn free_loopback_bind() -> anyhow::Result<String> {

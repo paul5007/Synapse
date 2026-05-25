@@ -294,7 +294,7 @@ OcrResult (extension; word-level), OcrWord
 
 ### 3.3 Channel + lifetime invariants (hard contract)
 
-- **EventBus**: `ArcSwap<Vec<Subscriber>>`. Per-subscriber bounded `crossbeam::channel` 4096 events, drop-oldest. Slow consumer increments `events_dropped_for_subscriber{subscription_id}` metric; subscription marked `lossy=true` on next push so SSE clients see the gap.
+- **EventBus**: `ArcSwap<Vec<Subscriber>>`. Per-subscriber bounded `crossbeam::channel` 4096 events, drop-oldest. Active subscriptions are capped at 64 per session by default; the HTTP/stdio MCP service can lower or raise the cap with `--max-subscriptions` / `SYNAPSE_MAX_SUBSCRIPTIONS`, and exceeding it returns `SUBSCRIPTION_CAP_REACHED`. Slow consumer increments `events_dropped_for_subscriber{subscription_id}` metric; subscription marked `lossy=true` on next push so SSE clients see the gap.
 - **Reflex scheduler tick**: 1 ms via `CreateWaitableTimerEx` + `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` + MMCSS "Pro Audio". On MMCSS-unavailable boxes (for example Linux) the bench gate stays disabled; production target is Win11. Fallback `tokio::time::interval(2ms)` is logged as `degraded` + spike check fires.
 - **Reflex cap 32 per session** (`REFLEX_CAP_REACHED`). Recursion guard ≤ 4 firings/tick (OQ-022, `REFLEX_RECURSION_LIMIT` — declare the new code in this PR and add to `synapse-core::error_codes`).
 - **Storage write batch flushes** every 100 ms or 64 KB or on explicit `Db::flush()`. Per-CF compaction filter runs in RocksDB's compaction thread; GC task runs in a dedicated `tokio::task` every 5 min checking soft caps and calling `DeleteRange` + manual `compact_range`. Disk-pressure responder polls disk every 30 s and emits `STORAGE_DISK_PRESSURE_LEVEL_N` on transitions.
