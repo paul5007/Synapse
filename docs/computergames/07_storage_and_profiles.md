@@ -453,7 +453,19 @@ emits_kind = "creeper-imminent"
 
 ### 8.3 Match precedence
 
-On foreground window change, profile detection runs: walk all loaded profiles in stable order (user-installed first, then bundled); for each, walk `matches` array in order; first match wins. A match must satisfy all populated fields (`exe`, `title_regex`, `steam_appid`; unspecified fields are wildcards). Agent can override via `profile_activate(profile_id=...)`.
+On foreground window change, profile detection follows ADR-0006. Each profile
+may define multiple `[[matches]]`; the resolver uses the strongest matching
+field from that profile. Across profiles, precedence is:
+
+1. `exe`
+2. `title_regex`
+3. `steam_appid`
+4. `window_class`
+
+If two profiles match at the same rank, the newer profile file mtime wins. Any
+remaining exact tie is broken deterministically by source path, profile id, and
+loaded index. Agent/operator override is explicit through
+`profile_activate(profile_id=...)`.
 
 ### 8.4 Bundled profiles at v1
 

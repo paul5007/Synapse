@@ -180,15 +180,14 @@ run concurrent per-monitor captures in M3.
 
 ---
 
-## OQ-015 — Profile match precedence
+## OQ-015 — Profile match precedence — DECIDED 2026-05-25
 
-**Q.** When multiple profiles match a window (exe match + title match), which wins?
+→ decided in ADR-0006.
 
-**Trade-off.** Insertion order: random across machines, bad. Most-specific match: principled, expensive. User > bundled: simple.
-
-**Default.** User-installed first, then bundled. Within directory: alphabetical. First match wins.
-
-**Target.** M3. Switch to most-specific scoring if ambiguity hit often.
+**Decision.** Automatic foreground profile resolution ranks matches by
+`exe > title_regex > steam_appid > window_class`. Same-rank conflicts are
+resolved by newer profile file mtime, then deterministic source path/profile id
+tie-breakers. Manual `profile_activate` remains an explicit override.
 
 ---
 
