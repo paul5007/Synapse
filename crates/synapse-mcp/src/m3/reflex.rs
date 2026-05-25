@@ -478,7 +478,8 @@ fn apply_backend_default(action: &mut Action, fallback: Backend) {
 mod tests {
     use serde_json::json;
     use synapse_core::{
-        Action, DataPredicate, EventFilter, KeyCode, KeystrokeDynamics, ReflexLifetime,
+        Action, Backend, DataPredicate, EventFilter, KeyCode, KeystrokeDynamics,
+        KeystrokeNaturalParams, ReflexLifetime,
     };
     use synapse_reflex::SchedulerTrigger;
 
@@ -547,6 +548,45 @@ mod tests {
                 );
             }
             other => panic!("second demo step should map to KeyPress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn demo_step_act_type_omitted_dynamics_resolves_to_natural_fast() {
+        let params: ReflexRegisterParams = serde_json::from_value(json!({
+            "kind": "on_event",
+            "when": { "op": "kind", "kind": "support-default-resolution" },
+            "then": {
+                "steps": [
+                    {
+                        "action": "act_type",
+                        "params": { "text": "abc" }
+                    }
+                ]
+            }
+        }))
+        .expect("default dynamics reflex shape should deserialize");
+
+        let reflex =
+            scheduled_reflex_from_params(params).expect("default dynamics reflex should build");
+
+        assert_eq!(reflex.then.len(), 1);
+        match &reflex.then[0] {
+            Action::TypeText {
+                text,
+                dynamics,
+                backend,
+            } => {
+                assert_eq!(text, "abc");
+                assert_eq!(
+                    dynamics,
+                    &KeystrokeDynamics::Natural {
+                        params: KeystrokeNaturalParams::FAST
+                    }
+                );
+                assert_eq!(*backend, Backend::Auto);
+            }
+            other => panic!("default act_type step should map to TypeText, got {other:?}"),
         }
     }
 
