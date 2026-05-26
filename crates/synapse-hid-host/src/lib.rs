@@ -5,6 +5,7 @@ pub mod error;
 pub mod handshake;
 pub mod pipeline;
 pub mod protocol;
+pub mod reconnect;
 pub mod transport;
 
 pub use discover::{candidate_port_names, connect_auto, is_synapse_pico_port};
@@ -28,5 +29,9 @@ pub use protocol::{
     HOST_COMMAND_PING, HOST_COMMAND_RELEASE_ALL, HOST_COMMAND_RESET_TO_BOOTLOADER,
     HOST_COMMAND_WATCHDOG_KICK, HOST_MAGIC, MAX_FRAME_LEN, MAX_PAYLOAD_LEN, encode_device_frame,
     encode_host_frame, encode_identify_frame, parse_device_frame, parse_device_frame_prefix,
+};
+pub use reconnect::{
+    HidReconnectGateway, HidReconnectTarget, RECONNECT_INTERVAL_MS, ReconnectConnector,
+    ReconnectGateway, ReconnectLink, ReconnectSnapshot, ReconnectStateKind,
 };
 pub use transport::{DEFAULT_BAUD_RATE, DEFAULT_READ_TIMEOUT_MS, HidGateway};

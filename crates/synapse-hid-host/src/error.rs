@@ -28,6 +28,8 @@ pub enum HidError {
         operation: &'static str,
         timeout_ms: u64,
     },
+    #[error("HID port disconnected: {detail}")]
+    PortDisconnected { detail: String },
 }
 
 impl HidError {
@@ -40,6 +42,7 @@ impl HidError {
             Self::FirmwareVersionMismatch { .. } => error_codes::HID_FIRMWARE_VERSION_MISMATCH,
             Self::CommandRejected { .. } => error_codes::HID_COMMAND_REJECTED,
             Self::LinkTimeout { .. } => error_codes::HID_LINK_TIMEOUT,
+            Self::PortDisconnected { .. } => error_codes::ACTION_HID_PORT_DISCONNECTED,
         }
     }
 }

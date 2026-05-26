@@ -47,6 +47,12 @@ fn hid_error_code_mapping_covers_m4_contract() {
             },
             error_codes::HID_LINK_TIMEOUT,
         ),
+        (
+            HidError::PortDisconnected {
+                detail: "reconnecting".to_owned(),
+            },
+            error_codes::ACTION_HID_PORT_DISCONNECTED,
+        ),
     ];
 
     for (error, code) in cases {
