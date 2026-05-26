@@ -130,3 +130,111 @@ async fn release_all_bypasses_empty_buckets_and_drains_state() {
         "readback=action_emitter_rate_limit edge=release_all_bypass before_state={before_state:?} before_limits={before_limits:?} after_state={after_state:?} after_limits={after_limits:?}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn release_all_dispatches_configured_hardware_backend_and_logs_backend() {
+    let trace_buffer = SharedTraceBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(trace_buffer.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_level(false)
+        .finish();
+    let software = Arc::new(RecordingBackend::new());
+    let vigem = Arc::new(RecordingBackend::new());
+    let hardware = Arc::new(RecordingBackend::new());
+    let software_backend: Arc<dyn ActionBackend> = software.clone();
+    let vigem_backend: Arc<dyn ActionBackend> = vigem.clone();
+    let hardware_backend: Arc<dyn ActionBackend> = hardware.clone();
+    let backends = Backends::from_parts(software_backend, vigem_backend, hardware_backend, true);
+    let (_handle, _snapshot_handle, mut emitter) = ActionEmitter::channel_with_backends(backends);
+    let w = key_named("w");
+    let ctrl = key_named("ctrl");
+
+    emitter
+        .execute(Action::KeyDown {
+            key: w.clone(),
+            backend: Backend::Hardware,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("hardware w keydown should hold state: {error}"));
+    emitter
+        .execute(Action::KeyDown {
+            key: ctrl.clone(),
+            backend: Backend::Hardware,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("hardware ctrl keydown should hold state: {error}"));
+    let before_state = emitter.snapshot();
+    let before_hardware_events = hardware.events();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let release_result = emitter.execute(Action::ReleaseAll).await;
+    drop(guard);
+
+    assert!(
+        release_result.is_ok(),
+        "release_all should release configured hardware backend: {release_result:?}"
+    );
+    let after_state = emitter.snapshot();
+    let software_events = software.events();
+    let hardware_events = hardware.events();
+    let log_output = trace_buffer.text();
+    let log_line = find_log_line(&log_output, error_codes::SAFETY_RELEASE_ALL_FIRED);
+    let expected_release_keys = vec![
+        KeyCode::Named {
+            value: "ctrl".to_owned(),
+        },
+        KeyCode::Named {
+            value: "w".to_owned(),
+        },
+    ];
+
+    assert_eq!(before_state.held_keys, vec![w.clone(), ctrl.clone()]);
+    assert_eq!(
+        before_hardware_events,
+        vec![
+            RecordedInput::KeyDown { key: w },
+            RecordedInput::KeyDown { key: ctrl },
+        ]
+    );
+    assert!(after_state.held_keys.is_empty());
+    assert!(after_state.held_buttons.is_empty());
+    assert!(after_state.pad_state.is_empty());
+    assert!(software_events.iter().any(|event| matches!(
+        event,
+        RecordedInput::ReleaseAll {
+            held_keys,
+            held_buttons,
+            pads,
+        } if held_keys.is_empty() && held_buttons.is_empty() && pads.is_empty()
+    )));
+    assert!(hardware_events.iter().any(|event| matches!(
+        event,
+        RecordedInput::ReleaseAll {
+            held_keys,
+            held_buttons,
+            pads,
+        } if held_keys == &expected_release_keys && held_buttons.is_empty() && pads.is_empty()
+    )));
+    assert!(
+        log_line.contains("code=\"SAFETY_RELEASE_ALL_FIRED\""),
+        "log_line={log_line}"
+    );
+    assert!(
+        log_line.contains("backend=\"hardware\""),
+        "log_line={log_line}"
+    );
+    assert!(
+        log_line.contains("primary_backend=\"software\""),
+        "log_line={log_line}"
+    );
+    assert!(
+        log_line.contains("hardware_release_ok=true"),
+        "log_line={log_line}"
+    );
+    println!(
+        "readback=hardware_release_all edge=emitter before_state={before_state:?} before_hardware_events={before_hardware_events:?} after_state={after_state:?} software_events={software_events:?} hardware_events={hardware_events:?} log_line={log_line}"
+    );
+}

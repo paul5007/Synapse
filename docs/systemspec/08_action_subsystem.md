@@ -99,7 +99,7 @@ For each `(Action, oneshot::Sender)` pulled from the channel:
    - **`HardwareBackend`** (`backend/hardware/*`): serializes supported key, mouse-relative, absolute-mouse-to-relative batch, pad, combo, and release commands through `synapse-hid-host::HidGateway`
    - **`HardwareUnavailableBackend`** (`backend/unavailable`): fail-closed response when hardware HID is not enabled, returning `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
 5. **Auto-release timers.** `emitter::keyboard` enforces `HELD_KEY_MAX_DURATION_MS` per held key — after the limit, the emitter inserts a synthetic `KeyUp` and emits a `STUCK_KEY_AUTO_RELEASED` warn-log + event.
-6. **ReleaseAll**: walks `EmitState`, emits a `KeyUp` for each held key, `MouseButton::Up` for each held button, and a `GamepadReport::neutral` for each tracked pad. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
+6. **ReleaseAll**: walks `EmitState`, emits a `KeyUp` for each held key, `MouseButton::Up` for each held button, and a `GamepadReport::neutral` for each tracked pad. When a real hardware HID backend was configured at startup, the emitter also dispatches `Action::ReleaseAll` to `HardwareBackend`, which sends one firmware `RELEASE_ALL (0x40)` command and clears the host mirror. The safety log records `code=SAFETY_RELEASE_ALL_FIRED`, `backend="hardware"`, `primary_backend`, `release_backends`, and `hardware_release_ok` for this path. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
 7. **Ack.** Send `Ok(())` or the `ActionError` back on the oneshot.
 
 ### 3.3 Lifecycle (`emitter::lifecycle`)

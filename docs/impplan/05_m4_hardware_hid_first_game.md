@@ -640,7 +640,7 @@ code exists; it is done only when the issue is closed with manual FSV evidence.
 | #394 | closed | C-03 Synapse key to HID usage-code mapping. |
 | #395 | closed | C-04 HID boot keyboard 6KRO and modifier handling. |
 | #396 | closed | C-05 hardware mouse relative-only rule and absolute fallback. |
-| #397 | open | C-06 hardware `ReleaseAll` to firmware `RELEASE_ALL`. |
+| #397 | closed | C-06 hardware `ReleaseAll` to firmware `RELEASE_ALL`. |
 | #398 | open | C-07 held-state interlock between hardware and software backends. |
 | #399 | open | C-08 `Backend::Auto` resolution for hardware-capable hosts. |
 

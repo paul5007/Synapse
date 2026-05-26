@@ -37,6 +37,7 @@ pub struct Backends {
     software: Arc<dyn ActionBackend>,
     vigem: Arc<dyn ActionBackend>,
     hardware: Arc<dyn ActionBackend>,
+    hardware_release_enabled: bool,
 }
 
 impl Backends {
@@ -46,6 +47,7 @@ impl Backends {
             software: Arc::new(SoftwareBackend::new()),
             vigem: Arc::new(VigemBackend::new()),
             hardware: Arc::new(HardwareUnavailableBackend::new()),
+            hardware_release_enabled: false,
         }
     }
 
@@ -77,6 +79,7 @@ impl Backends {
             software: Arc::new(SoftwareBackend::new()),
             vigem: Arc::new(VigemBackend::new()),
             hardware,
+            hardware_release_enabled: true,
         }
     }
 
@@ -86,6 +89,23 @@ impl Backends {
             software: Arc::clone(&backend),
             vigem: Arc::clone(&backend),
             hardware: backend,
+            hardware_release_enabled: false,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn from_parts(
+        software: Arc<dyn ActionBackend>,
+        vigem: Arc<dyn ActionBackend>,
+        hardware: Arc<dyn ActionBackend>,
+        hardware_release_enabled: bool,
+    ) -> Self {
+        Self {
+            software,
+            vigem,
+            hardware,
+            hardware_release_enabled,
         }
     }
 
@@ -102,6 +122,14 @@ impl Backends {
         backend: &Arc<dyn ActionBackend>,
     ) -> Option<Arc<dyn ActionBackend>> {
         (!Arc::ptr_eq(backend, &self.vigem)).then(|| Arc::clone(&self.vigem))
+    }
+
+    pub(super) fn pick_hardware_release_if_enabled_and_distinct_from(
+        &self,
+        backend: &Arc<dyn ActionBackend>,
+    ) -> Option<Arc<dyn ActionBackend>> {
+        (self.hardware_release_enabled && !Arc::ptr_eq(backend, &self.hardware))
+            .then(|| Arc::clone(&self.hardware))
     }
 }
 

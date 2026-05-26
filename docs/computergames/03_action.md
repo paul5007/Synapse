@@ -381,7 +381,7 @@ Three layers ensure no stuck inputs:
 - All tracked held keys → `KeyUp` via active back-end
 - All tracked held mouse buttons → up
 - All ViGEm pads → neutral report (no buttons, sticks centered, triggers 0)
-- All hardware HID inputs → neutral
+- All hardware HID inputs → a single firmware `RELEASE_ALL (0x40)` command when hardware HID is configured; the host mirror is cleared and the daemon log records `SAFETY_RELEASE_ALL_FIRED backend="hardware"`
 
 Runs in ≤ 10 ms.
 

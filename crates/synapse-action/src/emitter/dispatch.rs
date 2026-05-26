@@ -158,29 +158,44 @@ impl ActionEmitter {
         let cancelled_key_timers = self.abort_all_held_key_timers();
 
         let resolved = resolved_backend_for_action(&Action::ReleaseAll)?;
-        let backend = self.backends.pick(resolved);
-        let result = self
-            .dispatch_via_backend(Arc::clone(&backend), Action::ReleaseAll)
+        let primary_backend = self.backends.pick(resolved);
+        let mut release_backends = vec![resolved.as_str()];
+        let mut hardware_release_ok = None;
+        let mut result = self
+            .dispatch_via_backend(Arc::clone(&primary_backend), Action::ReleaseAll)
             .await;
-        let result = if released_pads == 0 {
-            result
-        } else if let Some(vigem_backend) = self.backends.pick_vigem_if_distinct_from(&backend) {
-            match (
-                result,
-                self.dispatch_via_backend(vigem_backend, Action::ReleaseAll)
-                    .await,
-            ) {
-                (Ok(()), vigem_result) => vigem_result,
-                (software_result @ Err(_), Ok(())) => software_result,
-                (software_result @ Err(_), Err(_vigem_error)) => software_result,
-            }
+        if released_pads != 0
+            && let Some(vigem_backend) = self.backends.pick_vigem_if_distinct_from(&primary_backend)
+        {
+            release_backends.push("vigem");
+            let vigem_result = self
+                .dispatch_via_backend(vigem_backend, Action::ReleaseAll)
+                .await;
+            result = combine_release_results(result, vigem_result);
+        }
+        if let Some(hardware_backend) = self
+            .backends
+            .pick_hardware_release_if_enabled_and_distinct_from(&primary_backend)
+        {
+            release_backends.push("hardware");
+            let hardware_result = self
+                .dispatch_via_backend(hardware_backend, Action::ReleaseAll)
+                .await;
+            hardware_release_ok = Some(hardware_result.is_ok());
+            result = combine_release_results(result, hardware_result);
+        }
+        let release_backend = if hardware_release_ok.is_some() {
+            "hardware"
         } else {
-            result
+            resolved.as_str()
         };
 
         tracing::warn!(
             code = error_codes::SAFETY_RELEASE_ALL_FIRED,
             reason,
+            backend = release_backend,
+            primary_backend = resolved.as_str(),
+            release_backends = ?release_backends,
             held_keys = ?before.held_keys,
             held_key_bits = ?before.held_key_bits,
             held_key_timer_keys = ?before.held_key_timer_keys,
@@ -192,6 +207,7 @@ impl ActionEmitter {
             released_buttons,
             released_pads,
             cancelled_key_timers,
+            hardware_release_ok,
             backend_ok = result.is_ok(),
             "release_all drained action emitter held state"
         );
@@ -203,5 +219,12 @@ impl ActionEmitter {
             self.state.release_all();
         }
         result
+    }
+}
+
+fn combine_release_results(current: ActionResult<()>, next: ActionResult<()>) -> ActionResult<()> {
+    match current {
+        Ok(()) => next,
+        error @ Err(_) => error,
     }
 }

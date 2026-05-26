@@ -192,6 +192,57 @@ fn keyboard_mouse_and_release_actions_emit_firmware_commands() {
 }
 
 #[test]
+fn release_all_emits_single_firmware_command_and_clears_host_state() {
+    let gateway = StubGateway::default();
+    let records = gateway.clone();
+    let backend = HardwareBackend::with_gateway(gateway);
+    let mut state = EmitState::new();
+    let w = named_key("w");
+    let ctrl = named_key("ctrl");
+
+    backend
+        .execute(
+            &Action::KeyDown {
+                key: w.clone(),
+                backend: Backend::Hardware,
+            },
+            &mut state,
+        )
+        .unwrap_or_else(|error| panic!("hardware key down should hold w: {error}"));
+    backend
+        .execute(
+            &Action::KeyDown {
+                key: ctrl.clone(),
+                backend: Backend::Hardware,
+            },
+            &mut state,
+        )
+        .unwrap_or_else(|error| panic!("hardware key down should hold ctrl: {error}"));
+    let before_commands = records.commands();
+    let before_snapshot = state.snapshot();
+    println!(
+        "readback=hardware_release_all edge=held_keys before_commands={before_commands:?} before_state={before_snapshot:?}"
+    );
+
+    backend
+        .execute(&Action::ReleaseAll, &mut state)
+        .unwrap_or_else(|error| panic!("hardware release_all should emit: {error}"));
+
+    let after_commands = records.commands();
+    let after_snapshot = state.snapshot();
+    let new_commands = &after_commands[before_commands.len()..];
+    println!(
+        "readback=hardware_release_all edge=held_keys after_commands={after_commands:?} new_commands={new_commands:?} after_state={after_snapshot:?}"
+    );
+
+    assert_eq!(before_snapshot.held_keys, vec![w, ctrl]);
+    assert_eq!(new_commands, &[(HOST_COMMAND_RELEASE_ALL, vec![])]);
+    assert!(after_snapshot.held_keys.is_empty());
+    assert!(after_snapshot.held_buttons.is_empty());
+    assert!(after_snapshot.pad_state.is_empty());
+}
+
+#[test]
 fn pad_actions_emit_full_report_payloads() {
     let gateway = StubGateway::default();
     let records = gateway.clone();
