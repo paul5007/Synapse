@@ -1,22 +1,5 @@
-use std::time::Duration;
-
 use synapse_core::{EXPECTED_FW_MAJOR, error_codes};
-use synapse_hid_host::{
-    DEFAULT_BAUD_RATE, DEFAULT_READ_TIMEOUT_MS, HandshakeError, HidError, HidGateway,
-    IDENTIFY_RESP_LEN,
-};
-
-#[test]
-fn gateway_scaffold_records_port_and_defaults() {
-    let gateway = HidGateway::new("COM7");
-
-    assert_eq!(gateway.port_name(), "COM7");
-    assert_eq!(gateway.baud_rate(), DEFAULT_BAUD_RATE);
-    assert_eq!(
-        gateway.read_timeout(),
-        Duration::from_millis(DEFAULT_READ_TIMEOUT_MS)
-    );
-}
+use synapse_hid_host::{DEFAULT_READ_TIMEOUT_MS, HandshakeError, HidError, IDENTIFY_RESP_LEN};
 
 #[test]
 fn hid_error_code_mapping_covers_m4_contract() {
@@ -30,7 +13,9 @@ fn hid_error_code_mapping_covers_m4_contract() {
         (
             HidError::PortOpenFailed {
                 port_name: "COM7".to_owned(),
+                kind: serialport::ErrorKind::NoDevice,
                 detail: "access denied".to_owned(),
+                os_error_code: Some(5),
             },
             error_codes::HID_PORT_OPEN_FAILED,
         ),

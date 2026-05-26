@@ -8,8 +8,15 @@ pub type HidResult<T> = Result<T, HidError>;
 pub enum HidError {
     #[error("HID port not found: {port_name}")]
     PortNotFound { port_name: String },
-    #[error("HID port open failed for {port_name}: {detail}")]
-    PortOpenFailed { port_name: String, detail: String },
+    #[error(
+        "HID port open failed for {port_name}: {detail} (kind={kind:?}, os_error_code={os_error_code:?})"
+    )]
+    PortOpenFailed {
+        port_name: String,
+        kind: serialport::ErrorKind,
+        detail: String,
+        os_error_code: Option<i32>,
+    },
     #[error("HID protocol handshake failed: {detail}")]
     ProtocolHandshakeFailed { detail: String },
     #[error("HID firmware major version {actual} did not match expected {expected}")]
