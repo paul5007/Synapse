@@ -361,10 +361,11 @@ M2+ uses manual FSV on the operator's configured Windows host as the shipping
 gate. GitHub Actions/CI, automated FSV scripts, and missing-dependency
 portability tests are not release gates. A missing configured-host prerequisite
 is an acquisition/setup task, not a reason to mark the issue blocked by itself:
-use Synapse/local computer control plus host OS, shell, browser,
-package-manager, and device-management workflows to install, connect, download,
-configure, or generate the real prerequisite, then read its authoritative SoT
-directly before shipping.
+figure out where the thing must come from, where it must physically appear, and
+make it happen on this configured host. Use Synapse/local computer control plus
+host OS, shell, browser, package-manager, and device-management workflows to
+install, connect, download, configure, or generate the real prerequisite, then
+read its authoritative SoT directly before shipping.
 Only hard-to-reverse external actions such as spending money, private
 credentials, billing, or external account changes require narrow operator
 approval, and every reversible local step must be complete before asking.

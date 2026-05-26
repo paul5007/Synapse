@@ -6,10 +6,12 @@ Recommendations for keeping a long-lived synapse development host (Windows or Li
 
 If a required host prerequisite is absent, treat that as setup/acquisition work,
 not as completion evidence, a portability gate, or a reason to mark the issue
-blocked by itself. Use Synapse computer-control surfaces as the same practical
-control surface the operator has on this configured host, plus normal OS,
-shell, browser, package-manager, and device-manager workflows, to install,
-connect, download, configure, or generate the real prerequisite on this host.
+blocked by itself. Missing means: figure out where the thing must come from,
+where it must physically appear, and make it happen on this configured host.
+Use Synapse computer-control surfaces as the same practical control surface the
+operator has on this configured host, plus normal OS, shell, browser,
+package-manager, and device-manager workflows, to install, connect, download,
+configure, or generate the real prerequisite on this host.
 Then read the physical source of truth where the prerequisite must appear:
 package inventory, driver/service list, `Get-PnpDevice`, registry Enum key,
 firmware volume, config file, model path plus hash, or equivalent.

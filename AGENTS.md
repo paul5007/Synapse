@@ -40,11 +40,13 @@ this repo must include `[skip ci]`.
 
 If a required local tool, driver, model, device, file, service, account state,
 or other prerequisite is missing, do not treat the absence as a stopping point
-or mark the issue blocked for that reason alone. Use Synapse's local
-computer-control surfaces as the same practical control surface the operator
-has on this configured host, plus normal OS, shell, browser, package-manager,
-and device-management workflows, to acquire, install, connect, configure,
-generate, or otherwise make the prerequisite real on this host.
+or mark the issue blocked for that reason alone. Missing means: figure out
+where the thing must come from, where it must physically appear, and make it
+happen. Use Synapse's local computer-control surfaces as the same practical
+control surface the operator has on this configured host, plus normal OS,
+shell, browser, package-manager, and device-management workflows, to acquire,
+install, connect, configure, generate, or otherwise make the prerequisite real
+on this host.
 
 Missing prerequisites become concrete work items with source-of-truth readback:
 identify what is missing, identify the authoritative place it should appear,
