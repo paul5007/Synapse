@@ -1,0 +1,94 @@
+---
+source: crates/synapse-mcp/tests/m4_tools_list.rs
+expression: snapshot
+---
+{
+  "count": 33,
+  "m4_defaults": [
+    {
+      "actual": "auto",
+      "path": "inputSchema.properties.backend.default",
+      "tool": "act_combo"
+    },
+    {
+      "actual": [],
+      "path": "inputSchema.properties.args.default",
+      "tool": "act_run_shell"
+    },
+    {
+      "actual": {},
+      "path": "inputSchema.properties.env.default",
+      "tool": "act_run_shell"
+    },
+    {
+      "actual": 30000,
+      "path": "inputSchema.properties.timeout_ms.default",
+      "tool": "act_run_shell"
+    },
+    {
+      "actual": [],
+      "path": "inputSchema.properties.args.default",
+      "tool": "act_launch"
+    },
+    {
+      "actual": {},
+      "path": "inputSchema.properties.env.default",
+      "tool": "act_launch"
+    },
+    {
+      "actual": 10000,
+      "path": "inputSchema.properties.timeout_ms.default",
+      "tool": "act_launch"
+    },
+    {
+      "actual_contains": "steps",
+      "path": "inputSchema.required",
+      "tool": "act_combo"
+    },
+    {
+      "actual_contains": "command",
+      "path": "inputSchema.required",
+      "tool": "act_run_shell"
+    },
+    {
+      "actual_contains": "target",
+      "path": "inputSchema.required",
+      "tool": "act_launch"
+    }
+  ],
+  "tools": [
+    "act_aim",
+    "act_click",
+    "act_clipboard",
+    "act_combo",
+    "act_drag",
+    "act_launch",
+    "act_pad",
+    "act_press",
+    "act_run_shell",
+    "act_scroll",
+    "act_type",
+    "audio_tail",
+    "audio_transcribe",
+    "find",
+    "health",
+    "observe",
+    "profile_activate",
+    "profile_list",
+    "read_text",
+    "reflex_cancel",
+    "reflex_history",
+    "reflex_list",
+    "reflex_register",
+    "release_all",
+    "replay_record",
+    "set_capture_target",
+    "set_perception_mode",
+    "storage_gc_once",
+    "storage_inspect",
+    "storage_pressure_sample",
+    "storage_put_probe_rows",
+    "subscribe",
+    "subscribe_cancel"
+  ]
+}

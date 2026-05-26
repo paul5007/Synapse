@@ -65,6 +65,10 @@ use crate::{
             cancel_subscription, subscribe_to_events,
         },
     },
+    m4::{
+        ActComboParams, ActComboResponse, ActLaunchParams, ActLaunchResponse, ActRunShellParams,
+        ActRunShellResponse, execute_combo, launch, required_combo_permissions, run_shell,
+    },
 };
 
 mod context;
@@ -73,6 +77,7 @@ mod health;
 mod m1_tools;
 mod m2_tools;
 mod m3_tools;
+mod m4_tools;
 #[cfg(test)]
 mod tests;
 
@@ -168,7 +173,10 @@ impl SynapseService {
     }
 
     fn tool_router() -> ToolRouter<Self> {
-        Self::m1_tool_router() + Self::m2_tool_router() + Self::m3_tool_router()
+        Self::m1_tool_router()
+            + Self::m2_tool_router()
+            + Self::m3_tool_router()
+            + Self::m4_tool_router()
     }
 }
 

@@ -4,13 +4,16 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 30] = [
+const EXPECTED_TOOLS: [&str; 33] = [
     "act_aim",
     "act_click",
     "act_clipboard",
+    "act_combo",
     "act_drag",
+    "act_launch",
     "act_pad",
     "act_press",
+    "act_run_shell",
     "act_scroll",
     "act_type",
     "audio_tail",
@@ -38,7 +41,7 @@ const EXPECTED_TOOLS: [&str; 30] = [
 ];
 
 #[tokio::test]
-async fn m3_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<()> {
+async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<()> {
     let mut client = StdioMcpClient::launch_and_init().await?;
     let response = client.tools_list().await?;
     let tools = response
@@ -46,38 +49,29 @@ async fn m3_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<
         .and_then(Value::as_array)
         .context("tools array missing")?;
 
-    let names = sorted_m3_tool_names(tools)?;
+    let names = sorted_tool_names(tools)?;
     let expected = EXPECTED_TOOLS
         .iter()
         .copied()
         .map(str::to_owned)
         .collect::<Vec<_>>();
     assert_eq!(names, expected);
+    assert_eq!(names.len(), 33);
     assert_no_duplicate_names(&names)?;
 
     assert_schema_roots_closed(tools)?;
-    let defaults = m3_default_readbacks(tools)?;
+    let defaults = m4_default_readbacks(tools)?;
 
     let snapshot = json!({
         "count": names.len(),
         "tools": names,
-        "m3_defaults": defaults,
+        "m4_defaults": defaults,
     });
-    insta::assert_json_snapshot!("m3_tools_list", snapshot);
+    insta::assert_json_snapshot!("m4_tools_list", snapshot);
 
     let status = client.shutdown().await?;
     assert!(status.success());
     Ok(())
-}
-
-fn sorted_m3_tool_names(tools: &[Value]) -> anyhow::Result<Vec<String>> {
-    let expected = EXPECTED_TOOLS.iter().copied().collect::<BTreeSet<_>>();
-    let mut names = sorted_tool_names(tools)?
-        .into_iter()
-        .filter(|name| expected.contains(name.as_str()))
-        .collect::<Vec<_>>();
-    names.sort();
-    Ok(names)
 }
 
 fn sorted_tool_names(tools: &[Value]) -> anyhow::Result<Vec<String>> {
@@ -125,128 +119,61 @@ fn assert_schema_roots_closed(tools: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn m3_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
+fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     let mut readbacks = Vec::new();
-    read_schema_defaults(&mut readbacks, tools)?;
-    read_required_fields(&mut readbacks, tools)?;
-    Ok(readbacks)
-}
-
-fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::Result<()> {
     read_default(
-        readbacks,
+        &mut readbacks,
         tools,
-        "subscribe",
-        "inputSchema.properties.kinds.default",
-        &json!([]),
-    )?;
-    read_default(
-        readbacks,
-        tools,
-        "subscribe",
-        "inputSchema.properties.snapshot_first.default",
-        &json!(false),
-    )?;
-    read_default(
-        readbacks,
-        tools,
-        "subscribe",
-        "inputSchema.properties.buffer_size.default",
-        &json!(4096),
-    )?;
-    read_default(
-        readbacks,
-        tools,
-        "reflex_register",
-        "inputSchema.properties.priority.default",
-        &json!(100),
-    )?;
-    read_default(
-        readbacks,
-        tools,
-        "reflex_register",
-        "inputSchema.properties.lifetime.default",
-        &json!({"kind": "until_cancelled"}),
-    )?;
-    read_default(
-        readbacks,
-        tools,
-        "reflex_register",
+        "act_combo",
         "inputSchema.properties.backend.default",
         &json!("auto"),
     )?;
     read_default(
-        readbacks,
+        &mut readbacks,
         tools,
-        "reflex_list",
-        "inputSchema.properties.include_expired.default",
-        &json!(false),
+        "act_run_shell",
+        "inputSchema.properties.args.default",
+        &json!([]),
     )?;
     read_default(
-        readbacks,
+        &mut readbacks,
         tools,
-        "reflex_history",
-        "inputSchema.properties.limit.default",
-        &json!(50),
+        "act_run_shell",
+        "inputSchema.properties.env.default",
+        &json!({}),
     )?;
     read_default(
-        readbacks,
+        &mut readbacks,
         tools,
-        "profile_list",
-        "inputSchema.properties.include_inactive.default",
-        &json!(true),
+        "act_run_shell",
+        "inputSchema.properties.timeout_ms.default",
+        &json!(30000),
     )?;
     read_default(
-        readbacks,
+        &mut readbacks,
         tools,
-        "replay_record",
-        "inputSchema.properties.format.default",
-        &json!("jsonl"),
+        "act_launch",
+        "inputSchema.properties.args.default",
+        &json!([]),
     )?;
     read_default(
-        readbacks,
+        &mut readbacks,
         tools,
-        "replay_record",
-        "inputSchema.properties.target.default",
-        &json!("observations"),
+        "act_launch",
+        "inputSchema.properties.env.default",
+        &json!({}),
     )?;
     read_default(
-        readbacks,
+        &mut readbacks,
         tools,
-        "audio_tail",
-        "inputSchema.properties.seconds.default",
-        &json!(5),
+        "act_launch",
+        "inputSchema.properties.timeout_ms.default",
+        &json!(10000),
     )?;
-    read_default(
-        readbacks,
-        tools,
-        "audio_transcribe",
-        "inputSchema.properties.seconds.default",
-        &json!(5),
-    )?;
-    read_default(
-        readbacks,
-        tools,
-        "audio_transcribe",
-        "inputSchema.properties.language.default",
-        &json!("en"),
-    )?;
-    Ok(())
-}
-
-fn read_required_fields(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::Result<()> {
-    read_required(readbacks, tools, "subscribe_cancel", "subscription_id")?;
-    read_required(readbacks, tools, "reflex_cancel", "reflex_id")?;
-    read_required(readbacks, tools, "profile_activate", "profile_id")?;
-    read_required(readbacks, tools, "storage_put_probe_rows", "cf_name")?;
-    read_required(readbacks, tools, "storage_put_probe_rows", "key_prefix")?;
-    read_required(readbacks, tools, "storage_put_probe_rows", "rows")?;
-    read_required(readbacks, tools, "storage_put_probe_rows", "value_bytes")?;
-    read_required(readbacks, tools, "storage_gc_once", "cf_name")?;
-    read_required(readbacks, tools, "storage_gc_once", "soft_cap_rows")?;
-    read_required(readbacks, tools, "storage_gc_once", "hard_cap_rows")?;
-    read_required(readbacks, tools, "storage_pressure_sample", "free_bytes")?;
-    Ok(())
+    read_required(&mut readbacks, tools, "act_combo", "steps")?;
+    read_required(&mut readbacks, tools, "act_run_shell", "command")?;
+    read_required(&mut readbacks, tools, "act_launch", "target")?;
+    Ok(readbacks)
 }
 
 fn read_default(
