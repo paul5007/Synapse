@@ -1,36 +1,28 @@
 use std::{
-    collections::{HashSet, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    collections::VecDeque,
+    sync::{Arc, Mutex, atomic::AtomicBool},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use chrono::Utc;
-use serde_json::json;
 use synapse_action::ActionHandle;
-use synapse_core::{
-    Action, EventFilter, ReflexId, ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION,
-    StoredReflexAudit, error_codes,
-};
+use synapse_core::{Action, EventFilter, ReflexId, ReflexLifetime};
 use synapse_storage::Db;
-use uuid::Uuid;
 
 use crate::{
-    EventBus, REFLEX_LIFETIME_EXPIRED_KIND, SubscriberHandle,
+    EventBus,
     error::{ReflexError, ReflexResult},
-    kinds::{
-        aim_track::{AimTrackController, AimTrackParams},
-        combo::ComboController,
-        hold_button::{HoldButtonController, HoldButtonParams},
-        hold_move::{HoldMoveController, HoldMoveParams},
-        on_event::OnEventState,
-    },
-    write_audit,
+    kinds::on_event::OnEventState,
+    kinds::{aim_track::AimTrackParams, hold_button::HoldButtonParams, hold_move::HoldMoveParams},
 };
-use scheduler_tick::tick;
+pub use scheduler_handle::SchedulerHandle;
+use scheduler_loop::{
+    ReflexControl, RuntimeReflex, RuntimeState, aim_track_states, hold_button_states,
+    hold_move_states, lock_controls, mark_reflex_active_if_starved, mark_reflex_error,
+    mark_reflex_fired, mark_reflex_lifetime_expired, mark_reflex_starved, run_scheduler_thread,
+    status_for_reflex,
+};
 
 pub const MAX_SCHEDULED_REFLEXES: usize = 32;
 pub const MAX_REFLEX_PRIORITY: u32 = 1000;
@@ -255,143 +247,6 @@ pub struct TickSample {
     pub degraded: bool,
 }
 
-pub struct SchedulerHandle {
-    stop: Arc<AtomicBool>,
-    join: Option<thread::JoinHandle<()>>,
-    samples: Arc<Mutex<VecDeque<TickSample>>>,
-    controls: Arc<Mutex<Vec<ReflexControl>>>,
-    statuses: Arc<Mutex<Vec<ReflexStatus>>>,
-}
-
-impl SchedulerHandle {
-    #[must_use]
-    pub fn samples(&self) -> Vec<TickSample> {
-        lock_samples(&self.samples).iter().copied().collect()
-    }
-
-    #[must_use]
-    pub fn wait_for_samples(&self, count: usize, timeout: Duration) -> Vec<TickSample> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let samples = self.samples();
-            if samples.len() >= count || Instant::now() >= deadline {
-                return samples;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    #[must_use]
-    pub fn statuses(&self) -> Vec<ReflexStatus> {
-        lock_statuses(&self.statuses).clone()
-    }
-
-    #[must_use]
-    pub fn set_priority(&self, reflex_id: &str, priority: u32) -> bool {
-        let Some(index) = status_index(&self.statuses, reflex_id) else {
-            return false;
-        };
-        if let Some(control) = lock_controls(&self.controls).get_mut(index) {
-            control.priority = priority;
-        }
-        if let Some(status) = lock_statuses(&self.statuses).get_mut(index) {
-            status.priority = priority;
-        }
-        true
-    }
-
-    #[must_use]
-    pub fn cancel_reflex(&self, reflex_id: &str) -> bool {
-        let Some(index) = status_index(&self.statuses, reflex_id) else {
-            return false;
-        };
-        if let Some(control) = lock_controls(&self.controls).get_mut(index) {
-            control.active = false;
-        }
-        if let Some(status) = lock_statuses(&self.statuses).get_mut(index) {
-            status.state = ReflexState::Cancelled;
-        }
-        true
-    }
-
-    #[must_use]
-    pub fn disable_reflexes(&self, reflex_ids: &[ReflexId]) -> Vec<ReflexStatus> {
-        if reflex_ids.is_empty() {
-            return Vec::new();
-        }
-        let reflex_ids = reflex_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let indexes = {
-            let statuses = lock_statuses(&self.statuses);
-            statuses
-                .iter()
-                .enumerate()
-                .filter_map(|(index, status)| {
-                    (reflex_ids.contains(status.id.as_str())
-                        && is_operator_disable_candidate(status.state))
-                    .then_some(index)
-                })
-                .collect::<Vec<_>>()
-        };
-        if indexes.is_empty() {
-            return Vec::new();
-        }
-
-        {
-            let mut controls = lock_controls(&self.controls);
-            for index in &indexes {
-                if let Some(control) = controls.get_mut(*index) {
-                    control.active = false;
-                }
-            }
-        }
-
-        let mut disabled = Vec::with_capacity(indexes.len());
-        let mut statuses = lock_statuses(&self.statuses);
-        for index in indexes {
-            if let Some(status) = statuses.get_mut(index) {
-                status.state = ReflexState::Disabled;
-                status.last_error_code = Some(error_codes::REFLEX_DISABLED_BY_OPERATOR.to_owned());
-                disabled.push(status.clone());
-            }
-        }
-        disabled
-    }
-
-    #[must_use]
-    pub fn disable_all_reflexes(&self) -> Vec<ReflexStatus> {
-        let reflex_ids = lock_statuses(&self.statuses)
-            .iter()
-            .filter(|status| is_operator_disable_candidate(status.state))
-            .map(|status| status.id.clone())
-            .collect::<Vec<_>>();
-        self.disable_reflexes(&reflex_ids)
-    }
-
-    /// Stops the scheduler thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the scheduler thread panicked before joining.
-    pub fn stop(&mut self) -> ReflexResult<()> {
-        self.stop.store(true, Ordering::Release);
-        if let Some(join) = self.join.take() {
-            join.join().map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("scheduler thread panicked: {error:?}"),
-            })?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for SchedulerHandle {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
 pub struct ReflexScheduler;
 
 impl ReflexScheduler {
@@ -514,88 +369,6 @@ impl ReflexScheduler {
     }
 }
 
-#[derive(Clone, Debug)]
-struct RuntimeReflex {
-    registration_order: usize,
-    reflex: ScheduledReflex,
-}
-
-#[derive(Clone, Debug)]
-struct ReflexControl {
-    priority: u32,
-    active: bool,
-}
-
-struct RuntimeState {
-    event_bus: EventBus,
-    action_handle: ActionHandle,
-    reflexes: Vec<RuntimeReflex>,
-    active_combos: Vec<ComboController>,
-    aim_track_states: Vec<Option<AimTrackController>>,
-    hold_move_states: Vec<Option<HoldMoveController>>,
-    hold_button_states: Vec<Option<HoldButtonController>>,
-    on_event_states: Vec<OnEventState>,
-    starvation_states: Vec<crate::conflict::StarvationState>,
-    subscription: SubscriberHandle,
-    stop: Arc<AtomicBool>,
-    samples: Arc<Mutex<VecDeque<TickSample>>>,
-    controls: Arc<Mutex<Vec<ReflexControl>>>,
-    statuses: Arc<Mutex<Vec<ReflexStatus>>>,
-    config: SchedulerConfig,
-    audit_db: Option<Arc<Db>>,
-    tick_index: u64,
-}
-
-fn aim_track_states(reflexes: &[ScheduledReflex]) -> ReflexResult<Vec<Option<AimTrackController>>> {
-    reflexes
-        .iter()
-        .map(|reflex| match &reflex.driver {
-            ScheduledReflexDriver::AimTrack(params) => {
-                AimTrackController::new(reflex.reflex_id.clone(), params.clone()).map(Some)
-            }
-            ScheduledReflexDriver::Actions
-            | ScheduledReflexDriver::HoldMove(_)
-            | ScheduledReflexDriver::HoldButton(_) => Ok(None),
-        })
-        .collect()
-}
-
-fn hold_move_states(reflexes: &[ScheduledReflex]) -> ReflexResult<Vec<Option<HoldMoveController>>> {
-    reflexes
-        .iter()
-        .map(|reflex| match &reflex.driver {
-            ScheduledReflexDriver::HoldMove(params) => HoldMoveController::new(
-                reflex.reflex_id.clone(),
-                params.clone(),
-                reflex.lifetime.clone(),
-            )
-            .map(Some),
-            ScheduledReflexDriver::Actions
-            | ScheduledReflexDriver::AimTrack(_)
-            | ScheduledReflexDriver::HoldButton(_) => Ok(None),
-        })
-        .collect()
-}
-
-fn hold_button_states(
-    reflexes: &[ScheduledReflex],
-) -> ReflexResult<Vec<Option<HoldButtonController>>> {
-    reflexes
-        .iter()
-        .map(|reflex| match &reflex.driver {
-            ScheduledReflexDriver::HoldButton(params) => HoldButtonController::new(
-                reflex.reflex_id.clone(),
-                params.clone(),
-                reflex.lifetime.clone(),
-            )
-            .map(Some),
-            ScheduledReflexDriver::Actions
-            | ScheduledReflexDriver::AimTrack(_)
-            | ScheduledReflexDriver::HoldMove(_) => Ok(None),
-        })
-        .collect()
-}
-
 pub(crate) fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()> {
     if reflexes.len() > MAX_SCHEDULED_REFLEXES {
         return Err(ReflexError::CapReached {
@@ -619,259 +392,6 @@ pub(crate) fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()
     Ok(())
 }
 
-#[cfg(windows)]
-fn run_scheduler_thread(mut runtime: RuntimeState) {
-    if runtime.config.force_degraded {
-        run_degraded(runtime, "forced_degraded_config");
-        return;
-    }
-
-    match windows_timer::WindowsHighResolutionTimer::start(runtime.config.target_interval) {
-        Ok(timer) => {
-            let mut last = Instant::now();
-            while should_tick(&runtime) {
-                let deadline = last + runtime.config.target_interval;
-                if let Err(error) = timer.wait_until(deadline) {
-                    run_degraded(runtime, &error);
-                    return;
-                }
-                let now = Instant::now();
-                let elapsed = now.duration_since(last);
-                last = now;
-                tick(&mut runtime, elapsed, false);
-            }
-        }
-        Err(error) => run_degraded(runtime, &error),
-    }
-}
-
-#[cfg(not(windows))]
-fn run_scheduler_thread(runtime: RuntimeState) {
-    run_degraded(
-        runtime,
-        "high-resolution waitable timer is only available on Windows",
-    );
-}
-
-fn run_degraded(mut runtime: RuntimeState, reason: &str) {
-    tracing::warn!(
-        component = "reflex_scheduler",
-        degraded = true,
-        reason = %reason,
-        "reflex scheduler falling back to tokio interval"
-    );
-    let Ok(tokio_runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    else {
-        tracing::error!(
-            component = "reflex_scheduler",
-            degraded = true,
-            "reflex scheduler could not build fallback tokio runtime"
-        );
-        return;
-    };
-    tokio_runtime.block_on(async move {
-        let mut interval = tokio::time::interval(runtime.config.fallback_interval);
-        interval.tick().await;
-        let mut last = Instant::now();
-        while should_tick(&runtime) {
-            interval.tick().await;
-            let now = Instant::now();
-            let elapsed = now.duration_since(last);
-            last = now;
-            tick(&mut runtime, elapsed, true);
-        }
-    });
-}
-
-fn should_tick(runtime: &RuntimeState) -> bool {
-    if runtime.stop.load(Ordering::Acquire) {
-        return false;
-    }
-    runtime
-        .config
-        .max_ticks
-        .is_none_or(|max_ticks| runtime.tick_index < max_ticks)
-}
-
-fn lock_samples(
-    samples: &Arc<Mutex<VecDeque<TickSample>>>,
-) -> std::sync::MutexGuard<'_, VecDeque<TickSample>> {
-    match samples.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn lock_controls(
-    controls: &Arc<Mutex<Vec<ReflexControl>>>,
-) -> std::sync::MutexGuard<'_, Vec<ReflexControl>> {
-    match controls.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn lock_statuses(
-    statuses: &Arc<Mutex<Vec<ReflexStatus>>>,
-) -> std::sync::MutexGuard<'_, Vec<ReflexStatus>> {
-    match statuses.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn status_index(statuses: &Arc<Mutex<Vec<ReflexStatus>>>, reflex_id: &str) -> Option<usize> {
-    lock_statuses(statuses)
-        .iter()
-        .position(|status| status.id == reflex_id)
-}
-
-const fn is_operator_disable_candidate(state: ReflexState) -> bool {
-    matches!(
-        state,
-        ReflexState::Active | ReflexState::Paused | ReflexState::Starved
-    )
-}
-
-fn status_for_reflex(
-    reflex: &ScheduledReflex,
-    registered_at: chrono::DateTime<Utc>,
-) -> ReflexStatus {
-    ReflexStatus {
-        id: reflex.reflex_id.clone(),
-        kind_summary: kind_summary(reflex),
-        state: ReflexState::Active,
-        registered_at,
-        last_fired_at: None,
-        fire_count: 0,
-        priority: reflex.priority,
-        lifetime: reflex.lifetime.clone(),
-        exclusive: reflex.exclusive,
-        last_error_code: None,
-    }
-}
-
-fn kind_summary(reflex: &ScheduledReflex) -> String {
-    match &reflex.driver {
-        ScheduledReflexDriver::Actions => match &reflex.trigger {
-            SchedulerTrigger::EveryTick => format!("every_tick:{} actions", reflex.then.len()),
-            SchedulerTrigger::OnEvent(_filter) => format!("on_event:{} actions", reflex.then.len()),
-        },
-        ScheduledReflexDriver::AimTrack(_params) => "aim_track".to_owned(),
-        ScheduledReflexDriver::HoldMove(params) => format!("hold_move:{} keys", params.keys.len()),
-        ScheduledReflexDriver::HoldButton(_params) => "hold_button".to_owned(),
-    }
-}
-
-fn mark_reflex_fired(runtime: &RuntimeState, index: usize) {
-    let expired = runtime
-        .reflexes
-        .get(index)
-        .is_some_and(|reflex| matches!(reflex.reflex.lifetime, ReflexLifetime::OneShot));
-    if expired && let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
-        control.active = false;
-    }
-    let mut expired_status = None;
-    if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = if expired {
-            ReflexState::Expired
-        } else {
-            ReflexState::Active
-        };
-        status.last_fired_at = Some(Utc::now());
-        status.fire_count = status.fire_count.saturating_add(1);
-        status.last_error_code = None;
-        if expired {
-            expired_status = Some(status.clone());
-        }
-    }
-    if let Some(status) = expired_status {
-        write_lifetime_expired_audit(runtime, &status, "one_shot");
-    }
-}
-
-fn mark_reflex_lifetime_expired(runtime: &RuntimeState, index: usize, reason: &str) {
-    if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
-        control.active = false;
-    }
-    let expired_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::Expired;
-        status.last_fired_at = Some(Utc::now());
-        status.fire_count = status.fire_count.saturating_add(1);
-        status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
-        Some(status.clone())
-    } else {
-        None
-    };
-    if let Some(status) = expired_status {
-        write_lifetime_expired_audit(runtime, &status, reason);
-    }
-}
-
-fn mark_reflex_error(runtime: &RuntimeState, index: usize, code: &str) {
-    if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.last_error_code = Some(code.to_owned());
-    }
-}
-
-fn write_lifetime_expired_audit(runtime: &RuntimeState, status: &ReflexStatus, reason: &str) {
-    let Some(db) = runtime.audit_db.as_deref() else {
-        return;
-    };
-    let audit = StoredReflexAudit {
-        schema_version: SCHEMA_VERSION,
-        audit_id: Uuid::now_v7().to_string(),
-        reflex_id: status.id.clone(),
-        ts_ns: now_ts_ns(),
-        status: ReflexState::Expired,
-        event_id: None,
-        steps: Vec::new(),
-        error_code: Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned()),
-        details: json!({
-            "kind": REFLEX_LIFETIME_EXPIRED_KIND,
-            "reason": reason,
-            "tick_index": runtime.tick_index,
-            "fire_count": status.fire_count,
-        }),
-        redacted: false,
-        redactions: Vec::new(),
-    };
-    if let Err(error) = write_audit(db, &audit) {
-        tracing::warn!(
-            component = "reflex_lifetime",
-            reflex_id = %audit.reflex_id,
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "reflex lifetime audit write failed"
-        );
-    }
-}
-
-fn now_ts_ns() -> u64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
-}
-
-fn mark_reflex_starved(runtime: &RuntimeState, index: usize) {
-    if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::Starved;
-        status.last_error_code = Some(synapse_core::error_codes::REFLEX_STARVED.to_owned());
-    }
-}
-
-fn mark_reflex_active_if_starved(runtime: &RuntimeState, index: usize) {
-    if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index)
-        && matches!(status.state, ReflexState::Starved)
-    {
-        status.state = ReflexState::Active;
-        status.last_error_code = None;
-    }
-}
-
 #[path = "scheduler_stats.rs"]
 mod scheduler_stats;
 pub use scheduler_stats::p99_jitter_us;
@@ -881,6 +401,12 @@ mod scheduler_combo;
 
 #[path = "scheduler_stateful.rs"]
 mod scheduler_stateful;
+
+#[path = "scheduler_handle.rs"]
+mod scheduler_handle;
+
+#[path = "scheduler_loop.rs"]
+mod scheduler_loop;
 
 #[path = "scheduler_tick.rs"]
 mod scheduler_tick;
