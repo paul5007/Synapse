@@ -163,7 +163,7 @@ adds each tool.
 
 - Production target: configured Windows 11 host (DX11-capable GPU; ViGEmBus working).
 - Dev box: WSL2 on Win11. `rocksdb`/`wasapi` build on Linux + Windows; `windows`-feature deps stay Win-only.
-- **Manual configured-host FSV is the M3 shipping gate** (issues #246/#247/#350/#351). Use local checks for supporting evidence; do not dispatch or wait on GitHub Actions/CI. Do not create automated FSV scripts, harnesses, or `*_fsv` tests.
+- **Manual configured-host FSV is the M3 shipping gate** (issues #246/#247/#350/#351). Use local checks for supporting evidence; do not dispatch or wait on GitHub Actions/CI. Do not create automated verification scripts, harnesses, or `*_fsv` tests.
 
 ### 1.6 Things that are NOT done at M3 (deferred ≥ M4)
 
