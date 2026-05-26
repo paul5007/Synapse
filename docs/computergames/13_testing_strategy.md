@@ -359,8 +359,12 @@ with FSV naming are regression artifacts until renamed or removed.
 
 M2+ uses manual FSV on the operator's configured Windows host as the shipping
 gate. GitHub Actions/CI, automated FSV scripts, and missing-dependency
-portability tests are not release gates. Before tagging a release, the
-maintainer runs:
+portability tests are not release gates. A missing configured-host prerequisite
+is an acquisition/setup task: install, connect, download, configure, or generate
+the real prerequisite, then read its authoritative SoT directly before shipping.
+Only hard-to-reverse external actions such as spending money, private
+credentials, billing, or external account changes require narrow operator
+approval. Before tagging a release, the maintainer runs:
 
 1. **Configured Windows 11 host.** Verify ViGEmBus is installed, Synapse is installed, Claude Desktop is connected, and run "open Notepad, type, save".
 2. **Live game session.** Pick one bundled game profile, play 15 minutes via agent, verify reasonable behavior and no stuck inputs.

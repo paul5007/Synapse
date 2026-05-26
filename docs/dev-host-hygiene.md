@@ -2,6 +2,20 @@
 
 Recommendations for keeping a long-lived synapse development host (Windows or Linux) lean and predictable. None of this is enforced at build time; it's collected here so contributors don't have to rediscover the trade-offs each time.
 
+## Missing configured-host prerequisites
+
+If a required host prerequisite is absent, treat that as setup/acquisition work,
+not as completion evidence or a portability gate. Use normal OS, shell,
+browser, package-manager, device-manager, and Synapse computer-control surfaces
+to install, connect, download, configure, or generate the real prerequisite on
+this host. Then read the physical source of truth where the prerequisite must
+appear: package inventory, driver/service list, `Get-PnpDevice`, registry Enum
+key, firmware volume, config file, model path plus hash, or equivalent.
+
+Ask for narrow operator approval only before hard-to-reverse external actions:
+spending money, using private credentials, changing billing, modifying an
+external account, or irreversible shared-state changes.
+
 ## Coordinates: `act_aim` / `act_click({x,y})` / `act_drag` / `act_scroll`
 
 Synapse interprets all `{x, y}` mouse coordinates as **physical (DPI-aware) pixels** — the same units `GetCursorPos` returns from a per-monitor-DPI-aware process, and the same units UI Automation bounding boxes use. This matches the daemon's own DPI awareness (synapse-mcp is built as per-monitor V2) and `mouse_coordinates.rs::normalize_absolute_mouse_point` which feeds `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`.

@@ -36,6 +36,24 @@ Do not dispatch, wait on, or use GitHub Actions/CI as a shipping gate unless a
 later explicit operator decision reverses issue #351. Agent commits pushed to
 this repo must include `[skip ci]`.
 
+## Missing Dependency Acquisition Rule
+
+If a required local tool, driver, model, device, file, service, account state,
+or other prerequisite is missing, do not treat the absence as a stopping point.
+Use Synapse's local computer-control surfaces plus normal OS, shell, browser,
+package-manager, and device-management workflows to acquire, install, connect,
+configure, generate, or otherwise make the prerequisite real on this configured
+host.
+
+Missing prerequisites become concrete work items with source-of-truth readback:
+identify what is missing, identify the authoritative place it should appear,
+perform the acquisition/setup step, then read that source of truth directly. If
+the next step requires a hard-to-reverse external action such as spending money,
+using private credentials, changing billing, or modifying an external account,
+prepare the exact action and ask only for that approval. Do not call the issue
+done until the real prerequisite and the feature that depends on it are manually
+verified.
+
 ## Required Wake-Up Context
 
 After compaction or a new session, re-read:

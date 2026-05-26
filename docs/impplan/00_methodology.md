@@ -2,11 +2,12 @@
 
 Discipline applied across M0-M5. PRD authority: `docs/computergames/README.md` §"Authoring rules" + `14_build_and_packaging.md` + `13_testing_strategy.md`. State-tracking authority: git tags + `CHANGELOG.md` (final) > codebase on `main` (operational) > GitHub Issues (https://github.com/ChrisRoyse/Synapse/issues — every PR-sized task, `[DECISION]`, `[DISCOVERY]`, `[BUG]`, `[RISK]`, `[CONTEXT]`). Use `gh issue list --state all --search 'phase:m4'` (etc.) to walk landed-decision history for context the commit message did not carry. **All M0/M1/M2/M3 historical issues are closed as of 2026-05-25** (`v0.1.0-m3` tag); new M4 work opens fresh issues with the same labels.
 
-**Three load-bearing operator directives (NEVER violate):**
+**Four load-bearing operator directives (NEVER violate):**
 
 1. **No backwards compatibility (pre-v1).** Schema/API changes break callers. No fallbacks, no compatibility shims, no silent error swallowing. Fail fast with a structured `synapse_core::error_codes::*` code and a `tracing` line carrying that code so the failure is debuggable.
 2. **No mocks gate completion.** Unit fakes are fine for isolation. An OS-bound work-item is **not done** until a real-OS integration test exercises it and a separate source-of-truth read confirms the side effect landed.
 3. **Manual configured-host FSV is the shipping gate, not GitHub Actions** (issues #246/#247/#350/#351, operator decision 2026-05-24). Use local checks for supporting evidence. Do not dispatch, wait on, or block a tag on GitHub Actions/CI. FSV must never be delegated to scripts, automated tests, benchmarks, harnesses, CI jobs, or any other automated substitute.
+4. **Missing prerequisites are acquisition work, not a stopping point.** If a local tool, driver, model, device, file, service, account state, or other prerequisite is absent, use Synapse computer-control surfaces plus normal OS, shell, browser, package-manager, and device-management workflows to make it real on the configured host. Identify the authoritative SoT where it should appear, perform the setup/acquisition step, then read that SoT directly. Ask only for narrow approval before hard-to-reverse external actions such as spending money, using private credentials, changing billing, or modifying an external account.
 
 ---
 
@@ -103,6 +104,16 @@ Test pyramid: `13_testing_strategy.md` §2.
 8. **Process-restart durability check** for any test touching persistent storage (RocksDB CFs from M3 onward): write data, drop the daemon, spawn a fresh `StdioMcpClient`, read back, assert data survived.
 
 A change that asserts only on return values is **not done**; review fails the PR. A resolution that omits manual final observed result values in the issue evidence fails review even if automated checks passed.
+
+Missing prerequisite handling is part of this same gate. If a driver, model,
+tool, firmware device, config file, or service is required for the configured
+host, the agent must create an explicit setup action and verify the real
+source of truth where that prerequisite should appear. Examples: `rustup target
+list --installed` for an embedded target, `Get-PnpDevice` / `HKLM` for an
+attached hardware device, `%APPDATA%\synapse\config.toml` for setup output, or
+the model file path plus hash for a downloaded model. Do not replace this with
+absent-dependency portability testing, scripts, or CI; acquire or configure the
+real thing and then inspect it.
 
 ---
 
