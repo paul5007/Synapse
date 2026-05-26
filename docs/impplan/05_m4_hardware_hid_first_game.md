@@ -1,11 +1,11 @@
-# 05 — M4: Hardware HID + First Game Profile (2-3 weeks) — BLOCKED BY M3
+# 05 — M4: Hardware HID + First Game Profile (2-3 weeks) — ACTIVE
 
-> Read after `04_m3_reflex_mcp_surface.md` is closed (`v0.1.0-m3` tagged).
-> This file is structured as a planning sketch; it gets a full self-contained
-> M2-style rewrite as the first M4 task once M3 lands. **All global
-> invariants apply** (no backcompat, no mocks gate completion, FSV with
-> source-of-truth read-back, Natural-only motion, manual configured-host
-> shipping gate).
+> M3 closed 2026-05-25 (`v0.1.0-m3` @ `97019ec`); M4 is the active phase as
+> of HEAD `6ed52e4`. This file is structured as a planning sketch; the first
+> M4 task is a full self-contained M2/M3-style rewrite once Block A.0 (M3
+> carry-over) lands. **All global invariants apply** (no backcompat, no mocks
+> gate completion, FSV with source-of-truth read-back, Natural-only motion,
+> manual configured-host shipping gate).
 
 PRD: `docs/computergames/15_roadmap_and_milestones.md` §6. Hardware: `09_hardware_hid_gateway.md`. Firmware: `09 §4`. Wire protocol: `09 §5`. Supported-use policy: `08_*.md`. Doctrine: `00_methodology.md` + `07_cross_cutting.md`.
 
@@ -27,14 +27,16 @@ RP2040 firmware (Rust + `embassy-rp`) + serial driver (`synapse-hid-host`) + `ac
 
 ## Inputs
 
-- M3 demo gate passed; `v0.1.0-m3` tag cut
+- M3 demo gate passed; `v0.1.0-m3` tag cut on commit `97019ec` (2026-05-25)
+- 30 MCP tools live on `main` (6 M1 + 9 M2 + 15 M3); reflex scheduler + RocksDB + WASAPI + HTTP/SSE + 4 bundled profiles operational; operator panic hotkey (`Ctrl+Alt+Shift+P`) wired
 - Hardware: 1× Raspberry Pi Pico (RP2040), USB-A cable, host PC with free USB port
 - Rust toolchain extension: `rustup target add thumbv6m-none-eabi`; `cargo install elf2uf2-rs`
 - Minecraft Java Edition installed (single-player creative/survival world for testing)
 - `embassy-rp` + `embassy-usb` resolvable; `serialport = "4.9.0"` already in `[workspace.dependencies]` at the repo root
 - `firmware/pico-hid/` directory does **not yet exist** (excluded from workspace per root `Cargo.toml:21`). M4 work-item 1 creates it from scratch with its own `Cargo.toml` (separate workspace targeting `thumbv6m-none-eabi`).
 - `synapse-hid-host` crate currently empty stub (1 LoC `lib.rs`); M4 fills it out.
-- `Backend::Hardware` already routes through `crates/synapse-action/src/backend/unavailable.rs` returning `ACTION_BACKEND_UNAVAILABLE` (verified at `crates/synapse-action/src/backend/mod.rs:57-60`); M4 replaces that route with a real `HardwareBackend` impl that proxies to `synapse-hid-host`.
+- `Backend::Hardware` already routes through `synapse-action`'s `HardwareUnavailableBackend` returning `ACTION_BACKEND_UNAVAILABLE`; M4 replaces that route with a real `HardwareBackend` impl that proxies to `synapse-hid-host`.
+- M3 carry-over (see `04_m3_reflex_mcp_surface.md` header): Block A.0 splits the over-cap files (synapse-a11y/lib.rs 2087, synapse-capture/lib.rs 1798, synapse-core/types.rs 1567, synapse-mcp/server.rs 1335, synapse-mcp/m3/reflex.rs 1165, synapse-reflex/lib.rs 986, synapse-reflex/scheduler.rs 890, synapse-mcp/http/sse.rs 764, synapse-mcp/m3/replay.rs 651) **before** building hardware HID on top, and fixes the CHANGELOG M3 tool-name drift (`profile_get`→`profile_list`, `profile_set_active`→`profile_activate`, and adds the four `storage_*` diagnostic tools to the entry).
 
 ---
 

@@ -165,4 +165,5 @@ CAPTURE_TARGET_INVALID
 Closed 2026-05-23 by `v0.1.0-m1` (commit `b8ad120`). M2 began against `main`
 without waiting on a self-hosted runner; manual configured-host FSV is the
 shipping evidence (see `00_methodology.md` §5 + issues #246/#247). Open
-next: `03_m2_action_mvp.md` (also closed); active phase: `04_m3_reflex_mcp_surface.md`.
+next: `03_m2_action_mvp.md` (closed) → `04_m3_reflex_mcp_surface.md`
+(closed); active phase: `05_m4_hardware_hid_first_game.md`.

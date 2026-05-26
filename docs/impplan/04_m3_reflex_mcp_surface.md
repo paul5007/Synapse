@@ -1,16 +1,44 @@
-# 04 — M3: Reflex + MCP Surface (2-3 weeks) — ACTIVE
+# 04 — M3: Reflex + MCP Surface (2-3 weeks) — DONE (archival + M4 carry-over)
 
-> Read this whole file before writing code. It is self-contained and assumes a
-> fresh AI coding agent context. Every claim about the existing codebase is
-> verified against `main` HEAD `51836fe` (2026-05-24, post tag `v0.1.0-m2`).
-> **Assume the task is wrong.** If the codebase contradicts this document,
-> the codebase wins — patch this file in the same PR and call it out in the
-> PR description. **No backwards compatibility:** pre-v1 schema/API changes
-> break callers. **No mocks gate completion:** OS-bound paths must be
-> exercised against the real OS resource and verified by source-of-truth
-> read-back (`00_methodology.md` §5). **Natural-only motion** (OQ-004
-> DECIDED 2026-05-22 — `07_cross_cutting.md` §12) applies to every bundled
-> profile this phase adds.
+**Status:** Closed 2026-05-25 by release tag `v0.1.0-m3` (commit `97019ec`).
+ADRs landed in this phase: ADR-0003 (reflex recursion guard, OQ-022),
+ADR-0004 (reflex priority, OQ-005), ADR-0005 (multi-monitor capture target,
+OQ-012), ADR-0006 (profile match precedence, OQ-015), ADR-0007 (per-event
+vs batched notifications, OQ-029). M3 ships 30 MCP tools total (6 M1 + 9
+M2 + 15 M3 including 4 `storage_*` diagnostics), real RocksDB w/ 11 CFs,
+real WASAPI loopback + Whisper-tiny STT, real time-critical reflex
+scheduler, streamable HTTP transport w/ SSE + bearer/Origin/session gates,
+4 bundled profiles, operator panic hotkey, and the Notepad save-dialog
+reflex demo from §2.
+
+**Carry-over for M4** (landed but imperfect after the tag):
+
+- **LoC overrun**: several files exceeded the 500 LoC hard cap during M3 —
+  `synapse-a11y/src/lib.rs` 2087, `synapse-capture/src/lib.rs` 1798,
+  `synapse-core/src/types.rs` 1567, `synapse-mcp/src/server.rs` 1335,
+  `synapse-mcp/src/m3/reflex.rs` 1165, `synapse-reflex/src/lib.rs` 986,
+  `synapse-reflex/src/scheduler.rs` 890, `synapse-mcp/src/http/sse.rs` 764,
+  `synapse-mcp/src/m3/replay.rs` 651, `synapse-models/src/lib.rs` 535
+  (plus several test files). M4's Block A.0 splits these before adding
+  hardware HID, mirroring the M2 → M3 Block A.0 pattern.
+- **CHANGELOG M3 entry tool names** name `profile_get`/`profile_set_active`
+  but the shipped names on `main` are `profile_list`/`profile_activate`;
+  the four `storage_*` diagnostic tools are also missing from the entry.
+  Fix during the first M4 docs sweep.
+
+> The rest of this file is preserved for onboarding so a fresh agent can see
+> how M3 was structured (the M3 file is the template for M4+ phase docs:
+> verbatim crate inventory, default-resolution table, FSV contract, manual
+> happy-path + edge-case plan, Occam's-razor recap, trigger→outcome map).
+> Every claim about the codebase below was verified against `main` at tag time.
+> If a discrepancy now exists, the **codebase wins** — file a follow-up issue
+> with the `phase:m3` + `area:docs` labels and patch this file in the same PR.
+
+> **No backwards compatibility:** pre-v1 schema/API changes break callers.
+> **No mocks gate completion:** OS-bound paths must be exercised against the
+> real OS resource and verified by source-of-truth read-back
+> (`00_methodology.md` §5). **Natural-only motion** (OQ-004 DECIDED 2026-05-22 —
+> `07_cross_cutting.md` §12) applies to every bundled profile this phase added.
 
 PRD authority: `docs/computergames/04_reflex_runtime.md` (Reflex subsystem),
 `docs/computergames/07_storage_and_profiles.md` (CFs, TTLs, profile TOML),
@@ -653,15 +681,9 @@ Pick inputs whose expected outputs are unambiguous; tests assert on them exactly
 
 ## 13. Definition of Done
 
-M3 closes when:
+Closed 2026-05-25 by `v0.1.0-m3` (commit `97019ec`). The §2 demo gate, the §10 acceptance gates, the §8 manual happy-path + edge-case plan, the CHANGELOG entry, and the tag are all on `main`. M4 starts against this state without waiting on a self-hosted runner; manual configured-host FSV remains the shipping evidence (see `00_methodology.md` §5).
 
-1. The demo gate (§2) passes on a real Win11 box, hand-driven through Claude Desktop, with **all four source-of-truth reads** confirmed.
-2. Every acceptance gate (§10) is green on `main`.
-3. The manual H1-H10 + E1-E12 table (§8) is filled in by the operator in the PR description, with literal source-of-truth read-back values pasted in.
-4. `CHANGELOG.md` updated with the M3 entry.
-5. `git tag v0.1.0-m3` cuts a build artifact for archival.
-
-Open next: `05_m4_hardware_hid_first_game.md`.
+Open next: `05_m4_hardware_hid_first_game.md` (active phase).
 
 ---
 

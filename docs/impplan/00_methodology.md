@@ -1,6 +1,6 @@
 # 00 — Methodology
 
-Discipline applied across M0-M5. PRD authority: `docs/computergames/README.md` §"Authoring rules" + `14_build_and_packaging.md` + `13_testing_strategy.md`. State-tracking authority: git tags + `CHANGELOG.md` (final) > codebase on `main` (operational) > GitHub Issues (https://github.com/ChrisRoyse/Synapse/issues — every PR-sized task, `[DECISION]`, `[DISCOVERY]`, `[BUG]`, `[RISK]`, `[CONTEXT]`). Use `gh issue list --state all --search 'phase:m3'` (etc.) to walk landed-decision history for context the commit message did not carry. **All 244 historical issues are closed as of 2026-05-24**; new work opens fresh issues with the same labels.
+Discipline applied across M0-M5. PRD authority: `docs/computergames/README.md` §"Authoring rules" + `14_build_and_packaging.md` + `13_testing_strategy.md`. State-tracking authority: git tags + `CHANGELOG.md` (final) > codebase on `main` (operational) > GitHub Issues (https://github.com/ChrisRoyse/Synapse/issues — every PR-sized task, `[DECISION]`, `[DISCOVERY]`, `[BUG]`, `[RISK]`, `[CONTEXT]`). Use `gh issue list --state all --search 'phase:m4'` (etc.) to walk landed-decision history for context the commit message did not carry. **All M0/M1/M2/M3 historical issues are closed as of 2026-05-25** (`v0.1.0-m3` tag); new M4 work opens fresh issues with the same labels.
 
 **Three load-bearing operator directives (NEVER violate):**
 
@@ -15,7 +15,7 @@ Discipline applied across M0-M5. PRD authority: `docs/computergames/README.md` �
 | Rule | Mechanism |
 |---|---|
 | `#![forbid(unsafe_code)]` workspace-wide | per-crate override only for `synapse-action` (Win32 SendInput batching), `synapse-capture` (DX FFI), `synapse-hid-host` (serial OS handle), `firmware/pico-hid` |
-| File ≤ 500 LoC, function ≤ 30 LoC, cyclomatic ≤ 10 | clippy + local/reviewer check. **M2 left 6 files over cap** (emitter.rs 1474, vigem.rs 1131, invoke.rs 653, software.rs 586, m2/click.rs 506, m2/press.rs 545) — M3 work-item A.0a/A.0b splits them before building reflex on top. Reviewers must enforce at ≤ 450 LoC during code review to leave 50 LoC of margin. |
+| File ≤ 500 LoC, function ≤ 30 LoC, cyclomatic ≤ 10 | clippy + local/reviewer check. M2 carry-over (six action/MCP files over cap) is **closed in M3** by the Block A.0 split refactors — all six are now ≤ 112 LoC on `main`. M3 introduced its own LoC overrun (see `README.md` "M3 carry-over"); the largest offenders are `synapse-a11y/src/lib.rs` 2087, `synapse-capture/src/lib.rs` 1798, `synapse-core/src/types.rs` 1567, `synapse-mcp/src/server.rs` 1335, `synapse-mcp/src/m3/reflex.rs` 1165, `synapse-reflex/src/lib.rs` 986, `synapse-reflex/src/scheduler.rs` 890. M4's first PR splits these before hardware HID is built on top. Reviewers must enforce at ≤ 450 LoC during code review to leave 50 LoC of margin. |
 | `unwrap()` / `expect()` forbidden outside `#[cfg(test)]` | `#[deny(clippy::unwrap_used, clippy::expect_used)]` |
 | `anyhow` forbidden in library crates | manual review + workspace dep gating |
 | No `println!` / `eprintln!` | clippy lint + grep gate |

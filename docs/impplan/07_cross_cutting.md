@@ -1,6 +1,6 @@
 # 07 — Cross-cutting concerns
 
-Discipline applied across M0-M5, not owned by any single phase. Pointers to authoritative PRD sections; impplan adds enforcement rules. State-tracking authority: git tags + `CHANGELOG.md` > codebase on `main` > GitHub Issues. **All M0/M1/M2 issues are closed** (244 total as of 2026-05-24); M3+ opens new issues with `phase:mN` + `area:*` labels.
+Discipline applied across M0-M5, not owned by any single phase. Pointers to authoritative PRD sections; impplan adds enforcement rules. State-tracking authority: git tags + `CHANGELOG.md` > codebase on `main` > GitHub Issues. **All M0/M1/M2/M3 issues are closed** as of 2026-05-25 (`v0.1.0-m3` tag); M4+ opens new issues with `phase:mN` + `area:*` labels. ADRs landed through M3: 0001 (Rust + deps), 0002 (RocksDB primary), 0003 (reflex recursion guard), 0004 (reflex priority), 0005 (multi-monitor capture target), 0006 (profile match precedence), 0007 (per-event vs batched notifications).
 
 **Three operator-level invariants** that override anything below in case of conflict:
 1. No backwards compatibility (pre-v1). Fail fast with `error_codes::*`; no fallbacks/shims.
@@ -179,7 +179,7 @@ Closes during the phase that hits the decision:
 |---|---|
 | M1 | OQ-009 (max_elements default; M5 telem feedback expected); OQ-010 (CDP auto-attach); OQ-024 (token budget enforcement); OQ-023 (element_id stability) |
 | M2 | OQ-004 (productivity aim curve default) — partial; final at M5 |
-| M3 | OQ-001 (RocksDB primary per ADR-0002); OQ-015 (profile match precedence per ADR-0006); OQ-022 (recursion guard); OQ-029 (per-event notifications per ADR-0007); OQ-005 (reflex priority); OQ-012 (multi-monitor) |
+| M3 (closed) | OQ-001 (RocksDB primary per ADR-0002); OQ-005 (reflex priority per ADR-0004); OQ-012 (multi-monitor per ADR-0005); OQ-015 (profile match precedence per ADR-0006); OQ-022 (recursion guard per ADR-0003); OQ-029 (per-event notifications per ADR-0007) |
 | M4 | OQ-003 (detection model default — YOLOv10n vs RT-DETR-s); OQ-013 (aim_track EMA smoothing); OQ-016 (action coalescing on hardware) |
 | M5 | OQ-008 (VLM bundling); OQ-014 (Whisper-tiny vs base); OQ-017 (disk pressure thresholds); OQ-019 (telemetry split); OQ-020 (`game_screenshot_once` exposure); OQ-030 (GC cadence final) |
 | v1.x | OQ-006 (per-session permissions); OQ-007 (profile signing); OQ-021 (HRTF audio); OQ-027 (hardware HID 2FA); OQ-028 (migrations vs wipe); OQ-026 (cross-platform start trigger); OQ-018 (replay format final) |
@@ -268,17 +268,18 @@ Every PR must preserve this. PRs that add planning, MCTS, GOAP, skill libraries,
 
 ---
 
-## 14. M2 lessons — apply at M3+
+## 14. M2/M3 lessons — apply at M4+
 
 | Lesson | Source | Apply how |
 |---|---|---|
-| 500 LoC cap erodes silently — emitter.rs ended at 1474, vigem.rs 1131, invoke.rs 653 | M2 carry-over | Reviewers enforce at ≤ 450 LoC during code review; M3 work-item A.0 splits the M2 over-cap files **before** building reflex on top |
+| 500 LoC cap erodes silently — M2 closed at 6 over-cap action files; M3 reintroduced overrun (synapse-a11y/lib.rs 2087, synapse-capture/lib.rs 1798, synapse-core/types.rs 1567, synapse-mcp/server.rs 1335, synapse-mcp/m3/reflex.rs 1165, synapse-reflex/lib.rs 986, synapse-reflex/scheduler.rs 890, synapse-mcp/http/sse.rs 764, synapse-mcp/m3/replay.rs 651, synapse-models/lib.rs 535) | M2 + M3 carry-over | Reviewers enforce at ≤ 450 LoC during code review; M4 Block A.0 splits the M3 over-cap files **before** building hardware HID on top. Repeat the M2 → M3 closure pattern. |
 | Telemetry log GC at startup only -> long-lived daemon exceeds 500 MB cap | #241/#262 | Long-running cleanup tasks need an explicit cadence and manual evidence proving mid-uptime cleanup; telemetry GC uses the `synapse-telemetry-gc` worker with `SYNAPSE_LOG_GC_INTERVAL_S` |
 | Ephemeral verification run dirs leak into the worktree | #242/#261/#351 | Do not create new FSV scripts, harnesses, or run dirs. If a supporting check writes ad-hoc artifacts, use `.runs/` (gitignored) and `scripts/clean-runs.ps1`; never write into the repo root. |
 | `bench_results/<sha>/` was committed per commit (8 dirs removed by #260) | #243/#260 | Use local `critcmp` JSON outside the repo; stop committing per-commit baselines |
-| M2 packaged-Notepad UIA `MenuBar` discovery is silently empty under `ControlView` walker | #244 | M3 work-item A.0c switches to `RawView`; future a11y work must include a UWP-packaged-app smoke test |
-| Coords are physical (DPI-aware) pixels — undocumented; trips DPI-unaware SoT readers | #239 | M3 work-item A.0g patches tool schema descriptions + `03_action.md`; future tools must document coord space explicitly |
-| `SoftwareBackend::mouse_move` reads cursor via Enigo (DPI-unaware) in a DPI-aware host | #234 | M3 work-item A.0d routes through Win32 `GetCursorPos` in DPI-aware mode; future cross-DPI tests must assert byte-equal end position |
-| Backend wiring no-op (#228) went undetected until #219 live manual evidence | M2 carry-over | every backend integration test must dispatch through the real `ActionEmitter` actor with a real backend, not via direct backend `execute` calls |
-| ViGEmBus 1.22.0 installer fails unattended (-536870911 no log) | #229 | M2 explicitly scoped to **operator's configured host** with ViGEmBus pre-installed; do not gate M3+ on unattended driver install |
-| `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT` and `SYNAPSE_MCP_FORCE_*` env flags are deterministic trigger hooks for otherwise unreachable code paths | shipped through M1+M2 | M3 adds parallel `SYNAPSE_MCP_FORCE_REFLEX_*` / `SYNAPSE_MCP_FORCE_AUDIO_*` env flags to drive every M3 error path that cannot otherwise be triggered deterministically |
+| Packaged-Notepad UIA `MenuBar` discovery silently empty under `ControlView` walker | #244 closed by `a414226` | RawView walker is now the default; future a11y work must include a UWP-packaged-app smoke test |
+| Coords are physical (DPI-aware) pixels — undocumented; trips DPI-unaware SoT readers | #239 closed by `4eef83c` | Tool schema descriptions + `03_action.md` document coord space; future tools must document coord space explicitly |
+| `SoftwareBackend::mouse_move` read cursor via Enigo (DPI-unaware) in a DPI-aware host | #234 closed by `eef654f` | Win32 `GetCursorPos` is now the cursor source of truth in DPI-aware mode; future cross-DPI tests must assert byte-equal end position |
+| Backend wiring no-op (#228) went undetected until #219 live manual evidence | M2 carry-over | every backend integration test must dispatch through the real `ActionEmitter` actor with a real backend, not via direct backend `execute` calls; M3 added `eef654f fix: route recording mode through action actor` to enforce this for the recording backend |
+| ViGEmBus 1.22.0 installer fails unattended (-536870911 no log) | #229 | M2/M3 explicitly scoped to **operator's configured host** with ViGEmBus pre-installed; do not gate M4+ on unattended driver install |
+| `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT` and `SYNAPSE_MCP_FORCE_*` env flags are deterministic trigger hooks for otherwise unreachable code paths | shipped through M1+M2 | M3 added parallel `SYNAPSE_REFLEX_FORCE_DEGRADED`, `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE`, `SYNAPSE_MAX_SUBSCRIPTIONS` env knobs (visible in `crates/synapse-mcp/src/main.rs`) to drive M3 error paths; M4 adds parallel `SYNAPSE_MCP_FORCE_HID_*` env flags for the hardware-HID error surface |
+| M3 introduced its own carry-over: streamable HTTP SSE replay used to mis-track sequence cursors (`86a33ce fix(sse): use stream sequence cursors`); replay observation gaps tolerated under transient perception loss (`97019ec fix: tolerate transient replay perception gaps`) | M3 hotfixes after `f91f729 wire notepad save reflex demo` | Future SSE/replay work asserts the actual emitted sequence cursors against the per-sub ring buffer reader, not the internal counter; replay code paths must tolerate transient empty `Observation` reads without aborting the run |

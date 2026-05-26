@@ -38,7 +38,7 @@ Total token cost ≤ 30 K across the whole sequence.
 - `wix-installer` (WiX Toolset v4+) available
 - Reference machine for perf gates: RTX 3060 + 8-core CPU
 - Reference machine for soak: dedicated runner, 16 GB RAM, 5 GB free disk
-- M5 starting surface (verified at M4 close): 25 MCP tools live (15 from M1+M2 + 10 from M3) — M5 adds `describe` to make 26
+- M5 starting surface (verified at M4 close): 33 MCP tools live (30 shipped at M3 — 6 M1 + 9 M2 + 11 M3 reflex/profile/replay/audio + 4 M3 `storage_*` diagnostics — plus the 3 M4 tools `act_combo`/`act_run_shell`/`act_launch`). M5 adds `describe` to make 34.
 - M5 starting profile bundle: 5 (`notepad`, `vscode`, `chrome`, `terminal` from M3 + `minecraft.java` from M4)
 - `synapse-overlay` is still the 3-LoC binary skeleton from M0; first M5 task fills it out
 
@@ -107,7 +107,7 @@ All new profiles set `mouse_curve_default = "natural"` + `keyboard_dynamics_defa
 | `file_explorer.toml` | n/a | a11y_only |
 | `<one_fps>.toml` | single_player | TBD free single-player FPS for the M5 demo |
 | `roblox_studio.toml` | operator_owned_test | Studio only; runtime experiences start as unknown until profiled |
-| Pre-existing M3/M4: `notepad`, `vscode`, `chrome`, `terminal`, `minecraft.java` | | already shipped |
+| Pre-existing M3 (`notepad`, `vscode`, `chrome`, `terminal` — Natural defaults verified) + M4 `minecraft.java` | | already shipped |
 
 Plus inert `unknown` profile templates for local experiments: parseable, no keymap, no bundled game-specific assets, and explicit comments requiring a documented environment before actions are enabled.
 
