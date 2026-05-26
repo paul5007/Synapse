@@ -46,11 +46,13 @@ Board enumerates as a **USB HID composite device** with three interfaces:
 | 1 | HID (3) | Boot (1) | Keyboard (1) | Boot-protocol keyboard |
 | 2 | HID (3) | None (0) | None (0) | Standard HID gamepad (DirectInput-visible, Xbox-like 14-byte report; ADR-0009) |
 
-Plus a fourth control interface:
+Plus a CDC ACM command channel, which enumerates as a control/data interface
+pair:
 
 | Interface | Class | Purpose |
 |---|---|---|
-| 3 | CDC ACM | Serial command channel from Synapse host driver to firmware |
+| 3 | CDC Communications | ACM control interface for the Synapse serial command channel |
+| 4 | CDC Data | Serial data interface from Synapse host driver to firmware |
 
 VID/PID defaults:
 
@@ -144,6 +146,7 @@ thumb_lx: i16,
 thumb_ly: i16,
 thumb_rx: i16,
 thumb_ry: i16,
+reserved: u16,      // zero; keeps the M4 14-byte report ABI explicit
 ```
 
 Total 14 bytes. Sent at up to 1000 Hz. Games that require XInput/XUSB should

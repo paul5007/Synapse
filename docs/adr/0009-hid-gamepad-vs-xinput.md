@@ -26,6 +26,7 @@ thumb_lx: i16
 thumb_ly: i16
 thumb_rx: i16
 thumb_ry: i16
+reserved: u16       // zero; keeps the M4 14-byte report ABI explicit
 ```
 
 The descriptor must be HID class, Generic Desktop/Game Pad usage, with standard

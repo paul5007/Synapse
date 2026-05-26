@@ -6,3 +6,4 @@ runner = "elf2uf2-rs -d"
 
 [env]
 DEFMT_LOG = "info"
+EMBASSY_USB_MAX_INTERFACE_COUNT = "5"

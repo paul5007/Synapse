@@ -2,15 +2,24 @@ use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_time::Timer;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use embassy_usb::class::hid::{
+    Config as HidConfig, HidBootProtocol, HidProtocolMode, HidSubclass, HidWriter, ReportId,
+    RequestHandler, State as HidState,
+};
+use embassy_usb::control::OutResponse;
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
 
+use crate::hid_descriptors;
+use crate::reports::{self, BootKeyboardReport, BootMouseReport, GamepadReport};
 use crate::usb;
 
 const CDC_MAX_PACKET_SIZE: u16 = 64;
-const CONFIG_DESCRIPTOR_LEN: usize = 256;
+const HID_POLL_MS: u8 = 1;
+const CONFIG_DESCRIPTOR_LEN: usize = 512;
 const BOS_DESCRIPTOR_LEN: usize = 256;
 const CONTROL_BUF_LEN: usize = 64;
 
@@ -21,9 +30,18 @@ bind_interrupts!(struct Irqs {
 type UsbDriver = Driver<'static, USB>;
 type PicoUsbDevice = UsbDevice<'static, UsbDriver>;
 type PicoCdcAcmClass = CdcAcmClass<'static, UsbDriver>;
+type MouseWriter = HidWriter<'static, UsbDriver, { reports::BOOT_MOUSE_REPORT_LEN }>;
+type KeyboardWriter = HidWriter<'static, UsbDriver, { reports::BOOT_KEYBOARD_REPORT_LEN }>;
+type GamepadWriter = HidWriter<'static, UsbDriver, { reports::GAMEPAD_REPORT_LEN }>;
+
+struct HidWriters {
+    mouse: MouseWriter,
+    keyboard: KeyboardWriter,
+    gamepad: GamepadWriter,
+}
 
 pub fn spawn_usb(usb_peripheral: embassy_rp::Peri<'static, USB>, spawner: &Spawner) -> bool {
-    let (usb_device, serial_class) = build_usb_serial(usb_peripheral);
+    let (usb_device, serial_class, hid_writers) = build_usb_serial(usb_peripheral);
 
     let device_spawned = match usb_task(usb_device) {
         Ok(token) => {
@@ -39,13 +57,34 @@ pub fn spawn_usb(usb_peripheral: embassy_rp::Peri<'static, USB>, spawner: &Spawn
         }
         Err(_) => false,
     };
+    let mouse_spawned = match mouse_hid_task(hid_writers.mouse) {
+        Ok(token) => {
+            spawner.spawn(token);
+            true
+        }
+        Err(_) => false,
+    };
+    let keyboard_spawned = match keyboard_hid_task(hid_writers.keyboard) {
+        Ok(token) => {
+            spawner.spawn(token);
+            true
+        }
+        Err(_) => false,
+    };
+    let gamepad_spawned = match gamepad_hid_task(hid_writers.gamepad) {
+        Ok(token) => {
+            spawner.spawn(token);
+            true
+        }
+        Err(_) => false,
+    };
 
-    device_spawned && echo_spawned
+    device_spawned && echo_spawned && mouse_spawned && keyboard_spawned && gamepad_spawned
 }
 
 fn build_usb_serial(
     usb_peripheral: embassy_rp::Peri<'static, USB>,
-) -> (PicoUsbDevice, PicoCdcAcmClass) {
+) -> (PicoUsbDevice, PicoCdcAcmClass, HidWriters) {
     let driver = Driver::new(usb_peripheral, Irqs);
     let identity = usb::identity();
 
@@ -59,7 +98,13 @@ fn build_usb_serial(
     static CONFIG_DESCRIPTOR: StaticCell<[u8; CONFIG_DESCRIPTOR_LEN]> = StaticCell::new();
     static BOS_DESCRIPTOR: StaticCell<[u8; BOS_DESCRIPTOR_LEN]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; CONTROL_BUF_LEN]> = StaticCell::new();
-    static STATE: StaticCell<State<'static>> = StaticCell::new();
+    static CDC_STATE: StaticCell<State<'static>> = StaticCell::new();
+    static MOUSE_STATE: StaticCell<HidState<'static>> = StaticCell::new();
+    static KEYBOARD_STATE: StaticCell<HidState<'static>> = StaticCell::new();
+    static GAMEPAD_STATE: StaticCell<HidState<'static>> = StaticCell::new();
+    static MOUSE_REQUESTS: StaticCell<HidRequestState> = StaticCell::new();
+    static KEYBOARD_REQUESTS: StaticCell<HidRequestState> = StaticCell::new();
+    static GAMEPAD_REQUESTS: StaticCell<HidRequestState> = StaticCell::new();
 
     let mut builder = Builder::new(
         driver,
@@ -70,11 +115,70 @@ fn build_usb_serial(
         CONTROL_BUF.init([0; CONTROL_BUF_LEN]),
     );
 
-    let state = STATE.init(State::new());
+    let mouse = HidWriter::new(
+        &mut builder,
+        MOUSE_STATE.init(HidState::new()),
+        hid_config(
+            hid_descriptors::BOOT_MOUSE,
+            HidSubclass::Boot,
+            HidBootProtocol::Mouse,
+            MOUSE_REQUESTS.init(HidRequestState::new(true)),
+            reports::BOOT_MOUSE_REPORT_LEN as u16,
+        ),
+    );
+    let keyboard = HidWriter::new(
+        &mut builder,
+        KEYBOARD_STATE.init(HidState::new()),
+        hid_config(
+            hid_descriptors::BOOT_KEYBOARD,
+            HidSubclass::Boot,
+            HidBootProtocol::Keyboard,
+            KEYBOARD_REQUESTS.init(HidRequestState::new(true)),
+            reports::BOOT_KEYBOARD_REPORT_LEN as u16,
+        ),
+    );
+    let gamepad = HidWriter::new(
+        &mut builder,
+        GAMEPAD_STATE.init(HidState::new()),
+        hid_config(
+            hid_descriptors::GAMEPAD,
+            HidSubclass::No,
+            HidBootProtocol::None,
+            GAMEPAD_REQUESTS.init(HidRequestState::new(false)),
+            reports::GAMEPAD_REPORT_LEN as u16,
+        ),
+    );
+
+    let state = CDC_STATE.init(State::new());
     let serial_class = CdcAcmClass::new(&mut builder, state, CDC_MAX_PACKET_SIZE);
     let usb_device = builder.build();
 
-    (usb_device, serial_class)
+    (
+        usb_device,
+        serial_class,
+        HidWriters {
+            mouse,
+            keyboard,
+            gamepad,
+        },
+    )
+}
+
+fn hid_config(
+    report_descriptor: &'static [u8],
+    hid_subclass: HidSubclass,
+    hid_boot_protocol: HidBootProtocol,
+    request_handler: &'static mut HidRequestState,
+    max_packet_size: u16,
+) -> HidConfig<'static> {
+    HidConfig {
+        report_descriptor,
+        request_handler: Some(request_handler),
+        poll_ms: HID_POLL_MS,
+        max_packet_size,
+        hid_subclass,
+        hid_boot_protocol,
+    }
 }
 
 #[embassy_executor::task]
@@ -90,6 +194,39 @@ async fn cdc_echo_task(mut serial_class: PicoCdcAcmClass) -> ! {
     }
 }
 
+#[embassy_executor::task]
+async fn mouse_hid_task(mut writer: MouseWriter) -> ! {
+    let neutral = BootMouseReport::neutral().to_bytes();
+
+    loop {
+        writer.ready().await;
+        let _ = writer.write(&neutral).await;
+        Timer::after_secs(1).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn keyboard_hid_task(mut writer: KeyboardWriter) -> ! {
+    let neutral = BootKeyboardReport::neutral().to_bytes();
+
+    loop {
+        writer.ready().await;
+        let _ = writer.write(&neutral).await;
+        Timer::after_secs(1).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn gamepad_hid_task(mut writer: GamepadWriter) -> ! {
+    let neutral = GamepadReport::neutral().to_bytes();
+
+    loop {
+        writer.ready().await;
+        let _ = writer.write(&neutral).await;
+        Timer::after_secs(1).await;
+    }
+}
+
 async fn echo_until_disconnect(serial_class: &mut PicoCdcAcmClass) -> Result<(), Disconnected> {
     let mut packet = [0u8; CDC_MAX_PACKET_SIZE as usize];
 
@@ -100,6 +237,51 @@ async fn echo_until_disconnect(serial_class: &mut PicoCdcAcmClass) -> Result<(),
         serial_class.write_packet(data).await?;
         if count == serial_class.max_packet_size() as usize {
             serial_class.write_packet(&[]).await?;
+        }
+    }
+}
+
+struct HidRequestState {
+    supports_boot_protocol: bool,
+    protocol: HidProtocolMode,
+    idle_ms: u32,
+}
+
+impl HidRequestState {
+    const fn new(supports_boot_protocol: bool) -> Self {
+        Self {
+            supports_boot_protocol,
+            protocol: HidProtocolMode::Report,
+            idle_ms: u32::MAX,
+        }
+    }
+}
+
+impl RequestHandler for HidRequestState {
+    fn get_protocol(&self) -> HidProtocolMode {
+        self.protocol
+    }
+
+    fn set_protocol(&mut self, protocol: HidProtocolMode) -> OutResponse {
+        if matches!(protocol, HidProtocolMode::Boot) && !self.supports_boot_protocol {
+            return OutResponse::Rejected;
+        }
+
+        self.protocol = protocol;
+        OutResponse::Accepted
+    }
+
+    fn get_idle_ms(&mut self, id: Option<ReportId>) -> Option<u32> {
+        if id.is_some() {
+            None
+        } else {
+            Some(self.idle_ms)
+        }
+    }
+
+    fn set_idle_ms(&mut self, id: Option<ReportId>, duration_ms: u32) {
+        if id.is_none() {
+            self.idle_ms = duration_ms;
         }
     }
 }
