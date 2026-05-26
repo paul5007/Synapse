@@ -2,7 +2,11 @@
 
 ## 1. Design rules
 
-1. **Tool count cap: 30 at v1.** Overlapping tools merge. Profile and parameter knobs are the escape hatches.
+1. **Tool count cap:** M3 shipped 30 live MCP tools. M4 expands the target
+   surface to 33 live MCP tools by adding `act_combo`, `act_run_shell`, and
+   `act_launch` per the M4 phase plan. Any further agent-facing tools require
+   an ADR-approved cap change. Overlapping tools merge. Profile and parameter
+   knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
 3. **Structured input, structured output.** Every tool defines a JSON Schema with `additionalProperties: false`. Every response carries explicit fields, no free-form text.
 4. **No silent success.** If a tool did not do the work, it returns an MCP error with `code: SCREAMING_SNAKE_CASE`, never `success: true` with a partial result.
@@ -10,9 +14,11 @@
 6. **Idempotency tokens where it matters.** `act_run_shell`, `act_launch`, and similar accept an optional `idempotency_key` for safe retries.
 7. **Stable identifiers.** `element_id`, `entity_id`, `track_id`, `reflex_id`, `session_id` are returned by tools and accepted unchanged by subsequent calls. Agent never invents these.
 
-The tool list below is the current live M3 contract. Schemas use abbreviated
-JSON Schema syntax; canonical schema is exported by the daemon through standard
-MCP `tools/list`.
+The first 30 tools below are the current live M3 contract. M4 adds rows 31-33.
+Schemas use abbreviated JSON Schema syntax; canonical schema is exported by the
+daemon through standard MCP `tools/list`. Until the M4 tools are implemented,
+their schemas in this doc are the target contract for #401/#403/#406 and the
+future `tools/list` snapshots in #447/#448.
 
 ---
 
@@ -50,13 +56,15 @@ MCP `tools/list`.
 | 28 | `storage_put_probe_rows` | write | writes bounded synthetic storage rows |
 | 29 | `storage_gc_once` | write | runs one GC pass |
 | 30 | `storage_pressure_sample` | write | applies one synthetic pressure sample |
+| 31 | `act_combo` | write | schedules a one-shot timed action sequence |
+| 32 | `act_run_shell` | write | runs an allowlisted local shell command |
+| 33 | `act_launch` | write | launches an allowlisted local process |
 
-30 tools. Hard cap until ADR-approved exception.
+M3 live count: 30 tools. M4 target count: 33 tools.
 
-Deferred ideas from earlier drafts (`describe`, `read_hud`, standalone
-`act_combo`, `act_run_shell`, and `act_launch`) are not live M3 tools. Adding
-any of them requires either replacing an existing tool or an ADR-approved cap
-change.
+Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
+live M3/M4 agent-facing tools. `act_combo`, `act_run_shell`, and `act_launch`
+are the only M4 additions approved by the phase plan.
 
 ---
 
@@ -541,11 +549,16 @@ Drives a virtual or hardware gamepad.
 }
 ```
 
-### 3.18 `act_combo` (deferred, not live M3)
+### 3.18 `act_combo` (M4)
+
+Schedules a one-shot timed combo through the reflex scheduler. The tool is an
+M4 addition and must appear in `tools/list` only when its real runtime path is
+implemented.
 
 ```json
 {
   "name": "act_combo",
+  "description": "Execute a timed one-shot sequence of already-supported action tools through the reflex combo scheduler.",
   "input_schema": {
     "type": "object",
     "additionalProperties": false,
@@ -553,20 +566,60 @@ Drives a virtual or hardware gamepad.
     "properties": {
       "steps": {
         "type": "array",
+        "minItems": 1,
+        "maxItems": 256,
         "items": {
           "type": "object",
-          "required": ["at_ms", "input"],
+          "additionalProperties": false,
+          "required": ["at_ms", "action", "params"],
           "properties": {
             "at_ms": {"type": "integer", "minimum": 0},
-            "input": {"type": "object", "description": "Sub-action: key/mouse/pad press/release"}
+            "action": {
+              "enum": ["act_click", "act_type", "act_press", "act_aim", "act_drag", "act_scroll", "act_pad", "act_clipboard", "release_all"]
+            },
+            "params": {"type": "object", "description": "Validated against the selected action tool's schema before scheduling"},
+            "backend": {"enum": ["software", "hardware", "vigem", "auto"]}
           }
         }
       },
-      "backend": {"enum": ["software","hardware","vigem","auto"], "default": "auto"}
+      "backend": {"enum": ["software", "hardware", "vigem", "auto"], "default": "auto"},
+      "idempotency_key": {"type": "string"}
     }
   }
 }
 ```
+
+Returns:
+
+```json
+{
+  "combo_id": "uuid",
+  "scheduled_steps": 3,
+  "backend": "auto",
+  "started_at_ms": 0
+}
+```
+
+Required permissions:
+
+- `WRITE_REFLEX`
+- `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, and/or `INPUT_HARDWARE_HID`
+  according to the nested step actions and chosen backend.
+
+Rules:
+
+- `at_ms` values must be monotonic.
+- `act_run_shell`, `act_launch`, subscription tools, storage diagnostics, and
+  profile writes are not valid combo steps.
+- Step `params` must pass the selected action tool's own schema before the
+  combo is scheduled.
+- Unknown-scope profile gates still apply; denied action emission returns
+  `SAFETY_PROFILE_ACTION_DENIED`.
+
+Errors: `TOOL_PARAMS_INVALID`, `SAFETY_PERMISSION_DENIED`,
+`SAFETY_PROFILE_ACTION_DENIED`, `ACTION_BACKEND_UNAVAILABLE`,
+`ACTION_HID_PORT_DISCONNECTED`, `ACTION_QUEUE_FULL`,
+`REFLEX_ACTION_PERMISSION_DENIED`.
 
 ### 3.19 `act_clipboard`
 
@@ -586,22 +639,26 @@ Drives a virtual or hardware gamepad.
 }
 ```
 
-### 3.20 `act_run_shell` (deferred, not live M3)
+### 3.20 `act_run_shell` (M4)
 
-Gated. Disabled unless `--allow-shell <pattern>` was passed at startup.
+Runs an allowlisted local shell command. Disabled unless `--allow-shell
+<regex>` was passed at startup. Broad allowlists such as `.*` are rejected at
+startup per `11_security_and_safety.md`.
 
 ```json
 {
   "name": "act_run_shell",
+  "description": "Run a local shell command only when the startup allowlist permits the resolved command line.",
   "input_schema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["argv"],
+    "required": ["command"],
     "properties": {
-      "argv": {"type": "array", "items": {"type": "string"}},
-      "cwd": {"type": "string"},
-      "env": {"type": "object", "additionalProperties": {"type": "string"}},
-      "timeout_ms": {"type": "integer", "default": 30000},
+      "command": {"type": "string", "minLength": 1},
+      "args": {"type": "array", "items": {"type": "string"}, "default": []},
+      "working_dir": {"type": "string"},
+      "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
+      "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 30000},
       "idempotency_key": {"type": "string"}
     }
   }
@@ -611,25 +668,52 @@ Gated. Disabled unless `--allow-shell <pattern>` was passed at startup.
 Returns:
 
 ```json
-{"exit_code": 0, "stdout": "...", "stderr": "...", "duration_ms": 152}
+{
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": "...",
+  "duration_ms": 152,
+  "timed_out": false
+}
 ```
 
-### 3.21 `act_launch` (deferred, not live M3)
+Required policy gate: startup `--allow-shell <regex>` must match the resolved
+command line. M4 may add a dedicated permission enum later; until then the
+allowlist is the required permission surface.
 
-Gated.
+Rules:
+
+- `command + args` are resolved into a command line before allowlist matching.
+- `env` defaults to `{}` and only extends the child environment.
+- `working_dir` defaults to the daemon's current directory if omitted.
+- Timeout kills the process tree and returns `timed_out: true` with captured
+  output up to the implementation cap.
+
+Errors: `TOOL_PARAMS_INVALID`, `SAFETY_SHELL_DENIED_BY_POLICY`,
+`SAFETY_PERMISSION_DENIED`, `ACTION_TARGET_INVALID`.
+
+### 3.21 `act_launch` (M4)
+
+Launches an allowlisted local process and optionally waits for a window title.
+Disabled unless `--allow-launch <regex>` was passed at startup. Broad allowlists
+such as `.*` are rejected at startup per `11_security_and_safety.md`.
 
 ```json
 {
   "name": "act_launch",
+  "description": "Launch an allowlisted local executable and optionally wait for a matching window title.",
   "input_schema": {
     "type": "object",
     "additionalProperties": false,
     "required": ["target"],
     "properties": {
       "target": {"type": "string", "description": "Executable name (e.g., 'notepad.exe') or Steam appid (e.g., 'steam://run/440')"},
-      "args": {"type": "array", "items": {"type": "string"}},
+      "args": {"type": "array", "items": {"type": "string"}, "default": []},
+      "working_dir": {"type": "string"},
+      "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
       "wait_for_window_title_regex": {"type": "string"},
-      "wait_timeout_ms": {"type": "integer", "default": 10000}
+      "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 10000},
+      "idempotency_key": {"type": "string"}
     }
   }
 }
@@ -638,8 +722,28 @@ Gated.
 Returns:
 
 ```json
-{"pid": 12345, "hwnd": 67890, "launched_at": "..."}
+{
+  "pid": 12345,
+  "hwnd": 67890,
+  "matched_title": "Untitled - Notepad",
+  "launched_at": "..."
+}
 ```
+
+Required policy gate: startup `--allow-launch <regex>` must match the resolved
+launch target. M4 may add a dedicated permission enum later; until then the
+allowlist is the required permission surface.
+
+Rules:
+
+- `args` defaults to `[]`.
+- `env` defaults to `{}` and only extends the child environment.
+- `working_dir` defaults to the target resolver's process directory if omitted.
+- `wait_for_window_title_regex` is optional. When present, the tool reads real
+  window state until `timeout_ms` expires.
+
+Errors: `TOOL_PARAMS_INVALID`, `SAFETY_LAUNCH_DENIED_BY_POLICY`,
+`SAFETY_PERMISSION_DENIED`, `ACTION_TARGET_INVALID`.
 
 ### 3.22 `reflex_register`
 
@@ -898,7 +1002,43 @@ Full error code catalog in `06_data_schemas.md` §Error codes.
 
 ---
 
-## 5. Transports
+## 5. M4 Default Resolution Rows
+
+The `tools/list` schema must expose the JSON defaults below once these M4 tools
+land. Rows that say "required", "omitted", or "inherits" define runtime
+resolution behavior rather than a JSON-Schema `default` value. Issue #448 owns
+the future default-resolution readback; this table is the PRD source row for the
+three M4 tools.
+
+| Tool | Field | Default | Source |
+|---|---|---|---|
+| `act_combo` | `steps` | required; no default | M4 plan #444 |
+| `act_combo` | `steps[].backend` | inherits top-level `backend` | M4 plan #444 |
+| `act_combo` | `backend` | `"auto"` | M4 plan #444 |
+| `act_combo` | `idempotency_key` | omitted | M4 plan #444 |
+| `act_run_shell` | `command` | required; no default | M4 plan #444 |
+| `act_run_shell` | `args` | `[]` | M4 plan #444 |
+| `act_run_shell` | `working_dir` | daemon current directory | security policy #11 |
+| `act_run_shell` | `env` | `{}` | M4 plan #444 |
+| `act_run_shell` | `timeout_ms` | `30000` | PRD 05 + performance budget |
+| `act_run_shell` | `idempotency_key` | omitted | PRD 05 design rule 6 |
+| `act_launch` | `target` | required; no default | M4 plan #444 |
+| `act_launch` | `args` | `[]` | M4 plan #444 |
+| `act_launch` | `working_dir` | target resolver default | security policy #11 |
+| `act_launch` | `env` | `{}` | M4 plan #444 |
+| `act_launch` | `wait_for_window_title_regex` | omitted | M4 plan #444 |
+| `act_launch` | `timeout_ms` | `10000` | PRD 05 |
+| `act_launch` | `idempotency_key` | omitted | PRD 05 design rule 6 |
+
+All three schemas must serialize as closed top-level JSON objects with
+`additionalProperties: false`. `act_combo.steps[]` also serializes as a closed
+object. The nested `act_combo.steps[].params` object is validated against the
+selected action tool schema before scheduling; it is not accepted as unchecked
+free-form input.
+
+---
+
+## 6. Transports
 
 | Transport | When | Capabilities |
 |---|---|---|
@@ -917,7 +1057,7 @@ Final response arrives as a normal JSON-RPC reply when complete.
 
 ---
 
-## 6. Session model
+## 7. Session model
 
 `initialize` creates a session. Server returns `Mcp-Session-Id` (HTTP) or implicitly tracks the stdio process. Per-session state:
 
@@ -935,7 +1075,7 @@ Closing the session (or process exit) cancels all subscriptions and reflexes, re
 
 ---
 
-## 7. Push event format
+## 8. Push event format
 
 On subscription fire, server emits one notification/SSE frame per event:
 
@@ -970,7 +1110,7 @@ gap or overflow is detected, Synapse sends a `subscription_started` frame with
 
 ---
 
-## 8. Tool examples (end-to-end)
+## 9. Tool examples (end-to-end)
 
 ### Example A — open Notepad, type a paragraph, save
 
@@ -1020,7 +1160,7 @@ gap or overflow is detected, Synapse sends a `subscription_started` frame with
 
 ---
 
-## 9. Out of scope
+## 10. Out of scope
 
 - Internal `Action` enum and back-end selection → `03_action.md`
 - Reflex semantics in detail → `04_reflex_runtime.md`
