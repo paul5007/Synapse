@@ -55,13 +55,20 @@ Plus a fourth control interface:
 VID/PID defaults:
 
 ```
-VID: 0x1209  (pid.codes community VID)
-PID: 0xC0C0  (Synapse-allocated within the pid.codes range)
+VID: 0x2E8A  (Raspberry Pi RP2040 VID)
+PID: 0x1F50  (Synapse Pico HID internal reservation; ADR-0008)
+Manufacturer: Synapse
+Product: Synapse Pico HID
 ```
 
-pid.codes is the open community VID block for hobbyist projects; avoids using any commercial VID/PID. Operators can rebuild firmware with their own — `VID`/`PID`/`MANUFACTURER_STR`/`PRODUCT_STR` are build-time constants.
+The canonical constants live in `synapse-core::usb_identity` and are imported
+by `firmware/pico-hid/src/usb.rs`. Operators can rebuild firmware with their own
+`VID`/`PID`/`MANUFACTURER_STR`/`PRODUCT_STR`, but release firmware ships only the
+ADR-0008 Synapse identity.
 
-Release firmware ships only the Synapse VID/PID. Operators who need different IDs for their own hardware must rebuild firmware with their own choice.
+Before broad public distribution, Synapse should complete the Raspberry Pi
+`usb-pid` application/PR for the chosen PID or update ADR-0008 if Raspberry Pi
+assigns a replacement.
 
 ---
 

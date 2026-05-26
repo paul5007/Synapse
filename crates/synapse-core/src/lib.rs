@@ -3,6 +3,7 @@ pub mod error_codes;
 pub mod filter;
 pub mod retention;
 pub mod types;
+pub mod usb_identity;
 
 pub use defaults::SCHEMA_VERSION;
 pub use types::{
@@ -23,4 +24,8 @@ pub use types::{
     StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit, StoredReflexStep, StoredSession,
     SubscriptionId, SubsystemHealth, Trigger, UiaPattern, WindowEdge, element_id, entity_id,
     new_reflex_id, new_session_id, new_subscription_id,
+};
+pub use usb_identity::{
+    SYNAPSE_PICO_HID_MANUFACTURER, SYNAPSE_PICO_HID_PRODUCT, SYNAPSE_PICO_HID_SERIAL_PREFIX,
+    SYNAPSE_PICO_HID_USB_PID, SYNAPSE_PICO_HID_USB_VID,
 };

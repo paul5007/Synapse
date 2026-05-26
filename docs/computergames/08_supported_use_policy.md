@@ -42,7 +42,7 @@ These capabilities stay disabled unless an ADR explicitly changes the project sc
 2. **Raw process memory read/write tooling** for other processes. Game-provided or app-provided APIs are acceptable when documented by the application owner.
 3. **Kernel driver hooks.** Synapse is user-mode only. No `.sys` files in the install.
 4. **Graphics-pipeline injection.** Capture uses Windows capture APIs, not injected hooks.
-5. **Custom device-identity firmware in release builds.** Bundled firmware uses a project VID/PID from an open community allocation and does not ship commercial device IDs.
+5. **Custom device-identity firmware in release builds.** Bundled firmware uses the Synapse Pico HID VID/PID from ADR-0008 and does not ship unrelated commercial device IDs.
 6. **Unregistered persistence.** Synapse identifies itself plainly in process names, logs, metrics, and device identity strings.
 7. **Automatic escalation based on foreground app.** A profile match may select defaults, but it must not silently elevate permissions beyond the operator's startup configuration.
 
