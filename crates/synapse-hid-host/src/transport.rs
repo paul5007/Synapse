@@ -5,6 +5,7 @@ use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
 use tracing::debug;
 
 use crate::error::{HidError, HidResult};
+use crate::handshake::{FirmwareIdentity, IDENTIFY_TIMEOUT_MS, perform_identify_handshake};
 
 pub const DEFAULT_BAUD_RATE: u32 = 1_000_000;
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 5;
@@ -13,6 +14,7 @@ pub struct HidGateway {
     port_name: String,
     baud_rate: u32,
     read_timeout: Duration,
+    identity: FirmwareIdentity,
     port: Box<dyn SerialPort>,
 }
 
@@ -32,7 +34,7 @@ impl HidGateway {
             return Err(HidError::PortNotFound { port_name });
         }
 
-        let port = serialport::new(&port_name, DEFAULT_BAUD_RATE)
+        let mut port = serialport::new(&port_name, DEFAULT_BAUD_RATE)
             .timeout(read_timeout)
             .data_bits(DataBits::Eight)
             .flow_control(FlowControl::None)
@@ -40,6 +42,8 @@ impl HidGateway {
             .stop_bits(StopBits::One)
             .open()
             .map_err(|error| port_open_failed(port_name.clone(), error))?;
+        let identity =
+            perform_identify_handshake(port.as_mut(), Duration::from_millis(IDENTIFY_TIMEOUT_MS))?;
 
         debug!(
             port_name = %port_name,
@@ -52,6 +56,7 @@ impl HidGateway {
             port_name,
             baud_rate: DEFAULT_BAUD_RATE,
             read_timeout,
+            identity,
             port,
         })
     }
@@ -71,6 +76,11 @@ impl HidGateway {
         self.read_timeout
     }
 
+    #[must_use]
+    pub const fn identity(&self) -> &FirmwareIdentity {
+        &self.identity
+    }
+
     pub fn serial_port_mut(&mut self) -> &mut dyn SerialPort {
         self.port.as_mut()
     }
@@ -83,6 +93,7 @@ impl fmt::Debug for HidGateway {
             .field("port_name", &self.port_name)
             .field("baud_rate", &self.baud_rate)
             .field("read_timeout", &self.read_timeout)
+            .field("identity", &self.identity)
             .finish_non_exhaustive()
     }
 }

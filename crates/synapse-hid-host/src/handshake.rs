@@ -1,10 +1,21 @@
+use std::io::{ErrorKind, Read, Write};
+use std::time::{Duration, Instant};
+
 use synapse_core::error_codes;
 use synapse_core::{
     EXPECTED_FW_MAJOR, SYNAPSE_PICO_HID_BUILD_HASH_LEN, SYNAPSE_PICO_HID_FW_MINOR,
     SYNAPSE_PICO_HID_FW_PATCH,
 };
 
+use crate::error::{HidError, HidResult};
+use crate::protocol::{
+    DEVICE_COMMAND_IDENTIFY_RESP, EncodeError, MAX_FRAME_LEN, ParseError, encode_identify_frame,
+    parse_device_frame,
+};
+
 pub const IDENTIFY_RESP_LEN: usize = 20;
+pub const IDENTIFY_TIMEOUT_MS: u64 = 200;
+pub const IDENTIFY_SEQUENCE: u32 = 0;
 
 /// Parsed firmware identity from the Pico `IDENTIFY_RESP` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,4 +125,103 @@ pub const fn expected_version_triplet() -> [u8; 3] {
         SYNAPSE_PICO_HID_FW_MINOR,
         SYNAPSE_PICO_HID_FW_PATCH,
     ]
+}
+
+/// Sends `IDENTIFY` and waits for a validated `IDENTIFY_RESP`.
+///
+/// # Errors
+///
+/// Returns [`HidError::ProtocolHandshakeFailed`] when the frame cannot be
+/// written, no response arrives before `timeout`, or the response frame is
+/// malformed. Returns [`HidError::FirmwareVersionMismatch`] when the firmware
+/// major version differs from the host contract.
+pub fn perform_identify_handshake<T>(
+    transport: &mut T,
+    timeout: Duration,
+) -> HidResult<FirmwareIdentity>
+where
+    T: Read + Write + ?Sized,
+{
+    let mut tx = [0u8; MAX_FRAME_LEN];
+    let tx_len = encode_identify_frame(IDENTIFY_SEQUENCE, &mut tx).map_err(encode_error)?;
+    transport
+        .write_all(&tx[..tx_len])
+        .map_err(|error| handshake_failed(format!("failed to write IDENTIFY frame: {error}")))?;
+    transport
+        .flush()
+        .map_err(|error| handshake_failed(format!("failed to flush IDENTIFY frame: {error}")))?;
+
+    read_identify_response(transport, timeout)
+}
+
+fn read_identify_response<T>(transport: &mut T, timeout: Duration) -> HidResult<FirmwareIdentity>
+where
+    T: Read + ?Sized,
+{
+    let start = Instant::now();
+    let mut rx = [0u8; MAX_FRAME_LEN];
+    let mut rx_len = 0usize;
+
+    loop {
+        if start.elapsed() > timeout {
+            return Err(handshake_failed(format!(
+                "IDENTIFY_RESP timeout after {} ms",
+                timeout.as_millis()
+            )));
+        }
+
+        if rx_len == rx.len() {
+            return Err(handshake_failed("IDENTIFY_RESP frame exceeded buffer"));
+        }
+
+        match transport.read(&mut rx[rx_len..]) {
+            Ok(0) => {}
+            Ok(count) => {
+                rx_len += count;
+                match parse_device_frame(&rx[..rx_len]) {
+                    Ok(frame) => {
+                        return validate_identify_frame(frame.seq, frame.command, frame.payload);
+                    }
+                    Err(ParseError::NeedMore { .. }) => {}
+                    Err(error) => {
+                        return Err(handshake_failed(format!(
+                            "invalid IDENTIFY_RESP frame: {error:?}"
+                        )));
+                    }
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
+            Err(error) => {
+                return Err(handshake_failed(format!(
+                    "failed to read IDENTIFY_RESP frame: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn validate_identify_frame(seq: u32, command: u8, payload: &[u8]) -> HidResult<FirmwareIdentity> {
+    if seq != IDENTIFY_SEQUENCE {
+        return Err(handshake_failed(format!(
+            "IDENTIFY_RESP seq {seq} did not match request seq {IDENTIFY_SEQUENCE}"
+        )));
+    }
+
+    if command != DEVICE_COMMAND_IDENTIFY_RESP {
+        return Err(handshake_failed(format!(
+            "expected IDENTIFY_RESP 0x{DEVICE_COMMAND_IDENTIFY_RESP:02X}, got 0x{command:02X}"
+        )));
+    }
+
+    parse_and_validate_identify_response(payload).map_err(HidError::from)
+}
+
+fn encode_error(error: EncodeError) -> HidError {
+    handshake_failed(format!("failed to encode IDENTIFY frame: {error:?}"))
+}
+
+fn handshake_failed(detail: impl Into<String>) -> HidError {
+    HidError::ProtocolHandshakeFailed {
+        detail: detail.into(),
+    }
 }
