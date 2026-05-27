@@ -7,6 +7,7 @@ pub mod loopback;
 pub mod pipeline;
 pub mod protocol;
 pub mod reconnect;
+pub mod telemetry;
 pub mod transport;
 
 pub use discover::{candidate_port_names, connect_auto, is_synapse_pico_port};
@@ -40,6 +41,7 @@ pub use reconnect::{
     HidReconnectGateway, HidReconnectTarget, RECONNECT_INTERVAL_MS, ReconnectConnector,
     ReconnectGateway, ReconnectLink, ReconnectSnapshot, ReconnectStateKind,
 };
+pub use telemetry::{HidTelemetrySnapshot, TELEMETRY_PAYLOAD_LEN};
 pub use transport::{
     DEFAULT_BAUD_RATE, DEFAULT_READ_TIMEOUT_MS, HidGateway, perform_loopback_probe_on_port,
 };

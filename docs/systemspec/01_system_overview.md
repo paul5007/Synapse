@@ -283,7 +283,7 @@ Owns the process-wide `tracing` subscriber: JSON file appender (daily rolling, l
 Holds `ModelDescriptor` (id, path, sha256, input_shape, class_map), `Detector` trait (`infer(frame, opts)`), `DetectionFrame::validate`. Wraps `ort` v2.0.0-rc.12 with optional `cuda` and `directml` features (`directml` is required by `synapse-audio` for the Whisper-tiny inference). Validates SHA-256 before loading; emits `MODEL_HASH_MISMATCH` on drift.
 
 ### 9.13 synapse-hid-host
-USB-serial driver for the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the root workspace via `Cargo.toml::exclude`). The crate exposes serial discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frame encode/decode, pipelined send, reconnect state, and HID error mapping. `synapse-mcp --hardware-hid <port|auto>` uses this crate to build the live `HardwareBackend`.
+USB-serial driver for the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the root workspace via `Cargo.toml::exclude`). The crate exposes serial discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frame encode/decode, pipelined send, reconnect state, firmware telemetry snapshots, and HID error mapping. `synapse-mcp --hardware-hid <port|auto>` uses this crate to build the live `HardwareBackend`.
 
 ### 9.14 synapse-test-utils (shared test rig)
 Provides `StdioMcpClient` for spawning `synapse-mcp` over stdio and driving JSON-RPC initialize → tool calls in integration tests, plus Notepad/audio fixtures (`launch_notepad`, `wait_for_window_title_regex`, `notepad_process_ids`).

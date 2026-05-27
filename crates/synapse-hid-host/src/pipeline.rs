@@ -8,6 +8,7 @@ use crate::protocol::{
     DEVICE_COMMAND_ACK, DEVICE_COMMAND_NAK, EncodeError, MAX_FRAME_LEN, MAX_PAYLOAD_LEN,
     ParseError, encode_host_frame, parse_device_frame_prefix,
 };
+use crate::telemetry::{HidTelemetrySnapshot, request_telemetry};
 
 pub const FIRST_PIPELINE_SEQUENCE: u32 = 1;
 pub const MAX_OUTSTANDING_FRAMES: usize = 16;
@@ -254,6 +255,29 @@ impl HidPipeline {
         }
 
         Ok(seqs)
+    }
+
+    /// Requests the firmware telemetry snapshot with `GET_TELEMETRY`.
+    ///
+    /// # Errors
+    ///
+    /// Returns queue-full when earlier commands are still in flight, link
+    /// timeout when the telemetry response is absent/corrupt, or command
+    /// rejected when the response is not the expected `TELEMETRY_RESP` frame.
+    pub fn get_telemetry<T>(&mut self, transport: &mut T) -> HidResult<HidTelemetrySnapshot>
+    where
+        T: Read + Write + ?Sized,
+    {
+        if !self.inflight.is_empty() {
+            return Err(HidError::QueueFull {
+                outstanding: self.inflight.len(),
+                capacity: self.window_capacity(),
+            });
+        }
+
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        request_telemetry(transport, &mut self.rx, seq, self.config.ack_timeout_ms)
     }
 
     fn read_response<T>(&mut self, transport: &mut T) -> HidResult<Option<PipelineResponse>>

@@ -369,7 +369,7 @@ Owns the process-wide `tracing` subscriber: JSON file appender (daily rolling, l
 Holds `ModelDescriptor` (id, path, sha256, input_shape, class_map), `Detector` trait (`infer(frame, opts)`), `DetectionFrame::validate`. Wraps `ort` v2.0.0-rc.12 with optional `cuda` and `directml` features (`directml` is required by `synapse-audio` for the Whisper-tiny inference). Validates SHA-256 before loading; emits `MODEL_HASH_MISMATCH` on drift.
 
 ### 9.13 synapse-hid-host
-USB-serial driver for the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the root workspace via `Cargo.toml::exclude`). The crate exposes serial discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frame encode/decode, pipelined send, reconnect state, and HID error mapping. `synapse-mcp --hardware-hid <port|auto>` uses this crate to build the live `HardwareBackend`.
+USB-serial driver for the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the root workspace via `Cargo.toml::exclude`). The crate exposes serial discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frame encode/decode, pipelined send, reconnect state, firmware telemetry snapshots, and HID error mapping. `synapse-mcp --hardware-hid <port|auto>` uses this crate to build the live `HardwareBackend`.
 
 ### 9.14 synapse-test-utils (shared test rig)
 Provides `StdioMcpClient` for spawning `synapse-mcp` over stdio and driving JSON-RPC initialize → tool calls in integration tests, plus Notepad/audio fixtures (`launch_notepad`, `wait_for_window_title_regex`, `notepad_process_ids`).
@@ -690,6 +690,7 @@ crates/synapse-hid-host/
     ├── pipeline.rs                 # ACK/NAK pipeline, retries, backpressure
     ├── protocol.rs                 # CRC16 frame encoding/parsing
     ├── reconnect.rs                # Reconnect state machine and snapshots
+    ├── telemetry.rs                # GET_TELEMETRY request + snapshot parsing
     └── transport.rs                # Serialport-backed HidGateway
 ```
 
@@ -3355,12 +3356,12 @@ separate source-of-truth readback is `health.subsystems.action.backend_resolutio
 ```text
 crates/synapse-hid-host/src/
   discover.rs, error.rs, handshake.rs, lib.rs, pipeline.rs,
-  protocol.rs, reconnect.rs, transport.rs
+  protocol.rs, reconnect.rs, telemetry.rs, transport.rs
 ```
 
 Direct dependencies (`Cargo.toml`): `crc16`, `serde`, `serialport`, `synapse-core`, `thiserror`, `tokio`, `tracing`. The crate implements the host-side serial gateway used by `HardwareBackend`: port discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frames, pipelined send, reconnect state, and structured HID errors.
 
-The live driver talks to the RP2040 firmware over USB CDC at 1 Mbaud, with CRC16 frames and a firmware version handshake. Error codes surfaced by the driver include `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, and `HID_LINK_TIMEOUT`.
+The live driver talks to the RP2040 firmware over USB CDC at 1 Mbaud, with CRC16 frames and a firmware version handshake. `HidGateway::get_telemetry` and `HidReconnectGateway::get_telemetry` issue `GET_TELEMETRY` and parse the 28-byte `TELEMETRY_RESP` payload into `HidTelemetrySnapshot { uptime_ms, frames_received, frames_dropped, link_errors, commands_executed, watchdog_fires, crc_errors }`. Error codes surfaced by the driver include `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, and `HID_LINK_TIMEOUT`.
 
 ## 3. `synapse-telemetry`
 

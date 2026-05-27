@@ -284,6 +284,7 @@ crates/synapse-hid-host/
     ├── pipeline.rs                 # ACK/NAK pipeline, retries, backpressure
     ├── protocol.rs                 # CRC16 frame encoding/parsing
     ├── reconnect.rs                # Reconnect state machine and snapshots
+    ├── telemetry.rs                # GET_TELEMETRY request + snapshot parsing
     └── transport.rs                # Serialport-backed HidGateway
 ```
 

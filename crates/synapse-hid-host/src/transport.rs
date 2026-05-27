@@ -8,6 +8,7 @@ use crate::error::{HidError, HidResult};
 use crate::handshake::{FirmwareIdentity, IDENTIFY_TIMEOUT_MS, perform_identify_handshake};
 use crate::loopback::{LoopbackPong, perform_loopback_probe};
 use crate::pipeline::{HidPipeline, HostCommandRequest};
+use crate::telemetry::HidTelemetrySnapshot;
 
 pub const DEFAULT_BAUD_RATE: u32 = 1_000_000;
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 5;
@@ -166,6 +167,16 @@ impl HidGateway {
     /// Returns the underlying serial/protocol error.
     pub fn poll_response(&mut self) -> HidResult<Option<crate::pipeline::PipelineResponse>> {
         self.pipeline.poll_response(self.port.as_mut())
+    }
+
+    /// Requests a firmware telemetry snapshot through the opened CDC link.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying serial/protocol error when the firmware does not
+    /// return a valid `TELEMETRY_RESP` frame.
+    pub fn get_telemetry(&mut self) -> HidResult<HidTelemetrySnapshot> {
+        self.pipeline.get_telemetry(self.port.as_mut())
     }
 }
 

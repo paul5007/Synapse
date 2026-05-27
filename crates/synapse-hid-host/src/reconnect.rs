@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 use crate::discover::connect_auto;
 use crate::error::{HidError, HidResult};
 use crate::pipeline::HostCommandRequest;
+use crate::telemetry::HidTelemetrySnapshot;
 use crate::transport::HidGateway;
 
 pub const RECONNECT_INTERVAL_MS: u64 = 500;
@@ -28,6 +29,14 @@ pub trait ReconnectLink: Send + 'static {
     /// not accepted by the firmware or the serial link fails.
     fn send_commands(&mut self, commands: &[HostCommandRequest<'_>]) -> HidResult<Vec<u32>>;
 
+    /// Requests firmware telemetry through this connected link.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying HID transport/protocol error when telemetry
+    /// cannot be read from the firmware.
+    fn get_telemetry(&mut self) -> HidResult<HidTelemetrySnapshot>;
+
     /// Returns a stable label for readbacks/logging, normally the serial port name.
     fn link_label(&self) -> String;
 }
@@ -39,6 +48,10 @@ impl ReconnectLink for HidGateway {
 
     fn send_commands(&mut self, commands: &[HostCommandRequest<'_>]) -> HidResult<Vec<u32>> {
         Self::send_commands(self, commands)
+    }
+
+    fn get_telemetry(&mut self) -> HidResult<HidTelemetrySnapshot> {
+        Self::get_telemetry(self)
     }
 
     fn link_label(&self) -> String {
@@ -269,6 +282,59 @@ where
                     ..
                 } => match link.send_commands(commands) {
                     Ok(seqs) => Ok(seqs),
+                    Err(error) if should_enter_reconnect(&error) => {
+                        let disconnected = disconnected_error(&self.shared.target, &error);
+                        let stored = StoredError::from_hid_error(&error);
+                        let attempts = *reconnect_attempts;
+                        *state = LinkState::Disconnected {
+                            reconnect_attempts: attempts,
+                            last_error: stored,
+                        };
+                        self.shared.wake.notify_all();
+                        Err(disconnected)
+                    }
+                    Err(error) => {
+                        *last_error = Some(StoredError::from_hid_error(&error));
+                        Err(error)
+                    }
+                },
+                LinkState::Disconnected { last_error, .. } => Err(fail_fast_disconnected(
+                    &self.shared.target,
+                    Some(last_error),
+                )),
+                LinkState::Connecting { last_error, .. } => Err(fail_fast_disconnected(
+                    &self.shared.target,
+                    last_error.as_ref(),
+                )),
+                LinkState::Stopping => Err(HidError::PortDisconnected {
+                    detail: format!(
+                        "HID reconnect worker for {} is stopping",
+                        self.shared.target
+                    ),
+                }),
+            }
+        }
+    }
+
+    /// Requests telemetry through the current link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HidError::PortDisconnected`] immediately when the link is in
+    /// reconnect state. Serial link-loss errors from a connected link also move
+    /// the gateway into reconnect state before returning `PortDisconnected`.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn get_telemetry(&self) -> HidResult<HidTelemetrySnapshot> {
+        {
+            let mut state = lock_state(&self.shared.state);
+            match &mut *state {
+                LinkState::Connected {
+                    link,
+                    reconnect_attempts,
+                    last_error,
+                    ..
+                } => match link.get_telemetry() {
+                    Ok(snapshot) => Ok(snapshot),
                     Err(error) if should_enter_reconnect(&error) => {
                         let disconnected = disconnected_error(&self.shared.target, &error);
                         let stored = StoredError::from_hid_error(&error);
@@ -579,6 +645,7 @@ mod tests {
         ReconnectGateway, ReconnectLink, ReconnectStateKind,
     };
     use crate::protocol::HOST_COMMAND_MOUSE_MOVE_REL;
+    use crate::telemetry::HidTelemetrySnapshot;
 
     #[test]
     fn reconnect_interval_contract_is_500_ms() {
@@ -795,6 +862,10 @@ mod tests {
         fn send_commands(&mut self, commands: &[HostCommandRequest<'_>]) -> HidResult<Vec<u32>> {
             let seq = self.send_command(0, &[])?;
             Ok(commands.iter().map(|_| seq).collect())
+        }
+
+        fn get_telemetry(&mut self) -> HidResult<HidTelemetrySnapshot> {
+            Ok(HidTelemetrySnapshot::default())
         }
 
         fn link_label(&self) -> String {

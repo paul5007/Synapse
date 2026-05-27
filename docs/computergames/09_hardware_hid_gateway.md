@@ -139,10 +139,9 @@ async fn main(spawner: Spawner) {
 
 Implementation checkpoint: current `main.rs` calls `serial::spawn_usb(...)`,
 then runs the LED loop. `serial.rs` builds the USB device, CDC ACM serial class,
-and three HID writers, parses CDC frames, and dispatches through `dispatch.rs`.
-The present HID writer tasks emit neutral reports every second; issue
-#374/#397/#393 own routing dispatched report state into live HID writes, and
-issue #375 owns polling `safety::Watchdog` in the hardware loop.
+and three HID writers, parses CDC frames, dispatches through `dispatch.rs`, and
+feeds shared runtime report state into the live HID writers. `RuntimeState`
+polls `safety::Watchdog`, tracks parser/drop telemetry, and feeds LED inputs.
 
 ### 4.2 Cooperative loops
 
@@ -156,7 +155,9 @@ issue #375 owns polling `safety::Watchdog` in the hardware loop.
 
 ### 4.3 HID descriptors
 
-**Mouse (boot-protocol superset).** Standard boot mouse (3 buttons + X/Y 8-bit deltas) extended with 5 buttons (forward/back) and 16-bit X/Y for higher resolution. Boot-protocol-compatible structure works at BIOS.
+**Mouse (boot protocol).** Standard boot mouse with 3 buttons, relative X/Y
+8-bit deltas, and vertical wheel. Host-side absolute/large relative movement is
+chunked into the firmware's `-127..=127` relative range before transmission.
 
 **Keyboard (boot-protocol superset).** 8-byte boot keyboard report: modifiers byte + reserved + 6 keycodes. Reports HID Usage IDs directly.
 
@@ -318,13 +319,18 @@ impl HidGateway {
     {
         self.pipeline.send_commands(self.port.as_mut(), commands)
     }
+
+    pub fn get_telemetry(&mut self) -> HidResult<HidTelemetrySnapshot> {
+        self.pipeline.get_telemetry(self.port.as_mut())
+    }
 }
 ```
 
 The current host driver is synchronous around `serialport`. `HidPipeline`
-provides the bounded sliding window, ACK/NAK parsing, and retry budget.
-`ReconnectGateway` wraps a connected link in a worker thread for reconnect
-attempts.
+provides the bounded sliding window, ACK/NAK parsing, retry budget, and
+`GET_TELEMETRY` request/`TELEMETRY_RESP` parsing. `ReconnectGateway` wraps a
+connected link in a worker thread for reconnect attempts and exposes the same
+telemetry snapshot read through the active link.
 
 ### 7.1 Auto-detect
 

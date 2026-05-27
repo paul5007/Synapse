@@ -173,12 +173,12 @@ separate source-of-truth readback is `health.subsystems.action.backend_resolutio
 ```text
 crates/synapse-hid-host/src/
   discover.rs, error.rs, handshake.rs, lib.rs, pipeline.rs,
-  protocol.rs, reconnect.rs, transport.rs
+  protocol.rs, reconnect.rs, telemetry.rs, transport.rs
 ```
 
 Direct dependencies (`Cargo.toml`): `crc16`, `serde`, `serialport`, `synapse-core`, `thiserror`, `tokio`, `tracing`. The crate implements the host-side serial gateway used by `HardwareBackend`: port discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frames, pipelined send, reconnect state, and structured HID errors.
 
-The live driver talks to the RP2040 firmware over USB CDC at 1 Mbaud, with CRC16 frames and a firmware version handshake. Error codes surfaced by the driver include `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, and `HID_LINK_TIMEOUT`.
+The live driver talks to the RP2040 firmware over USB CDC at 1 Mbaud, with CRC16 frames and a firmware version handshake. `HidGateway::get_telemetry` and `HidReconnectGateway::get_telemetry` issue `GET_TELEMETRY` and parse the 28-byte `TELEMETRY_RESP` payload into `HidTelemetrySnapshot { uptime_ms, frames_received, frames_dropped, link_errors, commands_executed, watchdog_fires, crc_errors }`. Error codes surfaced by the driver include `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, and `HID_LINK_TIMEOUT`.
 
 ## 3. `synapse-telemetry`
 

@@ -303,6 +303,9 @@ Serial prefix: SYN-PICO-HID
   serial ports and proving identity.
 - Reconnect loop every 500 ms on serial disconnect.
 - Immediate fail-fast `ACTION_HID_PORT_DISCONNECTED` while disconnected.
+- `GET_TELEMETRY` host readback via `HidGateway::get_telemetry` /
+  `HidReconnectGateway::get_telemetry`, parsing the 28-byte firmware
+  `TELEMETRY_RESP` payload.
 - `hid identify` and `hid flash` support through `synapse-mcp` CLI surfaces.
 
 ### 3.3 Action backend deliverable
