@@ -288,6 +288,24 @@ from_filter = { op = "and", args = [
     { op = "kind", kind = "perception.hud_observed" }
 ] }
 emits_kind = "benchmark.luanti.hud_observed"
+
+[[event_extensions]]
+name = "luanti_entity_observed"
+from_filter = { op = "and", args = [
+    { op = "source", source = "perception_detection" },
+    { op = "kind", kind = "entity_appeared" },
+    { op = "data", path = "/profile_id", predicate = { op = "eq", value = "luanti.minetest" } }
+] }
+emits_kind = "benchmark.luanti.entity_observed"
+
+[[event_extensions]]
+name = "luanti_action_observed"
+from_filter = { op = "and", args = [
+    { op = "source", source = "action_emitter" },
+    { op = "kind", kind = "action.dispatched" },
+    { op = "data", path = "/tool", predicate = { op = "exists" } }
+] }
+emits_kind = "benchmark.luanti.action_observed"
 "#;
 
     let loaded = parse_profile_bytes(
@@ -311,10 +329,62 @@ emits_kind = "benchmark.luanti.hud_observed"
         loaded.profile.hud[0].extractor,
         HudExtractor::ColorRatio { .. }
     ));
-    assert_eq!(loaded.profile.event_extensions.len(), 1);
+    assert_eq!(loaded.profile.event_extensions.len(), 3);
     assert_eq!(
         loaded.profile.event_extensions[0].emits_kind,
         "benchmark.luanti.hud_observed"
+    );
+    assert_eq!(
+        loaded.profile.event_extensions[1].emits_kind,
+        "benchmark.luanti.entity_observed"
+    );
+    assert_eq!(
+        loaded.profile.event_extensions[2].emits_kind,
+        "benchmark.luanti.action_observed"
+    );
+}
+
+#[test]
+fn parser_rejects_trivially_true_event_extension_filter() {
+    let toml = r#"
+id = "always_true_event"
+label = "Always True Event"
+schema_version = 1
+use_scope = "operator_owned_test"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "always-true.exe"
+
+[[event_extensions]]
+name = "always_true"
+from_filter = { op = "all" }
+emits_kind = "always.true"
+"#;
+
+    let result = parse_profile_bytes(
+        "always_true_event.toml",
+        toml.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    );
+    let Err(error) = result else {
+        panic!("always-true event extension parsed successfully but should fail");
+    };
+    println!(
+        "readback=profile_event_extension edge=always_true after=code:{} error:{}",
+        error.code(),
+        error
+    );
+    assert_eq!(error.code(), error_codes::PROFILE_PARSE_ERROR);
+    assert!(
+        error
+            .to_string()
+            .contains("from_filter must not be trivially always true")
     );
 }
 

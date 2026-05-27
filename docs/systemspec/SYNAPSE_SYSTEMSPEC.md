@@ -2981,6 +2981,7 @@ The crate ensures a per-thread COM apartment (`ComApartmentKind`) before any UIA
 | `OcrProvider`, `TextRegion`, `is_empty_region`, `read_text`, `read_text_with_provider` | `ocr.rs` |
 | `read_text_from_software_bitmap` (Windows only) | `ocr.rs` |
 | `HudTemplate`, `TemplateCounterConfig`, `extract_template_counter_from_region`, `extract_template_counter_from_frame` | `template_match.rs` — slotted normalized-correlation HUD counter extraction for hearts/hunger-style icon bars |
+| `evaluate_event_extensions`, `validate_event_extension`, `validate_event_extensions` | `event_extensions.rs` — profile `EventExtension` validation and synthetic event derivation using `synapse-core::EventFilter` |
 
 ### 4.2 `ObservationAssembler::assemble` algorithm
 
@@ -3122,6 +3123,10 @@ The fixed JSON-RPC code `-32099` is the rmcp custom-error slot; the structured `
   regions, but `observe()` does not yet run profile HUD extractors against live
   captured frames. `hud: HudReadings` is empty unless populated synthetically or
   by a caller that invokes the extractor directly.
+- **Event extension runtime wiring.** `synapse-perception` exposes the
+  `event_extensions` evaluator and validator, but the current `observe()` path
+  does not yet automatically feed live detection/HUD events through profile
+  extensions and publish them. #414 owns the creeper-nearby runtime path.
 - **Audio in `Observation`.** The `audio: AudioContext` field is populated only when an audio runtime is initialized and pushing into the observation source (current build leaves it default).
 - **Linux/macOS.** All UIA / WinEvent / WinRT OCR paths are `cfg(windows)`; non-Windows builds return `A11Y_NOT_AVAILABLE` / `OCR_BACKEND_UNAVAILABLE`.
 

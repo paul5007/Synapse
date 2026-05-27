@@ -3673,6 +3673,7 @@ dependencies = [
  "synapse-a11y",
  "synapse-capture",
  "synapse-core",
+ "synapse-reflex",
  "thiserror",
  "tokio",
  "tracing",

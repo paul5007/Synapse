@@ -644,7 +644,11 @@ from_filter = { op = "and", args = [
 emits_kind = "creeper-imminent"
 ```
 
-`event_extensions` rewrites/derives custom events the agent can subscribe to or use in `on_event` reflexes. Evaluated by perception.
+`event_extensions` derives custom events the agent can subscribe to or use in
+`on_event` reflexes. Perception validates each extension with the shared
+`EventFilter` evaluator, rejects syntactically always-true filters such as
+`{ op = "all" }`, and emits a correlated synthetic `Event` whose data includes
+the extension name plus the triggering event source, kind, sequence, and data.
 
 ### 8.3 Match precedence
 

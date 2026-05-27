@@ -97,6 +97,27 @@ impl EventFilter {
     }
 
     #[must_use]
+    pub fn is_trivially_always_true(&self) -> bool {
+        match self {
+            Self::All => true,
+            Self::None | Self::Kind { .. } | Self::Source { .. } | Self::Data { .. } => false,
+            Self::And { args } => args.iter().all(Self::is_trivially_always_true),
+            Self::Or { args } => args.iter().any(Self::is_trivially_always_true),
+            Self::Not { arg } => arg.is_trivially_always_false(),
+        }
+    }
+
+    fn is_trivially_always_false(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::All | Self::Kind { .. } | Self::Source { .. } | Self::Data { .. } => false,
+            Self::And { args } => args.iter().any(Self::is_trivially_always_false),
+            Self::Or { args } => args.iter().all(Self::is_trivially_always_false),
+            Self::Not { arg } => arg.is_trivially_always_true(),
+        }
+    }
+
+    #[must_use]
     pub fn depth(&self) -> u32 {
         match self {
             Self::All

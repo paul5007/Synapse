@@ -84,6 +84,36 @@ fn event_filter_validation_edges_have_readback() {
 }
 
 #[test]
+fn event_filter_trivially_always_true_detection_has_readback() {
+    let all_filter = EventFilter::All;
+    println!("readback=event_filter_trivial_true edge=all before={all_filter:?}");
+    let all_after = all_filter.is_trivially_always_true();
+    println!("readback=event_filter_trivial_true edge=all after={all_after}");
+    assert!(all_after);
+
+    let not_none = EventFilter::Not {
+        arg: Box::new(EventFilter::None),
+    };
+    println!("readback=event_filter_trivial_true edge=not_none before={not_none:?}");
+    let not_none_after = not_none.is_trivially_always_true();
+    println!("readback=event_filter_trivial_true edge=not_none after={not_none_after}");
+    assert!(not_none_after);
+
+    let guarded_kind = EventFilter::And {
+        args: vec![
+            EventFilter::All,
+            EventFilter::Kind {
+                kind: "entity_appeared".to_owned(),
+            },
+        ],
+    };
+    println!("readback=event_filter_trivial_true edge=guarded_kind before={guarded_kind:?}");
+    let guarded_kind_after = guarded_kind.is_trivially_always_true();
+    println!("readback=event_filter_trivial_true edge=guarded_kind after={guarded_kind_after}");
+    assert!(!guarded_kind_after);
+}
+
+#[test]
 fn event_filter_predicate_matches_have_readback() {
     let event = sample_event();
     let low_hp = EventFilter::And {

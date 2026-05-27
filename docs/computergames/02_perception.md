@@ -373,6 +373,14 @@ pub struct Event {
 
 Full schema in `06_data_schemas.md`. Persistence in `CF_EVENTS` (`07_storage_and_profiles.md`).
 
+Profile `event_extensions` are evaluated in `synapse-perception` after a real
+event is produced. Each matching extension emits a new
+`EventSource::Perception` event with `kind = emits_kind`, a correlation back to
+the triggering event sequence, and compact readback data containing the
+extension name and triggering event fields. Registration fails closed for
+invalid filters or trivially always-true filters so a profile cannot turn every
+incoming event into unbounded synthetic traffic.
+
 ---
 
 ## 8. The unified Observation

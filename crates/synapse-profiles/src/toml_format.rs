@@ -340,6 +340,15 @@ fn validate_event_extensions(
                     extension.name
                 ),
             })?;
+        if extension.from_filter.is_trivially_always_true() {
+            return Err(ProfileError::Parse {
+                path: path.to_path_buf(),
+                message: format!(
+                    "event extension {:?} from_filter must not be trivially always true",
+                    extension.name
+                ),
+            });
+        }
     }
     Ok(())
 }
