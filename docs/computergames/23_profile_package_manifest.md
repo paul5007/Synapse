@@ -214,6 +214,10 @@ real runtime install FSV.
 | `edge_bad_signature_package_manifest.toml` | Signed-required package with a known signer and intentionally corrupted signature; expected quarantine-only install failure. |
 | `edge_unknown_signer_package_manifest.toml` | Signed-required package whose signer is absent from the local trust roots; expected quarantine-only install failure. |
 | `../curated_starter_registry/curated_luanti_package_manifest.toml` | Valid curated seed package that writes a `curated_profile_target` row for `luanti.minetest`. |
+| `../curated_starter_registry/curated_notepad_package_manifest.toml` | Valid curated seed package that writes a `curated_profile_target` row for `notepad.windows`. |
+| `../curated_starter_registry/edge_notepad_unknown_use_scope_manifest.toml` | Invalid Notepad curated package with `use_scope = "unknown"`. |
+| `../curated_starter_registry/edge_notepad_missing_compatibility_manifest.toml` | Invalid Notepad curated package with no compatibility target. |
+| `../curated_starter_registry/edge_notepad_profile_mismatch_manifest.toml` | Invalid Notepad curated package whose manifest `profile_id` does not match the profile TOML id. |
 | `../curated_starter_registry/edge_unknown_use_scope_manifest.toml` | Invalid curated package with `use_scope = "unknown"`. |
 | `../curated_starter_registry/edge_missing_compatibility_manifest.toml` | Invalid curated package with no compatibility target. |
 

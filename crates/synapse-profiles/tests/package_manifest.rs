@@ -41,6 +41,28 @@ fn package_manifest_accepts_happy_fixture() -> TestResult {
 }
 
 #[test]
+fn package_manifest_accepts_curated_notepad_fixture() -> TestResult {
+    let path = curated_fixture("curated_notepad_package_manifest.toml");
+    let manifest = parse_package_manifest_file(&path)?;
+
+    assert_eq!(manifest.package_id, "profile.notepad.curated");
+    assert_eq!(manifest.profile_id, "notepad");
+    assert_eq!(
+        manifest.permissions.use_scope,
+        ProfileUseScope::Productivity
+    );
+    assert_eq!(manifest.targets[0].target_id, "notepad.windows");
+    assert_eq!(
+        manifest
+            .metadata
+            .get("curated.backlog_issue")
+            .map(String::as_str),
+        Some("#478")
+    );
+    Ok(())
+}
+
+#[test]
 fn package_manifest_accepts_signed_fixture_metadata() -> TestResult {
     let path = fixture("signed_good_package_manifest.toml");
     let manifest = parse_package_manifest_file(&path)?;
@@ -148,5 +170,16 @@ fn fixture(name: &str) -> PathBuf {
         .join("computergames")
         .join("fixtures")
         .join("profile_package_manifest")
+        .join(name)
+}
+
+fn curated_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("computergames")
+        .join("fixtures")
+        .join("curated_starter_registry")
         .join(name)
 }

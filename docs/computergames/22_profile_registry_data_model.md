@@ -423,6 +423,7 @@ classes exist in RocksDB after the MCP trigger.
 | `cf_profiles_installed_row.json` | Local installed profile row. |
 | `cf_profiles_compatibility_row.json` | Compatibility target row. |
 | `../curated_starter_registry/cf_profiles_curated_luanti_row.json` | Curated starter target row for `starter.v1` / `luanti.minetest`. |
+| `../curated_starter_registry/cf_profiles_curated_notepad_row.json` | Curated starter target row for `starter.v1` / `notepad.windows`. |
 | `cf_profiles_quality_link_row.json` | Link from registry package to `profile_quality/v1/<profile_id>`. |
 | `cf_profiles_trust_root_row.json` | Trust root row for the synthetic Ed25519 signer. |
 | `cf_profiles_quarantine_row.json` | Quarantine-only row for a rejected signed package. |

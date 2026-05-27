@@ -41,7 +41,7 @@ pad_default = "auto"
 [metadata]
 "registry.family" = "profile-registry/audit-data"
 "registry.curated_seed" = "starter.v1"
-"registry.curated_status" = "shipped_profile_needs_package"
+"registry.curated_status" = "shipped_curated_package"
 "registry.curated_tier" = "productivity.seed"
 "registry.curated_priority" = "p1"
 "registry.backlog_issue" = "#478"

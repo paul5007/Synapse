@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use anyhow::Context;
@@ -9,8 +10,12 @@ use synapse_storage::cf;
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 use tempfile::TempDir;
 
+static CURATED_REGISTRY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[tokio::test]
 async fn curated_package_install_writes_seed_target_row() -> anyhow::Result<()> {
+    let _guard = CURATED_REGISTRY_TEST_LOCK.lock().await;
     let logs = TempDir::new()?;
     let db = TempDir::new()?;
     let db_path = db.path().join("db");
@@ -33,6 +38,76 @@ async fn curated_package_install_writes_seed_target_row() -> anyhow::Result<()> 
     let after = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
     assert_eq!(after["cf_row_counts"][cf::CF_PROFILES], 6);
     assert_eq!(after["cf_row_counts"][cf::CF_KV], 1);
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn curated_productivity_package_accepts_single_token_profile_id() -> anyhow::Result<()> {
+    let _guard = CURATED_REGISTRY_TEST_LOCK.lock().await;
+    let logs = TempDir::new()?;
+    let db = TempDir::new()?;
+    let db_path = db.path().join("db");
+    let db_path_string = db_path.to_string_lossy().to_string();
+    let mut client = StdioMcpClient::launch_and_init_with_env(
+        Some(logs.path()),
+        &[("SYNAPSE_DB", db_path_string.as_str())],
+    )
+    .await?;
+
+    let manifests = TempDir::new()?;
+    let manifest_path = prepare_manifest(
+        "docs/computergames/fixtures/curated_starter_registry/curated_notepad_package_manifest.toml",
+        manifests.path(),
+        "curated-notepad.toml",
+    )?;
+    let install = structured(
+        &client
+            .tools_call(
+                "profile_registry_install",
+                json!({"manifest_path": manifest_path.display().to_string()}),
+            )
+            .await?,
+    )?;
+    assert_eq!(install["wrote_rows"], true);
+    assert_eq!(install["profile_id"], "notepad");
+    let row_keys = install["cf_profile_row_keys"]
+        .as_array()
+        .context("cf_profile_row_keys missing")?;
+    assert!(row_keys.iter().any(|key| {
+        key.as_str() == Some("profile_registry/v1/curated_target/starter.v1/notepad.windows")
+    }));
+
+    let inspect = structured(
+        &client
+            .tools_call(
+                "profile_registry_inspect",
+                json!({"row_key": "profile_registry/v1/curated_target/starter.v1/notepad.windows"}),
+            )
+            .await?,
+    )?;
+    let value = &inspect["row"]["value"];
+    assert_eq!(value["row_kind"], "curated_profile_target");
+    assert_eq!(value["target_id"], "notepad.windows");
+    assert_eq!(value["profile_id"], "notepad");
+    assert_eq!(value["use_scope"], "productivity");
+    assert_eq!(value["quality_signal"], "profile_quality.notepad");
+
+    let mismatch_path = prepare_manifest(
+        "docs/computergames/fixtures/curated_starter_registry/edge_notepad_profile_mismatch_manifest.toml",
+        manifests.path(),
+        "notepad-profile-mismatch.toml",
+    )?;
+    let mismatch = client
+        .tools_call_error(
+            "profile_registry_install",
+            json!({"manifest_path": mismatch_path.display().to_string()}),
+        )
+        .await?;
+    assert_eq!(mismatch["data"]["code"], "TOOL_PARAMS_INVALID");
+    assert_eq!(mismatch["data"]["reason"], "profile_toml_id_mismatch");
 
     let status = client.shutdown().await?;
     assert!(status.success());
@@ -160,12 +235,21 @@ fn prepare_manifest(
         .join("crates/synapse-profiles/profiles/luanti.minetest.toml")
         .canonicalize()
         .context("canonicalize Luanti profile TOML")?;
+    let notepad_profile_toml = root
+        .join("crates/synapse-profiles/profiles/notepad.toml")
+        .canonicalize()
+        .context("canonicalize Notepad profile TOML")?;
     let source = fs::read_to_string(root.join(fixture_relative_path))
         .with_context(|| format!("read fixture manifest {fixture_relative_path}"))?;
-    let rewritten = source.replace(
-        "profile_toml = \"crates/synapse-profiles/profiles/luanti.minetest.toml\"",
-        &format!("profile_toml = \"{}\"", toml_path(&profile_toml)),
-    );
+    let rewritten = source
+        .replace(
+            "profile_toml = \"crates/synapse-profiles/profiles/luanti.minetest.toml\"",
+            &format!("profile_toml = \"{}\"", toml_path(&profile_toml)),
+        )
+        .replace(
+            "profile_toml = \"crates/synapse-profiles/profiles/notepad.toml\"",
+            &format!("profile_toml = \"{}\"", toml_path(&notepad_profile_toml)),
+        );
     let path = output_dir.join(output_name);
     fs::write(&path, rewritten)?;
     Ok(path)

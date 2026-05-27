@@ -49,7 +49,7 @@ impl ProfilePackageManifest {
         }
         require_equals(path, "kind", &self.kind, PROFILE_PACKAGE_KIND)?;
         validate_package_id(path, "package_id", &self.package_id)?;
-        validate_package_id(path, "profile_id", &self.profile_id)?;
+        validate_profile_id(path, "profile_id", &self.profile_id)?;
         validate_semver(path, "package_version", &self.package_version)?;
         validate_semver(path, "profile_version", &self.profile_version)?;
         validate_timestamp(path, "created_at", &self.created_at)?;
@@ -381,6 +381,19 @@ fn validate_package_id(path: &Path, field: &str, value: &str) -> Result<(), Prof
             message: format!("{field} must contain a registry or namespace separator '.'"),
         });
     }
+    if !value.chars().all(|item| {
+        item.is_ascii_lowercase() || item.is_ascii_digit() || matches!(item, '.' | '-' | '_')
+    }) {
+        return Err(ProfileError::Parse {
+            path: path.to_path_buf(),
+            message: format!("{field} must use lowercase ascii letters, digits, '.', '-', or '_'"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_profile_id(path: &Path, field: &str, value: &str) -> Result<(), ProfileError> {
+    require_non_empty(path, field, value)?;
     if !value.chars().all(|item| {
         item.is_ascii_lowercase() || item.is_ascii_digit() || matches!(item, '.' | '-' | '_')
     }) {

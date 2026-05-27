@@ -28,7 +28,7 @@ Seed set id: `starter.v1`
 | Priority | Target | Profile id | Status | Issue | Use scope | Minimum manual FSV |
 |---|---|---|---|---|---|---|
 | P0 | Luanti / Minetest Game benchmark | `luanti.minetest` | Shipped benchmark profile | #471-#476 | `operator_owned_test` | `profile_list`, registry install/search/inspect, `observe`, action audit rows, Luanti process/log/world files, `profile_quality_refresh` |
-| P1 | Notepad | `notepad` | Bundled profile, package backlog | #478 | `productivity` | `profile_list`, registry package install, foreground observe, text/action audit row, profile quality refresh |
+| P1 | Notepad | `notepad` | Shipped productivity package | #478 | `productivity` | `profile_list`, registry package install/search/inspect, foreground observe, text/action audit row, profile quality refresh, Notepad value readback |
 | P1 | Visual Studio Code / VSCodium | `vscode` | Bundled profile, package backlog | #479 | `productivity` | `profile_list`, registry package install, foreground observe, key action audit row, profile quality refresh |
 | P1 | Windows Terminal / PowerShell | `terminal` | Bundled profile, package backlog | #480 | `productivity` | `profile_list`, registry package install, foreground observe, text/action audit row, profile quality refresh |
 | P1 | Chromium-family browsers | `chrome` | Bundled profile, package backlog | #481 | `productivity` | `profile_list`, registry package install, foreground observe, navigation/tab action audit row, profile quality refresh |
@@ -135,5 +135,10 @@ Fixture directory:
 |---|---|
 | `curated_luanti_package_manifest.toml` | Valid curated package manifest that writes a `curated_profile_target` row for `luanti.minetest`. |
 | `cf_profiles_curated_luanti_row.json` | Static expected row shape for docs/data-model review; runtime FSV must still inspect RocksDB. |
+| `curated_notepad_package_manifest.toml` | Valid curated package manifest that writes a `curated_profile_target` row for `notepad.windows`. |
+| `cf_profiles_curated_notepad_row.json` | Static expected row shape for the Notepad starter package; runtime FSV must still inspect RocksDB. |
+| `edge_notepad_unknown_use_scope_manifest.toml` | Invalid Notepad package: installable curated package cannot use `use_scope = "unknown"`. |
+| `edge_notepad_missing_compatibility_manifest.toml` | Invalid Notepad package: curated target cannot ship without a compatibility target. |
+| `edge_notepad_profile_mismatch_manifest.toml` | Invalid Notepad package: manifest `profile_id` must match the authored profile TOML id. |
 | `edge_unknown_use_scope_manifest.toml` | Invalid package: installable curated package cannot use `use_scope = "unknown"`. |
 | `edge_missing_compatibility_manifest.toml` | Invalid package: curated target cannot ship without a compatibility target. |
