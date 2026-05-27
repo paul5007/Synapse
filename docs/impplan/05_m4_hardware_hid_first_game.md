@@ -28,10 +28,11 @@ package-manager installs, model/file generation, firmware flashing, launching
 apps, USB/COM inspection, and Synapse-driven UI inspection are agent-owned work
 when reversible on this host; they are not reasons to stop and are not operator
 errands while the agent can do them locally.
-Missing local state creates the next action for the agent, not a blocker while
-reversible host work remains. Use Synapse's local computer-control surface to
-keep moving until the remaining step is a specific operator-only external
-decision.
+Missing local state creates the next action for the agent and must be made
+real, not handed back to the operator or treated as a blocker while reversible
+host work remains. Use Synapse's local computer-control surface, equivalent to
+the operator's local control for reversible host work, to keep moving until the
+remaining step is a specific operator-only external decision.
 Nothing is ever `status:blocked` because a configured-host prerequisite is
 absent; the only blockable item is the exact operator-only hard-to-reverse
 external action left after every reversible local step is exhausted.

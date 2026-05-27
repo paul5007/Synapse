@@ -17,11 +17,13 @@ browser, package-manager, and device-management workflows, to make missing
 tools, drivers, models, files, services, account state, firmware, and hardware
 surfaces real. They must then read the physical source of truth directly and
 ask only before hard-to-reverse external actions.
-Do not stop at "missing": if the operator could do it from this computer, the
-agent must use Synapse/local host control to make it happen, then inspect the
-resulting source of truth.
-Missing local state creates the next action for the agent, not a blocker while
-reversible host work remains.
+Do not stop at "missing": Synapse gives the agent the same practical local
+host-control ability the operator has at this computer. If the operator could
+do it locally, the agent must use Synapse/local host control to make it happen,
+then inspect the resulting source of truth.
+Missing local state creates the next action for the agent and must be made
+real, not handed back to the operator or treated as a blocker while reversible
+host work remains.
 Nothing is ever `status:blocked` because a configured-host prerequisite is
 absent; the only blockable item is the exact operator-only hard-to-reverse
 external action left after every reversible local step is exhausted.

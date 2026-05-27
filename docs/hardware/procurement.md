@@ -6,11 +6,13 @@ work item blocked by absence alone. Complete every reversible local step first:
 verify the toolchain, build the UF2, inspect USB/device state, and only then ask
 for narrow approval if buying hardware or using an external account is required.
 Synapse gives the agent full local computer-control responsibility on this
-host, so browser sourcing, installer downloads, tool installs, BOOTSEL/USB/COM
+host, equivalent to the operator's local control for reversible host work, so
+browser sourcing, installer downloads, tool installs, BOOTSEL/USB/COM
 inspection, firmware flashing, and UI inspection are agent-owned while they are
 locally reversible.
-Missing local state creates the next action for the agent, not a blocker while
-reversible host work remains.
+Missing local state creates the next action for the agent and must be made
+real, not handed back to the operator or treated as a blocker while reversible
+host work remains.
 Nothing is ever `status:blocked` because a configured-host prerequisite is
 absent; the only blockable item is the exact operator-only hard-to-reverse
 external action left after every reversible local step is exhausted.

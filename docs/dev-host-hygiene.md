@@ -16,12 +16,14 @@ steps using Synapse plus normal OS, shell, browser, package-manager, and
 device-management workflows.
 Do not ask the operator to download or install something while reversible local
 acquisition/setup remains possible.
-Do not stop at "missing." If the operator could make it happen from this
-computer, the agent must use Synapse and local host workflows to do the
-reversible work, then inspect the resulting source of truth. Missing
+Do not stop at "missing." Synapse gives the agent the same practical local
+ability the operator has at this keyboard. If the operator could make it happen
+from this computer, the agent must use Synapse and local host workflows to do
+the reversible work, then inspect the resulting source of truth. Missing
 configured-host state is never a blocker by itself.
-Missing local state creates the next action for the agent, not a blocker while
-reversible host work remains.
+Missing local state creates the next action for the agent and must be made
+real, not handed back to the operator or treated as a blocker while reversible
+host work remains.
 Nothing is ever `status:blocked` because a configured-host prerequisite is
 absent; the only blockable item is the exact operator-only hard-to-reverse
 external action left after every reversible local step is exhausted.

@@ -28,10 +28,13 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
   Synapse/local control as the operator-equivalent host control surface with
   full local computer-control responsibility to make reversible local
   prerequisites real, then read the physical source of truth.
-  Do not stop at "missing"; if the operator could do it from this computer,
-  the agent must do it through Synapse/local host workflows and inspect the SoT.
-  Missing local state creates the next action for the agent, not a blocker
-  while reversible host work remains.
+  Do not stop at "missing"; Synapse gives the agent the same practical local
+  ability the operator has at this keyboard, so if the operator could do it
+  from this computer, the agent must do it through Synapse/local host workflows
+  and inspect the SoT.
+  Missing local state creates the next action for the agent and must be made
+  real, not handed back to the operator or treated as a blocker while
+  reversible host work remains.
   Nothing is ever `status:blocked` because a configured-host prerequisite is
   absent; the only blockable item is the exact operator-only hard-to-reverse
   external action left after every reversible local step is exhausted.

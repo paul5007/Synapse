@@ -53,17 +53,19 @@ Do not ask the operator to download or install something while reversible local
 acquisition/setup remains possible.
 
 Operationally: do not stop at "missing." Use the same local host control the
-operator has through Synapse. If it can be done from this computer, do it and
-then inspect the resulting source of truth. Missing configured-host state is
-never a blocker by itself.
+operator has through Synapse. For reversible local work, Synapse gives the
+agent the same practical ability the operator has at this keyboard. If it can
+be done from this computer, the agent must do it and then inspect the resulting
+source of truth. Missing configured-host state is never a blocker by itself.
 Nothing is ever `status:blocked` because a configured-host prerequisite is
 absent; the only blockable item is the exact operator-only hard-to-reverse
 external action left after every reversible local step is exhausted.
 
-Treat missing local state as the next action, not as an excuse to pause. Synapse
-gives enough local computer control to do every reversible host action the
-operator could do from this machine. Use that control to keep the issue moving
-until the only remaining step is a specific operator-only external decision.
+Treat missing local state as the next action and make it happen, not as an
+excuse to pause or ask the operator to do local setup. Synapse gives enough
+local computer control to do every reversible host action the operator could do
+from this machine. Use that control to keep the issue moving until the only
+remaining step is a specific operator-only external decision.
 
 Synapse gives the agent full local computer-control responsibility for this
 host. Do not hand local work back to the operator just because a prerequisite is
