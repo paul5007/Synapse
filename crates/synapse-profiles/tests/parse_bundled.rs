@@ -1,6 +1,6 @@
 use std::{fs, time::UNIX_EPOCH};
 
-use synapse_core::{Backend, HudExtractor, HudRegion, error_codes};
+use synapse_core::{Backend, HudExtractor, HudRegion, ProfileUseScope, error_codes};
 use synapse_profiles::{
     ProfileError, ScreenBounds, bundled_profiles_dir, parse_profile_bytes, parse_profile_file,
 };
@@ -33,7 +33,53 @@ fn bundled_profiles_parse_and_keep_natural_defaults() -> Result<(), Box<dyn std:
     ids.sort();
     assert_eq!(
         ids,
-        ["chrome", "luanti.minetest", "notepad", "terminal", "vscode"]
+        [
+            "chrome",
+            "luanti.minetest",
+            "minecraft.java",
+            "notepad",
+            "terminal",
+            "vscode",
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn bundled_minecraft_profile_carries_first_game_contract() -> Result<(), Box<dyn std::error::Error>>
+{
+    let path = bundled_profiles_dir().join("minecraft.java.toml");
+    let loaded = parse_profile_file(&path)?;
+    let profile = loaded.profile;
+
+    assert_eq!(profile.id, "minecraft.java");
+    assert_eq!(profile.use_scope, ProfileUseScope::SinglePlayer);
+    assert_eq!(profile.matches.len(), 2);
+    assert_eq!(
+        profile.detection.model_id.as_deref(),
+        Some("yolov10n_general")
+    );
+    assert_eq!(
+        profile.detection.classes_of_interest,
+        ["player", "zombie", "skeleton", "creeper", "villager"]
+    );
+    assert_eq!(profile.hud.len(), 3);
+    assert_eq!(profile.keymap["attack"], "lmb");
+    assert_eq!(profile.keymap["place"], "rmb");
+    assert_eq!(profile.keymap["sneak"], "lshift");
+    assert!(
+        profile
+            .event_extensions
+            .iter()
+            .any(|extension| extension.name == "creeper_nearby")
+    );
+    assert_eq!(
+        profile.metadata["supported_use.remote_server_allowed"],
+        "false"
+    );
+    assert_eq!(
+        profile.metadata["runtime.minecraft.configured_host_status"],
+        "launcher_installed_sign_in_required_java_runtime_not_verified"
     );
     Ok(())
 }

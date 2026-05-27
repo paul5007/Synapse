@@ -389,7 +389,7 @@ mod linux {
             "pagedown" | "page_down" => Some(EnigoKey::PageDown),
             "pageup" | "page_up" => Some(EnigoKey::PageUp),
             "right" | "arrowright" => Some(EnigoKey::RightArrow),
-            "shift" => Some(EnigoKey::Shift),
+            "shift" | "leftshift" | "lshift" | "rightshift" | "rshift" => Some(EnigoKey::Shift),
             "space" => Some(EnigoKey::Space),
             "tab" => Some(EnigoKey::Tab),
             "up" | "arrowup" => Some(EnigoKey::UpArrow),

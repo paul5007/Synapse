@@ -139,6 +139,41 @@ fn package_manifest_accepts_curated_chrome_fixture() -> TestResult {
 }
 
 #[test]
+fn package_manifest_accepts_curated_minecraft_fixture() -> TestResult {
+    let path = curated_fixture("curated_minecraft_package_manifest.toml");
+    let manifest = parse_package_manifest_file(&path)?;
+
+    assert_eq!(manifest.package_id, "profile.minecraft.java.curated");
+    assert_eq!(manifest.profile_id, "minecraft.java");
+    assert_eq!(
+        manifest.permissions.use_scope,
+        ProfileUseScope::SinglePlayer
+    );
+    assert_eq!(manifest.targets[0].target_id, "minecraft.java");
+    assert_eq!(
+        manifest.targets[0].process_name.as_deref(),
+        Some("javaw.exe")
+    );
+    assert_eq!(
+        manifest
+            .metadata
+            .get("runtime.minecraft.configured_host_status")
+            .map(String::as_str),
+        Some("launcher_installed_sign_in_required_java_runtime_not_verified")
+    );
+    assert_eq!(
+        manifest
+            .metadata
+            .get("curated.minimum_manual_fsv")
+            .map(String::as_str),
+        Some(
+            "profile_list,profile_registry_install,observe,storage_inspect,profile_quality_refresh,minecraft_process_window_readback,minecraft_world_log_readback,luanti_analogue_readback"
+        )
+    );
+    Ok(())
+}
+
+#[test]
 fn package_manifest_accepts_signed_fixture_metadata() -> TestResult {
     let path = fixture("signed_good_package_manifest.toml");
     let manifest = parse_package_manifest_file(&path)?;

@@ -116,7 +116,7 @@ fn named_key(value: &str) -> Option<EnigoKey> {
         "pagedown" => Some(EnigoKey::PageDown),
         "pageup" => Some(EnigoKey::PageUp),
         "right" | "arrowright" => Some(EnigoKey::RightArrow),
-        "shift" => Some(EnigoKey::Shift),
+        "shift" | "leftshift" | "lshift" | "rightshift" | "rshift" => Some(EnigoKey::Shift),
         "space" => Some(EnigoKey::Space),
         "tab" => Some(EnigoKey::Tab),
         "up" | "arrowup" => Some(EnigoKey::UpArrow),

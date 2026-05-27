@@ -218,6 +218,11 @@ real runtime install FSV.
 | `../curated_starter_registry/edge_notepad_unknown_use_scope_manifest.toml` | Invalid Notepad curated package with `use_scope = "unknown"`. |
 | `../curated_starter_registry/edge_notepad_missing_compatibility_manifest.toml` | Invalid Notepad curated package with no compatibility target. |
 | `../curated_starter_registry/edge_notepad_profile_mismatch_manifest.toml` | Invalid Notepad curated package whose manifest `profile_id` does not match the profile TOML id. |
+| `../curated_starter_registry/curated_minecraft_package_manifest.toml` | Valid Minecraft Java curated seed package that writes a `curated_profile_target` row for `minecraft.java`. |
+| `../curated_starter_registry/edge_minecraft_unknown_use_scope_manifest.toml` | Invalid Minecraft curated package with `use_scope = "unknown"`. |
+| `../curated_starter_registry/edge_minecraft_missing_compatibility_manifest.toml` | Invalid Minecraft curated package with no compatibility target. |
+| `../curated_starter_registry/edge_minecraft_remote_allowed_manifest.toml` | Invalid Minecraft curated package that attempts to allow remote/server execution. |
+| `../curated_starter_registry/edge_minecraft_profile_mismatch_manifest.toml` | Invalid Minecraft curated package whose manifest `profile_id` does not match the profile TOML id. |
 | `../curated_starter_registry/edge_unknown_use_scope_manifest.toml` | Invalid curated package with `use_scope = "unknown"`. |
 | `../curated_starter_registry/edge_missing_compatibility_manifest.toml` | Invalid curated package with no compatibility target. |
 

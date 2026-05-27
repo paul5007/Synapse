@@ -141,6 +141,23 @@ fn normalized_keys_accept_vs_code_terminal_backtick_shortcut() {
 }
 
 #[test]
+fn normalized_keys_accept_minecraft_lshift_alias() {
+    let before = vec!["lshift".to_owned()];
+    println!("readback=act_press_keys edge=lshift_alias before={before:?}");
+    let after =
+        normalized_keys(&before).unwrap_or_else(|error| panic!("lshift should normalize: {error}"));
+    let labels = after
+        .iter()
+        .map(|key| match &key.code {
+            synapse_core::KeyCode::Named { value } => value.as_str(),
+            _ => "",
+        })
+        .collect::<Vec<_>>();
+    println!("readback=act_press_keys edge=lshift_alias after={labels:?}");
+    assert_eq!(labels, ["shift"]);
+}
+
+#[test]
 fn event_sequence_reads_recording_events() {
     let before = vec![
         RecordedInput::KeyDown { key: key("ctrl") },

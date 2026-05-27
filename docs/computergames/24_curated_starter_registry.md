@@ -32,7 +32,7 @@ Seed set id: `starter.v1`
 | P1 | Visual Studio Code / VSCodium | `vscode` | Shipped productivity package | #479 | `productivity` | `profile_list`, registry package install/search/inspect, foreground observe, key/text action audit rows, profile quality refresh, VS Code file/command-palette/terminal readback |
 | P1 | Windows Terminal / PowerShell | `terminal` | Shipped productivity package | #480 | `productivity` | `profile_list`, registry package install/search/inspect, foreground observe, clipboard paste/enter action audit rows, command output readback, profile quality refresh, terminal settings readback |
 | P1 | Chromium-family browsers | `chrome` | Shipped productivity package | #481 | `productivity` | `profile_list`, registry package install/search/inspect, foreground observe, address-bar clipboard navigation/action audit rows, browser title/history readback, profile quality refresh |
-| P1 | Minecraft Java | `minecraft.java` | Planned game profile | #482 | `operator_owned_test` / `single_player` only after policy decision | Real game process/window/world/log SoTs, supported-use denial edges, registry package install, action/reflex audit rows |
+| P1 | Minecraft Java | `minecraft.java` | Shipped profile/package; real runtime evidence pending local game install/login | #416/#482 | `single_player` | `profile_list`, registry install/search/inspect, metadata readback, Luanti analogue readback, real Minecraft process/window/world/log SoTs before runtime claims |
 
 Luanti remains the whole-system benchmark target because it is installed,
 account-free, resettable, and already verified on this configured host. Minecraft
@@ -149,6 +149,12 @@ Fixture directory:
 | `edge_chrome_unknown_use_scope_manifest.toml` | Invalid browser package: installable curated package cannot use `use_scope = "unknown"`. |
 | `edge_chrome_missing_compatibility_manifest.toml` | Invalid browser package: curated target cannot ship without a compatibility target. |
 | `edge_chrome_profile_mismatch_manifest.toml` | Invalid browser package: manifest `profile_id` must match the authored profile TOML id. |
+| `curated_minecraft_package_manifest.toml` | Valid curated package manifest that writes a `curated_profile_target` row for `minecraft.java` without claiming real Minecraft runtime evidence. |
+| `cf_profiles_curated_minecraft_row.json` | Static expected row shape for the Minecraft Java starter package; runtime FSV must still inspect RocksDB. |
+| `edge_minecraft_unknown_use_scope_manifest.toml` | Invalid Minecraft package: installable curated package cannot use `use_scope = "unknown"`. |
+| `edge_minecraft_missing_compatibility_manifest.toml` | Invalid Minecraft package: curated target cannot ship without a compatibility target. |
+| `edge_minecraft_remote_allowed_manifest.toml` | Invalid Minecraft package: profile packages remain local-only and cannot allow remote/server execution. |
+| `edge_minecraft_profile_mismatch_manifest.toml` | Invalid Minecraft package: manifest `profile_id` must match the authored profile TOML id. |
 | `edge_vscode_unknown_use_scope_manifest.toml` | Invalid VS Code package: installable curated package cannot use `use_scope = "unknown"`. |
 | `edge_vscode_missing_compatibility_manifest.toml` | Invalid VS Code package: curated target cannot ship without a compatibility target. |
 | `edge_vscode_profile_mismatch_manifest.toml` | Invalid VS Code package: manifest `profile_id` must match the authored profile TOML id. |

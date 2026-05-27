@@ -58,6 +58,7 @@ fn canonical_key_name(raw_key: &str) -> Result<String, ErrorData> {
         "escape" => "esc",
         "return" => "enter",
         "backtick" | "grave" | "graveaccent" | "keyboardgraveaccent" => "`",
+        "leftshift" | "lshift" | "rightshift" | "rshift" => "shift",
         "arrowup" => "up",
         "arrowdown" => "down",
         "arrowleft" => "left",
