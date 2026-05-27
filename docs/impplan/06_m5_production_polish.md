@@ -45,6 +45,12 @@ required for local use; read-only source config, package fetch, update
 metadata, contribution submission, moderation records, trust metadata, and
 revocations remain distinct source-of-truth surfaces.
 
+Local registry storage/data-model boundaries are governed by
+`docs/computergames/22_profile_registry_data_model.md`. Registry source,
+package, profile-version, installed-profile, compatibility, and quality-link
+rows live under namespaced `CF_PROFILES` keys; `CF_KV` holds only tiny head
+pointers.
+
 ## Demo gate
 
 Fresh Windows 11 VM (no Synapse pre-installed) → operator runs `synapse-mcp setup` wizard → Claude Desktop completes the multi-app scenario per `15 §7`:

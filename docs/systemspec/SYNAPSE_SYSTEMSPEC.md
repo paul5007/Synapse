@@ -74,7 +74,7 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
   installs, model/file generation, firmware flashing, app launching, USB/COM
   inspection, and UI inspection are agent-owned work when reversible on this
   host.
-- For the contract-level PRD, see `docs/computergames/` (numbered 00-21).
+- For the contract-level PRD, see `docs/computergames/` (numbered 00-22).
 - For the per-milestone work-item ledger, see `docs/impplan/` (numbered 00–07).
 
 
@@ -777,7 +777,7 @@ crates/synapse-overlay/
 
 | Path | Description |
 |---|---|
-| `docs/computergames/` | Product Requirements Document (PRD) — 22 numbered files covering architecture, perception, action, reflex, MCP surface, schemas, storage, supported use, hardware HID, perf budget, security, observability, testing, build, roadmap, open questions, research appendix, Luanti benchmark/runbook, profile-registry governance, and optional registry protocol |
+| `docs/computergames/` | Product Requirements Document (PRD) — 23 numbered files covering architecture, perception, action, reflex, MCP surface, schemas, storage, supported use, hardware HID, perf budget, security, observability, testing, build, roadmap, open questions, research appendix, Luanti benchmark/runbook, profile-registry governance, optional registry protocol, and local registry data model |
 | `docs/impplan/` | Implementation plan — methodology + per-milestone work-item ledger (M0 through M5) + cross-cutting concerns |
 | `docs/adr/0001-current-rust-and-dependencies.md` | ADR: pinned to current stable Rust, no MSRV downgrade |
 | `docs/adr/0002-rocksdb-primary-storage.md` | ADR: RocksDB chosen over LMDB/sled for primary storage |
@@ -3582,6 +3582,7 @@ Source files covered:
 - `docs/computergames/19_luanti_manual_fsv_runbook.md`
 - `docs/computergames/20_profile_registry_governance.md`
 - `docs/computergames/21_profile_registry_protocol.md`
+- `docs/computergames/22_profile_registry_data_model.md`
 - `docs/adr/0001..0007*.md`
 
 ## 1. Authority order
@@ -3824,6 +3825,7 @@ Open items remaining (PRD §16): OQ-003 (detection model default — YOLOv10n vs
 | `docs/computergames/19_luanti_manual_fsv_runbook.md` | Manual whole-system FSV runbook for the Luanti benchmark |
 | `docs/computergames/20_profile_registry_governance.md` | Profile/audit contribution rights, licensing, attribution, provenance, and revocation governance |
 | `docs/computergames/21_profile_registry_protocol.md` | Optional shared registry protocol, source config, moderation state, update metadata, and contribution submission boundary |
+| `docs/computergames/22_profile_registry_data_model.md` | Local profile registry data model, `CF_PROFILES`/`CF_KV` row namespaces, and install/register edge rules |
 | `docs/impplan/00_methodology.md` | Dev discipline, FSV protocol, work-item shape |
 | `docs/impplan/0{1..6}_m{0..5}_*.md` | Per-milestone work-item ledger |
 | `docs/impplan/07_cross_cutting.md` | Perf gates, security, observability, release |

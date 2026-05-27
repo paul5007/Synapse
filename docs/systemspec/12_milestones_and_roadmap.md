@@ -19,6 +19,7 @@ Source files covered:
 - `docs/computergames/19_luanti_manual_fsv_runbook.md`
 - `docs/computergames/20_profile_registry_governance.md`
 - `docs/computergames/21_profile_registry_protocol.md`
+- `docs/computergames/22_profile_registry_data_model.md`
 - `docs/adr/0001..0007*.md`
 
 ## 1. Authority order
@@ -261,6 +262,7 @@ Open items remaining (PRD §16): OQ-003 (detection model default — YOLOv10n vs
 | `docs/computergames/19_luanti_manual_fsv_runbook.md` | Manual whole-system FSV runbook for the Luanti benchmark |
 | `docs/computergames/20_profile_registry_governance.md` | Profile/audit contribution rights, licensing, attribution, provenance, and revocation governance |
 | `docs/computergames/21_profile_registry_protocol.md` | Optional shared registry protocol, source config, moderation state, update metadata, and contribution submission boundary |
+| `docs/computergames/22_profile_registry_data_model.md` | Local profile registry data model, `CF_PROFILES`/`CF_KV` row namespaces, and install/register edge rules |
 | `docs/impplan/00_methodology.md` | Dev discipline, FSV protocol, work-item shape |
 | `docs/impplan/0{1..6}_m{0..5}_*.md` | Per-milestone work-item ledger |
 | `docs/impplan/07_cross_cutting.md` | Perf gates, security, observability, release |

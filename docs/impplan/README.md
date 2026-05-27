@@ -82,6 +82,11 @@ The protocol/moderation baseline for #469 is
 state is optional; local registry behavior must remain offline-capable, and
 search/fetch/contribution/moderation/update metadata are separate SoTs.
 
+The local storage/data-model baseline for #455 is
+`docs/computergames/22_profile_registry_data_model.md`. M5 v0 registry rows use
+`CF_PROFILES` namespaced JSON rows plus `CF_KV` head pointers; no new
+registry-specific CF migration is introduced by default.
+
 ---
 
 ## State-tracking — three sources, in order of authority

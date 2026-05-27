@@ -336,6 +336,25 @@ operator-approved path and the governance metadata defined in
 license SPDX expression, attribution, provenance, revocation state, redaction
 policy, and operator consent id.
 
+### 7.1 Local profile registry row namespaces
+
+The local profile registry uses existing `CF_PROFILES` JSON rows for M5 v0; no
+new RocksDB column family is introduced until runtime access patterns prove one
+is needed. `CF_KV` is reserved only for tiny registry head/pointer rows.
+
+| Row kind | CF | Key |
+|---|---|---|
+| Registry source | `CF_PROFILES` | `profile_registry/v1/source/<source_id>` |
+| Profile package | `CF_PROFILES` | `profile_registry/v1/package/<package_id>/<package_version>` |
+| Profile version | `CF_PROFILES` | `profile_registry/v1/profile/<profile_id>/<profile_version>` |
+| Installed profile | `CF_PROFILES` | `profile_registry/v1/installed/<profile_id>` |
+| Compatibility target | `CF_PROFILES` | `profile_registry/v1/compat/<target_id>/<profile_id>/<profile_version>` |
+| Quality link | `CF_PROFILES` | `profile_registry/v1/quality_link/<profile_id>/<profile_version>` |
+| Registry head pointer | `CF_KV` | `profile_registry/v1/head/<source_id>` |
+
+The data model and synthetic row fixtures are defined in
+[`22_profile_registry_data_model.md`](22_profile_registry_data_model.md).
+
 ---
 
 ## 8. Profile system

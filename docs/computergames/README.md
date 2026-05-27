@@ -124,6 +124,7 @@ directly; scripts, tests, benchmarks, GitHub Actions, and CI are never FSV.
 | 19 | [`19_luanti_manual_fsv_runbook.md`](19_luanti_manual_fsv_runbook.md) | Manual whole-system FSV runbook for the Luanti benchmark. |
 | 20 | [`20_profile_registry_governance.md`](20_profile_registry_governance.md) | Profile/audit contribution rights, licenses, attribution, provenance, and revocation governance. |
 | 21 | [`21_profile_registry_protocol.md`](21_profile_registry_protocol.md) | Optional shared registry protocol, local source config, moderation state, update metadata, and contribution submission boundary. |
+| 22 | [`22_profile_registry_data_model.md`](22_profile_registry_data_model.md) | Local-first profile registry data model, `CF_PROFILES`/`CF_KV` row namespaces, and install/register edge rules. |
 
 ---
 

@@ -48,6 +48,9 @@ revocation semantics for that loop are governed by
 The optional shared-registry protocol and moderation boundary are governed by
 [docs/computergames/21_profile_registry_protocol.md](docs/computergames/21_profile_registry_protocol.md);
 local registry use stays offline-capable and account-free.
+The local registry storage model is governed by
+[docs/computergames/22_profile_registry_data_model.md](docs/computergames/22_profile_registry_data_model.md),
+using namespaced `CF_PROFILES` rows plus small `CF_KV` head pointers.
 
 ## Tools
 
