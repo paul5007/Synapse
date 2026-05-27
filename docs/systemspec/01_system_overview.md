@@ -166,6 +166,21 @@ All 34 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 |---|---|---|
 | `profile_quality_refresh` | Refresh a local profile-quality snapshot from real `CF_ACTION_LOG` rows and persist/read it in `CF_PROFILES` | `server.rs::profile_quality_refresh`, `m3/profile_quality.rs` |
 
+The profile-registry / audit-data network effect is the P1 strategic moat
+tracked by #454 and child issues #455-#470. Profiles encode app/game operating
+knowledge; runtime audit rows prove which decisions worked on this host; local
+quality and compatibility scoring converts that evidence into better profile
+packages; and registry distribution feeds improved profiles back into future
+runs.
+
+Physical sources of truth for this loop are profile TOML files, future registry
+index/package files, RocksDB `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`,
+`CF_OBSERVATIONS`, `CF_SESSIONS`, and `CF_PROFILES` rows, consent/export
+bundles, and MCP readbacks such as `profile_list`, `profile_quality_refresh`,
+`storage_inspect`, and future registry/audit tools. Manual FSV must trigger the
+real runtime path and then read these physical stores directly; GitHub
+Actions/CI and automated checks never substitute for FSV.
+
 Full parameter/return tables: [13_mcp_tool_reference.md](13_mcp_tool_reference.md).
 
 ### 4.6 PRD-planned tools NOT live in this build
@@ -314,7 +329,7 @@ Currently `fn main() {}`. Will hold the debug overlay UI shipped at M5.
 | M2 — action MVP | DONE | `v0.1.0-m2` (2026-05-24) | Nine action tools, Software + ViGEm + Recording backends, operator panic hotkey, `release_all` safety paths |
 | M3 — reflex / MCP surface | DONE | `v0.1.0-m3` (2026-05-25, @ `97019ec`) | SSE bus, reflex runtime + 1 ms time-critical scheduler, RocksDB (11 CFs) + GC + 4-level disk pressure, profile loader + watcher (4 bundled), WASAPI loopback + Whisper-tiny STT, replay JSONL recorder, streamable HTTP/SSE transport with Bearer + Origin/Host + Mcp-Session-Id, 15 M3 tools (incl. four `storage_*` diagnostics) |
 | M4 — hardware HID + first game | ACTIVE | — | RP2040 firmware (`firmware/pico-hid/`) + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` |
-| M5 — production polish | blocked by M4 | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak |
+| M5 — production polish + registry/audit moat | release gate blocked by M4; registry/audit work active | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak, and the #454/#455-#470 profile-registry/audit-data learning loop |
 
 ## 11. What is NOT covered
 

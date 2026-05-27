@@ -34,7 +34,7 @@ Per `docs/impplan/README.md` §"State-tracking", the authority order is:
 | M2 | Action MVP — `synapse-action` + 9 tools + `release_all` | `v0.1.0-m2` | 2026-05-24 | `CHANGELOG.md::v0.1.0-m2` |
 | M3 | Reflex + RocksDB + profiles + HTTP/SSE + audio + 15 tools | `v0.1.0-m3` (@ `97019ec`) | 2026-05-25 | `CHANGELOG.md::v0.1.0-m3` + `docs/impplan/04_m3_reflex_mcp_surface.md` |
 | **M4** | **RP2040 firmware + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch`** | — | **ACTIVE** | `docs/impplan/05_m4_hardware_hid_first_game.md` |
-| M5 | Production polish — installer, overlay, ≥10 profiles, profile-registry/audit quality loop, VLM `describe`, soak | — | active for registry/audit child issues | `docs/impplan/06_m5_production_polish.md` |
+| M5 | Production polish — installer, overlay, ≥10 profiles, profile-registry/audit-data moat, VLM `describe`, soak | — | release gate blocked by M4; #454/#455-#470 registry/audit moat active as P1 | `docs/impplan/06_m5_production_polish.md` |
 
 M3 closed 2026-05-25 (`v0.1.0-m3` @ `97019ec`). What landed on `main`:
 
@@ -46,6 +46,32 @@ M3 closed 2026-05-25 (`v0.1.0-m3` @ `97019ec`). What landed on `main`:
 - 15 M3 tools (11 PRD M3 tools + 4 operator-only `storage_*` diagnostics added during M3 — see §3)
 - Operator panic hotkey (`Ctrl+Alt+Shift+P`) wired with 50 ms `ReleaseAll` budget
 - ADRs landed: 0003 (recursion guard, OQ-022), 0004 (priority, OQ-005), 0005 (multi-monitor capture target, OQ-012), 0006 (profile match precedence, OQ-015), 0007 (per-event notifications, OQ-029)
+
+## 2.1 P1 profile-registry / audit-data moat
+
+Issue #454 is the binding context decision for the M5 strategic data loop.
+The loop is: profile used -> audit evidence captured -> quality/compatibility
+learned -> profile improved -> registry distributes a better profile -> more
+evidence. This is product architecture, not incidental telemetry.
+
+Child issue ledger: #455 local registry storage SoT; #456 package manifest,
+provenance, compatibility; #457 profile-linked session/action/reflex audit
+rows; #458 MCP registry/audit tools; #459 signing/trust/rollback/quarantine;
+#460 consent/redaction/export bundles; #461 local quality scoring; #462
+authoring from audit/replay evidence; #463 retention/dedupe/compaction/backfill;
+#464 offline sync/contribution bundles; #465 poisoning and low-quality defenses;
+#466 curated seed registry; #467 roadmap/docs alignment; #468 inspector;
+#469 optional shared registry protocol and moderation; #470 contribution
+rights, licensing, revocation.
+
+Registry/audit work must name the physical SoT in its acceptance evidence:
+profile TOML files, future registry index/package files, RocksDB `CF_ACTION_LOG`,
+`CF_REFLEX_AUDIT`, `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, and
+`CF_PROFILES` rows, consent/export bundles, and MCP readbacks
+(`profile_list`, `profile_quality_refresh`, `storage_inspect`, and future
+registry/audit tools). Manual FSV triggers the real runtime surface and then
+reads those stores directly. GitHub Actions/CI, scripts, tests, and benchmarks
+are supporting evidence only.
 
 M3 carry-over open for M4 to address:
 

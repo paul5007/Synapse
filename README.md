@@ -1,8 +1,8 @@
 # Synapse
 
-[![M1 Perception MVP](https://img.shields.io/badge/status-M1_perception_mvp-blue)](https://github.com/ChrisRoyse/Synapse/milestone/2)
+[![M4 Active + M5 Registry/Audit Moat](https://img.shields.io/badge/status-M4_active_%2B_M5_registry_audit_moat-blue)](https://github.com/ChrisRoyse/Synapse/issues/454)
 
-Synapse is a Rust MCP server that gives AI agents a local computer-use body: structured perception, action, and low-latency reflexes live in Synapse while the connected model remains the brain. M1 ships the local perception tool surface; action, storage, profiles, and game-control surfaces start in later milestones.
+Synapse is a Rust MCP server that gives AI agents a local computer-use body: structured perception, action, and low-latency reflexes live in Synapse while the connected model remains the brain. M0-M3 are tagged, M4 hardware HID / first-game work is active, and the M5 profile-registry / audit-data moat is an active P1 workstream tracked from issue #454.
 
 ## Agent Doctrine
 
@@ -34,11 +34,17 @@ inspection, and UI inspection are agent-owned work when they are reversible on
 this host. A blocker exists only for the exact hard-to-reverse external action
 left after that local work is exhausted.
 
-## Status: M1
+## Status: M4 Active + M5 Registry/Audit Moat
 
-M1 is the local perception milestone: a working `synapse-mcp` binary serves MCP over stdio, exposes the six local tools below, and verifies the perception surface through local manual FSV instead of GitHub Actions. The live tracker is the [M1 milestone](https://github.com/ChrisRoyse/Synapse/milestone/2), with mission context pinned in [issue #86](https://github.com/ChrisRoyse/Synapse/issues/86). The implementation checklist is [docs/impplan/02_m1_perception_mvp.md](docs/impplan/02_m1_perception_mvp.md).
+M0-M3 are tagged (`v0.1.0-m0` through `v0.1.0-m3`). M4 remains the active hardware HID + first-game phase, while the M5 profile-registry / audit-data learning loop is active now as P1 product architecture. The live strategic context is [issue #454](https://github.com/ChrisRoyse/Synapse/issues/454); child work is tracked in #455-#470.
+
+The profile-registry / audit-data moat is the compounding loop: profile used -> runtime outcome audited -> quality/compatibility learned -> profile improved -> registry distributes better profile -> more evidence. Agents must treat this as a first-class product surface, not incidental telemetry.
+
+Physical sources of truth for that loop include profile TOML and future registry index/package files, RocksDB `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, and `CF_PROFILES` quality rows, consent/export bundles, and MCP readbacks such as `profile_list`, `profile_quality_refresh`, `storage_inspect`, and future registry/audit tools. Manual FSV must trigger the real runtime surface and then read those physical stores directly; GitHub Actions/CI and automated tests remain supporting evidence only.
 
 ## Tools
+
+The full current tool registry is documented in [docs/computergames/05_mcp_tool_surface.md](docs/computergames/05_mcp_tool_surface.md) and [docs/systemspec/13_mcp_tool_reference.md](docs/systemspec/13_mcp_tool_reference.md). The table below is the M1 starter surface retained for quick orientation.
 
 | Tool | Description | Milestone | Status |
 |---|---|---:|---|

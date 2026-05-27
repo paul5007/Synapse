@@ -1,20 +1,37 @@
-# 06 — M5: Production Polish (3-4 weeks) — BLOCKED BY M4
+# 06 — M5: Production Polish (3-4 weeks)
 
 > Read after `05_m4_hardware_hid_first_game.md` is closed (`v0.1.0-m4`
 > tagged). Gets a full self-contained M2-style rewrite as the first M5 task.
 > **All global invariants apply** (no backcompat, no mocks gate completion,
 > FSV with source-of-truth read-back, Natural-only motion, manual
 > configured-host shipping gate; local checks are regression support only).
+> The full v1.0 release gate remains blocked by M4, but the P1
+> profile-registry / audit-data moat track is active now via #454/#455-#470.
 
 PRD: `docs/computergames/15_roadmap_and_milestones.md` §7. Build/install: `14_build_and_packaging.md`. Acceptance: `15 §10`. Manual test plan: `13 §15`. Doctrine: `00_methodology.md` + `07_cross_cutting.md`.
 
 ## Mission (Occam's razor)
 
-**Sign an installer, fill out the debug overlay (currently a 3-LoC main.rs in `synapse-overlay`), bundle 10+ profiles including the M4 `minecraft.java` lighthouse, ship the VLM `describe` tool, and prove an 8 h soak.** Every other M5 clause is a consequence of that sentence plus the global invariants.
+**Sign an installer, fill out the debug overlay (currently a 3-LoC main.rs in `synapse-overlay`), bundle 10+ profiles including the M4 `minecraft.java` lighthouse, make the profile-registry / audit-data moat real, ship the VLM `describe` tool, and prove an 8 h soak.** Every other M5 clause is a consequence of that sentence plus the global invariants.
 
 ## Goal
 
 v1.0 ship-ready: signed installer, 10+ bundled profiles (4 from M3 + 1 from M4 + 5+ new), debug overlay (fills out `synapse-overlay` crate from M0 stub), VLM `describe` (Florence-2-base, downloaded on first call — never bundled), Grafana dashboards, soak 8 h clean, setup wizard, tray icon, public release on GitHub Releases + crates.io + winget submission.
+
+The P1 strategic data loop from #454 is part of "ship-ready": profile used ->
+audit evidence captured -> quality/compatibility learned -> profile improved
+-> registry distributes a better profile -> more evidence. Child issues
+#455-#470 are the current ledger for data model, packages, audit linkage, MCP
+tools, trust policy, consent/export, scoring, authoring, retention, sync,
+abuse defenses, seed registry, docs, inspector, shared-registry boundary, and
+governance.
+
+Manual FSV for registry/audit work must trigger the real Synapse runtime path
+where one exists and then read the physical source of truth: profile TOML,
+future registry index/package files, RocksDB `CF_ACTION_LOG`,
+`CF_REFLEX_AUDIT`, `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, and
+`CF_PROFILES`, consent/export bundles, and MCP readbacks. CI, GitHub Actions,
+tests, scripts, and benchmarks are supporting evidence only.
 
 ## Demo gate
 

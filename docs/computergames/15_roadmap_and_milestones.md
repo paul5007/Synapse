@@ -9,7 +9,7 @@
 | **M2** | Action MVP — kbd/mouse/pad + clipboard | 2 weeks |
 | **M3** | Reflex + MCP surface — tools, push events, profiles | 2-3 weeks |
 | **M4** | Hardware HID + first game profile | 2-3 weeks |
-| **M5** | Production polish — installer, docs, profiles, perf | 3-4 weeks |
+| **M5** | Production polish + profile-registry/audit-data moat | 3-4 weeks |
 
 ~14 weeks solo full-time to v1.0; ~8 weeks with two engineers. Each milestone has a hard demo criterion. No demo, no milestone.
 
@@ -187,6 +187,24 @@ Bonus: same demo via hardware HID (`--hardware-hid auto`).
 
 **Goal:** v1.0 ship-ready.
 
+M5 has one P1 strategic track that starts before the full M5 release gate:
+the profile-registry / audit-data network effect from #454. Future agents must
+not treat it as optional polish. The child issue set is #455-#470 and covers
+local registry storage, package manifests, linked audit rows, MCP registry and
+audit tools, signing/trust/rollback/quarantine, consent/redaction/export,
+profile-quality scoring, authoring from audit/replay evidence, retention and
+backfill, offline sync/contribution bundles, poisoning defenses, curated seed
+profiles, inspector UI, shared-registry moderation, and governance/licensing.
+
+Physical sources of truth for this track are registry index/package files,
+profile TOML files, RocksDB rows in `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`,
+`CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, and `CF_PROFILES`, consent and
+export bundles, and MCP readbacks (`profile_list`, `profile_quality_refresh`,
+`storage_inspect`, and future registry/audit tools). Manual FSV must trigger
+real Synapse runtime surfaces and then read those physical stores directly.
+GitHub Actions/CI, scripts, tests, and benchmark harnesses are supporting
+evidence only.
+
 ### Scope
 
 - Installer (`SynapseSetup.msi`) via `wix-installer`
@@ -195,6 +213,7 @@ Bonus: same demo via hardware HID (`--hardware-hid auto`).
 - Debug overlay (`synapse-overlay`)
 - VLM-based `describe` (Florence-2-base ONNX)
 - Full Grafana dashboards
+- Local-first profile registry + audit-data learning loop (#454, #455-#470)
 - Complete docs (this PRD + user-facing `USER_GUIDE.md`)
 - Stable schema (v1 locked; future via migration / DB wipe)
 - Performance budgets in `10_performance_budget.md` met on reference machine

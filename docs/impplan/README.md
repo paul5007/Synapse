@@ -27,10 +27,49 @@ Doctrine: `docs2/compressionprompt.md` §0-13. Keep verbatim: paths, crate names
 | 03 | [`03_m2_action_mvp.md`](03_m2_action_mvp.md) | M2 — `synapse-action` + 9 tools + `ReleaseAll` | §4 | **DONE** — tag `v0.1.0-m2` @ `51836fe` (2026-05-24) |
 | 04 | [`04_m3_reflex_mcp_surface.md`](04_m3_reflex_mcp_surface.md) | M3 — reflexes + RocksDB + profiles + HTTP/SSE + audio + 15 tools | §5 | **DONE** — tag `v0.1.0-m3` @ `97019ec` (2026-05-25) |
 | 05 | [`05_m4_hardware_hid_first_game.md`](05_m4_hardware_hid_first_game.md) | M4 — RP2040 firmware + `synapse-hid-host` + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` | §6 | **ACTIVE** — start from this file |
-| 06 | [`06_m5_production_polish.md`](06_m5_production_polish.md) | M5 — installer + overlay + 10+ profiles + VLM `describe` + soak | §7 | blocked by M4 |
+| 06 | [`06_m5_production_polish.md`](06_m5_production_polish.md) | M5 — installer + overlay + 10+ profiles + VLM `describe` + soak + registry/audit moat | §7 | release gate blocked by M4; P1 registry/audit moat active via #454/#455-#470 |
 | 07 | [`07_cross_cutting.md`](07_cross_cutting.md) | Perf gates, security, observability, release | §10/§11/§12/§14 | active |
 
 Total estimate: ~5-7w solo remaining from M4 → v1.0.0 (M4 2-3w, M5 3-4w). Each phase is merge-blocked by the prior phase's demo gate.
+
+---
+
+## P1 registry/audit moat track
+
+The profile-registry / audit-data network effect is tracked by #454 and is
+active even while the broader M5 release gate remains behind M4. Treat this as
+product architecture: profiles encode app/game operating knowledge, audit rows
+prove what worked, profile quality learns from that evidence, and registry
+packages distribute better profiles back into the loop.
+
+Child issue ledger:
+
+| Issue | Workstream |
+|---|---|
+| #455 | local-first registry data model + storage SoT |
+| #456 | profile package manifest, provenance, compatibility matrix |
+| #457 | profile-linked session/action/reflex outcome audit data |
+| #458 | MCP `profile_registry` and audit intelligence tools |
+| #459 | signing, trust policy, rollback, quarantine |
+| #460 | consent, redaction, and local export bundles |
+| #461 | local profile quality scoring from audit outcomes |
+| #462 | profile authoring loop from audit and replay evidence |
+| #463 | retention, dedupe, compaction, migration, backfill |
+| #464 | offline registry sync and contribution bundles |
+| #465 | poisoning, abuse, and low-quality contribution defenses |
+| #466 | curated starter registry and per-target profile backlog |
+| #467 | roadmap/docs alignment for the moat |
+| #468 | overlay/CLI profile registry and audit-data inspector |
+| #469 | optional shared registry protocol and moderation boundary |
+| #470 | contribution rights, licensing, revocation |
+
+Manual FSV for this track always names and reads the physical source of truth:
+profile TOML files, future registry index/package files, RocksDB
+`CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`, `CF_OBSERVATIONS`,
+`CF_SESSIONS`, and `CF_PROFILES` rows, consent/export bundles, and MCP
+readbacks (`profile_list`, `profile_quality_refresh`, `storage_inspect`, and
+future registry/audit tools). GitHub Actions/CI, scripts, tests, and benchmarks
+are supporting evidence only.
 
 ---
 

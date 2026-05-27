@@ -77,6 +77,24 @@ Shared load-bearing primitives:
 
 Two separate products would duplicate ~90% of engineering. **Synapse ships them once.**
 
+## Strategic moat: profile registry + audit data
+
+Issue #454 is the binding product decision: the profile-registry / audit-data
+network effect is P1 strategic architecture. Profiles encode app/game operating
+knowledge; audit rows prove which profile decisions worked on this configured
+host. The compounding loop is profile used -> audit evidence captured ->
+quality/compatibility learned -> profile improved -> registry distributes a
+better profile -> more evidence.
+
+This loop must be designed as local-first and consent-gated. The physical
+sources of truth are the profile TOML files, future registry index/package
+files, RocksDB `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`,
+`CF_OBSERVATIONS`, `CF_SESSIONS`, and `CF_PROFILES` quality rows,
+consent/export bundles, and MCP readbacks such as `profile_list`,
+`profile_quality_refresh`, `storage_inspect`, and future registry/audit tools.
+Manual FSV must trigger the real runtime surface and then read these stores
+directly; scripts, tests, benchmarks, GitHub Actions, and CI are never FSV.
+
 ---
 
 ## Read order
