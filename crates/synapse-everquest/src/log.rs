@@ -27,6 +27,8 @@ pub enum EverQuestLogError {
     Timestamp { timestamp: String },
     #[error("EverQuest location log line could not be parsed: {message}")]
     Location { message: String },
+    #[error("EverQuest zone-entry log line could not be parsed: {message}")]
+    Zone { message: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,6 +49,7 @@ pub struct EverQuestLogFile {
 pub enum EverQuestLogKind {
     LoggingEnabled,
     Location,
+    ZoneEntered,
     TargetNpc,
     TargetPlayer,
     TargetCleared,
@@ -76,6 +79,8 @@ pub struct EverQuestLogEvent {
     pub level: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<EverQuestLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
     pub summary: String,
 }
 
@@ -180,6 +185,9 @@ pub fn parse_log_line(line: &str) -> Result<Option<EverQuestLogEvent>, EverQuest
         .trim();
     if message.starts_with(location_prefix()) {
         return parse_location_message(timestamp, message).map(Some);
+    }
+    if message.starts_with(zone_entered_prefix()) {
+        return parse_zone_entered_message(timestamp, message).map(Some);
     }
     Ok(Some(classify_event(timestamp, message)))
 }
@@ -324,6 +332,7 @@ fn parse_location_message(
         target: None,
         channel: None,
         level: None,
+        zone: None,
         summary: format!(
             "location y={} x={} z={}",
             compact_coord(location.display_y),
@@ -346,6 +355,38 @@ fn parse_location_coord(value: Option<&str>, message: &str) -> Result<f64, EverQ
         .map_err(|_| EverQuestLogError::Location {
             message: message.to_owned(),
         })
+}
+
+fn parse_zone_entered_message(
+    timestamp: NaiveDateTime,
+    message: &str,
+) -> Result<EverQuestLogEvent, EverQuestLogError> {
+    let zone = message
+        .strip_prefix(zone_entered_prefix())
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if zone.is_empty() {
+        return Err(EverQuestLogError::Zone {
+            message: message.to_owned(),
+        });
+    }
+    Ok(EverQuestLogEvent {
+        timestamp,
+        kind: EverQuestLogKind::ZoneEntered,
+        actor: None,
+        target: None,
+        channel: None,
+        level: None,
+        location: None,
+        zone: Some(zone.to_owned()),
+        summary: format!("entered zone {zone}"),
+    })
+}
+
+const fn zone_entered_prefix() -> &'static str {
+    "You have entered "
 }
 
 fn classify_logging_or_target(
@@ -515,6 +556,7 @@ fn event(
         channel: channel.map(ToOwned::to_owned),
         level,
         location: None,
+        zone: None,
         summary: summary.into(),
     }
 }
@@ -627,6 +669,18 @@ mod tests {
         assert!((location.display_x - 23.25).abs() < f64::EPSILON);
         assert!((location.display_z - 7.0).abs() < f64::EPSILON);
         assert_eq!(event.summary, "location y=-14.5 x=23.25 z=7");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_zone_entered_event() -> Result<(), EverQuestLogError> {
+        let event = parse_log_line(
+            "[Thu May 28 12:45:46 2026] You have entered Neriak - Foreign Quarter.",
+        )?
+        .unwrap_or_else(|| panic!("expected zone event"));
+        assert_eq!(event.kind, EverQuestLogKind::ZoneEntered);
+        assert_eq!(event.zone.as_deref(), Some("Neriak - Foreign Quarter"));
+        assert_eq!(event.summary, "entered zone Neriak - Foreign Quarter");
         Ok(())
     }
 

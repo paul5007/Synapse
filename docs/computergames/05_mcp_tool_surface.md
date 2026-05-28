@@ -8,9 +8,10 @@
    tool `profile_quality_refresh` plus the #458 local registry/intelligence
    tool set, #460 adds local audit-export consent/bundle tools, and #462 adds
    six local profile-authoring candidate tools, and #468 adds the read-only
-   registry/audit inspector, #499 adds a profile-keymap action alias tool, and
-   #508 adds the narrow EverQuest `/loc` probe, bringing the live surface to
-   53. Any further agent-facing tools require an ADR-approved cap change.
+   registry/audit inspector, #499 adds a profile-keymap action alias tool,
+   #508 adds the narrow EverQuest `/loc` probe, and #510 adds the compact
+   EverQuest current-state estimator, bringing the live surface to 54. Any
+   further agent-facing tools require an ADR-approved cap change.
    Overlapping tools merge. Profile and parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
 3. **Structured input, structured output.** Every tool defines a JSON Schema with `additionalProperties: false`. Every response carries explicit fields, no free-form text.
@@ -20,8 +21,9 @@
 7. **Stable identifiers.** `element_id`, `entity_id`, `track_id`, `reflex_id`, `session_id` are returned by tools and accepted unchanged by subsequent calls. Agent never invents these.
 
 The first 30 tools below are the live M3 baseline. #499 adds `act_keymap` as a
-profile-keymap action alias and #508 adds `everquest_loc_probe` as a literal
-EverQuest `/loc` readback tool. M4 adds `act_combo`, `act_run_shell`, and
+profile-keymap action alias, #508 adds `everquest_loc_probe` as a literal
+EverQuest `/loc` readback tool, and #510 adds `everquest_current_state` as the
+compact world-state row writer/readback tool. M4 adds `act_combo`, `act_run_shell`, and
 `act_launch`; M5 adds local profile-registry/audit quality scoring, authoring
 candidates, registry row operations, import/export, audit intelligence, and
 consented redacted audit export bundles.
@@ -89,13 +91,15 @@ future `tools/list` snapshots in #447/#448.
 | 51 | `audit_export_consent_set` | write/read | writes local consent state to `CF_KV` and reads it back |
 | 52 | `audit_export_bundle` | read/write | writes a local redacted audit bundle after consent verification |
 | 53 | `everquest_loc_probe` | write/read | sends literal `/loc` to `everquest.live` and verifies the EQ log coordinate line |
+| 54 | `everquest_current_state` | write/read | fuses foreground, EQ log, map, HUD, and action audit into a compact `CF_KV` row and reads it back |
 
-M3 live count: 30 tools. Current live count: 53
+M3 live count: 30 tools. Current live count: 54
 tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
 live M3/M4 agent-facing tools. `act_keymap` is the #499 profile-keymap alias
 addition; `everquest_loc_probe` is the #508 literal `/loc` readback tool;
+`everquest_current_state` is the #510 current-state row writer/readback tool;
 `act_combo`, `act_run_shell`, and `act_launch` remain the M4 phase plan
 additions.
 
@@ -552,6 +556,40 @@ say` count before and after the trigger, plus the `CF_ACTION_LOG` started/ok or
 denied rows through `storage_inspect`. Disabled logging, non-EQ foreground,
 unknown parameters, malformed or absent location output, and any player-say
 output are failure cases, not fallbacks.
+
+### 3.13c `everquest_current_state`
+
+```json
+{
+  "name": "everquest_current_state",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
+```
+
+`everquest_current_state` estimates the compact live EverQuest state without
+sending gameplay input. It reads the active foreground/profile and HUD fields,
+the physical EverQuest log tail, recent `/loc` and zone events, local
+`maps/*.txt` landmarks, and the latest EverQuest-linked Synapse action-audit rows. It then
+writes the current snapshot to `CF_KV` key
+`everquest/current_state/v1/everquest.live` and immediately reads that same row
+back before returning.
+
+The response includes confidence-scored fields for foreground focus,
+character/server, log cursor, zone, zone short name, map-order location,
+nearest landmarks, visible level, target/consider, latest action summaries, and
+hazards. Unknown parameters fail with `TOOL_PARAMS_INVALID`. Missing active EQ
+log state, disabled logging, storage write/read failure, or malformed map/log
+state fail closed or lower confidence with explicit hazards rather than
+inventing coordinates or levels.
+
+Manual FSV must read the physical EQ log/config/map files and foreground state
+before the trigger, call the real MCP tool, then separately read the
+`CF_KV/everquest/current_state/v1/everquest.live` row through storage readback.
+The returned row readback is useful evidence, but it does not replace the
+separate source-of-truth read after the trigger.
 
 ### 3.14 `act_aim`
 

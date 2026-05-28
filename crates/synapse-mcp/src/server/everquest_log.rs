@@ -425,6 +425,7 @@ fn log_event_summary(
                 "channel": event.channel,
                 "level": event.level,
                 "location": event.location,
+                "zone": event.zone,
                 "summary": safe_event_summary(event),
                 "redacted": event_body_redacted(&event.kind),
             }
@@ -436,6 +437,7 @@ const fn kind_name(kind: &EverQuestLogKind) -> &'static str {
     match kind {
         EverQuestLogKind::LoggingEnabled => "logging_enabled",
         EverQuestLogKind::Location => "location",
+        EverQuestLogKind::ZoneEntered => "zone_entered",
         EverQuestLogKind::TargetNpc => "target_npc",
         EverQuestLogKind::TargetPlayer => "target_player",
         EverQuestLogKind::TargetCleared => "target_cleared",
@@ -485,6 +487,7 @@ mod tests {
             channel: Some("general3:2".to_owned()),
             level: None,
             location: None,
+            zone: None,
             summary: "Mikaylah tells general3:2".to_owned(),
         };
         assert_eq!(safe_event_summary(&event), "Mikaylah tells general3:2");

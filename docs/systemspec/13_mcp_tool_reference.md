@@ -3,12 +3,14 @@
 Source files covered:
 - `crates/synapse-mcp/src/server.rs`
 - `crates/synapse-mcp/src/server/everquest_tools.rs`
+- `crates/synapse-mcp/src/server/everquest_log.rs`
+- `crates/synapse-mcp/src/server/everquest_state.rs`
 - `crates/synapse-mcp/src/m1.rs` (+ `m1/{ocr, search, sources}.rs`)
 - `crates/synapse-mcp/src/m2/{aim, click, clipboard, drag, pad, press, release_all, scroll, type_text}.rs`
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 53 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 54 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -183,6 +185,20 @@ Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32
 **Errors:** `SAFETY_PROFILE_ACTION_DENIED`, `ACTION_TARGET_INVALID` with reasons such as `active_profile_mismatch`, `focused_text_entry_not_empty`, `active_log_unavailable`, `log_tail_failed`, `chat_pollution_detected`, or `location_log_line_absent`.
 
 Manual FSV must read the physical EQ log byte offset, location count, and `You say` count before and after the trigger, then read `CF_ACTION_LOG` through `storage_inspect` for the started/ok or denied rows. Automated tests are only supporting evidence.
+
+## 9c. `everquest_current_state`
+
+**Description:** "Estimate and persist compact EverQuest current state from foreground, logs, map files, HUD, and action audit"
+**Side effects:** Reads foreground/profile/HUD state, tails the active EverQuest log, reads local map files and newest EverQuest-linked action-audit rows, writes `CF_KV/everquest/current_state/v1/everquest.live`, then reads that row back before returning.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| (none) | `{}` | no | `{}` | `deny_unknown_fields`; any parameter is `TOOL_PARAMS_INVALID` |
+
+**Returns:** `EverQuestCurrentStateResponse { ok, row_key, stored_value_len_bytes, state }`. `state` includes schema version, profile id, generation time, foreground focus, character/server, log cursor, zone and zone short name, map-order location, nearest local-map landmarks, visible level, target/consider, newest action summaries, and explicit hazards. Each inferred field is confidence-scored and carries source pointers such as EQ log path/offset, map file path, HUD field name, or action audit tail.
+**Errors:** `ACTION_TARGET_INVALID` for unavailable active log state or unresolved runtime inputs, `STORAGE_WRITE_FAILED` / `STORAGE_READ_FAILED` for the durable current-state row, and `TOOL_PARAMS_INVALID` for unknown parameters.
+
+Manual FSV must read the EQ log/config/map files and foreground state before the trigger, call the real MCP tool, then independently read `CF_KV/everquest/current_state/v1/everquest.live` through storage readback. The tool's internal row readback is supporting evidence, not the separate manual source-of-truth read required for shipping.
 
 ## 10. `act_aim`
 

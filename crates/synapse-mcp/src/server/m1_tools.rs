@@ -127,7 +127,7 @@ impl SynapseService {
 }
 
 impl SynapseService {
-    fn resolve_input_profile_and_hud(
+    pub(super) fn resolve_input_profile_and_hud(
         &self,
         input: &mut synapse_perception::ObservationInput,
         include_hud: bool,

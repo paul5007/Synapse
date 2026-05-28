@@ -130,6 +130,17 @@ must not add a new `You say` line. Unknown parameters, disabled `Log=0`, non-EQ
 foreground, missing/malformed location output, or any player-say output are
 hard failures.
 
+`everquest_current_state` is the compact world-state bridge for #510. It does
+not send gameplay input. It reads foreground/profile/HUD state, the active EQ
+log tail, latest zone and `/loc` events, local map landmarks, and recent
+EverQuest-linked Synapse action-audit rows, then writes the physical storage row
+`CF_KV/everquest/current_state/v1/everquest.live` and reads that row back. This
+row is the short-lived state packet for planners and future world-model
+injection: zone, map-order location, nearest landmarks, level, target/consider,
+latest actions, and hazards with source pointers and confidence. Manual FSV for
+the tool still requires an independent post-trigger storage readback; the
+returned readback is supporting evidence, not the only verdict.
+
 Before claiming an alias effect, manually read the visible UI/log/storage SoT
 before the trigger, call the real MCP `act_keymap` tool while `eqgame.exe` is
 foreground, then separately read the visible UI/log/storage state again. The
@@ -144,15 +155,15 @@ EverQuest already creates local activity logs on this host. Current readback:
 | File | Current role |
 |---|---|
 | `C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\Logs\eqlog_Thenumberone_frostreaver.txt` | Same-day in-game activity log |
-| `C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqclient.ini` | Client config; `LastCharSel=Thenumberone`, `Log=1` |
+| `C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqclient.ini` | Client config; `Log=1`; `LastCharSel` may read `Thenumberone` or `0` and must be treated as unknown when numeric |
 | `C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\Thenumberone_frostreaver_WIZ.ini` | Character config |
 | `C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\UI_Thenumberone_frostreaver_WIZ.ini` | Character UI layout |
 
 The `synapse-everquest` crate owns EverQuest-specific log discovery, parsing,
 cursor-based tailing, and token-efficient summaries. It must turn noisy raw log
-lines into compact events such as `target_npc`, `consider`, `cast_begins`,
-`location`, `tell`, `say`, and `system` while suppressing long chat bodies
-unless a later operator-approved feature explicitly needs them. Runtime
+lines into compact events such as `zone_entered`, `target_npc`, `consider`,
+`cast_begins`, `location`, `tell`, `say`, and `system` while suppressing long
+chat bodies unless a later operator-approved feature explicitly needs them. Runtime
 integration should feed these compact events into `observe`, event streams,
 profile quality, and audit storage without dumping full raw logs into the model
 context.
@@ -167,6 +178,12 @@ Subsequent observations report `everquest.log_cursor` plus compact
 current file length fail closed as explicit filesystem events or diagnostics;
 they are not silent fallbacks. Chat-like events must carry actor/channel/summary
 metadata only and mark the body redacted by default.
+
+The current-state path reads the same compact log stream in bounded tails rather
+than loading full raw logs into the model context. Its durable row is
+`CF_KV/everquest/current_state/v1/everquest.live`; downstream route planners,
+world-model context injection, surprise detection, and scorecards should read
+that row or derived storage rows instead of rereading unbounded log text.
 
 ## Profile Registry / Audit Moat Rows
 
@@ -206,6 +223,19 @@ GitHub issues remain the canonical coordination state:
 | #499 | Safe input aliases and foreground action audit |
 | #500 | Full-tool manual FSV coverage matrix against EverQuest |
 | #501 | Gameplay learning, hotkey/focus rules, and durable skill memory |
+| #505 | EverQuest world model / DynamicJEPA navigation architecture |
+| #508 | Literal `/loc` probe with EQ log readback |
+| #510 | Current-state estimator fusing logs, `/loc`, map, HUD, and action audit |
+| #517 | Stabilize EverQuest foreground before accepted action candidates |
+| #518 | Safe target/combat model for level-1 wizard leveling |
+| #519 | Manual FSV route from Neriak Foreign Quarter to Nektulos safe area |
+| #522 | Tiny local predictive EverQuest world model after verified trajectories |
+| #525 | Calibrated map-window sensor from visible map, `/loc`, and map files |
+| #526 | Compact outcome log taxonomy for combat/spell/XP/death/hazard learning |
+| #527 | Local route planner from current state to map landmarks/zone lines |
+| #528 | Hazard and safe-area memory rows for planning |
+| #529 | ContextGraph ingestion/retrieval for exported EQ memories |
+| #531 | 60-80% useful action-prior scorecard with honest abstention |
 | #504 | Remove unsafe `open_chat` alias and verify chat-focus denial |
 
 ## Gameplay Learning Memory
@@ -230,6 +260,21 @@ Initial learned rules:
 - Use the in-game Options/keybind UI as the authoritative control list when a
   binding is uncertain.
 - Summarize public chat bodies in issues; do not preserve unnecessary raw chat.
+
+## World Model And Competence Threshold
+
+The world-model goal is practical supervised competence, not a claim of full
+game intelligence. The first useful threshold is a calibrated action prior that
+is right roughly 60-80% of the time on manually verified local EverQuest
+trajectories, with honest abstention when state is sparse or contradictory.
+That threshold is a floor, not a ceiling: keep optimizing above it as the
+profile registry, action audit, log taxonomy, map rows, and ContextGraph-style
+trajectory exports accumulate more evidence.
+
+Manual FSV remains the runtime shipping gate. Model scorecards and prediction
+accuracy are planning-quality evidence only; any real action, route, level,
+zone, storage row, or profile claim still needs before/trigger/after physical
+SoT readback.
 
 ## Manual FSV Plan
 

@@ -505,7 +505,7 @@ crates/synapse-mcp/
 ├── Cargo.toml                      # Binary crate; depends on every other library crate
 └── src/
     ├── main.rs                     # Process entrypoint, clap CLI, telemetry init, stdio/http dispatch
-    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 52 MCP tools
+    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 54 MCP tools
     ├── server/
     │   ├── action_audit.rs         # CF_ACTION_LOG start/result audit rows with profile/session context
     │   ├── audit_context.rs        # Profile activation/session/event audit context persistence helpers
@@ -2013,7 +2013,7 @@ pub struct SynapseService {
 }
 ```
 
-Implements `rmcp::ServerHandler` via `#[tool_handler(router = self.tool_router)]`. The 52 tools are declared on the same struct under the M1/M2/M3/M4 `#[tool_router]` impls; `#[tool(description = "...")]` annotations produce JSON-Schema entries for `tools/list` automatically.
+Implements `rmcp::ServerHandler` via `#[tool_handler(router = self.tool_router)]`. The 54 tools are declared on the same struct under the M1/M2/M3/M4 `#[tool_router]` impls; `#[tool(description = "...")]` annotations produce JSON-Schema entries for `tools/list` automatically.
 
 ### 1.1 Constructors
 
@@ -2279,7 +2279,7 @@ The disabling step persists `StoredReflexAudit` rows with `error_code = REFLEX_D
 
 ## 8. Tool list snapshot
 
-The full list of 52 declared tools is in [13_mcp_tool_reference.md](#file-13). They are: `health`, `observe`, `find`, `read_text`, `set_capture_target`, `set_perception_mode`, `act_click`, `act_type`, `act_press`, `act_keymap`, `act_aim`, `act_drag`, `act_scroll`, `act_pad`, `act_clipboard`, `release_all`, `subscribe`, `subscribe_cancel`, `reflex_register`, `reflex_cancel`, `reflex_list`, `reflex_history`, `profile_list`, `profile_activate`, `profile_authoring_generate`, `profile_authoring_list`, `profile_authoring_inspect`, `profile_authoring_accept`, `profile_authoring_reject`, `profile_authoring_export`, `profile_quality_refresh`, `profile_registry_search`, `profile_registry_inspect`, `profile_registry_report`, `profile_registry_install`, `profile_registry_disable`, `profile_registry_export`, `profile_registry_import`, `profile_registry_rollback`, `audit_intelligence_query`, `audit_export_consent_set`, `audit_export_bundle`, `replay_record`, `audio_tail`, `audio_transcribe`, `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample`, `act_combo`, `act_run_shell`, `act_launch` — note the M3 module set lives in `m3_tool_stubs()` (length-asserted at 33 in `instructions()`).
+The full list of 54 declared tools is in [13_mcp_tool_reference.md](#file-13). They are: `health`, `observe`, `find`, `read_text`, `set_capture_target`, `set_perception_mode`, `act_click`, `act_type`, `act_press`, `act_keymap`, `act_aim`, `act_drag`, `act_scroll`, `act_pad`, `act_clipboard`, `release_all`, `subscribe`, `subscribe_cancel`, `reflex_register`, `reflex_cancel`, `reflex_list`, `reflex_history`, `profile_list`, `profile_activate`, `profile_authoring_generate`, `profile_authoring_list`, `profile_authoring_inspect`, `profile_authoring_accept`, `profile_authoring_reject`, `profile_authoring_export`, `profile_quality_refresh`, `profile_registry_search`, `profile_registry_inspect`, `profile_registry_report`, `profile_registry_install`, `profile_registry_disable`, `profile_registry_export`, `profile_registry_import`, `profile_registry_rollback`, `audit_intelligence_query`, `audit_export_consent_set`, `audit_export_bundle`, `replay_record`, `audio_tail`, `audio_transcribe`, `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample`, `act_combo`, `act_run_shell`, `act_launch`, `everquest_loc_probe`, `everquest_current_state` — note the M3 module set lives in `m3_tool_stubs()` (length-asserted at 33 in `instructions()`).
 
 
 ---
@@ -4151,12 +4151,14 @@ The M4 demo gate is defined in `docs/impplan/05_m4_hardware_hid_first_game.md` a
 Source files covered:
 - `crates/synapse-mcp/src/server.rs`
 - `crates/synapse-mcp/src/server/everquest_tools.rs`
+- `crates/synapse-mcp/src/server/everquest_log.rs`
+- `crates/synapse-mcp/src/server/everquest_state.rs`
 - `crates/synapse-mcp/src/m1.rs` (+ `m1/{ocr, search, sources}.rs`)
 - `crates/synapse-mcp/src/m2/{aim, click, clipboard, drag, pad, press, release_all, scroll, type_text}.rs`
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 53 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 54 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -4331,6 +4333,20 @@ Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32
 **Errors:** `SAFETY_PROFILE_ACTION_DENIED`, `ACTION_TARGET_INVALID` with reasons such as `active_profile_mismatch`, `focused_text_entry_not_empty`, `active_log_unavailable`, `log_tail_failed`, `chat_pollution_detected`, or `location_log_line_absent`.
 
 Manual FSV must read the physical EQ log byte offset, location count, and `You say` count before and after the trigger, then read `CF_ACTION_LOG` through `storage_inspect` for the started/ok or denied rows. Automated tests are only supporting evidence.
+
+## 9c. `everquest_current_state`
+
+**Description:** "Estimate and persist compact EverQuest current state from foreground, logs, map files, HUD, and action audit"
+**Side effects:** Reads foreground/profile/HUD state, tails the active EverQuest log, reads local map files and newest EverQuest-linked action-audit rows, writes `CF_KV/everquest/current_state/v1/everquest.live`, then reads that row back before returning.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| (none) | `{}` | no | `{}` | `deny_unknown_fields`; any parameter is `TOOL_PARAMS_INVALID` |
+
+**Returns:** `EverQuestCurrentStateResponse { ok, row_key, stored_value_len_bytes, state }`. `state` includes schema version, profile id, generation time, foreground focus, character/server, log cursor, zone and zone short name, map-order location, nearest local-map landmarks, visible level, target/consider, newest action summaries, and explicit hazards. Each inferred field is confidence-scored and carries source pointers such as EQ log path/offset, map file path, HUD field name, or action audit tail.
+**Errors:** `ACTION_TARGET_INVALID` for unavailable active log state or unresolved runtime inputs, `STORAGE_WRITE_FAILED` / `STORAGE_READ_FAILED` for the durable current-state row, and `TOOL_PARAMS_INVALID` for unknown parameters.
+
+Manual FSV must read the EQ log/config/map files and foreground state before the trigger, call the real MCP tool, then independently read `CF_KV/everquest/current_state/v1/everquest.live` through storage readback. The tool's internal row readback is supporting evidence, not the separate manual source-of-truth read required for shipping.
 
 ## 10. `act_aim`
 
