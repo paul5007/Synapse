@@ -154,6 +154,8 @@ async fn run() -> anyhow::Result<ExitCode> {
     );
 
     let m2_config = cli.m2_config();
+    safety::agreement::ensure_hardware_hid_agreement(&m2_config)
+        .context("ensure hardware HID safety agreement")?;
     let m3_config = cli.m3_config();
     let m4_config = match cli.m4_config() {
         Ok(config) => config,

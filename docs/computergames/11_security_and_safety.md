@@ -296,7 +296,7 @@ Interactive confirmation for first-use of dangerous capabilities (prompts are mi
 | First use of `--no-redaction` | Console prompt |
 | `db wipe` | Console prompt unless `--yes` passed |
 
-Agent never sees the prompt; it's a startup-time operator confirmation. After confirming, daemon records consent and doesn't re-ask until version bump.
+Agent never sees the prompt; it's a startup-time operator confirmation. After confirming, daemon records consent and doesn't re-ask until version bump. Hardware HID consent is persisted at `%APPDATA%\synapse\agreement.json` as schema version 1 with `acknowledged_at`, the configured `hardware_hid.port`, `hardware_hid.ack_phrase_sha256`, and `supported_use_scopes=["productivity","single_player"]`. On Windows the file DACL is protected: `NT AUTHORITY\SYSTEM` has full control, the current user has read access, and non-listed principals such as Everyone are denied by the DACL's absence of an allow ACE. An explicit Everyone deny ACE is not used because it also applies to the current user's token and would defeat the required read access.
 
 ---
 

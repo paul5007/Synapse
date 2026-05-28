@@ -1,5 +1,8 @@
 use std::{net::TcpListener, process::Stdio, sync::OnceLock, time::Duration};
 
+#[cfg(windows)]
+use std::process::Command as StdCommand;
+
 use anyhow::Context;
 use tempfile::TempDir;
 use tokio::{
@@ -114,6 +117,8 @@ async fn stdio_mode_reaches_transport_path_on_closed_stdin() -> anyhow::Result<(
 #[tokio::test]
 async fn hardware_hid_missing_literal_fails_startup_with_hid_code() -> anyhow::Result<()> {
     let _guard = cli_mode_test_lock().lock().await;
+    let dir = TempDir::new()?;
+    let agreement_path = dir.path().join("agreement.json");
     let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
         .args([
             "--mode",
@@ -121,6 +126,7 @@ async fn hardware_hid_missing_literal_fails_startup_with_hid_code() -> anyhow::R
             "--hardware-hid",
             "SYNAPSE_MISSING_PORT_393",
         ])
+        .env("SYNAPSE_AGREEMENT_PATH", &agreement_path)
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
@@ -131,6 +137,10 @@ async fn hardware_hid_missing_literal_fails_startup_with_hid_code() -> anyhow::R
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("HID_PORT_NOT_FOUND"), "{stderr}");
     assert!(stderr.contains("SYNAPSE_MISSING_PORT_393"), "{stderr}");
+    #[cfg(windows)]
+    if agreement_path.exists() {
+        restore_test_acl_for_cleanup(&agreement_path)?;
+    }
     Ok(())
 }
 
@@ -351,4 +361,19 @@ fn read_logs(path: &std::path::Path) -> anyhow::Result<String> {
         }
     }
     Ok(logs)
+}
+
+#[cfg(windows)]
+fn restore_test_acl_for_cleanup(path: &std::path::Path) -> anyhow::Result<()> {
+    let principal = format!(
+        r"{}\{}:F",
+        std::env::var("USERDOMAIN")?,
+        std::env::var("USERNAME")?
+    );
+    let status = StdCommand::new("icacls")
+        .arg(path)
+        .args(["/grant", &principal])
+        .status()?;
+    assert!(status.success(), "icacls cleanup grant failed: {status}");
+    Ok(())
 }
