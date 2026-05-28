@@ -341,14 +341,17 @@ samples must show the same `session_id`/`profile_id` chain and the expected
 redaction fields; return values alone do not prove the row exists.
 
 `profile_quality_refresh` is the first profile-registry/audit-data scoring
-surface. It reads real `CF_ACTION_LOG` rows, ignores stale/corrupt/non-matching
-audit rows for scoring, writes a redacted JSON snapshot to
+surface. It reads real `CF_ACTION_LOG`, `CF_OBSERVATIONS`, and `CF_EVENTS`
+rows, ignores stale/corrupt/non-matching rows for scoring, writes a redacted
+JSON snapshot to
 `CF_PROFILES` under `profile_quality/v1/<profile_id>`, and reads that exact row
 back before returning. The snapshot stores counts, rates, a Wilson 95% lower
 bound score for foreground-profile `ok` vs `error` outcomes, compatibility
 signals, profile-schema-version recency/mixed-version counters, source row
-range, evidence hash, and a local-only contribution policy. It never exports or
-shares data by itself. Offline contribution bundles now use
+range, runtime observation/event event-kind counts, compact log-kind counts, an
+optional manual FSV evidence reference, evidence hash, and a local-only
+contribution policy. It never exports or shares data by itself. Offline
+contribution bundles now use
 `profile_registry_export bundle_kind="contribution"` to package registry rows,
 redacted action-audit evidence summaries, and the quality summary under
 deterministic hashes, then `profile_registry_import` to stage the contribution

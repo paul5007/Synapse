@@ -8,14 +8,21 @@ use synapse_storage::{cf, decode_json};
 
 use super::{
     ProfileCompatibilitySummary, ProfileQualityContribution, ProfileQualityCounts,
-    ProfileQualityRates, ProfileQualityRedaction, ProfileQualityRefreshParams, ProfileQualityScore,
-    ProfileQualitySnapshot, ProfileQualitySource, ProfileQualityVersionSummary, hex_encode,
+    ProfileQualityRates, ProfileQualityRedaction, ProfileQualityRefreshParams,
+    ProfileQualityRuntimeEvidence, ProfileQualityScore, ProfileQualitySnapshot,
+    ProfileQualitySource, ProfileQualityVersionSummary, hex_encode,
 };
 
-const QUALITY_SCHEMA_VERSION: u32 = 1;
+const QUALITY_SCHEMA_VERSION: u32 = 2;
 const FUTURE_SKEW_NS: u64 = 60 * 1_000_000_000;
 const WILSON_Z_95: f64 = 1.959_963_984_540_054;
 const CONFIDENCE_FULL_SAMPLE: f64 = 20.0;
+
+pub(super) struct ProfileQualityInputRows {
+    pub action: Vec<(Vec<u8>, Vec<u8>)>,
+    pub observations: Vec<(Vec<u8>, Vec<u8>)>,
+    pub events: Vec<(Vec<u8>, Vec<u8>)>,
+}
 
 #[derive(Debug)]
 struct ParsedAuditRow {
@@ -32,17 +39,56 @@ struct ParsedAuditRow {
     response_backend: Option<String>,
 }
 
+#[derive(Debug)]
+struct ParsedObservationRow {
+    observation_id: Option<String>,
+    ts_ns: u64,
+    foreground_profile_id: Option<String>,
+    foreground_process_name: Option<String>,
+    target_id: Option<String>,
+    recent_event_kinds: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ParsedEventRow {
+    event_id: Option<String>,
+    ts_ns: u64,
+    profile_id: Option<String>,
+    kind: String,
+    process_name: Option<String>,
+    target_id: Option<String>,
+}
+
 pub(super) fn build_snapshot(
     profile: &ProfileStatus,
-    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    rows: ProfileQualityInputRows,
     params: &ProfileQualityRefreshParams,
     generated_at_ns: u64,
 ) -> ProfileQualitySnapshot {
-    let mut builder = SnapshotBuilder::new(profile, params, rows.len() as u64, generated_at_ns);
-    for (_key, value) in rows {
+    let mut builder = SnapshotBuilder::new(
+        profile,
+        params,
+        rows.action.len() as u64,
+        rows.observations.len() as u64,
+        rows.events.len() as u64,
+        generated_at_ns,
+    );
+    for (_key, value) in rows.action {
         match parse_audit_row(&value) {
-            Ok(row) => builder.record_row(&row),
+            Ok(row) => builder.record_action_row(&row),
             Err(()) => builder.source.audit_rows_decode_failed += 1,
+        }
+    }
+    for (_key, value) in rows.observations {
+        match parse_observation_row(&value) {
+            Ok(row) => builder.record_observation_row(&row),
+            Err(()) => builder.runtime_evidence.observation_rows_decode_failed += 1,
+        }
+    }
+    for (_key, value) in rows.events {
+        match parse_event_row(&value) {
+            Ok(row) => builder.record_event_row(&row),
+            Err(()) => builder.runtime_evidence.event_rows_decode_failed += 1,
         }
     }
     builder.finish()
@@ -72,23 +118,57 @@ fn parse_audit_row(value: &[u8]) -> Result<ParsedAuditRow, ()> {
         active_profile_id: optional_string(&row, "active_profile_id"),
         active_profile_schema_version: optional_u32(&row, "active_profile_schema_version")
             .or_else(|| optional_u32(&row, "profile_schema_version")),
-        foreground_profile_id: row
-            .pointer("/foreground/profile_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        foreground_profile_id: pointer_string(&row, "/foreground/profile_id"),
         foreground_profile_schema_version: row
             .pointer("/foreground/profile_schema_version")
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok()),
-        foreground_process_name: row
-            .pointer("/foreground/process_name")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        response_backend: row
-            .pointer("/details/response/backend")
-            .or_else(|| row.pointer("/details/response/backend_used"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        foreground_process_name: pointer_string(&row, "/foreground/process_name"),
+        response_backend: pointer_string(&row, "/details/response/backend")
+            .or_else(|| pointer_string(&row, "/details/response/backend_used")),
+    })
+}
+
+fn parse_observation_row(value: &[u8]) -> Result<ParsedObservationRow, ()> {
+    let row = decode_json::<Value>(value).map_err(|_error| ())?;
+    let recent_event_kinds = row
+        .get("recent_events")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| pointer_string(item, "/kind"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(ParsedObservationRow {
+        observation_id: optional_string(&row, "observation_id"),
+        ts_ns: row.get("ts_ns").and_then(Value::as_u64).ok_or(())?,
+        foreground_profile_id: pointer_string(&row, "/foreground/profile_id"),
+        foreground_process_name: pointer_string(&row, "/foreground/process_name"),
+        target_id: pointer_identifier_string(&row, "/foreground/steam_appid")
+            .or_else(|| pointer_string(&row, "/foreground/target_id")),
+        recent_event_kinds,
+    })
+}
+
+fn parse_event_row(value: &[u8]) -> Result<ParsedEventRow, ()> {
+    let row = decode_json::<Value>(value).map_err(|_error| ())?;
+    let kind = optional_string(&row, "kind").ok_or(())?;
+    Ok(ParsedEventRow {
+        event_id: optional_string(&row, "event_id"),
+        ts_ns: row.get("ts_ns").and_then(Value::as_u64).ok_or(())?,
+        profile_id: optional_string(&row, "profile_id")
+            .or_else(|| pointer_string(&row, "/audit_context/profile_id"))
+            .or_else(|| pointer_string(&row, "/data/profile_id"))
+            .or_else(|| pointer_string(&row, "/foreground/profile_id")),
+        kind,
+        process_name: pointer_string(&row, "/data/process_name")
+            .or_else(|| pointer_string(&row, "/audit_context/app_context/process_name"))
+            .or_else(|| pointer_string(&row, "/foreground/process_name")),
+        target_id: pointer_string(&row, "/audit_context/app_context/target_id")
+            .or_else(|| pointer_string(&row, "/data/target_id"))
+            .or_else(|| pointer_identifier_string(&row, "/foreground/steam_appid")),
     })
 }
 
@@ -105,17 +185,38 @@ fn optional_u32(row: &Value, field: &str) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
+fn pointer_string(row: &Value, pointer: &str) -> Option<String> {
+    row.pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn pointer_identifier_string(row: &Value, pointer: &str) -> Option<String> {
+    let value = row.pointer(pointer)?;
+    if let Some(value) = value.as_str().filter(|value| !value.is_empty()) {
+        return Some(value.to_owned());
+    }
+    value
+        .as_u64()
+        .map(|value| value.to_string())
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
+}
+
 struct SnapshotBuilder {
     profile_id: String,
     source: ProfileQualitySource,
     counts: ProfileQualityCounts,
     compatibility: ProfileCompatibilitySummary,
     versioning: ProfileQualityVersionSummary,
+    runtime_evidence: ProfileQualityRuntimeEvidence,
     generated_at_ns: u64,
     evidence_parts: Vec<String>,
     profile_label: String,
     profile_schema_version: u32,
     quality_signal: Option<String>,
+    manual_fsv_evidence_ref: Option<String>,
+    profile_target_id: Option<String>,
 }
 
 impl SnapshotBuilder {
@@ -123,6 +224,8 @@ impl SnapshotBuilder {
         profile: &ProfileStatus,
         params: &ProfileQualityRefreshParams,
         audit_rows_scanned: u64,
+        observation_rows_scanned: u64,
+        event_rows_scanned: u64,
         generated_at_ns: u64,
     ) -> Self {
         Self {
@@ -176,16 +279,34 @@ impl SnapshotBuilder {
                 mixed_profile_schema_versions: false,
                 observed_profile_schema_versions: BTreeMap::new(),
             },
+            runtime_evidence: ProfileQualityRuntimeEvidence {
+                observation_cf_name: cf::CF_OBSERVATIONS.to_owned(),
+                event_cf_name: cf::CF_EVENTS.to_owned(),
+                observation_rows_scanned,
+                event_rows_scanned,
+                ..ProfileQualityRuntimeEvidence::default()
+            },
             generated_at_ns,
             evidence_parts: Vec::new(),
             profile_label: profile.label.clone(),
             profile_schema_version: profile.schema_version,
             quality_signal: profile.metadata.get("registry.quality_signal").cloned(),
+            manual_fsv_evidence_ref: params
+                .manual_fsv_evidence_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            profile_target_id: profile
+                .metadata
+                .get("registry.compatibility_target")
+                .or_else(|| profile.metadata.get("benchmark_id"))
+                .cloned(),
         }
     }
 
-    fn record_row(&mut self, row: &ParsedAuditRow) {
-        if self.is_stale_or_future(row.ts_ns) {
+    fn record_action_row(&mut self, row: &ParsedAuditRow) {
+        if self.is_action_stale_or_future(row.ts_ns) {
             return;
         }
         let foreground_match = row.foreground_profile_id.as_deref() == Some(&self.profile_id);
@@ -196,7 +317,7 @@ impl SnapshotBuilder {
         }
 
         self.source.audit_rows_profile_relevant += 1;
-        self.record_range(row);
+        self.record_action_range(row);
         self.record_compatibility(row, foreground_match, active_match);
         *self.counts.tool_counts.entry(row.tool.clone()).or_default() += 1;
         if let Some(error_code) = &row.error_code {
@@ -218,10 +339,106 @@ impl SnapshotBuilder {
         }
         self.record_status(row, foreground_match);
         self.record_version(row, foreground_match);
-        self.evidence_parts.push(evidence_part(row));
+        self.evidence_parts.push(action_evidence_part(row));
     }
 
-    const fn is_stale_or_future(&mut self, ts_ns: u64) -> bool {
+    fn record_observation_row(&mut self, row: &ParsedObservationRow) {
+        if self.is_runtime_stale_or_future(row.ts_ns, RuntimeRowKind::Observation) {
+            return;
+        }
+        if row.foreground_profile_id.as_deref() != Some(&self.profile_id) {
+            self.runtime_evidence.observation_rows_other_profile += 1;
+            return;
+        }
+
+        self.runtime_evidence.observation_rows_profile_relevant += 1;
+        if self
+            .runtime_evidence
+            .first_relevant_observation_id
+            .is_none()
+        {
+            self.runtime_evidence
+                .first_relevant_observation_id
+                .clone_from(&row.observation_id);
+        }
+        self.runtime_evidence
+            .last_relevant_observation_id
+            .clone_from(&row.observation_id);
+        self.record_runtime_ts(row.ts_ns);
+        if let Some(process_name) = &row.foreground_process_name {
+            increment(
+                &mut self.runtime_evidence.observed_process_names,
+                process_name.clone(),
+            );
+        }
+        let target_id = row.target_id.as_ref().or(self.profile_target_id.as_ref());
+        if let Some(target_id) = target_id {
+            increment(
+                &mut self.runtime_evidence.observed_target_ids,
+                target_id.clone(),
+            );
+        }
+        for kind in &row.recent_event_kinds {
+            increment(
+                &mut self.runtime_evidence.observed_event_kinds,
+                kind.clone(),
+            );
+            if is_log_event_kind(kind) {
+                increment(
+                    &mut self.runtime_evidence.observed_log_event_kinds,
+                    kind.clone(),
+                );
+            }
+        }
+        self.evidence_parts.push(observation_evidence_part(row));
+    }
+
+    fn record_event_row(&mut self, row: &ParsedEventRow) {
+        if self.is_runtime_stale_or_future(row.ts_ns, RuntimeRowKind::Event) {
+            return;
+        }
+        if row.profile_id.as_deref() != Some(&self.profile_id) {
+            self.runtime_evidence.event_rows_other_profile += 1;
+            return;
+        }
+
+        self.runtime_evidence.event_rows_profile_relevant += 1;
+        if self.runtime_evidence.first_relevant_event_id.is_none() {
+            self.runtime_evidence
+                .first_relevant_event_id
+                .clone_from(&row.event_id);
+        }
+        self.runtime_evidence
+            .last_relevant_event_id
+            .clone_from(&row.event_id);
+        self.record_runtime_ts(row.ts_ns);
+        if let Some(process_name) = &row.process_name {
+            increment(
+                &mut self.runtime_evidence.observed_process_names,
+                process_name.clone(),
+            );
+        }
+        let target_id = row.target_id.as_ref().or(self.profile_target_id.as_ref());
+        if let Some(target_id) = target_id {
+            increment(
+                &mut self.runtime_evidence.observed_target_ids,
+                target_id.clone(),
+            );
+        }
+        increment(
+            &mut self.runtime_evidence.observed_event_kinds,
+            row.kind.clone(),
+        );
+        if is_log_event_kind(&row.kind) {
+            increment(
+                &mut self.runtime_evidence.observed_log_event_kinds,
+                row.kind.clone(),
+            );
+        }
+        self.evidence_parts.push(event_evidence_part(row));
+    }
+
+    const fn is_action_stale_or_future(&mut self, ts_ns: u64) -> bool {
         if ts_ns > self.generated_at_ns.saturating_add(FUTURE_SKEW_NS) {
             self.source.audit_rows_future += 1;
             return true;
@@ -233,7 +450,25 @@ impl SnapshotBuilder {
         false
     }
 
-    fn record_range(&mut self, row: &ParsedAuditRow) {
+    const fn is_runtime_stale_or_future(&mut self, ts_ns: u64, kind: RuntimeRowKind) -> bool {
+        if ts_ns > self.generated_at_ns.saturating_add(FUTURE_SKEW_NS) {
+            match kind {
+                RuntimeRowKind::Observation => self.runtime_evidence.observation_rows_future += 1,
+                RuntimeRowKind::Event => self.runtime_evidence.event_rows_future += 1,
+            }
+            return true;
+        }
+        if self.generated_at_ns.saturating_sub(ts_ns) > self.source.stale_after_ns {
+            match kind {
+                RuntimeRowKind::Observation => self.runtime_evidence.observation_rows_stale += 1,
+                RuntimeRowKind::Event => self.runtime_evidence.event_rows_stale += 1,
+            }
+            return true;
+        }
+        false
+    }
+
+    fn record_action_range(&mut self, row: &ParsedAuditRow) {
         if self.source.first_relevant_ts_ns.is_none() {
             self.source.first_relevant_ts_ns = Some(row.ts_ns);
             self.source
@@ -242,6 +477,14 @@ impl SnapshotBuilder {
         }
         self.source.last_relevant_ts_ns = Some(row.ts_ns);
         self.source.last_relevant_audit_id.clone_from(&row.audit_id);
+    }
+
+    fn record_runtime_ts(&mut self, ts_ns: u64) {
+        self.runtime_evidence.last_relevant_ts_ns = Some(
+            self.runtime_evidence
+                .last_relevant_ts_ns
+                .map_or(ts_ns, |previous| previous.max(ts_ns)),
+        );
     }
 
     fn record_compatibility(
@@ -325,7 +568,13 @@ impl SnapshotBuilder {
     fn finish(self) -> ProfileQualitySnapshot {
         let score = score_from_counts(&self.counts);
         let rates = rates_from_counts(&self.counts);
-        let evidence_hash = evidence_hash(&self.profile_id, &self.evidence_parts, &self.source);
+        let evidence_hash = evidence_hash(
+            &self.profile_id,
+            &self.evidence_parts,
+            &self.source,
+            &self.runtime_evidence,
+            self.manual_fsv_evidence_ref.as_deref(),
+        );
         let mut versioning = self.versioning;
         versioning.mixed_profile_schema_versions =
             versioning.observed_profile_schema_versions.len() > 1;
@@ -335,6 +584,7 @@ impl SnapshotBuilder {
             profile_label: self.profile_label,
             profile_schema_version: self.profile_schema_version,
             quality_signal: self.quality_signal,
+            manual_fsv_evidence_ref: self.manual_fsv_evidence_ref,
             generated_at_ns: self.generated_at_ns,
             evidence_hash,
             source: self.source,
@@ -343,25 +593,37 @@ impl SnapshotBuilder {
             score,
             compatibility: self.compatibility,
             versioning,
+            runtime_evidence: self.runtime_evidence,
             redaction: ProfileQualityRedaction {
                 local_only: true,
                 snapshot_redacts_process_path: true,
                 snapshot_redacts_window_title: true,
                 retained_identifiers: vec![
                     "profile_id".to_owned(),
+                    "manual_fsv_evidence_ref".to_owned(),
                     "tool".to_owned(),
                     "status".to_owned(),
                     "error_code".to_owned(),
                     "process_name".to_owned(),
+                    "target_id".to_owned(),
+                    "observation_id".to_owned(),
+                    "event_id".to_owned(),
+                    "event_kind".to_owned(),
                 ],
             },
             contribution: ProfileQualityContribution {
                 export_allowed: false,
                 operator_consent_required: true,
-                future_bundle_shape: "operator_approved_profile_quality_v1".to_owned(),
+                future_bundle_shape: "operator_approved_profile_quality_v2".to_owned(),
             },
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeRowKind {
+    Observation,
+    Event,
 }
 
 #[allow(
@@ -418,9 +680,9 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
     numerator as f64 / denominator as f64
 }
 
-fn evidence_part(row: &ParsedAuditRow) -> String {
+fn action_evidence_part(row: &ParsedAuditRow) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "action|{}|{}|{}|{}|{}|{}|{}|{}",
         row.audit_id.as_deref().unwrap_or(""),
         row.ts_ns,
         row.tool,
@@ -436,16 +698,63 @@ fn evidence_part(row: &ParsedAuditRow) -> String {
     )
 }
 
-fn evidence_hash(profile_id: &str, parts: &[String], source: &ProfileQualitySource) -> String {
+fn observation_evidence_part(row: &ParsedObservationRow) -> String {
+    format!(
+        "observation|{}|{}|{}|{}|{}",
+        row.observation_id.as_deref().unwrap_or(""),
+        row.ts_ns,
+        row.foreground_profile_id.as_deref().unwrap_or(""),
+        row.foreground_process_name.as_deref().unwrap_or(""),
+        row.recent_event_kinds.join(",")
+    )
+}
+
+fn event_evidence_part(row: &ParsedEventRow) -> String {
+    format!(
+        "event|{}|{}|{}|{}|{}|{}",
+        row.event_id.as_deref().unwrap_or(""),
+        row.ts_ns,
+        row.profile_id.as_deref().unwrap_or(""),
+        row.kind.as_str(),
+        row.process_name.as_deref().unwrap_or(""),
+        row.target_id.as_deref().unwrap_or("")
+    )
+}
+
+fn evidence_hash(
+    profile_id: &str,
+    parts: &[String],
+    source: &ProfileQualitySource,
+    runtime: &ProfileQualityRuntimeEvidence,
+    manual_fsv_evidence_ref: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(profile_id.as_bytes());
     hasher.update(source.stale_after_ns.to_be_bytes());
     hasher.update(source.audit_rows_decode_failed.to_be_bytes());
     hasher.update(source.audit_rows_stale.to_be_bytes());
     hasher.update(source.audit_rows_future.to_be_bytes());
+    hasher.update(runtime.observation_rows_decode_failed.to_be_bytes());
+    hasher.update(runtime.observation_rows_stale.to_be_bytes());
+    hasher.update(runtime.observation_rows_future.to_be_bytes());
+    hasher.update(runtime.event_rows_decode_failed.to_be_bytes());
+    hasher.update(runtime.event_rows_stale.to_be_bytes());
+    hasher.update(runtime.event_rows_future.to_be_bytes());
+    if let Some(value) = manual_fsv_evidence_ref {
+        hasher.update(value.as_bytes());
+    }
+    hasher.update([0]);
     for part in parts {
         hasher.update(part.as_bytes());
         hasher.update([0]);
     }
     format!("sha256:{}", hex_encode(&hasher.finalize()))
+}
+
+fn increment(counts: &mut BTreeMap<String, u64>, key: String) {
+    *counts.entry(key).or_default() += 1;
+}
+
+fn is_log_event_kind(kind: &str) -> bool {
+    kind.starts_with("everquest.log.")
 }

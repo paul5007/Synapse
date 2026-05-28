@@ -73,7 +73,7 @@ future `tools/list` snapshots in #447/#448.
 | 37 | `profile_authoring_accept` | write/read | marks a candidate accepted without activating it |
 | 38 | `profile_authoring_reject` | write/read | marks a candidate rejected |
 | 39 | `profile_authoring_export` | read/write | writes a local candidate export bundle file |
-| 40 | `profile_quality_refresh` | write/read | refreshes local profile quality from action audit rows |
+| 40 | `profile_quality_refresh` | write/read | refreshes local profile quality from action, observation, and event rows |
 | 41 | `profile_registry_search` | read | searches local registry rows in `CF_PROFILES` |
 | 42 | `profile_registry_inspect` | read | reads one registry row from `CF_PROFILES` or `CF_KV` |
 | 43 | `profile_registry_report` | read | reports registry, quality, audit, consent, quarantine, and SoT pointers |
@@ -1077,8 +1077,9 @@ file bytes.
 ### 3.28g `profile_quality_refresh`
 
 Refreshes the local profile-registry quality snapshot for one profile from real
-stored action audit rows. This is a local-only read/aggregate/write/readback
-surface: it scans `CF_ACTION_LOG`, writes the redacted snapshot to
+stored action audit rows plus observation/event rows. This is a local-only
+read/aggregate/write/readback surface: it scans `CF_ACTION_LOG`,
+`CF_OBSERVATIONS`, and `CF_EVENTS`, writes the redacted snapshot to
 `CF_PROFILES` at `profile_quality/v1/<profile_id>`, then reads that exact row
 back before returning.
 
@@ -1092,7 +1093,8 @@ back before returning.
     "properties": {
       "profile_id": {"type": "string"},
       "max_audit_rows": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 5000},
-      "stale_after_ns": {"type": "integer", "minimum": 1, "default": 86400000000000}
+      "stale_after_ns": {"type": "integer", "minimum": 1, "default": 86400000000000},
+      "manual_fsv_evidence_ref": {"type": "string"}
     }
   }
 }
@@ -1102,8 +1104,12 @@ Returns the `CF_PROFILES` key, whether a new snapshot was written, stored value
 length/prefix, and an explainable snapshot containing source row counts,
 ignored corrupt/stale rows, quality counts/rates, Wilson lower-bound score,
 compatibility counters, profile-schema-version recency/mixed-version counters,
-redaction policy, and contribution policy. Export is always `false`; sharing
-requires a future explicit operator-approved path.
+runtime observation/event evidence, compact event-kind and log-kind counters,
+an optional manual FSV evidence reference, redaction policy, and contribution
+policy. Export is always `false`; sharing requires a future explicit
+operator-approved path. The snapshot keeps bounded identifiers and counts only;
+it must not persist raw chat bodies, window titles, process paths, private
+session tickets, or full raw log lines.
 
 ### 3.28h `profile_registry_search`
 

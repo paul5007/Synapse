@@ -257,7 +257,7 @@ All 51 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `profile_authoring_accept` | Mark a candidate accepted without activating or mutating the active profile | `server.rs::profile_authoring_accept`, `m3/profile_authoring.rs` |
 | `profile_authoring_reject` | Mark a candidate rejected with an optional local reason | `server.rs::profile_authoring_reject`, `m3/profile_authoring.rs` |
 | `profile_authoring_export` | Export one candidate row to a local JSON bundle file and read the written file back | `server.rs::profile_authoring_export`, `m3/profile_authoring.rs` |
-| `profile_quality_refresh` | Refresh a local profile-quality snapshot from real `CF_ACTION_LOG` rows and persist/read it in `CF_PROFILES` | `server.rs::profile_quality_refresh`, `m3/profile_quality.rs` |
+| `profile_quality_refresh` | Refresh a local profile-quality snapshot from real `CF_ACTION_LOG`, `CF_OBSERVATIONS`, and `CF_EVENTS` rows and persist/read it in `CF_PROFILES` | `server.rs::profile_quality_refresh`, `m3/profile_quality.rs` |
 | `profile_registry_search` | Search local registry rows under `profile_registry/v1/` in `CF_PROFILES` | `server.rs::profile_registry_search`, `m3/profile_registry.rs` |
 | `profile_registry_inspect` | Inspect one registry row in `CF_PROFILES` or registry head row in `CF_KV` | `server.rs::profile_registry_inspect`, `m3/profile_registry.rs` |
 | `profile_registry_report` | Report installed registry packages, quarantine/rollback state, quality snapshots, consent/export status, recent audit evidence, and physical SoT pointers | `server.rs::profile_registry_report`, `m3/profile_registry.rs` |
@@ -1392,13 +1392,16 @@ Action tools write profile-linked action-audit rows to `CF_ACTION_LOG` through
 result audit returns. Rows carry the MCP audit `session_id`, active
 profile id/version/schema, backend policy, app/game context, result/error
 codes, and redaction/export flags where available. `profile_quality_refresh`
-reads those action rows,
-aggregates profile-relevant outcomes, writes a redacted
+reads those action rows plus `CF_OBSERVATIONS` and `CF_EVENTS`, aggregates
+profile-relevant outcomes and compact runtime event kinds, writes a redacted
 `ProfileQualitySnapshot` JSON row to `CF_PROFILES` at
 `profile_quality/v1/<profile_id>`, and reads that exact row back before
 returning. The score uses the Wilson 95% lower bound over foreground-profile
 `ok` vs `error` rows; denied, stale, corrupt, and profile-mismatch rows are
-explainability/compatibility counters, not invented success samples.
+explainability/compatibility counters, not invented success samples. Runtime
+evidence stores bounded app identity, event-kind/log-kind counts, and optional
+manual FSV evidence refs, not raw chat bodies, full window titles, process
+paths, private session tickets, or raw log lines.
 
 `audit_export_bundle` does not write RocksDB rows. It reads the consent row from
 `CF_KV`, reads matching `CF_ACTION_LOG` rows for the requested profile, redacts
@@ -3956,7 +3959,7 @@ expansion. Current build:
 | 37 | `profile_authoring_accept` | M5 (registry/audit) | live | marks a candidate accepted without activation |
 | 38 | `profile_authoring_reject` | M5 (registry/audit) | live | marks a candidate rejected |
 | 39 | `profile_authoring_export` | M5 (registry/audit) | live | exports one candidate bundle |
-| 40 | `profile_quality_refresh` | M5 (registry/audit) | live | writes `CF_PROFILES` quality snapshot from `CF_ACTION_LOG` |
+| 40 | `profile_quality_refresh` | M5 (registry/audit) | live | writes `CF_PROFILES` quality snapshot from action, observation, and event rows |
 | 41 | `profile_registry_search` | M5 (registry/audit) | live | searches `CF_PROFILES` registry rows |
 | 42 | `profile_registry_inspect` | M5 (registry/audit) | live | reads one `CF_PROFILES`/`CF_KV` registry row |
 | 43 | `profile_registry_report` | M5 (registry/audit) | live | reports registry, quality, audit, consent, quarantine, and SoT pointers |
@@ -4612,29 +4615,34 @@ contains the full candidate row plus schema/version/CF metadata.
 
 ## 23g. `profile_quality_refresh`
 
-**Description:** "Refresh local profile quality scoring from stored action audit rows"
+**Description:** "Refresh local profile quality scoring from stored action, observation, and event rows"
 **Permissions:** `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE`
-**Side effects:** reads `CF_ACTION_LOG`; writes and immediately reads back
-`CF_PROFILES` key `profile_quality/v1/<profile_id>`
+**Side effects:** reads `CF_ACTION_LOG`, `CF_OBSERVATIONS`, and `CF_EVENTS`;
+writes and immediately reads back `CF_PROFILES` key
+`profile_quality/v1/<profile_id>`
 
 | Parameter | Type | Required | Default | Range | Description |
 |---|---|---|---|---|---|
 | `profile_id` | `String` | yes | — | loaded profile id | Profile whose quality snapshot should be refreshed |
-| `max_audit_rows` | `u32` | no | `5000` | `1..=50000` | Newest action audit rows scanned |
+| `max_audit_rows` | `u32` | no | `5000` | `1..=50000` | Newest action, observation, and event rows scanned per CF |
 | `stale_after_ns` | `u64` | no | `86400000000000` | `1..=2592000000000000` | Rows older than this are counted as stale and ignored for scoring |
+| `manual_fsv_evidence_ref` | `String` | no | — | non-empty, <=512 chars | Issue comment or evidence id for manual SoT readback |
 
 **Returns:** `ProfileQualityRefreshResponse { profile_id, cf_name,
 key_hex, wrote_snapshot, previous_evidence_hash, stored_value_len_bytes,
 stored_value_utf8_prefix, snapshot }`. `snapshot` contains source counters,
 ignored corrupt/stale rows, counts/rates, Wilson lower-bound score,
 compatibility counters, profile-schema-version recency/mixed-version counters,
-redaction policy, and contribution policy.
+runtime observation/event evidence, compact event-kind/log-kind counters,
+manual FSV evidence ref, redaction policy, and contribution policy.
 
 The score-bearing sample is foreground-profile `ok` vs `error` rows only.
 Denied, stale, corrupt, active-profile-only, and profile-mismatch rows are
 reported as explainability/compatibility counters and do not invent success
 samples. Export is always disabled; contribution requires a future explicit
-operator-approved path.
+operator-approved path. The snapshot keeps bounded identifiers/counts only and
+must not store raw chat bodies, process paths, full window titles, private
+session tickets, or raw log lines by default.
 
 **Errors:** `PROFILE_NOT_FOUND`, `TOOL_PARAMS_INVALID`, `STORAGE_READ_FAILED`,
 `STORAGE_WRITE_FAILED`, `TOOL_INTERNAL_ERROR`.

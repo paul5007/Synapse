@@ -120,6 +120,27 @@ current file length fail closed as explicit filesystem events or diagnostics;
 they are not silent fallbacks. Chat-like events must carry actor/channel/summary
 metadata only and mark the body redacted by default.
 
+## Profile Registry / Audit Moat Rows
+
+`profile_quality_refresh` is the durable profile-registry/audit-data bridge for
+EverQuest. The physical row is
+`CF_PROFILES/profile_quality/v1/everquest.live`. It aggregates bounded action
+audit rows, observation rows, and event rows into source counts, app identity,
+event-kind counts, EverQuest log-kind counts, quality score inputs, and an
+optional `manual_fsv_evidence_ref` pointing to the GitHub issue comment that
+contains manual source-of-truth readback.
+
+For EverQuest, the row must link:
+
+- `profile_id=everquest.live`
+- app identity such as `eqgame.exe` and `registry.compatibility_target`
+- compact event kinds such as `perception.observed` and `everquest.log.*`
+- manual FSV evidence comment/id for the runtime verification
+- bounded outcome metadata only
+
+It must not store/export raw player chat bodies, private session tickets, full
+window titles, process paths, or full raw log lines by default.
+
 ## GitHub Issue Map
 
 GitHub issues remain the canonical coordination state:

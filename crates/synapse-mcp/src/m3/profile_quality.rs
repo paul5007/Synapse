@@ -20,13 +20,15 @@ use super::{
 mod aggregate;
 mod model;
 
-use aggregate::build_snapshot;
-use model::{MAX_AUDIT_ROWS, MAX_STALE_AFTER_NS, STORED_PREFIX_CHARS};
+use aggregate::{ProfileQualityInputRows, build_snapshot};
+use model::{
+    MAX_AUDIT_ROWS, MAX_MANUAL_FSV_EVIDENCE_REF_CHARS, MAX_STALE_AFTER_NS, STORED_PREFIX_CHARS,
+};
 pub use model::{
     ProfileCompatibilitySummary, ProfileQualityContribution, ProfileQualityCounts,
     ProfileQualityRates, ProfileQualityRedaction, ProfileQualityRefreshParams,
-    ProfileQualityRefreshResponse, ProfileQualityScore, ProfileQualitySnapshot,
-    ProfileQualitySource, ProfileQualityVersionSummary,
+    ProfileQualityRefreshResponse, ProfileQualityRuntimeEvidence, ProfileQualityScore,
+    ProfileQualitySnapshot, ProfileQualitySource, ProfileQualityVersionSummary,
 };
 
 #[must_use]
@@ -58,10 +60,25 @@ pub fn refresh_profile_quality(
         )
     })?;
     let previous_hash = read_existing_hash(&runtime, &key)?;
-    let rows = runtime
+    let action_rows = runtime
         .storage_cf_tail_rows(cf::CF_ACTION_LOG, params.max_audit_rows as usize)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let computed_snapshot = build_snapshot(&profile, rows, params, now_ns());
+    let observation_rows = runtime
+        .storage_cf_tail_rows(cf::CF_OBSERVATIONS, params.max_audit_rows as usize)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let event_rows = runtime
+        .storage_cf_tail_rows(cf::CF_EVENTS, params.max_audit_rows as usize)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let computed_snapshot = build_snapshot(
+        &profile,
+        ProfileQualityInputRows {
+            action: action_rows,
+            observations: observation_rows,
+            events: event_rows,
+        },
+        params,
+        now_ns(),
+    );
     let wrote_snapshot = previous_hash.as_deref() != Some(computed_snapshot.evidence_hash.as_str());
     if wrote_snapshot {
         let encoded = encode_json(&computed_snapshot).map_err(|error| {
@@ -115,6 +132,29 @@ fn validate_params(params: &ProfileQualityRefreshParams) -> Result<(), ErrorData
             error_codes::TOOL_PARAMS_INVALID,
             format!("profile_quality_refresh stale_after_ns must be 1..={MAX_STALE_AFTER_NS}"),
         ));
+    }
+    if let Some(value) = &params.manual_fsv_evidence_ref {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "profile_quality_refresh manual_fsv_evidence_ref must not be empty",
+            ));
+        }
+        if trimmed.chars().count() > MAX_MANUAL_FSV_EVIDENCE_REF_CHARS {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "profile_quality_refresh manual_fsv_evidence_ref must be <= {MAX_MANUAL_FSV_EVIDENCE_REF_CHARS} characters"
+                ),
+            ));
+        }
+        if trimmed.chars().any(char::is_control) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "profile_quality_refresh manual_fsv_evidence_ref must not contain control characters",
+            ));
+        }
     }
     Ok(())
 }

@@ -146,13 +146,16 @@ Action tools write profile-linked action-audit rows to `CF_ACTION_LOG` through
 result audit returns. Rows carry the MCP audit `session_id`, active
 profile id/version/schema, backend policy, app/game context, result/error
 codes, and redaction/export flags where available. `profile_quality_refresh`
-reads those action rows,
-aggregates profile-relevant outcomes, writes a redacted
+reads those action rows plus `CF_OBSERVATIONS` and `CF_EVENTS`, aggregates
+profile-relevant outcomes and compact runtime event kinds, writes a redacted
 `ProfileQualitySnapshot` JSON row to `CF_PROFILES` at
 `profile_quality/v1/<profile_id>`, and reads that exact row back before
 returning. The score uses the Wilson 95% lower bound over foreground-profile
 `ok` vs `error` rows; denied, stale, corrupt, and profile-mismatch rows are
-explainability/compatibility counters, not invented success samples.
+explainability/compatibility counters, not invented success samples. Runtime
+evidence stores bounded app identity, event-kind/log-kind counts, and optional
+manual FSV evidence refs, not raw chat bodies, full window titles, process
+paths, private session tickets, or raw log lines.
 
 `audit_export_bundle` does not write RocksDB rows. It reads the consent row from
 `CF_KV`, reads matching `CF_ACTION_LOG` rows for the requested profile, redacts
@@ -161,8 +164,9 @@ sensitive fields, and writes local bundle files (`manifest.json`, `rows.json`,
 
 `profile_registry_report` is read-only. It scans `CF_PROFILES` registry and
 quality prefixes, `CF_KV` registry-head and consent prefixes, and recent
-`CF_ACTION_LOG` rows, then returns exact CF/key/path pointers so the operator
-can verify the report with separate SoT reads.
+`CF_ACTION_LOG` rows plus quality snapshots populated from observations/events,
+then returns exact CF/key/path pointers so the operator can verify the report
+with separate SoT reads.
 
 `profile_registry_export bundle_kind="contribution"` writes a local JSON
 contribution bundle that combines registry rows, redacted action-audit evidence

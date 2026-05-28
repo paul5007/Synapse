@@ -9,6 +9,7 @@ pub(super) const MAX_AUDIT_ROWS: u32 = 50_000;
 pub(super) const DEFAULT_STALE_AFTER_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 pub(super) const MAX_STALE_AFTER_NS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 pub(super) const STORED_PREFIX_CHARS: usize = 512;
+pub(super) const MAX_MANUAL_FSV_EVIDENCE_REF_CHARS: usize = 512;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +21,8 @@ pub struct ProfileQualityRefreshParams {
     #[serde(default = "default_stale_after_ns")]
     #[schemars(default = "default_stale_after_ns", range(min = 1))]
     pub stale_after_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_fsv_evidence_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
@@ -43,6 +46,8 @@ pub struct ProfileQualitySnapshot {
     pub profile_label: String,
     pub profile_schema_version: u32,
     pub quality_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_fsv_evidence_ref: Option<String>,
     pub generated_at_ns: u64,
     pub evidence_hash: String,
     pub source: ProfileQualitySource,
@@ -51,6 +56,8 @@ pub struct ProfileQualitySnapshot {
     pub score: ProfileQualityScore,
     pub compatibility: ProfileCompatibilitySummary,
     pub versioning: ProfileQualityVersionSummary,
+    #[serde(default)]
+    pub runtime_evidence: ProfileQualityRuntimeEvidence,
     pub redaction: ProfileQualityRedaction,
     pub contribution: ProfileQualityContribution,
 }
@@ -121,6 +128,64 @@ pub struct ProfileCompatibilitySummary {
     pub target_denied_rows: u64,
     pub observed_process_names: BTreeMap<String, u64>,
     pub observed_backends: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileQualityRuntimeEvidence {
+    pub observation_cf_name: String,
+    pub event_cf_name: String,
+    pub observation_rows_scanned: u64,
+    pub observation_rows_decode_failed: u64,
+    pub observation_rows_stale: u64,
+    pub observation_rows_future: u64,
+    pub observation_rows_other_profile: u64,
+    pub observation_rows_profile_relevant: u64,
+    pub event_rows_scanned: u64,
+    pub event_rows_decode_failed: u64,
+    pub event_rows_stale: u64,
+    pub event_rows_future: u64,
+    pub event_rows_other_profile: u64,
+    pub event_rows_profile_relevant: u64,
+    pub first_relevant_observation_id: Option<String>,
+    pub last_relevant_observation_id: Option<String>,
+    pub first_relevant_event_id: Option<String>,
+    pub last_relevant_event_id: Option<String>,
+    pub last_relevant_ts_ns: Option<u64>,
+    pub observed_process_names: BTreeMap<String, u64>,
+    pub observed_target_ids: BTreeMap<String, u64>,
+    pub observed_event_kinds: BTreeMap<String, u64>,
+    pub observed_log_event_kinds: BTreeMap<String, u64>,
+}
+
+impl Default for ProfileQualityRuntimeEvidence {
+    fn default() -> Self {
+        Self {
+            observation_cf_name: "CF_OBSERVATIONS".to_owned(),
+            event_cf_name: "CF_EVENTS".to_owned(),
+            observation_rows_scanned: 0,
+            observation_rows_decode_failed: 0,
+            observation_rows_stale: 0,
+            observation_rows_future: 0,
+            observation_rows_other_profile: 0,
+            observation_rows_profile_relevant: 0,
+            event_rows_scanned: 0,
+            event_rows_decode_failed: 0,
+            event_rows_stale: 0,
+            event_rows_future: 0,
+            event_rows_other_profile: 0,
+            event_rows_profile_relevant: 0,
+            first_relevant_observation_id: None,
+            last_relevant_observation_id: None,
+            first_relevant_event_id: None,
+            last_relevant_event_id: None,
+            last_relevant_ts_ns: None,
+            observed_process_names: BTreeMap::new(),
+            observed_target_ids: BTreeMap::new(),
+            observed_event_kinds: BTreeMap::new(),
+            observed_log_event_kinds: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]

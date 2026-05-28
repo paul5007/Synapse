@@ -257,7 +257,7 @@ fn read_eqclient_state(install_root: &Path) -> Result<EqClientState, String> {
         trimmed
             .strip_prefix(EQCLIENT_LAST_CHAR_SEL)
             .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| is_named_character_selection(value))
             .map(ToOwned::to_owned)
     });
     let log_enabled = text
@@ -282,6 +282,15 @@ fn read_eqclient_state(install_root: &Path) -> Result<EqClientState, String> {
         last_char_sel,
         log_enabled,
     })
+}
+
+fn is_named_character_selection(value: &str) -> bool {
+    let normalized = value.trim();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.to_ascii_lowercase().as_str(),
+            "0" | "none" | "null" | "unknown"
+        )
 }
 
 fn parse_eqclient_bool(value: &str) -> Result<bool, String> {
@@ -489,6 +498,16 @@ mod tests {
         let state = read_eqclient_state(dir.path()).map_err(anyhow::Error::msg)?;
         assert_eq!(state.last_char_sel.as_deref(), Some("Thenumberone"));
         assert_eq!(state.log_enabled, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn eqclient_state_treats_numeric_character_selection_as_unknown() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join(EQCLIENT_FILE), "LastCharSel=0\r\nLog=1\r\n")?;
+        let state = read_eqclient_state(dir.path()).map_err(anyhow::Error::msg)?;
+        assert_eq!(state.last_char_sel, None);
+        assert_eq!(state.log_enabled, Some(true));
         Ok(())
     }
 }

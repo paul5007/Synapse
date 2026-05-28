@@ -396,14 +396,22 @@ pub struct ProfileRegistryReportQualitySnapshot {
     pub profile_id: Option<ProfileId>,
     pub generated_at_ns: Option<u64>,
     pub evidence_hash: Option<String>,
+    pub manual_fsv_evidence_ref: Option<String>,
     pub score_0_100: Option<u64>,
     pub sample_size: Option<u64>,
     pub audit_rows_scanned: Option<u64>,
     pub audit_rows_profile_relevant: Option<u64>,
     pub audit_rows_stale: Option<u64>,
+    pub observation_rows_scanned: Option<u64>,
+    pub observation_rows_profile_relevant: Option<u64>,
+    pub event_rows_scanned: Option<u64>,
+    pub event_rows_profile_relevant: Option<u64>,
     pub stale_after_ns: Option<u64>,
     pub stale_evidence_present: bool,
     pub quality_signal: Option<String>,
+    pub observed_target_ids: BTreeMap<String, u64>,
+    pub observed_event_kinds: BTreeMap<String, u64>,
+    pub observed_log_event_kinds: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -2561,7 +2569,12 @@ fn quality_link_row(
         "source_cf_ranges": {
             "audit_cf_name": quality.pointer("/source/audit_cf_name").cloned().unwrap_or_else(|| json!(cf::CF_ACTION_LOG)),
             "audit_rows_scanned": quality.pointer("/source/audit_rows_scanned").cloned().unwrap_or_else(|| json!(0)),
+            "observation_cf_name": quality.pointer("/runtime_evidence/observation_cf_name").cloned().unwrap_or_else(|| json!(cf::CF_OBSERVATIONS)),
+            "observation_rows_scanned": quality.pointer("/runtime_evidence/observation_rows_scanned").cloned().unwrap_or_else(|| json!(0)),
+            "event_cf_name": quality.pointer("/runtime_evidence/event_cf_name").cloned().unwrap_or_else(|| json!(cf::CF_EVENTS)),
+            "event_rows_scanned": quality.pointer("/runtime_evidence/event_rows_scanned").cloned().unwrap_or_else(|| json!(0)),
         },
+        "manual_fsv_evidence_ref": quality.get("manual_fsv_evidence_ref").cloned().unwrap_or(Value::Null),
         "quality_score": quality.pointer("/score/score_0_100").cloned().unwrap_or_else(|| json!(0)),
         "sample_count": quality.pointer("/score/sample_size").cloned().unwrap_or_else(|| json!(0)),
         "evidence_hash": quality.get("evidence_hash").cloned().unwrap_or_else(|| json!("")),
@@ -2958,6 +2971,18 @@ fn report_base_pointers(storage_path: &str) -> Vec<ProfileRegistryReportPointer>
             None,
             "tail rows scanned for recent profile-linked audit evidence",
         ),
+        (
+            "recent_observation_tail",
+            Some(cf::CF_OBSERVATIONS),
+            None,
+            "tail rows scanned for profile-linked observation evidence in quality snapshots",
+        ),
+        (
+            "recent_event_tail",
+            Some(cf::CF_EVENTS),
+            None,
+            "tail rows scanned for profile-linked event and log evidence in quality snapshots",
+        ),
     ]
     .into_iter()
     .map(
@@ -3159,6 +3184,7 @@ fn report_quality_snapshot(
         profile_id: string_field(&decoded, "profile_id"),
         generated_at_ns: decoded.get("generated_at_ns").and_then(Value::as_u64),
         evidence_hash: string_field(&decoded, "evidence_hash"),
+        manual_fsv_evidence_ref: string_field(&decoded, "manual_fsv_evidence_ref"),
         score_0_100: decoded
             .pointer("/score/score_0_100")
             .and_then(Value::as_u64),
@@ -3172,11 +3198,29 @@ fn report_quality_snapshot(
             .pointer("/source/audit_rows_profile_relevant")
             .and_then(Value::as_u64),
         audit_rows_stale,
+        observation_rows_scanned: decoded
+            .pointer("/runtime_evidence/observation_rows_scanned")
+            .and_then(Value::as_u64),
+        observation_rows_profile_relevant: decoded
+            .pointer("/runtime_evidence/observation_rows_profile_relevant")
+            .and_then(Value::as_u64),
+        event_rows_scanned: decoded
+            .pointer("/runtime_evidence/event_rows_scanned")
+            .and_then(Value::as_u64),
+        event_rows_profile_relevant: decoded
+            .pointer("/runtime_evidence/event_rows_profile_relevant")
+            .and_then(Value::as_u64),
         stale_after_ns: decoded
             .pointer("/source/stale_after_ns")
             .and_then(Value::as_u64),
         stale_evidence_present: audit_rows_stale.unwrap_or_default() > 0,
         quality_signal: string_field(&decoded, "quality_signal"),
+        observed_target_ids: u64_map_field(&decoded, "/runtime_evidence/observed_target_ids"),
+        observed_event_kinds: u64_map_field(&decoded, "/runtime_evidence/observed_event_kinds"),
+        observed_log_event_kinds: u64_map_field(
+            &decoded,
+            "/runtime_evidence/observed_log_event_kinds",
+        ),
     })
 }
 
@@ -4305,6 +4349,19 @@ fn string_array_field(value: &Value, field: &str) -> Vec<String> {
                 .filter_map(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn u64_map_field(value: &Value, pointer: &str) -> BTreeMap<String, u64> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_object)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|(key, value)| value.as_u64().map(|count| (key.clone(), count)))
                 .collect()
         })
         .unwrap_or_default()

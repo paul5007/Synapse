@@ -330,7 +330,9 @@ impl SynapseService {
         export_profile_authoring_candidate(&reflex_runtime, &params.0).map(Json)
     }
 
-    #[tool(description = "Refresh local profile quality scoring from stored action audit rows")]
+    #[tool(
+        description = "Refresh local profile quality scoring from stored action, observation, and event rows"
+    )]
     pub async fn profile_quality_refresh(
         &self,
         params: Parameters<ProfileQualityRefreshParams>,

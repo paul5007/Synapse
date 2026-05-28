@@ -34,15 +34,81 @@ async fn profile_quality_refresh_persists_explainable_snapshot() -> anyhow::Resu
     let before = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
     assert_eq!(before["cf_row_counts"][cf::CF_PROFILES], 0);
     assert_eq!(before["cf_row_counts"][cf::CF_ACTION_LOG], 7);
+    assert_eq!(before["cf_row_counts"][cf::CF_OBSERVATIONS], 2);
+    assert_eq!(before["cf_row_counts"][cf::CF_EVENTS], 2);
 
     let first = structured(
         &client
             .tools_call(
                 "profile_quality_refresh",
-                json!({"profile_id": "quality.synthetic"}),
+                json!({
+                    "profile_id": "quality.synthetic",
+                    "manual_fsv_evidence_ref": "https://github.com/ChrisRoyse/Synapse/issues/498#synthetic"
+                }),
             )
             .await?,
     )?;
+    assert_first_snapshot(&first);
+
+    let after = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
+    assert_eq!(after["cf_row_counts"][cf::CF_PROFILES], 1);
+
+    let second = structured(
+        &client
+            .tools_call(
+                "profile_quality_refresh",
+                json!({
+                    "profile_id": "quality.synthetic",
+                    "manual_fsv_evidence_ref": "https://github.com/ChrisRoyse/Synapse/issues/498#synthetic"
+                }),
+            )
+            .await?,
+    )?;
+    assert_eq!(second["wrote_snapshot"], false);
+    assert_eq!(
+        second["snapshot"]["evidence_hash"],
+        first["snapshot"]["evidence_hash"]
+    );
+    assert_eq!(
+        second["snapshot"]["generated_at_ns"],
+        first["snapshot"]["generated_at_ns"]
+    );
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+
+    let stored = read_profile_quality_row(&db_path, "quality.synthetic")?;
+    assert_eq!(stored["profile_id"], "quality.synthetic");
+    assert_eq!(stored["counts"]["quality_eligible_ok_rows"], 1);
+    assert_eq!(stored["counts"]["quality_eligible_error_rows"], 1);
+    assert_eq!(stored["versioning"]["mixed_profile_schema_versions"], true);
+    assert_eq!(stored["runtime_evidence"]["event_rows_profile_relevant"], 1);
+    Ok(())
+}
+
+fn write_profile(path: &Path) -> anyhow::Result<()> {
+    fs::write(
+        path,
+        r#"
+id = "quality.synthetic"
+label = "Quality Synthetic"
+schema_version = 2
+use_scope = "operator_owned_test"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "notepad.exe"
+
+[metadata]
+"registry.quality_signal" = "profile_quality.quality.synthetic"
+"registry.compatibility_target" = "quality.synthetic.target"
+"#,
+    )?;
+    Ok(())
+}
+
+fn assert_first_snapshot(first: &Value) {
     assert_eq!(first["wrote_snapshot"], true);
     assert_eq!(first["snapshot"]["source"]["audit_rows_scanned"], 7);
     assert_eq!(first["snapshot"]["source"]["audit_rows_decode_failed"], 1);
@@ -81,58 +147,30 @@ async fn profile_quality_refresh_persists_explainable_snapshot() -> anyhow::Resu
     );
     assert_eq!(first["snapshot"]["redaction"]["local_only"], true);
     assert_eq!(first["snapshot"]["contribution"]["export_allowed"], false);
-
-    let after = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
-    assert_eq!(after["cf_row_counts"][cf::CF_PROFILES], 1);
-
-    let second = structured(
-        &client
-            .tools_call(
-                "profile_quality_refresh",
-                json!({"profile_id": "quality.synthetic"}),
-            )
-            .await?,
-    )?;
-    assert_eq!(second["wrote_snapshot"], false);
     assert_eq!(
-        second["snapshot"]["evidence_hash"],
-        first["snapshot"]["evidence_hash"]
+        first["snapshot"]["manual_fsv_evidence_ref"],
+        "https://github.com/ChrisRoyse/Synapse/issues/498#synthetic"
     );
     assert_eq!(
-        second["snapshot"]["generated_at_ns"],
-        first["snapshot"]["generated_at_ns"]
+        first["snapshot"]["runtime_evidence"]["observation_rows_scanned"],
+        2
     );
-
-    let status = client.shutdown().await?;
-    assert!(status.success());
-
-    let stored = read_profile_quality_row(&db_path, "quality.synthetic")?;
-    assert_eq!(stored["profile_id"], "quality.synthetic");
-    assert_eq!(stored["counts"]["quality_eligible_ok_rows"], 1);
-    assert_eq!(stored["counts"]["quality_eligible_error_rows"], 1);
-    assert_eq!(stored["versioning"]["mixed_profile_schema_versions"], true);
-    Ok(())
-}
-
-fn write_profile(path: &Path) -> anyhow::Result<()> {
-    fs::write(
-        path,
-        r#"
-id = "quality.synthetic"
-label = "Quality Synthetic"
-schema_version = 2
-use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
-keyboard_dynamics_default = "natural"
-
-[[matches]]
-exe = "notepad.exe"
-
-[metadata]
-"registry.quality_signal" = "profile_quality.quality.synthetic"
-"#,
-    )?;
-    Ok(())
+    assert_eq!(
+        first["snapshot"]["runtime_evidence"]["observation_rows_profile_relevant"],
+        1
+    );
+    assert_eq!(
+        first["snapshot"]["runtime_evidence"]["event_rows_profile_relevant"],
+        1
+    );
+    assert_eq!(
+        first["snapshot"]["runtime_evidence"]["observed_target_ids"]["quality.synthetic.target"],
+        2
+    );
+    assert_eq!(
+        first["snapshot"]["runtime_evidence"]["observed_log_event_kinds"]["everquest.log.cast_begins"],
+        2
+    );
 }
 
 fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
@@ -195,6 +233,25 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
     {
         let db = Db::open(db_path, SCHEMA_VERSION)?;
         db.put_batch(cf::CF_ACTION_LOG, rows)?;
+        db.put_batch(
+            cf::CF_OBSERVATIONS,
+            vec![
+                observation_row(now - 1_800, 7, "quality.synthetic", "notepad.exe")?,
+                observation_row(now - 1_700, 8, "other.profile", "calc.exe")?,
+            ],
+        )?;
+        db.put_batch(
+            cf::CF_EVENTS,
+            vec![
+                event_row(
+                    now - 1_600,
+                    9,
+                    "quality.synthetic",
+                    "everquest.log.cast_begins",
+                )?,
+                event_row(now - 1_500, 10, "other.profile", "perception.observed")?,
+            ],
+        )?;
         db.flush()?;
     }
     Ok(())
@@ -235,6 +292,66 @@ fn action_row(
     Ok((
         audit_key(ts_ns, seq),
         encode_json(&value).context("audit row should encode")?,
+    ))
+}
+
+fn observation_row(
+    ts_ns: u64,
+    seq: u32,
+    profile_id: &str,
+    process_name: &str,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let value = json!({
+        "schema_version": 1,
+        "observation_id": format!("observe-{ts_ns:020}-{seq:010}"),
+        "ts_ns": ts_ns,
+        "foreground": {
+            "profile_id": profile_id,
+            "process_name": process_name
+        },
+        "recent_events": [
+            {
+                "seq": 1,
+                "kind": "everquest.log.cast_begins",
+                "data_excerpt": {
+                    "redacted": true,
+                    "summary": "synthetic compact event"
+                }
+            }
+        ]
+    });
+    Ok((
+        audit_key(ts_ns, seq),
+        encode_json(&value).context("observation row should encode")?,
+    ))
+}
+
+fn event_row(
+    ts_ns: u64,
+    seq: u32,
+    profile_id: &str,
+    kind: &str,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let value = json!({
+        "schema_version": 1,
+        "event_id": format!("event-{ts_ns:020}-{seq:010}"),
+        "ts_ns": ts_ns,
+        "audit_context": {
+            "profile_id": profile_id,
+            "app_context": {
+                "process_name": "notepad.exe",
+                "target_id": "quality.synthetic.target"
+            }
+        },
+        "kind": kind,
+        "data": {
+            "profile_id": profile_id,
+            "process_name": "notepad.exe"
+        }
+    });
+    Ok((
+        audit_key(ts_ns, seq),
+        encode_json(&value).context("event row should encode")?,
     ))
 }
 
