@@ -73,6 +73,23 @@ The level-2 acceptance source of truth is visible in-game character state:
 the game UI must show the character at level 2 after the run, with separate
 process/window/log/audit readback.
 
+## HUD Readback Contract
+
+The current configured-host level source is the visible Inventory character
+panel opened with `i`. On 2026-05-28 manual readback, that panel showed
+`Thenumberone`, `1 Wizard`, and `NEXT LEVEL 0.000%`.
+
+`everquest.level_text` is intentionally bounded to the Inventory panel instead
+of the whole EverQuest window. A whole-window HUD OCR pass can resolve to the
+UIA window title `EverQuest`, which is not character state and must not be used
+as a level claim. The Inventory crop is deliberately broad enough for the
+current windowed placement and the earlier fullscreen placement; the parser
+looks for the name/class line such as `1 Wizard`. `everquest.next_level_label`
+proves the XP panel is visible; the numeric XP percentage must still be read
+from the visible crop/screenshot unless OCR agrees with the crop. If OCR
+returns an ambiguous or contradictory XP percentage, the agent must treat the
+visible crop as the SoT and record the OCR mismatch on #495/#500.
+
 ## Log Pipeline
 
 EverQuest already creates local activity logs on this host. Current readback:
@@ -108,6 +125,25 @@ GitHub issues remain the canonical coordination state:
 | #498 | Profile-registry/audit-data moat rows |
 | #499 | Safe input aliases and foreground action audit |
 | #500 | Full-tool manual FSV coverage matrix against EverQuest |
+| #501 | Gameplay learning, hotkey/focus rules, and durable skill memory |
+
+## Gameplay Learning Memory
+
+EverQuest gameplay knowledge is durable project state. Store learned controls,
+focus rules, recovery steps, routes, combat loops, and UI source-of-truth
+findings in #501 as compact issue comments. Do not rely on the agent's current
+context window to remember how to play after compaction.
+
+Initial learned rules:
+
+- `i` opens the Inventory character panel used for level/XP readback.
+- `Enter` can focus or submit chat input; when chat input is focused, ordinary
+  keypresses type into chat instead of moving or triggering hotbar actions.
+- Restore world focus and read visible UI state before movement or combat
+  inputs.
+- Use the in-game Options/keybind UI as the authoritative control list when a
+  binding is uncertain.
+- Summarize public chat bodies in issues; do not preserve unnecessary raw chat.
 
 ## Manual FSV Plan
 

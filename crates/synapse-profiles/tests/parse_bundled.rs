@@ -125,6 +125,56 @@ fn bundled_minecraft_profile_carries_first_game_contract() -> Result<(), Box<dyn
 }
 
 #[test]
+fn bundled_everquest_profile_targets_inventory_panel() -> Result<(), Box<dyn std::error::Error>> {
+    let path = bundled_profiles_dir().join("everquest.live.toml");
+    let loaded = parse_profile_file(&path)?;
+    let profile = loaded.profile;
+
+    assert_eq!(profile.id, "everquest.live");
+    let level = profile
+        .hud
+        .iter()
+        .find(|field| field.name == "everquest.level_text")
+        .ok_or("everquest.level_text HUD field missing")?;
+    assert!(matches!(level.extractor, HudExtractor::WinrtOcr));
+    assert!(matches!(
+        level.parser,
+        HudParser::Regex { ref pattern, group }
+            if pattern.contains("[0-9]{1,3}") && pattern.contains("\\s+Wi(?:zard)?\\b") && group == 1
+    ));
+    assert!(matches!(
+        level.region,
+        HudRegion::AnchoredToEdge {
+            edge: WindowEdge::TopLeft,
+            x_offset: 80,
+            y_offset: 80,
+            w: 320,
+            h: 150,
+        }
+    ));
+
+    let next_level = profile
+        .hud
+        .iter()
+        .find(|field| field.name == "everquest.next_level_label")
+        .ok_or("everquest.next_level_label HUD field missing")?;
+    assert!(matches!(
+        next_level.region,
+        HudRegion::AnchoredToEdge {
+            edge: WindowEdge::TopLeft,
+            x_offset: 80,
+            y_offset: 180,
+            w: 320,
+            h: 260,
+        }
+    ));
+    assert!(
+        profile.metadata["capability.observe.hud"].contains("visible Inventory character panel")
+    );
+    Ok(())
+}
+
+#[test]
 fn parser_rejects_synthetic_invalid_profiles_with_exact_codes() {
     let cases = [
         (
