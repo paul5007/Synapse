@@ -508,18 +508,28 @@ fn latest_location_field(
                         display_y: location.display_y,
                         display_x: location.display_x,
                         display_z: location.display_z,
-                        map_x: location.display_x,
-                        map_y: location.display_y,
+                        map_x: display_to_map_x(location.display_x),
+                        map_y: display_to_map_y(location.display_y),
                         map_z: location.display_z,
                         log_timestamp: event.timestamp.format("%Y-%m-%dT%H:%M:%S").to_string(),
                     },
                     0.98,
                     log_source(batch, event),
-                    Some("EverQuest /loc displays Y, X, Z; map coordinates store X, Y, Z"),
+                    Some(
+                        "EverQuest /loc displays Y, X, Z; local map files use the negated X/Y axes",
+                    ),
                 )
             })
         })
         .unwrap_or_else(|| field_none("no /loc event in sampled log window"))
+}
+
+fn display_to_map_x(display_x: f64) -> f64 {
+    -display_x
+}
+
+fn display_to_map_y(display_y: f64) -> f64 {
+    -display_y
 }
 
 fn nearest_landmarks(
@@ -725,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn location_converts_display_order_to_map_order() -> anyhow::Result<()> {
+    fn location_converts_display_order_to_local_map_axes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("eqlog_Thenumberone_frostreaver.txt");
         std::fs::write(
@@ -738,8 +748,8 @@ mod tests {
             .value
             .as_ref()
             .unwrap_or_else(|| panic!("expected location"));
-        assert_eq!(location.map_x, 154.0);
-        assert_eq!(location.map_y, 50.94);
+        assert_eq!(location.map_x, -154.0);
+        assert_eq!(location.map_y, -50.94);
         assert_eq!(location.map_z, 31.19);
         Ok(())
     }
@@ -770,8 +780,8 @@ mod tests {
             .unwrap_or_else(|| panic!("expected latest location"));
         assert_eq!(location.display_y, 11.75);
         assert_eq!(location.display_x, 146.88);
-        assert_eq!(location.map_x, 146.88);
-        assert_eq!(location.map_y, 11.75);
+        assert_eq!(location.map_x, -146.88);
+        assert_eq!(location.map_y, -11.75);
         assert_eq!(location.log_timestamp, "2026-05-28T14:06:24");
         Ok(())
     }
