@@ -1011,6 +1011,20 @@ requirements for later attended action FSV. Floor-route guidance prunes already
 reached local map-line nodes before emitting the next waypoint so route rows do
 not steer back to a crossed guidance point.
 
+Before falling back to map labels, `everquest_route_plan` scans compact
+`everquest/transition/v1/everquest.live/*` world-model rows. A row is eligible
+only when it is a compact/redacted `transition` row with
+`verification_status="verified_zone_entry"`, matching from/to zones, complete
+`pre_zone_location` and `post_zone_location`, and confidence at least `0.70`.
+Eligible rows become `verified_transition_volume` waypoints and are copied into
+the route row as `verified_transition`. Static zone labels without a matching
+verified row remain routeable, but their final waypoint kind is
+`static_zone_label_hint` and the row records `static_zone_label_unverified`; the
+planner must not mark a zone crossing until physical EQ log/current-state
+readback proves it. If the current zone already matches the requested target
+zone, the tool persists `abstain_already_in_target_zone` so stale pre-crossing
+plans do not stay active after a transition.
+
 Unknown zone, missing `/loc`, absent target, stale state, or conflicting map
 calibration produce persisted abstain rows instead of guessed movement.
 Manual FSV must read the physical map/current-state SoT before the trigger,
@@ -1200,6 +1214,17 @@ inspect the same rows plus final JSONL bytes afterward.
 - `everquest/trajectory/v1/everquest.live/<row_id>`
 - `everquest/planner/v1/everquest.live/<row_id>`
 - `everquest/surprise/v1/everquest.live/<row_id>`
+
+For learned zone-transition volumes consumed by `everquest_route_plan`, use
+`row_kind="transition"` and a compact payload with:
+`verification_status="verified_zone_entry"`, `from_zone_short_name`,
+`to_zone_short_name`, optional `label`, complete `pre_zone_location` and
+`post_zone_location` objects with `map_x/map_y/map_z`, optional
+`action_cluster`, and `confidence >= 0.70`. The source refs must point at the
+physical EQ log zone-entry line, pre/post `/loc` evidence, and any storage or
+action rows used to reconstruct the crossing. Rows missing post-zone `/loc`,
+with unexpected destination zones, or with low confidence are storage evidence
+only and must not become planner-eligible transition volumes.
 
 Rows include schema version, profile id, world-model kind, row id/key,
 created/updated timestamps, revision, previous payload hash on replace,

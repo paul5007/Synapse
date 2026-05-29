@@ -3,16 +3,19 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use synapse_core::error_codes;
 use synapse_everquest::{
     EverQuestMapCoord, EverQuestZoneEdge, EverQuestZoneGraph, EverQuestZoneLandmark,
     EverQuestZoneSegment, build_zone_graph_from_root,
 };
+use synapse_storage::cf;
 
 use super::{
     Json, Parameters, SynapseService,
     everquest_log::EVERQUEST_PROFILE_ID,
     everquest_state::{CURRENT_STATE_ROW_KEY, EverQuestCurrentState, EverQuestStateSource},
+    everquest_world_model::model::{EverQuestWorldModelKind, EverQuestWorldModelRow},
     tool, tool_router,
 };
 use crate::m1::mcp_error;
@@ -20,13 +23,16 @@ use crate::m1::mcp_error;
 const TOOL: &str = "everquest_route_plan";
 const SCHEMA_VERSION: u32 = 1;
 const ROUTE_PLAN_PREFIX: &str = "everquest/route_plan/v1";
+const LEARNED_TRANSITION_PREFIX: &str = "everquest/transition/v1";
 const DEFAULT_STALE_AFTER_SECONDS: u64 = 300;
 const DEFAULT_MAX_WAYPOINTS: usize = 8;
 const MAX_WAYPOINTS: usize = 32;
 const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 512;
 const MAX_SOURCE_REFS: usize = 32;
+const LEARNED_TRANSITION_SCAN_LIMIT: usize = 256;
 const MIN_ROUTE_CONFIDENCE: f32 = 0.50;
+const MIN_VERIFIED_TRANSITION_CONFIDENCE: f32 = 0.70;
 const CALIBRATION_CONFLICT_DISTANCE: f64 = 150.0;
 const FLOOR_ROUTE_MIN_Z_DELTA: f64 = 8.0;
 const FLOOR_ROUTE_CONNECT_RADIUS: f64 = 96.0;
@@ -117,6 +123,8 @@ pub struct EverQuestRoutePlanRow {
     pub current_location: Option<EverQuestRouteLocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_landmark: Option<EverQuestRouteLandmark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_transition: Option<EverQuestRouteVerifiedTransition>,
     pub nearest_start_landmarks: Vec<EverQuestRouteLandmark>,
     pub nearest_target_landmarks: Vec<EverQuestRouteLandmark>,
     pub waypoints: Vec<EverQuestRouteWaypoint>,
@@ -182,6 +190,23 @@ pub struct EverQuestRouteWaypoint {
     pub source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_line_number: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EverQuestRouteVerifiedTransition {
+    pub row_key: String,
+    pub transition_id: String,
+    pub from_zone_short_name: String,
+    pub to_zone_short_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub pre_zone_location: EverQuestRouteLocation,
+    pub post_zone_location: EverQuestRouteLocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_cluster: Option<String>,
+    pub confidence: f32,
+    pub source_refs: Vec<EverQuestRouteSourceRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -269,6 +294,13 @@ struct RouteSourceState {
 struct RouteTargetMatch {
     landmark: EverQuestRouteLandmark,
     confidence: f32,
+    verified_transition: Option<EverQuestRouteVerifiedTransition>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LearnedTransitionIndex {
+    transitions: Vec<EverQuestRouteVerifiedTransition>,
+    hazards: Vec<EverQuestRouteHazard>,
 }
 
 #[derive(Clone, Debug)]
@@ -306,7 +338,8 @@ impl SynapseService {
                 format!("{TOOL} could not build EverQuest zone graph: {error}"),
             )
         })?;
-        let row = route_plan_row(&normalized, &source_state, &graph);
+        let learned_transitions = self.learned_transition_index(&normalized.profile_id)?;
+        let row = route_plan_row(&normalized, &source_state, &graph, &learned_transitions);
         let (plan, stored_value_len_bytes) =
             self.persist_route_plan_json(&normalized.row_key, &row)?;
         Ok(Json(EverQuestRoutePlanResponse {
@@ -319,6 +352,58 @@ impl SynapseService {
 }
 
 impl SynapseService {
+    fn learned_transition_index(
+        &self,
+        profile_id: &str,
+    ) -> Result<LearnedTransitionIndex, ErrorData> {
+        let prefix = learned_transition_prefix(profile_id);
+        let rows = {
+            let runtime = self.reflex_runtime()?;
+            let runtime = runtime.lock().map_err(|_| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "reflex runtime lock poisoned while reading EverQuest learned transitions",
+                )
+            })?;
+            runtime
+                .storage_cf_prefix_rows(
+                    cf::CF_KV,
+                    prefix.as_bytes(),
+                    LEARNED_TRANSITION_SCAN_LIMIT + 1,
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("read EverQuest learned transition rows: {error}"),
+                    )
+                })?
+        };
+        let scan_truncated = rows.len() > LEARNED_TRANSITION_SCAN_LIMIT;
+        let mut index = LearnedTransitionIndex::default();
+        for (key, value) in rows.into_iter().take(LEARNED_TRANSITION_SCAN_LIMIT) {
+            let key_text = String::from_utf8_lossy(&key).into_owned();
+            let row = decode_json_row::<EverQuestWorldModelRow>(
+                &value,
+                "EverQuest world-model transition row",
+            )?;
+            match learned_transition_from_world_model_row(key_text, row) {
+                Ok(Some(transition)) => index.transitions.push(transition),
+                Ok(None) => {}
+                Err(hazard) => index.hazards.push(hazard),
+            }
+        }
+        if scan_truncated {
+            index.hazards.push(EverQuestRouteHazard {
+                code: "learned_transition_scan_truncated".to_owned(),
+                severity: "warning".to_owned(),
+                detail: format!(
+                    "only the first {LEARNED_TRANSITION_SCAN_LIMIT} learned transition rows were scanned"
+                ),
+            });
+        }
+        Ok(index)
+    }
+
     fn route_source_state(&self, params: &NormalizedParams) -> Result<RouteSourceState, ErrorData> {
         if let Some(override_state) = &params.state_override {
             return Ok(RouteSourceState {
@@ -518,9 +603,10 @@ fn route_plan_row(
     params: &NormalizedParams,
     source: &RouteSourceState,
     graph: &EverQuestZoneGraph,
+    learned_transitions: &LearnedTransitionIndex,
 ) -> EverQuestRoutePlanRow {
     let mut source_refs = source.source_refs.clone();
-    let mut hazards = Vec::new();
+    let hazards = learned_transitions.hazards.clone();
     if let Some(calibration) = &params.map_calibration
         && let Some(ref source_ref) = calibration.source_ref
     {
@@ -546,13 +632,14 @@ fn route_plan_row(
         current_zone_short_name: source.zone_short_name.clone(),
         current_location: source.location.clone(),
         target_landmark: None,
+        verified_transition: None,
         nearest_start_landmarks: Vec::new(),
         nearest_target_landmarks: Vec::new(),
         waypoints: Vec::new(),
         total_distance: None,
         confidence: 0.0,
         guard_requirements,
-        hazards: Vec::new(),
+        hazards,
         source_refs,
         evidence_boundary: evidence_boundary(),
     };
@@ -566,7 +653,7 @@ fn route_plan_row(
         return row;
     }
     if is_stale_source(source.generated_at, params.stale_after_seconds) {
-        hazards.push(EverQuestRouteHazard {
+        row.hazards.push(EverQuestRouteHazard {
             code: "stale_current_state".to_owned(),
             severity: "warning".to_owned(),
             detail: format!(
@@ -574,7 +661,6 @@ fn route_plan_row(
                 params.stale_after_seconds
             ),
         });
-        row.hazards = hazards;
         abstain(
             &mut row,
             "abstain_stale_current_state",
@@ -590,6 +676,25 @@ fn route_plan_row(
         );
         return row;
     };
+    if params
+        .target_zone_short_name
+        .as_deref()
+        .is_some_and(|target_zone| target_zone.eq_ignore_ascii_case(zone_short_name))
+    {
+        row.hazards.push(EverQuestRouteHazard {
+            code: "already_in_target_zone".to_owned(),
+            severity: "info".to_owned(),
+            detail: format!(
+                "current zone {zone_short_name:?} already matches the requested target zone"
+            ),
+        });
+        abstain(
+            &mut row,
+            "abstain_already_in_target_zone",
+            "already in target zone; refresh current objective and re-plan from the new zone",
+        );
+        return row;
+    }
     let Some(current_location) = source.location.as_ref() else {
         abstain(
             &mut row,
@@ -616,7 +721,19 @@ fn route_plan_row(
         })
         .collect();
 
-    let Some(target_match) = find_target(params, graph, zone_short_name, current_location) else {
+    row.hazards.extend(verified_transition_mismatch_hazards(
+        params,
+        learned_transitions,
+        zone_short_name,
+    ));
+
+    let Some(target_match) = find_target(
+        params,
+        graph,
+        learned_transitions,
+        zone_short_name,
+        current_location,
+    ) else {
         abstain(
             &mut row,
             "abstain_target_not_found",
@@ -624,6 +741,20 @@ fn route_plan_row(
         );
         return row;
     };
+    if let Some(transition) = &target_match.verified_transition {
+        row.source_refs.extend(transition.source_refs.clone());
+        row.source_refs.truncate(MAX_SOURCE_REFS);
+        row.verified_transition = Some(transition.clone());
+    } else if target_match.landmark.target_zone_short_name.is_some() {
+        row.hazards.push(EverQuestRouteHazard {
+            code: "static_zone_label_unverified".to_owned(),
+            severity: "warning".to_owned(),
+            detail: format!(
+                "no verified transition row matched target {:?}; treating static map label {:?} as an approach hint only",
+                params.target_zone_short_name, target_match.landmark.label
+            ),
+        });
+    }
 
     let target_coord = EverQuestMapCoord {
         x: target_match.landmark.map_x,
@@ -649,6 +780,7 @@ fn route_plan_row(
         zone_short_name,
         current_location,
         &target_match.landmark,
+        target_match.verified_transition.as_ref(),
         (source.zone_confidence * source.location_confidence).clamp(0.0, 1.0),
         target_match.confidence,
         floor_route_required,
@@ -763,12 +895,142 @@ fn state_source_refs(sources: &[EverQuestStateSource]) -> Vec<EverQuestRouteSour
         .collect()
 }
 
+fn learned_transition_from_world_model_row(
+    storage_key: String,
+    row: EverQuestWorldModelRow,
+) -> Result<Option<EverQuestRouteVerifiedTransition>, EverQuestRouteHazard> {
+    if row.world_model_kind != EverQuestWorldModelKind::Transition {
+        return Ok(None);
+    }
+    if row.row_kind != "everquest_world_model" {
+        return Err(invalid_transition_hazard(
+            &storage_key,
+            "world-model row_kind is not everquest_world_model",
+        ));
+    }
+    if row.redaction.raw_chat_body_persisted || !row.redaction.compact_redacted {
+        return Err(invalid_transition_hazard(
+            &storage_key,
+            "transition row redaction boundary is not compact/redacted",
+        ));
+    }
+    let payload = row.payload.as_object().ok_or_else(|| {
+        invalid_transition_hazard(&storage_key, "transition payload must be a JSON object")
+    })?;
+    let verification_status = payload
+        .get("verification_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if verification_status != "verified_zone_entry" {
+        return Ok(None);
+    }
+    let from_zone_short_name = payload_text(payload, "from_zone_short_name")
+        .ok_or_else(|| invalid_transition_hazard(&storage_key, "missing from_zone_short_name"))?;
+    let to_zone_short_name = payload_text(payload, "to_zone_short_name")
+        .ok_or_else(|| invalid_transition_hazard(&storage_key, "missing to_zone_short_name"))?;
+    let pre_zone_location = payload_location(payload, "pre_zone_location").ok_or_else(|| {
+        invalid_transition_hazard(&storage_key, "missing complete pre_zone_location")
+    })?;
+    let post_zone_location = payload_location(payload, "post_zone_location").ok_or_else(|| {
+        invalid_transition_hazard(&storage_key, "missing complete post_zone_location")
+    })?;
+    let confidence = payload
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(f64::from(MIN_VERIFIED_TRANSITION_CONFIDENCE)) as f32;
+    if !confidence.is_finite() || confidence < MIN_VERIFIED_TRANSITION_CONFIDENCE {
+        return Ok(None);
+    }
+    let mut source_refs = vec![EverQuestRouteSourceRef {
+        kind: "everquest_world_model_transition".to_owned(),
+        row_key: Some(row.row_key.clone()),
+        path: None,
+        line_number: None,
+        start_offset: None,
+        next_offset: None,
+        summary: Some("verified learned zone-transition row".to_owned()),
+    }];
+    source_refs.extend(row.source_refs.iter().map(world_model_source_ref_to_route));
+    source_refs.truncate(MAX_SOURCE_REFS);
+    Ok(Some(EverQuestRouteVerifiedTransition {
+        row_key: row.row_key,
+        transition_id: row.row_id,
+        from_zone_short_name,
+        to_zone_short_name,
+        label: payload_text(payload, "label").or_else(|| payload_text(payload, "target_label")),
+        pre_zone_location,
+        post_zone_location,
+        action_cluster: payload_text(payload, "action_cluster").or_else(|| {
+            payload
+                .get("action_cluster")
+                .and_then(Value::as_object)
+                .and_then(|action| payload_text(action, "summary"))
+        }),
+        confidence,
+        source_refs,
+    }))
+}
+
+fn invalid_transition_hazard(row_key: &str, detail: impl Into<String>) -> EverQuestRouteHazard {
+    EverQuestRouteHazard {
+        code: "learned_transition_invalid".to_owned(),
+        severity: "warning".to_owned(),
+        detail: format!("{row_key}: {}", detail.into()),
+    }
+}
+
+fn world_model_source_ref_to_route(
+    source: &super::everquest_world_model::model::EverQuestWorldModelSourceRef,
+) -> EverQuestRouteSourceRef {
+    EverQuestRouteSourceRef {
+        kind: source.kind.clone(),
+        row_key: source.row_key.clone(),
+        path: source.path.clone(),
+        line_number: None,
+        start_offset: source.start_offset,
+        next_offset: source.next_offset,
+        summary: source.summary.clone(),
+    }
+}
+
+fn payload_text(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    map.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn payload_location(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<EverQuestRouteLocation> {
+    let location = map.get(key)?.as_object()?;
+    Some(EverQuestRouteLocation {
+        map_x: location.get("map_x")?.as_f64()?,
+        map_y: location.get("map_y")?.as_f64()?,
+        map_z: location.get("map_z")?.as_f64()?,
+    })
+}
+
 fn find_target(
     params: &NormalizedParams,
     graph: &EverQuestZoneGraph,
+    learned_transitions: &LearnedTransitionIndex,
     current_zone: &str,
     current_location: &EverQuestRouteLocation,
 ) -> Option<RouteTargetMatch> {
+    if let Some(transition) = best_matching_verified_transition(
+        params,
+        learned_transitions,
+        current_zone,
+        current_location,
+    ) {
+        return Some(target_from_verified_transition(
+            transition,
+            current_location,
+        ));
+    }
     if let Some(label) = params.target_label.as_deref() {
         if let Some(edge) =
             best_matching_edge_by_label(params, graph, current_zone, label, current_location)
@@ -789,6 +1051,7 @@ fn find_target(
                     None,
                 ),
                 confidence: 0.75,
+                verified_transition: None,
             });
         }
     }
@@ -874,7 +1137,143 @@ fn target_from_edge(
             target_zone_short_name: edge.target_zone_short_name.clone(),
         },
         confidence: edge.confidence,
+        verified_transition: None,
     }
+}
+
+fn target_from_verified_transition(
+    transition: EverQuestRouteVerifiedTransition,
+    current_location: &EverQuestRouteLocation,
+) -> RouteTargetMatch {
+    let location = route_location_to_coord(&transition.pre_zone_location);
+    let label = transition
+        .label
+        .clone()
+        .unwrap_or_else(|| transition.transition_id.clone());
+    RouteTargetMatch {
+        landmark: EverQuestRouteLandmark {
+            label,
+            zone_short_name: transition.from_zone_short_name.clone(),
+            map_x: transition.pre_zone_location.map_x,
+            map_y: transition.pre_zone_location.map_y,
+            map_z: transition.pre_zone_location.map_z,
+            distance_from_current: Some(distance(
+                &route_location_to_coord(current_location),
+                &location,
+            )),
+            confidence: transition.confidence,
+            source_path: transition.row_key.clone(),
+            source_line_number: 0,
+            target_zone_short_name: Some(transition.to_zone_short_name.clone()),
+        },
+        confidence: transition.confidence,
+        verified_transition: Some(transition),
+    }
+}
+
+fn best_matching_verified_transition(
+    params: &NormalizedParams,
+    learned_transitions: &LearnedTransitionIndex,
+    current_zone: &str,
+    current_location: &EverQuestRouteLocation,
+) -> Option<EverQuestRouteVerifiedTransition> {
+    let current = route_location_to_coord(current_location);
+    learned_transitions
+        .transitions
+        .iter()
+        .filter(|transition| {
+            transition
+                .from_zone_short_name
+                .eq_ignore_ascii_case(current_zone)
+        })
+        .filter(|transition| {
+            params
+                .target_zone_short_name
+                .as_deref()
+                .is_none_or(|zone| transition.to_zone_short_name.eq_ignore_ascii_case(zone))
+        })
+        .filter(|transition| {
+            params.target_label.as_deref().is_none_or(|label| {
+                transition
+                    .label
+                    .as_deref()
+                    .is_some_and(|candidate| normalize_label(candidate) == normalize_label(label))
+            })
+        })
+        .min_by(|left, right| {
+            distance(&route_location_to_coord(&left.pre_zone_location), &current).total_cmp(
+                &distance(&route_location_to_coord(&right.pre_zone_location), &current),
+            )
+        })
+        .cloned()
+}
+
+fn verified_transition_mismatch_hazards(
+    params: &NormalizedParams,
+    learned_transitions: &LearnedTransitionIndex,
+    current_zone: &str,
+) -> Vec<EverQuestRouteHazard> {
+    let Some(target_zone) = params.target_zone_short_name.as_deref() else {
+        return Vec::new();
+    };
+    let Some(target_label) = params.target_label.as_deref() else {
+        return Vec::new();
+    };
+    learned_transitions
+        .transitions
+        .iter()
+        .filter(|transition| transition.from_zone_short_name.eq_ignore_ascii_case(current_zone))
+        .filter(|transition| {
+            transition
+                .label
+                .as_deref()
+                .is_some_and(|label| normalize_label(label) == normalize_label(target_label))
+        })
+        .filter(|transition| !transition.to_zone_short_name.eq_ignore_ascii_case(target_zone))
+        .map(|transition| EverQuestRouteHazard {
+            code: "learned_transition_destination_mismatch".to_owned(),
+            severity: "high".to_owned(),
+            detail: format!(
+                "learned transition row {} has label {:?} but destination {:?}, not requested target {:?}",
+                transition.row_key, transition.label, transition.to_zone_short_name, target_zone
+            ),
+        })
+        .collect()
+}
+
+fn target_waypoint_contract(
+    target_landmark: &EverQuestRouteLandmark,
+    verified_transition: Option<&EverQuestRouteVerifiedTransition>,
+) -> (String, Vec<String>) {
+    if verified_transition.is_some() {
+        return (
+            "verified_transition_volume".to_owned(),
+            vec![
+                "bounded_step_probe".to_owned(),
+                "verify_loc_before_step".to_owned(),
+                "verify_zone_entry_log_after_crossing".to_owned(),
+                "replan_after_zone_change".to_owned(),
+            ],
+        );
+    }
+    if target_landmark.target_zone_short_name.is_some() {
+        return (
+            "static_zone_label_hint".to_owned(),
+            vec![
+                "bounded_step_probe".to_owned(),
+                "verify_loc_before_step".to_owned(),
+                "do_not_mark_transition_without_zone_entry_log".to_owned(),
+                "replan_after_zone_change_or_surprise".to_owned(),
+            ],
+        );
+    }
+    (
+        "target_landmark".to_owned(),
+        vec![
+            "bounded_step_probe".to_owned(),
+            "replan_after_zone_change_or_surprise".to_owned(),
+        ],
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -884,6 +1283,7 @@ fn route_waypoints(
     zone_short_name: &str,
     current_location: &EverQuestRouteLocation,
     target_landmark: &EverQuestRouteLandmark,
+    verified_transition: Option<&EverQuestRouteVerifiedTransition>,
     current_confidence: f32,
     target_confidence: f32,
     floor_route_required: bool,
@@ -959,9 +1359,11 @@ fn route_waypoints(
     }
     let target_step = distance(&previous, &target_coord);
     distance_from_start += target_step;
+    let (target_kind, target_guards) =
+        target_waypoint_contract(target_landmark, verified_transition);
     waypoints.push(EverQuestRouteWaypoint {
         step_index: waypoints.len(),
-        waypoint_kind: "target_landmark".to_owned(),
+        waypoint_kind: target_kind,
         label: target_landmark.label.clone(),
         zone_short_name: target_landmark.zone_short_name.clone(),
         map_x: target_landmark.map_x,
@@ -970,10 +1372,7 @@ fn route_waypoints(
         distance_from_previous: target_step,
         distance_from_start,
         confidence: target_confidence,
-        guard_requirements: vec![
-            "bounded_step_probe".to_owned(),
-            "replan_after_zone_change_or_surprise".to_owned(),
-        ],
+        guard_requirements: target_guards,
         source_path: Some(target_landmark.source_path.clone()),
         source_line_number: Some(target_landmark.source_line_number),
     });
@@ -1616,6 +2015,10 @@ fn route_plan_row_key(profile_id: &str, plan_id: &str) -> String {
     format!("{ROUTE_PLAN_PREFIX}/{profile_id}/{plan_id}")
 }
 
+fn learned_transition_prefix(profile_id: &str) -> String {
+    format!("{LEARNED_TRANSITION_PREFIX}/{profile_id}")
+}
+
 fn default_profile_id() -> String {
     EVERQUEST_PROFILE_ID.to_owned()
 }
@@ -1659,7 +2062,7 @@ mod tests {
     fn route_ready_to_matching_zone_line() {
         let params = params("happy", Some("to_Nektulos_Forest"), Some("nektulos"));
         let source = source_state(Some("neriaka"), Some(location(154.0, 50.94, 31.19)));
-        let row = route_plan_row(&params, &source, &graph());
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
 
         assert_eq!(row.decision, "route_ready");
         assert_eq!(
@@ -1673,10 +2076,113 @@ mod tests {
     }
 
     #[test]
+    fn route_prefers_verified_transition_volume() {
+        let params = params(
+            "verified-transition",
+            Some("to_Nektulos_Forest"),
+            Some("nektulos"),
+        );
+        let source = source_state(Some("neriaka"), Some(location(-155.18, -20.68, 28.63)));
+        let learned = LearnedTransitionIndex {
+            transitions: vec![learned_transition()],
+            hazards: Vec::new(),
+        };
+
+        let row = route_plan_row(&params, &source, &graph(), &learned);
+
+        assert_eq!(row.decision, "route_ready");
+        assert_eq!(
+            row.target_landmark.as_ref().unwrap().source_path,
+            "everquest/transition/v1/everquest.live/issue533-neriaka-nektulos"
+        );
+        assert_eq!(row.target_landmark.as_ref().unwrap().map_y, -51.56);
+        assert_eq!(
+            row.waypoints.last().unwrap().waypoint_kind,
+            "verified_transition_volume"
+        );
+        assert!(row.verified_transition.is_some());
+        assert!(
+            !row.hazards
+                .iter()
+                .any(|hazard| hazard.code == "static_zone_label_unverified")
+        );
+    }
+
+    #[test]
+    fn static_zone_label_is_hint_without_verified_transition() {
+        let params = params(
+            "static-label-hint",
+            Some("to_Nektulos_Forest"),
+            Some("nektulos"),
+        );
+        let source = source_state(Some("neriaka"), Some(location(-155.18, -20.68, 28.63)));
+
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
+
+        assert_eq!(row.decision, "route_ready");
+        assert_eq!(
+            row.waypoints.last().unwrap().waypoint_kind,
+            "static_zone_label_hint"
+        );
+        assert!(row.verified_transition.is_none());
+        assert!(
+            row.hazards
+                .iter()
+                .any(|hazard| hazard.code == "static_zone_label_unverified")
+        );
+    }
+
+    #[test]
+    fn stale_from_zone_target_abstains_after_zone_crossing() {
+        let params = params(
+            "already-crossed",
+            Some("to_Nektulos_Forest"),
+            Some("nektulos"),
+        );
+        let source = source_state(Some("nektulos"), Some(location(963.13, -1820.25, 26.59)));
+
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
+
+        assert_eq!(row.decision, "abstain_already_in_target_zone");
+        assert!(row.waypoints.is_empty());
+        assert!(
+            row.hazards
+                .iter()
+                .any(|hazard| hazard.code == "already_in_target_zone")
+        );
+    }
+
+    #[test]
+    fn invalid_transition_without_post_zone_loc_is_not_eligible() {
+        let row = world_model_transition_row(serde_json::json!({
+            "verification_status": "verified_zone_entry",
+            "from_zone_short_name": "neriaka",
+            "to_zone_short_name": "nektulos",
+            "label": "to_Nektulos_Forest",
+            "pre_zone_location": {"map_x": -156.65, "map_y": -51.56, "map_z": 31.19},
+            "confidence": 0.95
+        }));
+
+        let result = learned_transition_from_world_model_row(
+            "everquest/transition/v1/everquest.live/missing-post-loc".to_owned(),
+            row,
+        );
+
+        let hazard = result.unwrap_err();
+        assert_eq!(hazard.code, "learned_transition_invalid");
+        assert!(hazard.detail.contains("post_zone_location"));
+    }
+
+    #[test]
     fn z_level_route_inserts_map_line_guidance() {
         let params = params("floor-route", Some("to_Nektulos_Forest"), Some("nektulos"));
         let source = source_state(Some("neriaka"), Some(location(0.0, 0.0, 0.0)));
-        let row = route_plan_row(&params, &source, &floor_graph());
+        let row = route_plan_row(
+            &params,
+            &source,
+            &floor_graph(),
+            &empty_learned_transitions(),
+        );
 
         assert_eq!(row.decision, "route_ready");
         assert!(
@@ -1871,7 +2377,12 @@ mod tests {
         );
         params.max_waypoints = MAX_WAYPOINTS;
         let source = source_state(Some("neriaka"), Some(location(-65.9, -47.98, 19.51)));
-        let row = route_plan_row(&params, &source, &near_target_floor_graph());
+        let row = route_plan_row(
+            &params,
+            &source,
+            &near_target_floor_graph(),
+            &empty_learned_transitions(),
+        );
 
         assert_eq!(row.decision, "route_ready");
         assert!(row.waypoints.len() > 2);
@@ -1892,7 +2403,7 @@ mod tests {
         );
         params.max_waypoints = MAX_WAYPOINTS;
         let source = source_state(Some("neriaka"), Some(location(-77.65, -38.57, 22.27)));
-        let row = route_plan_row(&params, &source, &graph());
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
 
         assert_eq!(row.decision, "route_ready");
         assert_eq!(row.waypoints.last().unwrap().label, "to_Nektulos_Forest");
@@ -1908,10 +2419,14 @@ mod tests {
             Some("nektulos"),
         );
         let source = source_state(Some("neriaka"), Some(location(0.0, 0.0, 0.0)));
-        let row = route_plan_row(&params, &source, &graph());
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
 
         assert_eq!(row.decision, "abstain_floor_route_graph_missing");
-        assert_eq!(row.hazards[0].code, "floor_route_graph_missing");
+        assert!(
+            row.hazards
+                .iter()
+                .any(|hazard| hazard.code == "floor_route_graph_missing")
+        );
         assert!(row.waypoints.is_empty());
     }
 
@@ -1924,17 +2439,26 @@ mod tests {
         );
         params.max_waypoints = 4;
         let source = source_state(Some("neriaka"), Some(location(0.0, 0.0, 0.0)));
-        let row = route_plan_row(&params, &source, &long_floor_graph());
+        let row = route_plan_row(
+            &params,
+            &source,
+            &long_floor_graph(),
+            &empty_learned_transitions(),
+        );
 
         assert_eq!(row.decision, "abstain_floor_route_waypoint_budget_exceeded");
-        assert_eq!(row.hazards[0].code, "floor_route_waypoint_budget_exceeded");
+        assert!(
+            row.hazards
+                .iter()
+                .any(|hazard| hazard.code == "floor_route_waypoint_budget_exceeded")
+        );
     }
 
     #[test]
     fn unknown_zone_abstains_with_persistable_row() {
         let params = params("unknown-zone", Some("to_Nektulos_Forest"), Some("nektulos"));
         let source = source_state(None, Some(location(154.0, 50.94, 31.19)));
-        let row = route_plan_row(&params, &source, &graph());
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
 
         assert_eq!(row.decision, "abstain_unknown_current_zone");
         assert!(row.waypoints.is_empty());
@@ -1945,7 +2469,7 @@ mod tests {
     fn missing_location_abstains() {
         let params = params("no-loc", Some("to_Nektulos_Forest"), Some("nektulos"));
         let source = source_state(Some("neriaka"), None);
-        let row = route_plan_row(&params, &source, &graph());
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
 
         assert_eq!(row.decision, "abstain_no_current_loc");
         assert!(row.total_distance.is_none());
@@ -1955,7 +2479,7 @@ mod tests {
     fn absent_target_abstains() {
         let params = params("absent", Some("not_on_this_map"), None);
         let source = source_state(Some("neriaka"), Some(location(154.0, 50.94, 31.19)));
-        let row = route_plan_row(&params, &source, &graph());
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
 
         assert_eq!(row.decision, "abstain_target_not_found");
         assert!(row.abstain_reason.unwrap().contains("not_on_this_map"));
@@ -1971,7 +2495,7 @@ mod tests {
             source_ref: None,
         });
         let source = source_state(Some("neriaka"), Some(location(154.0, 50.94, 31.19)));
-        let row = route_plan_row(&params, &source, &graph());
+        let row = route_plan_row(&params, &source, &graph(), &empty_learned_transitions());
 
         assert_eq!(row.decision, "abstain_conflicting_map_calibration");
         assert_eq!(row.hazards[0].code, "map_calibration_zone_conflict");
@@ -2017,6 +2541,81 @@ mod tests {
                 next_offset: None,
                 summary: Some("synthetic route source".to_owned()),
             }],
+        }
+    }
+
+    fn empty_learned_transitions() -> LearnedTransitionIndex {
+        LearnedTransitionIndex::default()
+    }
+
+    fn learned_transition() -> EverQuestRouteVerifiedTransition {
+        EverQuestRouteVerifiedTransition {
+            row_key: "everquest/transition/v1/everquest.live/issue533-neriaka-nektulos".to_owned(),
+            transition_id: "issue533-neriaka-nektulos".to_owned(),
+            from_zone_short_name: "neriaka".to_owned(),
+            to_zone_short_name: "nektulos".to_owned(),
+            label: Some("to_Nektulos_Forest".to_owned()),
+            pre_zone_location: location(-156.65, -51.56, 31.19),
+            post_zone_location: location(963.13, -1820.25, 26.59),
+            action_cluster: Some("bounded forward300 after label approach".to_owned()),
+            confidence: 0.95,
+            source_refs: vec![EverQuestRouteSourceRef {
+                kind: "unit_test".to_owned(),
+                row_key: Some("synthetic/source".to_owned()),
+                path: None,
+                line_number: None,
+                start_offset: None,
+                next_offset: None,
+                summary: Some("synthetic verified transition".to_owned()),
+            }],
+        }
+    }
+
+    fn world_model_transition_row(payload: serde_json::Value) -> EverQuestWorldModelRow {
+        use super::super::everquest_world_model::model::{
+            EverQuestWorldModelCaps, EverQuestWorldModelEvidenceBoundary,
+            EverQuestWorldModelRedaction, EverQuestWorldModelRetention,
+            EverQuestWorldModelRetentionClass,
+        };
+
+        EverQuestWorldModelRow {
+            schema_version: 1,
+            row_kind: "everquest_world_model".to_owned(),
+            profile_id: EVERQUEST_PROFILE_ID.to_owned(),
+            world_model_kind: EverQuestWorldModelKind::Transition,
+            row_id: "missing-post-loc".to_owned(),
+            row_key: "everquest/transition/v1/everquest.live/missing-post-loc".to_owned(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            revision: 1,
+            previous_payload_sha256: None,
+            payload,
+            payload_sha256: "0".repeat(64),
+            payload_len_bytes: 1,
+            source_refs: Vec::new(),
+            redaction: EverQuestWorldModelRedaction {
+                compact_redacted: true,
+                raw_chat_body_persisted: false,
+                raw_target_names_persisted: false,
+                raw_payload_rejected: false,
+            },
+            retention: EverQuestWorldModelRetention {
+                class: EverQuestWorldModelRetentionClass::Strategic,
+                ttl_ns: None,
+                pressure_preserve: true,
+            },
+            caps: EverQuestWorldModelCaps {
+                max_payload_bytes: 8192,
+                max_source_refs: 32,
+                inspect_scan_limit: 4096,
+            },
+            evidence_boundary: EverQuestWorldModelEvidenceBoundary {
+                cf_name: cf::CF_KV.to_owned(),
+                source_rows_verified_by_caller: true,
+                manual_fsv_required_for_runtime: true,
+                is_fsv_script: false,
+                note: "synthetic unit row".to_owned(),
+            },
         }
     }
 

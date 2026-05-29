@@ -490,6 +490,18 @@ planners, ContextGraph/DynamicJEPA export, surprise detection, and manual FSV
 evidence. Raw chat/message payloads and raw target-name style data must be
 rejected before storage.
 
+Learned physical zone-transition volumes live under
+`everquest/transition/v1/everquest.live/<row_id>`. Planner-eligible payloads
+must be compact/redacted and include `verification_status="verified_zone_entry"`,
+`from_zone_short_name`, `to_zone_short_name`, optional `label`, complete
+`pre_zone_location` and `post_zone_location` coordinates (`map_x/map_y/map_z`),
+optional `action_cluster`, and `confidence >= 0.70`. The source refs must point
+at the physical EQ log zone-entry line, pre/post `/loc` evidence, and any guard,
+route, action, or current-state rows used to reconstruct the crossing.
+`everquest_route_plan` prefers these verified transition rows over static
+zone-line labels; static labels remain approach hints only until the log and
+current-state SoT prove the crossing.
+
 Manual FSV for these rows reads `CF_KV` before the trigger, calls the real MCP
 tool with known synthetic world-model data, then separately reads the selected
 key, prefix counts, and storage/WAL state afterward. These rows are not
