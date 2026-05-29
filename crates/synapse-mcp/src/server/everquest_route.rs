@@ -880,6 +880,7 @@ fn route_waypoints(
             floor_route_nodes(graph, zone_short_name, current_location, target_landmark)?;
         let current_coord = route_location_to_coord(current_location);
         prune_reached_floor_route_nodes(&mut nodes, &current_coord);
+        nodes = expand_current_to_first_guidance(&current_coord, &nodes);
         Some(nodes)
     } else {
         None
@@ -1226,6 +1227,30 @@ fn expand_long_guidance_segments(nodes: &[MapRouteNode]) -> Vec<MapRouteNode> {
         }
         expanded.push(node.clone());
     }
+    expanded
+}
+
+fn expand_current_to_first_guidance(
+    current: &EverQuestMapCoord,
+    nodes: &[MapRouteNode],
+) -> Vec<MapRouteNode> {
+    let Some(first) = nodes.first() else {
+        return Vec::new();
+    };
+    let mut expanded = Vec::new();
+    let step = distance(current, &first.location);
+    if step > MAX_GUIDANCE_STEP_DISTANCE {
+        let insert_count = guidance_insert_count(step);
+        for index in 1..=insert_count {
+            let ratio = guidance_ratio(index, insert_count);
+            expanded.push(MapRouteNode {
+                location: lerp_coord(current, &first.location, ratio),
+                source_path: first.source_path.clone(),
+                source_line_number: first.source_line_number,
+            });
+        }
+    }
+    expanded.extend_from_slice(nodes);
     expanded
 }
 
@@ -1747,6 +1772,33 @@ mod tests {
 
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].source_line_number, 1753);
+    }
+
+    #[test]
+    fn z_level_route_bounds_current_to_first_guidance_step() {
+        let current = EverQuestMapCoord {
+            x: -44.27,
+            y: -123.98,
+            z: 11.36,
+        };
+        let nodes = vec![MapRouteNode {
+            location: EverQuestMapCoord {
+                x: -55.6282,
+                y: -55.9878,
+                z: 14.4742,
+            },
+            source_path: "neriaka.txt".to_owned(),
+            source_line_number: 1755,
+        }];
+
+        let expanded = expand_current_to_first_guidance(&current, &nodes);
+
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded[0].source_line_number, 1755);
+        assert!(distance(&current, &expanded[0].location) <= MAX_GUIDANCE_STEP_DISTANCE);
+        assert!(
+            distance(&expanded[0].location, &expanded[1].location) <= MAX_GUIDANCE_STEP_DISTANCE
+        );
     }
 
     #[test]
