@@ -1160,7 +1160,6 @@ fn floor_route_segment_start_reached(nodes: &[MapRouteNode], current: &EverQuest
         return false;
     };
     projection.ratio > 0.0
-        && projection.ratio < 1.0
         && projection.distance_from_start >= FLOOR_ROUTE_REACHED_XY_DISTANCE
         && projection.distance_to_segment <= FLOOR_ROUTE_SEGMENT_PROXIMITY_DISTANCE
 }
@@ -1189,9 +1188,6 @@ fn segment_projection(
     let from_start_z = current.z - start.z;
     let ratio =
         from_start_x.mul_add(dx, from_start_y.mul_add(dy, from_start_z * dz)) / segment_len_squared;
-    if !(0.0..=1.0).contains(&ratio) {
-        return None;
-    }
     let projected = lerp_coord(start, end, ratio);
     Some(SegmentProjection {
         ratio,
@@ -1672,6 +1668,51 @@ mod tests {
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].source_line_number, 1755);
+    }
+
+    #[test]
+    fn z_level_route_skips_guidance_when_current_is_past_first_subsegment() {
+        let mut nodes = vec![
+            MapRouteNode {
+                location: EverQuestMapCoord {
+                    x: -34.8122,
+                    y: -195.0499,
+                    z: 4.0505,
+                },
+                source_path: "neriaka.txt".to_owned(),
+                source_line_number: 1753,
+            },
+            MapRouteNode {
+                location: EverQuestMapCoord {
+                    x: -41.75086666666667,
+                    y: -148.69586666666666,
+                    z: 7.525066666666667,
+                },
+                source_path: "neriaka.txt".to_owned(),
+                source_line_number: 1755,
+            },
+            MapRouteNode {
+                location: EverQuestMapCoord {
+                    x: -48.68953333333333,
+                    y: -102.34183333333334,
+                    z: 10.999633333333334,
+                },
+                source_path: "neriaka.txt".to_owned(),
+                source_line_number: 1755,
+            },
+        ];
+        let current = EverQuestMapCoord {
+            x: -42.36,
+            y: -136.69,
+            z: 10.41,
+        };
+
+        prune_reached_floor_route_nodes(&mut nodes, &current);
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].source_line_number, 1755);
+        assert_eq!(nodes[0].location.x, -48.68953333333333);
+        assert_eq!(nodes[0].location.y, -102.34183333333334);
     }
 
     #[test]
