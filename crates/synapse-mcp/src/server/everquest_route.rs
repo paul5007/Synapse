@@ -672,19 +672,32 @@ fn route_plan_row(
     row.total_distance = Some(route_distance.unwrap_or(distance_to_target));
     row.confidence = confidence;
     row.waypoints = waypoints;
-    if floor_route_required && waypoint_max_step(&row.waypoints) > MAX_GUIDANCE_STEP_DISTANCE {
+    if waypoint_max_step(&row.waypoints) > MAX_GUIDANCE_STEP_DISTANCE {
+        let (hazard_code, abstain_decision, abstain_reason, detail) = if floor_route_required {
+            (
+                "floor_route_waypoint_budget_exceeded",
+                "abstain_floor_route_waypoint_budget_exceeded",
+                "floor/ramp route needs more waypoint budget for bounded guidance steps",
+                format!(
+                    "floor route has a guidance step longer than {MAX_GUIDANCE_STEP_DISTANCE:.0} map units; increase max_waypoints"
+                ),
+            )
+        } else {
+            (
+                "route_waypoint_budget_exceeded",
+                "abstain_route_waypoint_budget_exceeded",
+                "route needs more waypoint budget for bounded guidance steps",
+                format!(
+                    "route has a guidance step longer than {MAX_GUIDANCE_STEP_DISTANCE:.0} map units; increase max_waypoints"
+                ),
+            )
+        };
         row.hazards.push(EverQuestRouteHazard {
-            code: "floor_route_waypoint_budget_exceeded".to_owned(),
+            code: hazard_code.to_owned(),
             severity: "high".to_owned(),
-            detail: format!(
-                "floor route has a guidance step longer than {MAX_GUIDANCE_STEP_DISTANCE:.0} map units; increase max_waypoints"
-            ),
+            detail,
         });
-        abstain(
-            &mut row,
-            "abstain_floor_route_waypoint_budget_exceeded",
-            "floor/ramp route needs more waypoint budget for bounded guidance steps",
-        );
+        abstain(&mut row, abstain_decision, abstain_reason);
         return row;
     }
     if confidence >= MIN_ROUTE_CONFIDENCE {
@@ -875,10 +888,10 @@ fn route_waypoints(
     target_confidence: f32,
     floor_route_required: bool,
 ) -> Option<(Vec<EverQuestRouteWaypoint>, Option<f64>)> {
+    let current_coord = route_location_to_coord(current_location);
     let route_nodes = if floor_route_required {
         let mut nodes =
             floor_route_nodes(graph, zone_short_name, current_location, target_landmark)?;
-        let current_coord = route_location_to_coord(current_location);
         prune_reached_floor_route_nodes(&mut nodes, &current_coord);
         nodes = expand_current_to_first_guidance(&current_coord, &nodes);
         Some(nodes)
@@ -886,16 +899,24 @@ fn route_waypoints(
         None
     };
     let max_guidance = params.max_waypoints.saturating_sub(2);
-    let guidance_nodes = route_nodes
+    let mut guidance_nodes = route_nodes
         .as_deref()
         .map(|nodes| select_guidance_nodes(nodes, max_guidance))
         .unwrap_or_default();
-    let mut waypoints = Vec::with_capacity(2 + guidance_nodes.len());
-    let mut previous = EverQuestMapCoord {
-        x: current_location.map_x,
-        y: current_location.map_y,
-        z: current_location.map_z,
+    let target_coord = EverQuestMapCoord {
+        x: target_landmark.map_x,
+        y: target_landmark.map_y,
+        z: target_landmark.map_z,
     };
+    extend_target_guidance(
+        &mut guidance_nodes,
+        max_guidance,
+        &current_coord,
+        &target_coord,
+        target_landmark,
+    );
+    let mut waypoints = Vec::with_capacity(2 + guidance_nodes.len());
+    let mut previous = current_coord;
     let mut distance_from_start = 0.0;
     waypoints.push(EverQuestRouteWaypoint {
         step_index: 0,
@@ -936,11 +957,6 @@ fn route_waypoints(
         });
         previous = node.location.clone();
     }
-    let target_coord = EverQuestMapCoord {
-        x: target_landmark.map_x,
-        y: target_landmark.map_y,
-        z: target_landmark.map_z,
-    };
     let target_step = distance(&previous, &target_coord);
     distance_from_start += target_step;
     waypoints.push(EverQuestRouteWaypoint {
@@ -1149,6 +1165,35 @@ fn select_guidance_nodes(nodes: &[MapRouteNode], max_guidance: usize) -> Vec<Map
         }
     }
     selected
+}
+
+fn extend_target_guidance(
+    guidance_nodes: &mut Vec<MapRouteNode>,
+    max_guidance: usize,
+    current: &EverQuestMapCoord,
+    target: &EverQuestMapCoord,
+    target_landmark: &EverQuestRouteLandmark,
+) {
+    let previous_guidance = guidance_nodes
+        .last()
+        .map_or_else(|| current.clone(), |node| node.location.clone());
+    let target_step = distance(&previous_guidance, target);
+    if target_step <= MAX_GUIDANCE_STEP_DISTANCE {
+        return;
+    }
+    let insert_count = guidance_insert_count(target_step);
+    let remaining_guidance = max_guidance.saturating_sub(guidance_nodes.len());
+    if insert_count > remaining_guidance {
+        return;
+    }
+    for index in 1..=insert_count {
+        let ratio = guidance_ratio(index, insert_count);
+        guidance_nodes.push(MapRouteNode {
+            location: lerp_coord(&previous_guidance, target, ratio),
+            source_path: target_landmark.source_path.clone(),
+            source_line_number: target_landmark.source_line_number,
+        });
+    }
 }
 
 fn prune_reached_floor_route_nodes(nodes: &mut Vec<MapRouteNode>, current: &EverQuestMapCoord) {
@@ -1621,7 +1666,8 @@ mod tests {
             row.target_landmark.as_ref().unwrap().source_line_number,
             2983
         );
-        assert_eq!(row.waypoints.len(), 2);
+        assert!(row.waypoints.len() > 2);
+        assert!(waypoint_max_step(&row.waypoints) <= MAX_GUIDANCE_STEP_DISTANCE);
         assert!(row.confidence > 0.7);
         assert!(!row.evidence_boundary.movement_executed);
     }
@@ -1834,6 +1880,23 @@ mod tests {
                 .iter()
                 .any(|waypoint| waypoint.label.starts_with("map_line_"))
         );
+        assert!(waypoint_max_step(&row.waypoints) <= MAX_GUIDANCE_STEP_DISTANCE);
+    }
+
+    #[test]
+    fn direct_route_bounds_target_guidance_step() {
+        let mut params = params(
+            "direct-target-guidance",
+            Some("to_Nektulos_Forest"),
+            Some("nektulos"),
+        );
+        params.max_waypoints = MAX_WAYPOINTS;
+        let source = source_state(Some("neriaka"), Some(location(-77.65, -38.57, 22.27)));
+        let row = route_plan_row(&params, &source, &graph());
+
+        assert_eq!(row.decision, "route_ready");
+        assert_eq!(row.waypoints.last().unwrap().label, "to_Nektulos_Forest");
+        assert!(row.waypoints.len() > 2);
         assert!(waypoint_max_step(&row.waypoints) <= MAX_GUIDANCE_STEP_DISTANCE);
     }
 
