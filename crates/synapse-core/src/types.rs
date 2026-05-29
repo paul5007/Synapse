@@ -4,6 +4,7 @@ mod geometry;
 mod health;
 mod observation;
 mod profile;
+mod reality;
 mod reflex;
 mod stored;
 
@@ -13,5 +14,6 @@ pub use geometry::*;
 pub use health::*;
 pub use observation::*;
 pub use profile::*;
+pub use reality::*;
 pub use reflex::*;
 pub use stored::*;

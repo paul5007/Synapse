@@ -289,23 +289,59 @@ pub enum SensorStatus {
 
 ### 2.10 Reality baseline, deltas, and audits (target)
 
-Issue #536 introduces the target delta-first reality contract. These schemas
-are the intended shape for #537; they are not live until implemented in
-`synapse-core` and exposed through `tools/list`.
+Issue #536 introduces the target delta-first reality contract. #537 implements
+these as canonical `synapse-core` schemas; MCP surfaces remain planned until
+#538 exposes them through `tools/list`.
 
 ```rust
 pub struct SourceRef {
-    pub kind: String,                 // "window" | "log" | "file" | "rocksdb" | ...
+    pub surface: RealitySourceSurface,
     pub path: String,
     pub offset: Option<u64>,
     pub hash: Option<String>,
     pub summary: String,
 }
 
+#[serde(rename_all = "snake_case")]
+pub enum RealitySourceSurface {
+    Window,
+    A11yUia,
+    PixelFrame,
+    Hud,
+    GameLog,
+    File,
+    Process,
+    ActionAudit,
+    Storage,
+    Device,
+    Profile,
+    Model,
+    IssueState,
+    Other,
+}
+
 pub struct RedactionSummary {
-    pub policy: String,
+    pub policy: RedactionPolicy,
     pub raw_private_fields_omitted: bool,
     pub redacted_fields: Vec<String>,
+    pub forbidden_raw_kinds: Vec<ForbiddenRawDataKind>,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum RedactionPolicy {
+    DefaultPrivate,
+    PublicOnly,
+    ExplicitOperatorApproved,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum ForbiddenRawDataKind {
+    RawChatBody,
+    RawLogBody,
+    HighCardinalityPrivateData,
+    Secret,
+    Credential,
+    AccountIdentifier,
 }
 
 pub struct RealityBaseline {
@@ -313,6 +349,7 @@ pub struct RealityBaseline {
     pub baseline_seq: u64,
     pub generated_at: chrono::DateTime<chrono::Utc>,
     pub profile_id: Option<ProfileId>,
+    pub source_surfaces: Vec<RealitySourceSurface>,
     pub source_refs: Vec<SourceRef>,
     pub compact_state_hash: String,
     pub redaction: RedactionSummary,
@@ -328,27 +365,69 @@ pub struct RealityDelta {
     pub source: EventSource,
     pub kind: String,
     pub path: String,
+    pub target: RealityTargetRef,
     pub before: serde_json::Value,
     pub after: serde_json::Value,
     pub confidence: f32,
     pub expected_previous_hash: Option<String>,
     pub source_refs: Vec<SourceRef>,
     pub correlations: Vec<EventRef>,
+    pub conflict: Option<RealityDeltaConflict>,
     pub redaction: RedactionSummary,
+}
+
+pub struct RealityTargetRef {
+    pub kind: RealityTargetKind,
+    pub entity_id: Option<EntityId>,
+    pub field: Option<String>,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum RealityTargetKind {
+    Foreground,
+    Focus,
+    HudField,
+    Entity,
+    LogCursor,
+    Zone,
+    Location,
+    Action,
+    StorageRow,
+    Profile,
+    Device,
+    Other,
+}
+
+pub struct RealityDeltaConflict {
+    pub expected_previous_hash: Option<String>,
+    pub actual_previous_hash: Option<String>,
+    pub detail: String,
+    pub source_refs: Vec<SourceRef>,
 }
 
 pub struct RealityAudit {
     pub audit_id: String,
     pub epoch_id: String,
+    pub baseline_seq: u64,
     pub compared_seq_start: u64,
     pub compared_seq_end: u64,
     pub ran_at: chrono::DateTime<chrono::Utc>,
+    pub baseline_status: RealityBaselineStatus,
     pub assumption_hash: String,
     pub actual_hash: String,
     pub drift_status: RealityDriftStatus,
     pub drift_items: Vec<RealityDriftItem>,
     pub physical_source_refs: Vec<SourceRef>,
     pub rebase_required: bool,
+    pub rebase_reason: Option<String>,
+    pub follow_up_refs: Vec<EventRef>,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum RealityBaselineStatus {
+    Current,
+    Stale,
+    SourceUnavailable,
 }
 
 pub struct RealityDriftItem {
@@ -372,6 +451,12 @@ pub enum RealityDriftStatus {
 Deltas are append-only within an epoch. If retention, source loss, invalid
 cursors, or conflicting evidence makes the assumption untrustworthy, the system
 returns `rebase_required` instead of guessing.
+
+`RedactionSummary::default_private()` omits raw private fields and lists raw
+chat bodies, raw log bodies, high-cardinality private data, secrets,
+credentials, and account identifiers as forbidden raw payload kinds. Reality
+records should carry compact derived values and source pointers, not raw
+chat/log bodies.
 
 Physical storage target:
 
