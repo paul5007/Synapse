@@ -1,3 +1,20 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::bool_assert_comparison,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::items_after_test_module,
+        clippy::manual_let_else,
+        clippy::needless_pass_by_value,
+        clippy::needless_raw_string_hashes,
+        clippy::redundant_clone,
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines,
+        clippy::unreadable_literal,
+        clippy::unwrap_used
+    )
+)]
 mod cli;
 mod http;
 mod m1;

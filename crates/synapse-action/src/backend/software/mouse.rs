@@ -221,7 +221,7 @@ fn send_mouse_button_event(button: MouseButton, action: ButtonAction) -> Result<
     )
 }
 
-fn mouse_button_event_parts(
+const fn mouse_button_event_parts(
     button: MouseButton,
     action: ButtonAction,
 ) -> (

@@ -163,6 +163,10 @@ fn assert_schema_roots_closed(tools: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "schema readback table is intentionally kept as one ordered assertion"
+)]
 fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     let mut readbacks = Vec::new();
     read_default(

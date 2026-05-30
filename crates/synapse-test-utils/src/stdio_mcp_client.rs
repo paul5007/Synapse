@@ -74,6 +74,7 @@ impl StdioMcpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY", "1")
             .env("SYNAPSE_LOG_LEVEL", "debug");
         if let Some(log_dir) = log_dir {
             command.env("SYNAPSE_LOG_DIR", log_dir);

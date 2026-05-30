@@ -1,6 +1,5 @@
 ---
 source: crates/synapse-mcp/tests/m3_profile_tools.rs
-assertion_line: 263
 expression: profile_tool_shapes
 ---
 [
@@ -1713,6 +1712,12 @@ expression: profile_tool_shapes
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "manual_fsv_evidence_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_audit_rows": {
           "default": 5000,
           "format": "uint32",
@@ -1929,6 +1934,210 @@ expression: profile_tool_shapes
           ],
           "type": "object"
         },
+        "ProfileQualityRealityEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "audit_drift_status_counts": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "audit_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "audited_delta_rate": {
+              "format": "double",
+              "type": "number"
+            },
+            "audited_delta_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "baseline_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "calibration_source": {
+              "type": "string"
+            },
+            "delta_first_supported": {
+              "type": "boolean"
+            },
+            "delta_kind_counts": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "delta_path_counts": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "delta_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "drift_audit_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "drift_rate": {
+              "format": "double",
+              "type": "number"
+            },
+            "full_snapshot_required": {
+              "type": "boolean"
+            },
+            "head_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "in_sync_audit_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kv_cf_name": {
+              "type": "string"
+            },
+            "latest_audit_compared_seq_end": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "latest_audit_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "latest_audit_status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "latest_baseline_epoch_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "latest_head_epoch_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "latest_head_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "no_op_ratio": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "no_op_ratio_source": {
+              "type": "string"
+            },
+            "reality_rows_decode_failed": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reality_rows_other_profile": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reality_rows_scanned": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rebase_rate": {
+              "format": "double",
+              "type": "number"
+            },
+            "rebase_required_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "source_surface_counts": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "source_unavailable_audit_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unaudited_delta_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kv_cf_name",
+            "reality_rows_scanned",
+            "reality_rows_decode_failed",
+            "reality_rows_other_profile",
+            "baseline_rows",
+            "head_rows",
+            "delta_rows",
+            "audit_rows",
+            "audited_delta_rows",
+            "unaudited_delta_rows",
+            "in_sync_audit_rows",
+            "drift_audit_rows",
+            "rebase_required_rows",
+            "source_unavailable_audit_rows",
+            "delta_kind_counts",
+            "delta_path_counts",
+            "audit_drift_status_counts",
+            "source_surface_counts",
+            "drift_rate",
+            "rebase_rate",
+            "audited_delta_rate",
+            "no_op_ratio_source",
+            "delta_first_supported",
+            "full_snapshot_required",
+            "calibration_source"
+          ],
+          "type": "object"
+        },
         "ProfileQualityRedaction": {
           "additionalProperties": false,
           "properties": {
@@ -1953,6 +2162,162 @@ expression: profile_tool_shapes
             "snapshot_redacts_process_path",
             "snapshot_redacts_window_title",
             "retained_identifiers"
+          ],
+          "type": "object"
+        },
+        "ProfileQualityRuntimeEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "event_cf_name": {
+              "type": "string"
+            },
+            "event_rows_decode_failed": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event_rows_future": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event_rows_other_profile": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event_rows_profile_relevant": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event_rows_scanned": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event_rows_stale": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "first_relevant_event_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "first_relevant_observation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_relevant_event_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_relevant_observation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_relevant_ts_ns": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "observation_cf_name": {
+              "type": "string"
+            },
+            "observation_rows_decode_failed": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observation_rows_future": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observation_rows_other_profile": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observation_rows_profile_relevant": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observation_rows_scanned": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observation_rows_stale": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observed_event_kinds": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "observed_log_event_kinds": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "observed_process_names": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "observed_target_ids": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "observation_cf_name",
+            "event_cf_name",
+            "observation_rows_scanned",
+            "observation_rows_decode_failed",
+            "observation_rows_stale",
+            "observation_rows_future",
+            "observation_rows_other_profile",
+            "observation_rows_profile_relevant",
+            "event_rows_scanned",
+            "event_rows_decode_failed",
+            "event_rows_stale",
+            "event_rows_future",
+            "event_rows_other_profile",
+            "event_rows_profile_relevant",
+            "observed_process_names",
+            "observed_target_ids",
+            "observed_event_kinds",
+            "observed_log_event_kinds"
           ],
           "type": "object"
         },
@@ -2010,6 +2375,12 @@ expression: profile_tool_shapes
               "minimum": 0,
               "type": "integer"
             },
+            "manual_fsv_evidence_ref": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "profile_id": {
               "type": "string"
             },
@@ -2030,8 +2401,66 @@ expression: profile_tool_shapes
             "rates": {
               "$ref": "#/$defs/ProfileQualityRates"
             },
+            "reality_evidence": {
+              "$ref": "#/$defs/ProfileQualityRealityEvidence",
+              "default": {
+                "audit_drift_status_counts": {},
+                "audit_rows": 0,
+                "audited_delta_rate": 0.0,
+                "audited_delta_rows": 0,
+                "baseline_rows": 0,
+                "calibration_source": "none",
+                "delta_first_supported": false,
+                "delta_kind_counts": {},
+                "delta_path_counts": {},
+                "delta_rows": 0,
+                "drift_audit_rows": 0,
+                "drift_rate": 0.0,
+                "full_snapshot_required": true,
+                "head_rows": 0,
+                "in_sync_audit_rows": 0,
+                "kv_cf_name": "CF_KV",
+                "no_op_ratio_source": "not_persisted_noop_observe_delta_writes_no_delta_row",
+                "reality_rows_decode_failed": 0,
+                "reality_rows_other_profile": 0,
+                "reality_rows_scanned": 0,
+                "rebase_rate": 0.0,
+                "rebase_required_rows": 0,
+                "source_surface_counts": {},
+                "source_unavailable_audit_rows": 0,
+                "unaudited_delta_rows": 0
+              }
+            },
             "redaction": {
               "$ref": "#/$defs/ProfileQualityRedaction"
+            },
+            "runtime_evidence": {
+              "$ref": "#/$defs/ProfileQualityRuntimeEvidence",
+              "default": {
+                "event_cf_name": "CF_EVENTS",
+                "event_rows_decode_failed": 0,
+                "event_rows_future": 0,
+                "event_rows_other_profile": 0,
+                "event_rows_profile_relevant": 0,
+                "event_rows_scanned": 0,
+                "event_rows_stale": 0,
+                "first_relevant_event_id": null,
+                "first_relevant_observation_id": null,
+                "last_relevant_event_id": null,
+                "last_relevant_observation_id": null,
+                "last_relevant_ts_ns": null,
+                "observation_cf_name": "CF_OBSERVATIONS",
+                "observation_rows_decode_failed": 0,
+                "observation_rows_future": 0,
+                "observation_rows_other_profile": 0,
+                "observation_rows_profile_relevant": 0,
+                "observation_rows_scanned": 0,
+                "observation_rows_stale": 0,
+                "observed_event_kinds": {},
+                "observed_log_event_kinds": {},
+                "observed_process_names": {},
+                "observed_target_ids": {}
+              }
             },
             "schema_version": {
               "format": "uint32",
@@ -3745,6 +4174,22 @@ expression: profile_tool_shapes
                 "null"
               ]
             },
+            "event_rows_profile_relevant": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "event_rows_scanned": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "evidence_hash": {
               "type": [
                 "string",
@@ -3761,6 +4206,52 @@ expression: profile_tool_shapes
             },
             "key_hex": {
               "type": "string"
+            },
+            "manual_fsv_evidence_ref": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observation_rows_profile_relevant": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "observation_rows_scanned": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "observed_event_kinds": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "observed_log_event_kinds": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "observed_target_ids": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
             },
             "profile_id": {
               "type": [
@@ -3808,7 +4299,10 @@ expression: profile_tool_shapes
           "required": [
             "row_key",
             "key_hex",
-            "stale_evidence_present"
+            "stale_evidence_present",
+            "observed_target_ids",
+            "observed_event_kinds",
+            "observed_log_event_kinds"
           ],
           "type": "object"
         },

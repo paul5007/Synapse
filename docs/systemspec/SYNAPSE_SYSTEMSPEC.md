@@ -1,6 +1,6 @@
 # Synapse Systemspec — Bundled Reference
 
-> Auto-generated 2026-05-29 by `docs/systemspec/bundle.ps1`. Source: the 16 individual `docs/systemspec/*.md` files, concatenated in order. In-bundle cross-references between systemspec files are rewritten to anchors; references to files outside the bundle (impplan, computergames, adr, source code) keep their original paths.
+> Auto-generated 2026-05-30 by `docs/systemspec/bundle.ps1`. Source: the 16 individual `docs/systemspec/*.md` files, concatenated in order. In-bundle cross-references between systemspec files are rewritten to anchors; references to files outside the bundle (impplan, computergames, adr, source code) keep their original paths.
 >
 > Re-run the script after editing any source file so the bundle stays in sync. The individual files remain the authoritative copies.
 
@@ -1192,6 +1192,7 @@ synapse-mcp --help
 | `SYNAPSE_MCP_FORCE_NO_PERCEPTION` | `crates/synapse-mcp/src/m1.rs::M1State::from_env` | `bool` (`1`/`true`) | unset | Force every `observe` call to return `OBSERVE_NO_PERCEPTION_AVAILABLE`. Test knob. |
 | `SYNAPSE_MCP_FORCE_OBSERVE_INTERNAL` | `crates/synapse-mcp/src/m1.rs::M1State::from_env` | `bool` (`1`/`true`) | unset | Force every `observe` call to return `OBSERVE_INTERNAL`. Test knob. |
 | `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT` | `crates/synapse-mcp/src/server.rs::maybe_force_panic_during_act` (debug builds only) | `String` | unset | When equal to `1` in a debug build, `act_press` panics inside `block_in_place`. Used to validate the operator-hotkey + panic-hook path. |
+| `SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY` | `crates/synapse-mcp/src/safety.rs::install_operator_hotkey` | `bool` (`1`/`true`/`yes`/`on`, or `0`/`false`/`no`/`off`) | unset → `false` | Explicit local-check escape hatch that skips singleton `Ctrl+Alt+Shift+P` registration. Intended for short-lived stdio regression children when a live attended daemon already owns the Windows hotkey. Do not set on the live gameplay daemon. Invalid values refuse startup. |
 | `SYNAPSE_MCP_RECORDING_BACKEND` | `crates/synapse-mcp/src/m2.rs::M2State::from_env` | `bool` (`1`/`true`/`TRUE`) | unset | Routes M2 emits to a `RecordingBackend` instead of the live Windows backends. Used for integration tests. |
 
 Additional crate-private env vars used only in `#[cfg(test)]` or doc-hidden API paths (e.g., `synapse-storage` test toggles) are not part of the runtime contract and are intentionally omitted here.
@@ -2202,6 +2203,16 @@ All inner tool returns use `Json<T>` (the `rmcp::handler::server::wrapper::Json`
 
 `maybe_force_panic_during_act(tool)` (`server.rs:732`): in debug builds, if `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT == "1"`, panics during `act_press` (used to validate the operator-hotkey + panic-hook path).
 
+### 1.7 Local-check hotkey override
+
+`safety::install_operator_hotkey` honors
+`SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY=1` as an explicit local-check escape hatch.
+When set, the process skips the singleton Windows `Ctrl+Alt+Shift+P`
+registration and logs `SAFETY_OPERATOR_HOTKEY_DISABLED`. This is for short-lived
+stdio regression children that run while an attended live daemon already owns
+the hotkey; live gameplay daemons must leave the variable unset so the operator
+panic path remains active.
+
 ## 2. Binary entrypoint (`crates/synapse-mcp/src/main.rs`)
 
 ### 2.1 CLI shape
@@ -2217,7 +2228,7 @@ All inner tool returns use `Json<T>` (the `rmcp::handler::server::wrapper::Json`
    - `emitter_shutdown_token` — propagated to `M2State` so the action emitter task exits on shutdown
    - `emitter_connection_closed_token` — additionally observed by tool calls so they can refuse work after EOF
 2. Builds `SynapseService::try_with_m2_shutdown_reason_and_m3_config(emitter_shutdown_token, "sigint", emitter_connection_closed_token, m3_config)`.
-3. Installs the action panic hook (`synapse_action::install_panic_hook`) and the operator hotkey guard (`safety::install_operator_hotkey(service.m3_state_handle())`).
+3. Installs the action panic hook (`synapse_action::install_panic_hook`) and, unless explicitly disabled for a local check child, the operator hotkey guard (`safety::install_operator_hotkey(service.m3_state_handle())`).
 4. Builds the rmcp stdio transport (`rmcp::transport::stdio()`) and wraps stdin in `CancelOnEofRead` so a closed pipe cancels both tokens after the first EOF read.
 5. `service.serve_with_ct((stdin, stdout), rmcp_token)` returns the rmcp service future. Selected against `wait_for_shutdown_signal` (Ctrl-C on POSIX, Ctrl-C or Ctrl-Break on Windows).
 6. On EOF or service exit, drains the M2 emitter task by waiting on its `watch::Receiver<Option<ActionStateSnapshot>>` for up to 1 second (`wait_for_m2_emitter_done`).
@@ -2232,7 +2243,7 @@ All inner tool returns use `Json<T>` (the `rmcp::handler::server::wrapper::Json`
 2. `TcpListener::bind(addr).await`.
 3. Build `SseState::with_max_subscriptions(m3_config.max_subscriptions)`.
 4. Build `SynapseService` via `http_service` (uses `shutdown_reason = "http"`).
-5. Install operator hotkey.
+5. Install operator hotkey unless explicitly disabled for a local check child.
 6. Construct the axum `Router` (see §3).
 7. `axum::serve(listener, app).with_graceful_shutdown(shutdown_cancel.cancelled_owned())`. Joined or shut down via `wait_for_shutdown_signal("http")`, after which `wait_for_server_stop` gives the server up to 2 seconds to drain before aborting.
 
@@ -4172,20 +4183,19 @@ reads from disk.
 | `docs/adr/0007-per-event-vs-batched-notifications.md` | Per-event vs batched SSE notifications | One Event = one SSE frame; no in-process batching to keep `event-to-subscriber p99 ≤ 50 ms` achievable |
 | `docs/adr/0010-detection-model-default.md` | Default detection model | Default detector is `rtdetr_v2_s_coco_onnx`; YOLO remains operator-import only when license-compliant and SHA-pinned |
 
-## 5. Operator-level invariants (from `docs/impplan/00_methodology.md`)
+## 5. Operator-level invariants
 
-These are doctrine — **NEVER violate**:
+Doctrine — **NEVER violate**. Defined once and referenced by tag; canonical text lives in the source column. See `docs/impplan/README.md` §"Operator-level invariants" for the same table.
 
-1. **No backward compatibility (pre-v1).** Schema/API changes break callers; no fallbacks, no shims, no silent error swallowing. Anything that does not work must fail fast with a structured `synapse_core::error_codes::*` code and a tracing log line containing that code.
-2. **No mocks gate completion.** OS-bound work-items are not done until a real-OS integration test exercises them against the real SoT (UIA `ValuePattern`, `XInputGetState`, RocksDB key, `GetClipboardData`, `GetCursorPos`, low-level keyboard hook, etc.).
-3. **Full-State Verification (FSV) is mandatory and manual.** The agent reads the SoT before, executes the trigger, performs a separate read for "after", exercises ≥3 edge cases (empty/boundary/structurally-invalid), and records actual state. **Scripts, tests, benchmarks, harnesses, GitHub Actions, and CI are supporting evidence only.** They never count as FSV. Do not add `*_fsv` tests, FSV harnesses, or FSV scripts.
-4. **Natural-only motion (OQ-004 DECIDED 2026-05-22).** `Natural` curves + `Natural` keystroke dynamics tuned `FAST` are the resolved default of every tool, profile, and reflex. `Instant`/`Burst` exist for explicit opt-in only.
-5. **Manual FSV on the configured Windows host is the shipping gate, not CI** (operator decision 2026-05-24, issues #246/#247/#350/#351). Do not dispatch, wait on, or block a tag on GitHub Actions/CI. Do not add `*_fsv` tests.
-6. **Synapse MCP runtime is a required FSV precondition and trigger surface.** For any Synapse behavior with an MCP tool, the agent must read the live `synapse-mcp` process/stdout child or socket, authenticate when HTTP is used, call `health`, initialize an MCP session, verify the tool through `tools/list`, trigger the behavior through real MCP `tools/call`, and then perform a separate physical SoT readback. Return values and `health` prove liveness/attempt only.
-7. **Reality context should be delta-first with periodic drift audits.** Issue #536 changes the target context model: a full snapshot establishes or repairs a baseline; routine context is ordered reality deltas; periodic full physical audits compare the delta-guided assumption against actual UI/log/file/process/storage/device SoTs and force rebase on drift.
-8. **Missing configured-host prerequisites are agent work, not blockers.** Do not stop at "missing." Synapse gives the agent full local computer-control responsibility for this host and the same practical local ability the operator has at this keyboard. If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must use Synapse/local host control to make it happen and then inspect the physical SoT. Missing local state creates the next action for the agent and must be made real, not handed back to the operator or treated as a blocker while reversible host work remains. Nothing is ever `status:blocked` because a configured-host prerequisite is absent; the only blockable item is the exact operator-only hard-to-reverse external action left after every reversible local step is exhausted. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, USB/COM inspection, and UI inspection are agent-owned work when reversible on this host. Ask only for narrow approval on hard-to-reverse external actions after reversible local work is exhausted.
-
-`AGENTS.md` reinforces these and pins **`[skip ci]` on every agent commit**.
+| Tag | Directive | Canonical source |
+|---|---|---|
+| D1 | Manual FSV (read SoT before → trigger → separate read after → ≥3 edge cases) + MCP precondition (`health`, session, `tools/list`) and real `tools/call` trigger; tests/scripts/benches/CI are supporting evidence only; no `*_fsv` tests/harnesses/scripts | `AGENTS.md` §D1 |
+| D2 | Delta-of-reality: baseline → ordered deltas → periodic physical drift audit → rebase (#536; tools #537-#543) | `AGENTS.md` §D2 |
+| D3 | No GitHub Actions/CI shipping gate; `[skip ci]` on every agent commit (#246/#247/#350/#351) | `AGENTS.md` §D3 |
+| D4 | Missing configured-host prereq = reversible local acquisition work; never `status:blocked` by absence alone | `AGENTS.md` §D4 |
+| D5 | No backward compatibility pre-v1; fail fast with `synapse_core::error_codes::*` + tracing line | `00_methodology.md` §"Operator directives" |
+| D6 | No mocks gate completion; OS-bound item needs real-OS test + separate SoT read (UIA `ValuePattern`, `XInputGetState`, RocksDB key, `GetClipboardData`, `GetCursorPos`, keyboard hook) | `00_methodology.md` §"Operator directives" |
+| D7 | Natural-only motion `FAST` default; `Instant`/`Burst` opt-in only (OQ-004 DECIDED 2026-05-22) | `07_cross_cutting.md` §12 |
 
 ## 6. Per-PR contract (from `docs/impplan/README.md`)
 

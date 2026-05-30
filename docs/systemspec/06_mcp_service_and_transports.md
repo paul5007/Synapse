@@ -97,6 +97,16 @@ All inner tool returns use `Json<T>` (the `rmcp::handler::server::wrapper::Json`
 
 `maybe_force_panic_during_act(tool)` (`server.rs:732`): in debug builds, if `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT == "1"`, panics during `act_press` (used to validate the operator-hotkey + panic-hook path).
 
+### 1.7 Local-check hotkey override
+
+`safety::install_operator_hotkey` honors
+`SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY=1` as an explicit local-check escape hatch.
+When set, the process skips the singleton Windows `Ctrl+Alt+Shift+P`
+registration and logs `SAFETY_OPERATOR_HOTKEY_DISABLED`. This is for short-lived
+stdio regression children that run while an attended live daemon already owns
+the hotkey; live gameplay daemons must leave the variable unset so the operator
+panic path remains active.
+
 ## 2. Binary entrypoint (`crates/synapse-mcp/src/main.rs`)
 
 ### 2.1 CLI shape
@@ -112,7 +122,7 @@ All inner tool returns use `Json<T>` (the `rmcp::handler::server::wrapper::Json`
    - `emitter_shutdown_token` — propagated to `M2State` so the action emitter task exits on shutdown
    - `emitter_connection_closed_token` — additionally observed by tool calls so they can refuse work after EOF
 2. Builds `SynapseService::try_with_m2_shutdown_reason_and_m3_config(emitter_shutdown_token, "sigint", emitter_connection_closed_token, m3_config)`.
-3. Installs the action panic hook (`synapse_action::install_panic_hook`) and the operator hotkey guard (`safety::install_operator_hotkey(service.m3_state_handle())`).
+3. Installs the action panic hook (`synapse_action::install_panic_hook`) and, unless explicitly disabled for a local check child, the operator hotkey guard (`safety::install_operator_hotkey(service.m3_state_handle())`).
 4. Builds the rmcp stdio transport (`rmcp::transport::stdio()`) and wraps stdin in `CancelOnEofRead` so a closed pipe cancels both tokens after the first EOF read.
 5. `service.serve_with_ct((stdin, stdout), rmcp_token)` returns the rmcp service future. Selected against `wait_for_shutdown_signal` (Ctrl-C on POSIX, Ctrl-C or Ctrl-Break on Windows).
 6. On EOF or service exit, drains the M2 emitter task by waiting on its `watch::Receiver<Option<ActionStateSnapshot>>` for up to 1 second (`wait_for_m2_emitter_done`).
@@ -127,7 +137,7 @@ All inner tool returns use `Json<T>` (the `rmcp::handler::server::wrapper::Json`
 2. `TcpListener::bind(addr).await`.
 3. Build `SseState::with_max_subscriptions(m3_config.max_subscriptions)`.
 4. Build `SynapseService` via `http_service` (uses `shutdown_reason = "http"`).
-5. Install operator hotkey.
+5. Install operator hotkey unless explicitly disabled for a local check child.
 6. Construct the axum `Router` (see §3).
 7. `axum::serve(listener, app).with_graceful_shutdown(shutdown_cancel.cancelled_owned())`. Joined or shut down via `wait_for_shutdown_signal("http")`, after which `wait_for_server_stop` gives the server up to 2 seconds to drain before aborting.
 

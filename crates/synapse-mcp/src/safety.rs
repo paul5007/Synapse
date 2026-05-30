@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use synapse_action::{OperatorHotkeyGuard, RELEASE_ALL_HANDLE};
+use synapse_action::{ActionError, OperatorHotkeyGuard, RELEASE_ALL_HANDLE};
 use synapse_core::error_codes;
 
 use crate::m3::SharedM3State;
@@ -8,6 +8,7 @@ use crate::m3::SharedM3State;
 pub mod agreement;
 pub mod hardware_consent;
 
+pub const DISABLE_OPERATOR_HOTKEY_ENV: &str = "SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY";
 const OPERATOR_RELEASE_ALL_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
@@ -27,8 +28,32 @@ struct ReleaseAllReport {
 
 pub fn install_operator_hotkey(
     m3_state: SharedM3State,
-) -> synapse_action::ActionResult<OperatorHotkeyGuard> {
-    synapse_action::install_operator_hotkey(move || handle_operator_hotkey(&m3_state))
+) -> synapse_action::ActionResult<Option<OperatorHotkeyGuard>> {
+    if operator_hotkey_disabled_by_env()? {
+        tracing::warn!(
+            code = "SAFETY_OPERATOR_HOTKEY_DISABLED",
+            env = DISABLE_OPERATOR_HOTKEY_ENV,
+            "operator hotkey disabled by explicit environment override"
+        );
+        return Ok(None);
+    }
+    synapse_action::install_operator_hotkey(move || handle_operator_hotkey(&m3_state)).map(Some)
+}
+
+fn operator_hotkey_disabled_by_env() -> synapse_action::ActionResult<bool> {
+    let Some(raw) = std::env::var_os(DISABLE_OPERATOR_HOTKEY_ENV) else {
+        return Ok(false);
+    };
+    let value = raw.to_string_lossy();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ActionError::BackendUnavailable {
+            detail: format!(
+                "{DISABLE_OPERATOR_HOTKEY_ENV} must be one of 1/true/yes/on or 0/false/no/off"
+            ),
+        }),
+    }
 }
 
 fn handle_operator_hotkey(m3_state: &SharedM3State) {

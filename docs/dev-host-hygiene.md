@@ -85,6 +85,60 @@ transport state: use the wrapper or restart the Codex session. Do not request
 the key from the operator unless both the user environment and DPAPI fallback
 are physically absent after direct readback.
 
+## Windows Cargo supporting-check profile (#502)
+
+This configured Windows host runs long-lived Synapse MCP daemons while agents
+also rebuild the repo. Do not run live daemons directly from
+`target\debug\synapse-mcp.exe` during issue work: Windows holds the executable
+open and Cargo cannot replace it during `cargo test`, `cargo check`, or
+`cargo clippy`.
+
+Before broad local Rust checks, read the host SoT:
+
+```powershell
+Get-Content -Raw "$env:USERPROFILE\.cargo\config.toml"
+Get-Process synapse-mcp -ErrorAction SilentlyContinue |
+  Select-Object Id,Path,StartTime
+Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 7702 -ErrorAction SilentlyContinue
+```
+
+The user-level Cargo config on this host should contain:
+
+```toml
+[build]
+jobs = 1
+```
+
+That single-job default keeps broad supporting checks from overloading the
+Windows rustc/MSVC toolchain. For suspicious cache or resource failures, run
+the focused command with incremental disabled in the current shell:
+
+```powershell
+$env:CARGO_INCREMENTAL = '0'
+cargo test -p synapse-mcp --test m3_profile_tools
+```
+
+Stdio integration children should set `SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY=1`
+so they do not compete with the live attended daemon for the singleton Windows
+`Ctrl+Alt+Shift+P` registration. Do not set that variable on the live gameplay
+daemon; the operator panic hotkey remains part of the attended FSV safety
+surface.
+
+When a live HTTP daemon is needed after building, copy the freshly built binary
+to an issue-local runtime path and launch the copy:
+
+```powershell
+New-Item -ItemType Directory -Force .runs\<run-id>\bin | Out-Null
+Copy-Item target\debug\synapse-mcp.exe .runs\<run-id>\bin\synapse-mcp-runtime.exe -Force
+Start-Process .runs\<run-id>\bin\synapse-mcp-runtime.exe `
+  -ArgumentList '--mode','http','--bind','127.0.0.1:7702','--db','.runs\<run-id>\db','--log-level','debug' `
+  -WindowStyle Hidden
+```
+
+Then manually read back the process path, loopback socket, authenticated
+`health`, MCP `initialize`, and `tools/list`. The copied runtime path is the
+live-daemon SoT; `target\debug` must remain free for Cargo to rebuild.
+
 ## Coordinates: `act_aim` / `act_click({x,y})` / `act_drag` / `act_scroll`
 
 Synapse interprets all `{x, y}` mouse coordinates as **physical (DPI-aware) pixels** — the same units `GetCursorPos` returns from a per-monitor-DPI-aware process, and the same units UI Automation bounding boxes use. This matches the daemon's own DPI awareness (synapse-mcp is built as per-monitor V2) and `mouse_coordinates.rs::normalize_absolute_mouse_point` which feeds `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`.
