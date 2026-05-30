@@ -651,9 +651,16 @@ fn classify_con(summary: Option<&str>, target_level_max: u32) -> ConDecision {
     {
         return ConDecision::NonNpc;
     }
-    if con_phrase_too_high(&lower) {
+    // "Red" cons mean the target is far above a level-1 wizard regardless of any
+    // parsed level (and cover the no-level-parsed case); reject outright.
+    if con_phrase_red(&lower) {
         return ConDecision::TooHigh;
     }
+    // The absolute level is the primary safety gate. The con difficulty phrase
+    // ("gamble" = yellow/even, "even fight" = white, "easy prey" = green) only
+    // reflects RELATIVE level, which the absolute cap already bounds — so a
+    // level-<=cap NPC is huntable for a ranged nuker even at a yellow ("gamble")
+    // con. HP-floor flee + the operator panic hotkey remain the lethality guard.
     match parse_target_level(summary) {
         Some(level) if level > target_level_max => ConDecision::TooHigh,
         Some(_) => ConDecision::Safe,
@@ -667,20 +674,24 @@ fn classify_con(summary: Option<&str>, target_level_max: u32) -> ConDecision {
     }
 }
 
-fn con_phrase_too_high(lower: &str) -> bool {
-    lower.contains("gamble")
-        || lower.contains("threatening")
+/// True only for cons that mean the target is much higher level than a level-1
+/// wizard. "gamble" (yellow/even) and faction-hostility phrases are intentionally
+/// NOT here — the absolute `target_level_max` gate handles level safety.
+fn con_phrase_red(lower: &str) -> bool {
+    lower.contains("crazy to attack")
         || lower.contains("kill you")
+        || lower.contains("rip you")
         || lower.contains("deadly")
-        || lower.contains("scowls")
-        || lower.contains("ready to attack")
-        || lower.contains("glares")
 }
 
 fn con_phrase_safe(lower: &str) -> bool {
     lower.contains("regards you indifferently")
         || lower.contains("looks upon you warmly")
         || lower.contains("even fight")
+        || lower.contains("gamble")
+        || lower.contains("easy prey")
+        || lower.contains("afraid")
+        || lower.contains("worthy opponent")
 }
 
 /// Classify the cast outcome from a window of log summaries (newest wins).
@@ -714,8 +725,23 @@ mod tests {
     }
 
     #[test]
-    fn classifies_gamble_level_three_as_too_high() {
+    fn classifies_gamble_level_two_within_cap_as_safe() {
+        // Yellow ("gamble") con on a neutral-faction Lvl-2 NPC, cap 2: huntable
+        // for a ranged nuker — the absolute level cap is the gate, not the phrase.
+        let line = "A garter snake regards you indifferently -- looks like quite a gamble. (Lvl: 2)";
+        assert_eq!(classify_con(Some(line), 2), ConDecision::Safe);
+    }
+
+    #[test]
+    fn classifies_gamble_level_three_over_cap_as_too_high() {
+        // Same yellow con but Lvl 3 > cap 2 -> rejected by the absolute level gate.
         let line = "An araneidae spiderling regards you indifferently -- looks like quite a gamble. (Lvl: 3)";
+        assert_eq!(classify_con(Some(line), 2), ConDecision::TooHigh);
+    }
+
+    #[test]
+    fn classifies_red_con_as_too_high_regardless_of_level() {
+        let line = "An ancient wurm glares at you, ready to attack -- you would have to be crazy to attack it!";
         assert_eq!(classify_con(Some(line), 2), ConDecision::TooHigh);
     }
 
