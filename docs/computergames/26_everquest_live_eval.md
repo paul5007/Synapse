@@ -163,7 +163,10 @@ Food/drink absence is detected from the
 physical `You are out of food and drink` log signal; positive item counting from
 bags/merchant windows is not implied. Merchant/economy/item acquisition remains
 outside the supported live surface unless a future issue carries explicit
-operator approval and separate manual FSV.
+operator approval and separate manual FSV. Casting posture can be proven from
+recent physical spell-cast log lines such as `You begin casting ...` or
+`Your <spell> spell fizzles!`; the row stores compact own-player cast/posture
+summaries and timestamps, not raw chat bodies.
 
 Manual FSV for the chat gate must read the physical UI file, visible OCR crop,
 EQ log `You say` count, and `CF_ACTION_LOG` rows before and after. Required

@@ -175,6 +175,10 @@ pub struct EverQuestSurvivalLogReadback {
     pub latest_out_of_food_drink_timestamp: Option<String>,
     pub latest_rest_timestamp: Option<String>,
     pub latest_rest_summary: Option<String>,
+    pub latest_cast_timestamp: Option<String>,
+    pub latest_cast_summary: Option<String>,
+    pub latest_posture_timestamp: Option<String>,
+    pub latest_posture_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -209,6 +213,10 @@ pub struct EverQuestPostureReadiness {
     pub is_sitting: Option<bool>,
     pub latest_rest_timestamp: Option<String>,
     pub latest_rest_summary: Option<String>,
+    pub latest_cast_timestamp: Option<String>,
+    pub latest_cast_summary: Option<String>,
+    pub latest_posture_timestamp: Option<String>,
+    pub latest_posture_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -536,7 +544,8 @@ impl SynapseService {
         let hud = survival_hud_readback(&input.hud);
         let posture = posture_readiness(&log);
         let food_drink = food_drink_readiness(&log);
-        let combat_readiness = combat_readiness_readback(&hud, &posture);
+        let combat_readiness =
+            combat_readiness_readback(&foreground, &chat_input_state, &hud, &food_drink, &posture);
         let blockers = survival_blockers(
             &foreground,
             &chat_input_state,
@@ -894,6 +903,86 @@ impl SynapseService {
 }
 
 fn read_survival_log_readback(log_path: &Path) -> Result<EverQuestSurvivalLogReadback, ErrorData> {
+    let (start_offset, file_len_bytes, bytes) = read_survival_log_tail(log_path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut latest_hunger_timestamp = None;
+    let mut latest_thirst_timestamp = None;
+    let mut latest_out_of_food_drink_timestamp = None;
+    let mut latest_rest_timestamp = None;
+    let mut latest_rest_summary = None;
+    let mut latest_cast_timestamp = None;
+    let mut latest_cast_summary = None;
+    let mut latest_posture_timestamp = None;
+    let mut latest_posture_summary = None;
+    let mut signal_count = 0_usize;
+    for line in text.lines() {
+        let Some((timestamp, message)) = split_eq_log_line(line) else {
+            continue;
+        };
+        match message {
+            "You are hungry." => {
+                latest_hunger_timestamp = Some(timestamp.to_owned());
+                signal_count = signal_count.saturating_add(1);
+            }
+            "You are thirsty." => {
+                latest_thirst_timestamp = Some(timestamp.to_owned());
+                signal_count = signal_count.saturating_add(1);
+            }
+            "You are out of food and drink." => {
+                latest_out_of_food_drink_timestamp = Some(timestamp.to_owned());
+                signal_count = signal_count.saturating_add(1);
+            }
+            "You sit down." | "You begin to meditate." => {
+                latest_rest_timestamp = Some(timestamp.to_owned());
+                latest_rest_summary = Some("sitting_or_meditating".to_owned());
+                latest_posture_timestamp = Some(timestamp.to_owned());
+                latest_posture_summary = Some("sitting_or_meditating".to_owned());
+                signal_count = signal_count.saturating_add(1);
+            }
+            "You stand up." => {
+                latest_rest_timestamp = Some(timestamp.to_owned());
+                latest_rest_summary = Some("standing".to_owned());
+                latest_posture_timestamp = Some(timestamp.to_owned());
+                latest_posture_summary = Some("standing".to_owned());
+                signal_count = signal_count.saturating_add(1);
+            }
+            message if message.starts_with("You begin casting ") => {
+                latest_cast_timestamp = Some(timestamp.to_owned());
+                latest_cast_summary = Some("casting_started".to_owned());
+                latest_posture_timestamp = Some(timestamp.to_owned());
+                latest_posture_summary = Some("standing_casting".to_owned());
+                signal_count = signal_count.saturating_add(1);
+            }
+            message if is_own_cast_fizzle_message(message) => {
+                latest_cast_timestamp = Some(timestamp.to_owned());
+                latest_cast_summary = Some("casting_fizzled".to_owned());
+                latest_posture_timestamp = Some(timestamp.to_owned());
+                latest_posture_summary = Some("standing_casting".to_owned());
+                signal_count = signal_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(EverQuestSurvivalLogReadback {
+        path: log_path.display().to_string(),
+        start_offset,
+        next_offset: file_len_bytes,
+        file_len_bytes,
+        bytes_read: bytes.len(),
+        signal_count,
+        latest_hunger_timestamp,
+        latest_thirst_timestamp,
+        latest_out_of_food_drink_timestamp,
+        latest_rest_timestamp,
+        latest_rest_summary,
+        latest_cast_timestamp,
+        latest_cast_summary,
+        latest_posture_timestamp,
+        latest_posture_summary,
+    })
+}
+
+fn read_survival_log_tail(log_path: &Path) -> Result<(u64, u64, Vec<u8>), ErrorData> {
     let metadata = fs::metadata(log_path).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,
@@ -922,62 +1011,18 @@ fn read_survival_log_readback(log_path: &Path) -> Result<EverQuestSurvivalLogRea
             format!("read active EverQuest log for survival readiness: {error}"),
         )
     })?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut latest_hunger_timestamp = None;
-    let mut latest_thirst_timestamp = None;
-    let mut latest_out_of_food_drink_timestamp = None;
-    let mut latest_rest_timestamp = None;
-    let mut latest_rest_summary = None;
-    let mut signal_count = 0_usize;
-    for line in text.lines() {
-        let Some((timestamp, message)) = split_eq_log_line(line) else {
-            continue;
-        };
-        match message {
-            "You are hungry." => {
-                latest_hunger_timestamp = Some(timestamp.to_owned());
-                signal_count = signal_count.saturating_add(1);
-            }
-            "You are thirsty." => {
-                latest_thirst_timestamp = Some(timestamp.to_owned());
-                signal_count = signal_count.saturating_add(1);
-            }
-            "You are out of food and drink." => {
-                latest_out_of_food_drink_timestamp = Some(timestamp.to_owned());
-                signal_count = signal_count.saturating_add(1);
-            }
-            "You sit down." | "You begin to meditate." => {
-                latest_rest_timestamp = Some(timestamp.to_owned());
-                latest_rest_summary = Some("sitting_or_meditating".to_owned());
-                signal_count = signal_count.saturating_add(1);
-            }
-            "You stand up." => {
-                latest_rest_timestamp = Some(timestamp.to_owned());
-                latest_rest_summary = Some("standing".to_owned());
-                signal_count = signal_count.saturating_add(1);
-            }
-            _ => {}
-        }
-    }
-    Ok(EverQuestSurvivalLogReadback {
-        path: log_path.display().to_string(),
-        start_offset,
-        next_offset: file_len_bytes,
-        file_len_bytes,
-        bytes_read: bytes.len(),
-        signal_count,
-        latest_hunger_timestamp,
-        latest_thirst_timestamp,
-        latest_out_of_food_drink_timestamp,
-        latest_rest_timestamp,
-        latest_rest_summary,
-    })
+    Ok((start_offset, file_len_bytes, bytes))
 }
 
 fn split_eq_log_line(line: &str) -> Option<(&str, &str)> {
     let rest = line.strip_prefix('[')?;
     let (timestamp, message) = rest.split_once("] ")?;
     Some((timestamp, message.trim()))
+}
+
+fn is_own_cast_fizzle_message(message: &str) -> bool {
+    message == "Your spell fizzles!"
+        || (message.starts_with("Your ") && message.ends_with(" spell fizzles!"))
 }
 
 fn survival_hud_readback(hud: &synapse_core::HudReadings) -> EverQuestSurvivalHudReadback {
@@ -1119,28 +1164,45 @@ fn food_drink_readiness(log: &EverQuestSurvivalLogReadback) -> EverQuestFoodDrin
 fn posture_readiness(log: &EverQuestSurvivalLogReadback) -> EverQuestPostureReadiness {
     let latest_rest_timestamp = log.latest_rest_timestamp.clone();
     let latest_rest_summary = log.latest_rest_summary.clone();
-    let is_sitting = latest_rest_summary
-        .as_deref()
-        .map(|summary| summary != "standing");
+    let latest_cast_timestamp = log.latest_cast_timestamp.clone();
+    let latest_cast_summary = log.latest_cast_summary.clone();
+    let latest_posture_timestamp = log.latest_posture_timestamp.clone();
+    let latest_posture_summary = log.latest_posture_summary.clone();
+    let posture_summary = latest_posture_summary
+        .clone()
+        .or_else(|| latest_rest_summary.clone());
+    let is_sitting = match posture_summary.as_deref() {
+        Some("sitting_or_meditating") => Some(true),
+        Some("standing" | "standing_casting") => Some(false),
+        Some(_) | None => None,
+    };
     EverQuestPostureReadiness {
-        rest_state: latest_rest_summary
-            .clone()
-            .unwrap_or_else(|| "unknown".to_owned()),
+        rest_state: posture_summary.unwrap_or_else(|| "unknown".to_owned()),
         is_sitting,
         latest_rest_timestamp,
         latest_rest_summary,
+        latest_cast_timestamp,
+        latest_cast_summary,
+        latest_posture_timestamp,
+        latest_posture_summary,
     }
 }
 
 fn combat_readiness_readback(
+    foreground: &EverQuestSurvivalForeground,
+    chat: &EverQuestChatInputState,
     hud: &EverQuestSurvivalHudReadback,
+    food_drink: &EverQuestFoodDrinkReadiness,
     posture: &EverQuestPostureReadiness,
 ) -> EverQuestCombatReadinessReadback {
     let health_floor_percent = 80;
     let mana_floor_percent = 30;
-    let ready = hud
-        .hp_percent
-        .is_some_and(|value| value >= health_floor_percent)
+    let ready = foreground.is_everquest_foreground
+        && chat.allows_text_command()
+        && food_drink.has_food_or_drink != Some(false)
+        && hud
+            .hp_percent
+            .is_some_and(|value| value >= health_floor_percent)
         && hud
             .mana_percent
             .is_some_and(|value| value >= mana_floor_percent)
@@ -1150,8 +1212,15 @@ fn combat_readiness_readback(
         health_floor_percent,
         mana_floor_percent,
         source_summary: format!(
-            "hp={:?}/{:?} mana={:?}/{:?} posture={}",
-            hud.hp_current, hud.hp_max, hud.mana_current, hud.mana_max, posture.rest_state
+            "foreground={} chat={} food={} hp={:?}/{:?} mana={:?}/{:?} posture={}",
+            foreground.is_everquest_foreground,
+            chat.decision,
+            food_drink.status,
+            hud.hp_current,
+            hud.hp_max,
+            hud.mana_current,
+            hud.mana_max,
+            posture.rest_state
         ),
     }
 }
@@ -2148,6 +2217,169 @@ mod tests {
     #[test]
     fn survival_parser_ignores_unbounded_numeric_text() {
         assert!(parse_hp_mana_from_hud_text("NEXT LEVEL 0.000% STR 60 STA 80").is_none());
+    }
+
+    #[test]
+    fn survival_log_readback_treats_own_fizzle_as_posture_signal() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("eqlog_Thenumberone_frostreaver.txt");
+        std::fs::write(
+            &path,
+            "[Sat May 30 07:20:38 2026] Your Minor Shielding spell fizzles!\r\n",
+        )?;
+
+        let log = read_survival_log_readback(&path)
+            .unwrap_or_else(|error| panic!("expected survival log readback: {error:?}"));
+
+        assert_eq!(
+            log.latest_cast_timestamp.as_deref(),
+            Some("Sat May 30 07:20:38 2026")
+        );
+        assert_eq!(log.latest_cast_summary.as_deref(), Some("casting_fizzled"));
+        assert_eq!(
+            log.latest_posture_summary.as_deref(),
+            Some("standing_casting")
+        );
+        assert_eq!(posture_readiness(&log).is_sitting, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn survival_log_readback_ignores_other_player_casts_for_posture() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("eqlog_Thenumberone_frostreaver.txt");
+        std::fs::write(
+            &path,
+            "[Sat May 30 07:20:28 2026] Dariel begins casting Minor Shielding.\r\n\
+             [Sat May 30 07:24:29 2026] Deadish's Bone Walk spell fizzles!\r\n",
+        )?;
+
+        let log = read_survival_log_readback(&path)
+            .unwrap_or_else(|error| panic!("expected survival log readback: {error:?}"));
+
+        assert_eq!(log.latest_cast_timestamp, None);
+        assert_eq!(log.latest_posture_summary, None);
+        assert_eq!(posture_readiness(&log).rest_state, "unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn survival_combat_readiness_rejects_known_food_absence() {
+        let foreground = EverQuestSurvivalForeground {
+            is_everquest_foreground: true,
+            process_name: "eqgame.exe".to_owned(),
+            window_title: "EverQuest".to_owned(),
+            profile_id: Some(EVERQUEST_PROFILE_ID.to_owned()),
+        };
+        let hud = EverQuestSurvivalHudReadback {
+            level_raw: Some("Inventory Thenumberone 1 Wizard".to_owned()),
+            resource_raw: Some("36/36 28/28 NEXT LEVEL 0.000%".to_owned()),
+            hp_current: Some(36),
+            hp_max: Some(36),
+            hp_percent: Some(100),
+            mana_current: Some(28),
+            mana_max: Some(28),
+            mana_percent: Some(100),
+            resource_parse_status: "parsed_hp_mana".to_owned(),
+        };
+        let food_drink = EverQuestFoodDrinkReadiness {
+            status: "out_of_food_and_drink".to_owned(),
+            has_food_or_drink: Some(false),
+            hunger_signal_seen: true,
+            thirst_signal_seen: true,
+            out_of_food_drink_seen: true,
+            source: "physical_eq_log_out_of_food_and_drink".to_owned(),
+        };
+        let posture = EverQuestPostureReadiness {
+            rest_state: "standing_casting".to_owned(),
+            is_sitting: Some(false),
+            latest_rest_timestamp: None,
+            latest_rest_summary: None,
+            latest_cast_timestamp: Some("Sat May 30 07:34:49 2026".to_owned()),
+            latest_cast_summary: Some("casting_started".to_owned()),
+            latest_posture_timestamp: Some("Sat May 30 07:34:49 2026".to_owned()),
+            latest_posture_summary: Some("standing_casting".to_owned()),
+        };
+        let chat = empty_chat_state();
+
+        let combat = combat_readiness_readback(&foreground, &chat, &hud, &food_drink, &posture);
+        let blockers = survival_blockers(&foreground, &chat, &hud, &food_drink, &posture, &combat);
+
+        assert!(!combat.ready_for_combat_spell);
+        assert_eq!(blockers, vec!["food_drink_absent"]);
+    }
+
+    #[test]
+    fn survival_posture_accepts_recent_casting_as_standing() {
+        let log = survival_log_for_posture(
+            None,
+            None,
+            Some("Sat May 30 07:20:38 2026"),
+            Some("casting_started"),
+            Some("Sat May 30 07:20:38 2026"),
+            Some("standing_casting"),
+        );
+
+        let posture = posture_readiness(&log);
+
+        assert_eq!(posture.rest_state, "standing_casting");
+        assert_eq!(posture.is_sitting, Some(false));
+        assert_eq!(
+            posture.latest_cast_timestamp.as_deref(),
+            Some("Sat May 30 07:20:38 2026")
+        );
+        assert_eq!(
+            posture.latest_cast_summary.as_deref(),
+            Some("casting_started")
+        );
+    }
+
+    #[test]
+    fn survival_posture_keeps_later_sitting_over_old_casting() {
+        let log = survival_log_for_posture(
+            Some("Sat May 30 07:21:00 2026"),
+            Some("sitting_or_meditating"),
+            Some("Sat May 30 07:20:38 2026"),
+            Some("casting_started"),
+            Some("Sat May 30 07:21:00 2026"),
+            Some("sitting_or_meditating"),
+        );
+
+        let posture = posture_readiness(&log);
+
+        assert_eq!(posture.rest_state, "sitting_or_meditating");
+        assert_eq!(posture.is_sitting, Some(true));
+        assert_eq!(
+            posture.latest_rest_timestamp.as_deref(),
+            Some("Sat May 30 07:21:00 2026")
+        );
+    }
+
+    fn survival_log_for_posture(
+        latest_rest_timestamp: Option<&str>,
+        latest_rest_summary: Option<&str>,
+        latest_cast_timestamp: Option<&str>,
+        latest_cast_summary: Option<&str>,
+        latest_posture_timestamp: Option<&str>,
+        latest_posture_summary: Option<&str>,
+    ) -> EverQuestSurvivalLogReadback {
+        EverQuestSurvivalLogReadback {
+            path: "synthetic.log".to_owned(),
+            start_offset: 0,
+            next_offset: 0,
+            file_len_bytes: 0,
+            bytes_read: 0,
+            signal_count: 0,
+            latest_hunger_timestamp: None,
+            latest_thirst_timestamp: None,
+            latest_out_of_food_drink_timestamp: None,
+            latest_rest_timestamp: latest_rest_timestamp.map(str::to_owned),
+            latest_rest_summary: latest_rest_summary.map(str::to_owned),
+            latest_cast_timestamp: latest_cast_timestamp.map(str::to_owned),
+            latest_cast_summary: latest_cast_summary.map(str::to_owned),
+            latest_posture_timestamp: latest_posture_timestamp.map(str::to_owned),
+            latest_posture_summary: latest_posture_summary.map(str::to_owned),
+        }
     }
 
     #[test]

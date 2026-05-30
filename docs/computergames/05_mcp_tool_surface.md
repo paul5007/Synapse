@@ -772,7 +772,10 @@ OCR accepts normal slash pairs such as `28/28` and the observed slash-loss form
 where the separator is read as `1`, such as `28128` for `28/28`. It detects
 food/drink absence from the authoritative log signal `You are out of food and
 drink` without persisting raw chat bodies, and records hunger/thirst timestamps
-as compact booleans/timestamps.
+as compact booleans/timestamps. Casting posture can be proven by recent
+physical spell-cast log signals such as `You begin casting ...` or
+`Your <spell> spell fizzles!`; those own-player signals are stored only as
+compact cast/posture summaries and timestamps.
 
 This row is a readiness verdict, not an action surface. It can prove current
 blockers such as `mana_below_combat_floor`, `food_drink_absent`,
