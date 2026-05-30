@@ -19,37 +19,7 @@ summarizes the queue as read on 2026-05-26 after `git pull --ff-only`, but an
 agent must re-read the current issue before claiming work. If source, docs, and
 issues disagree, inspect the physical source of truth and update the issue.
 
-**Binding doctrine:** issue #351 and `AGENTS.md` control this phase. Manual FSV
-is mandatory and cannot be replaced by tests, scripts, benchmarks, CI, GitHub
-Actions, harnesses, or return values. Missing tools, drivers, models, files,
-services, firmware, account state, or hardware are acquisition/setup work, not a
-reason to mark an issue blocked by absence alone. Synapse gives the agent local
-computer-control responsibility; treat Synapse/local control as the
-operator-equivalent host control surface. If the operator could download,
-install, connect, configure, generate, flash, launch, or inspect it from this
-host, the agent must attempt those reversible local steps using Synapse plus
-normal host workflows before
-asking the operator. Then read the authoritative source of truth directly. Ask
-only for narrow approval before hard-to-reverse external actions such as
-spending money, private credentials, billing, external-account changes, or
-irreversible shared-state changes.
-Within M4, browser downloads, GUI installers, Device Manager checks,
-package-manager installs, model/file generation, firmware flashing, launching
-apps, USB/COM inspection, and Synapse-driven UI inspection are agent-owned work
-when reversible on this host; they are not reasons to stop and are not operator
-errands while the agent can do them locally.
-Missing local state creates the next action for the agent and must be made
-real, not handed back to the operator or treated as a blocker while reversible
-host work remains. Use Synapse's local computer-control surface, equivalent to
-the operator's local control for reversible host work, to keep moving until the
-remaining step is a specific operator-only external decision.
-Nothing is ever `status:blocked` because a configured-host prerequisite is
-absent; the only blockable item is the exact operator-only hard-to-reverse
-external action left after every reversible local step is exhausted.
-
-**No GitHub Actions or CI gate.** Agent commits pushed during M4 include
-`[skip ci]`. Local checks may support regression confidence, but the shipping
-gate is configured-host manual FSV with source-of-truth readback.
+**Binding doctrine:** issue #351 and `AGENTS.md` control this phase. Operator directives D1–D4 apply verbatim (`AGENTS.md`): D1 manual FSV only (no test/script/bench/CI/return-value substitute), D3 no GitHub Actions/CI gate + `[skip ci]` on every M4 commit, D4 missing tool/driver/model/firmware/hardware = reversible local acquisition work, never `status:blocked` by absence alone. The M4-specific reversible surfaces are firmware flashing, USB/COM inspection, and Device Manager checks for the RP2040/serial device.
 
 **PRD authority:** [15_roadmap_and_milestones.md](../computergames/15_roadmap_and_milestones.md)
 section 6, [09_hardware_hid_gateway.md](../computergames/09_hardware_hid_gateway.md),

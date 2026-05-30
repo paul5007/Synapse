@@ -2,10 +2,7 @@
 
 Discipline applied across M0-M5, not owned by any single phase. Pointers to authoritative PRD sections; impplan adds enforcement rules. State-tracking authority: git tags + `CHANGELOG.md` > codebase on `main` > GitHub Issues. **All M0/M1/M2/M3 issues are closed** as of 2026-05-25 (`v0.1.0-m3` tag); M4+ opens new issues with `phase:mN` + `area:*` labels. ADRs landed through M3: 0001 (Rust + deps), 0002 (RocksDB primary), 0003 (reflex recursion guard), 0004 (reflex priority), 0005 (multi-monitor capture target), 0006 (profile match precedence), 0007 (per-event vs batched notifications).
 
-**Three operator-level invariants** that override anything below in case of conflict:
-1. No backwards compatibility (pre-v1). Fail fast with `error_codes::*`; no fallbacks/shims.
-2. No mocks gate completion. OS-bound work needs a real-OS integration test with source-of-truth read-back.
-3. Manual configured-host FSV is the shipping gate (issues #246/#247/#350/#351). Use local checks for supporting evidence; do not dispatch or wait on GitHub Actions/CI. FSV must never be delegated to scripts, automated tests, benchmarks, harnesses, CI jobs, or any other automated substitute.
+**Operator directives D1–D7 override anything below on conflict.** Canonical: `AGENTS.md` §D1–D4, `00_methodology.md` §"Operator directives" (D5/D6), §12 below (D7). Most relevant here: D1 (manual FSV, no automated substitute), D3 (no GitHub Actions/CI gate; #246/#247/#350/#351), D5 (no pre-v1 back-compat), D6 (no mocks gate completion).
 
 ---
 

@@ -218,20 +218,19 @@ reads from disk.
 | `docs/adr/0007-per-event-vs-batched-notifications.md` | Per-event vs batched SSE notifications | One Event = one SSE frame; no in-process batching to keep `event-to-subscriber p99 ≤ 50 ms` achievable |
 | `docs/adr/0010-detection-model-default.md` | Default detection model | Default detector is `rtdetr_v2_s_coco_onnx`; YOLO remains operator-import only when license-compliant and SHA-pinned |
 
-## 5. Operator-level invariants (from `docs/impplan/00_methodology.md`)
+## 5. Operator-level invariants
 
-These are doctrine — **NEVER violate**:
+Doctrine — **NEVER violate**. Defined once and referenced by tag; canonical text lives in the source column. See `docs/impplan/README.md` §"Operator-level invariants" for the same table.
 
-1. **No backward compatibility (pre-v1).** Schema/API changes break callers; no fallbacks, no shims, no silent error swallowing. Anything that does not work must fail fast with a structured `synapse_core::error_codes::*` code and a tracing log line containing that code.
-2. **No mocks gate completion.** OS-bound work-items are not done until a real-OS integration test exercises them against the real SoT (UIA `ValuePattern`, `XInputGetState`, RocksDB key, `GetClipboardData`, `GetCursorPos`, low-level keyboard hook, etc.).
-3. **Full-State Verification (FSV) is mandatory and manual.** The agent reads the SoT before, executes the trigger, performs a separate read for "after", exercises ≥3 edge cases (empty/boundary/structurally-invalid), and records actual state. **Scripts, tests, benchmarks, harnesses, GitHub Actions, and CI are supporting evidence only.** They never count as FSV. Do not add `*_fsv` tests, FSV harnesses, or FSV scripts.
-4. **Natural-only motion (OQ-004 DECIDED 2026-05-22).** `Natural` curves + `Natural` keystroke dynamics tuned `FAST` are the resolved default of every tool, profile, and reflex. `Instant`/`Burst` exist for explicit opt-in only.
-5. **Manual FSV on the configured Windows host is the shipping gate, not CI** (operator decision 2026-05-24, issues #246/#247/#350/#351). Do not dispatch, wait on, or block a tag on GitHub Actions/CI. Do not add `*_fsv` tests.
-6. **Synapse MCP runtime is a required FSV precondition and trigger surface.** For any Synapse behavior with an MCP tool, the agent must read the live `synapse-mcp` process/stdout child or socket, authenticate when HTTP is used, call `health`, initialize an MCP session, verify the tool through `tools/list`, trigger the behavior through real MCP `tools/call`, and then perform a separate physical SoT readback. Return values and `health` prove liveness/attempt only.
-7. **Reality context should be delta-first with periodic drift audits.** Issue #536 changes the target context model: a full snapshot establishes or repairs a baseline; routine context is ordered reality deltas; periodic full physical audits compare the delta-guided assumption against actual UI/log/file/process/storage/device SoTs and force rebase on drift.
-8. **Missing configured-host prerequisites are agent work, not blockers.** Do not stop at "missing." Synapse gives the agent full local computer-control responsibility for this host and the same practical local ability the operator has at this keyboard. If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must use Synapse/local host control to make it happen and then inspect the physical SoT. Missing local state creates the next action for the agent and must be made real, not handed back to the operator or treated as a blocker while reversible host work remains. Nothing is ever `status:blocked` because a configured-host prerequisite is absent; the only blockable item is the exact operator-only hard-to-reverse external action left after every reversible local step is exhausted. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, USB/COM inspection, and UI inspection are agent-owned work when reversible on this host. Ask only for narrow approval on hard-to-reverse external actions after reversible local work is exhausted.
-
-`AGENTS.md` reinforces these and pins **`[skip ci]` on every agent commit**.
+| Tag | Directive | Canonical source |
+|---|---|---|
+| D1 | Manual FSV (read SoT before → trigger → separate read after → ≥3 edge cases) + MCP precondition (`health`, session, `tools/list`) and real `tools/call` trigger; tests/scripts/benches/CI are supporting evidence only; no `*_fsv` tests/harnesses/scripts | `AGENTS.md` §D1 |
+| D2 | Delta-of-reality: baseline → ordered deltas → periodic physical drift audit → rebase (#536; tools #537-#543) | `AGENTS.md` §D2 |
+| D3 | No GitHub Actions/CI shipping gate; `[skip ci]` on every agent commit (#246/#247/#350/#351) | `AGENTS.md` §D3 |
+| D4 | Missing configured-host prereq = reversible local acquisition work; never `status:blocked` by absence alone | `AGENTS.md` §D4 |
+| D5 | No backward compatibility pre-v1; fail fast with `synapse_core::error_codes::*` + tracing line | `00_methodology.md` §"Operator directives" |
+| D6 | No mocks gate completion; OS-bound item needs real-OS test + separate SoT read (UIA `ValuePattern`, `XInputGetState`, RocksDB key, `GetClipboardData`, `GetCursorPos`, keyboard hook) | `00_methodology.md` §"Operator directives" |
+| D7 | Natural-only motion `FAST` default; `Instant`/`Burst` opt-in only (OQ-004 DECIDED 2026-05-22) | `07_cross_cutting.md` §12 |
 
 ## 6. Per-PR contract (from `docs/impplan/README.md`)
 

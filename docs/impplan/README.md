@@ -2,19 +2,23 @@
 
 Operational map from PRD (`docs/computergames/`) → code. Each phase is a binary deliverable with a hard demo gate. Files in this directory are **prescriptive**; PRD is descriptive. Conflict ⇒ PRD wins, file is patched in the same PR.
 
-Doctrine: `docs2/compressionprompt.md` §0-13. Keep verbatim: paths, crate names, error codes, thresholds, deps. Cut meta-framing, restatement, motivation prose — PRD already says it.
+Doctrine: `docs/compressionprompt.md` §0-13. Keep verbatim: paths, crate names, error codes, thresholds, deps. Cut meta-framing, restatement, motivation prose — PRD already says it.
 
 ---
 
 ## Operator-level invariants (NEVER violate)
 
-1. **No backwards compatibility (pre-v1).** Schema/API changes break callers. No fallbacks, no compatibility shims, no silent error swallowing. Anything that does not work must fail fast with a structured `synapse_core::error_codes::*` code and a tracing log line containing that code, so the failure is debuggable.
-2. **No mocks gate completion.** Unit fakes are fine for isolation. An OS-bound work-item is **not done** until a real-OS integration test exercises it against the real source of truth (UIA `ValuePattern`, `XInputGetState`, file on disk, RocksDB key, `GetClipboardData`, `GetCursorPos`, low-level keyboard hook, etc.).
-3. **Full-State Verification (FSV) is mandatory and manual.** The agent identifies the source of truth, reads `before`, executes the trigger, performs a separate read for `after`, exercises ≥3 edge cases (empty / boundary / structurally invalid), and records the actual state. Scripts, tests, benchmarks, harnesses, GitHub Actions, and CI are supporting evidence only; never call them FSV. See `00_methodology.md` §5.
-4. **Natural-only motion (OQ-004 DECIDED 2026-05-22).** `Natural` curves + `Natural` keystroke dynamics tuned `FAST` (50 ms `Snap` travel, ~190 WPM typing with `mean_iki_ms=32, stddev=10, bigram_bias=true`) are the resolved default of every tool, profile, and reflex. No `Instant` jumps, no `Burst` typing as defaults. `Instant`/`Burst` remain in the enums for explicit caller opt-in only. See `07_cross_cutting.md` §12.
-5. **Manual FSV on the configured Windows host is the shipping gate, not CI** (operator decision 2026-05-24, issues #246/#247/#350/#351). Use local checks for supporting evidence. Do not dispatch, wait on, or block a tag on GitHub Actions/CI. Do not add `*_fsv` tests, FSV harnesses, or FSV scripts.
-6. **Missing configured-host prerequisites are work, not blockers.** Do not stop at "missing." Synapse gives the agent full local computer-control responsibility for this host and the same practical local ability the operator has at this keyboard. If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must make it happen through Synapse/local host workflows and then inspect the physical SoT. Missing local state creates the next action for the agent and must be made real, not handed back to the operator or treated as a blocker while reversible host work remains. Nothing is ever `status:blocked` because a configured-host prerequisite is absent; the only blockable item is the exact operator-only hard-to-reverse external action left after every reversible local step is exhausted. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, USB/COM inspection, and UI inspection are agent-owned work when reversible on this host. Ask only for narrow approval on hard-to-reverse external actions after every reversible local step is complete.
-7. **Reality context is moving delta-first.** Per #536, a full snapshot should establish or repair a baseline; routine agent context should be ordered reality deltas, and Synapse should periodically run full physical reality audits to detect drift and force a rebase. Until the MCP/storage/perception tools exist (#537-#543), existing real MCP tools plus manual SoT readback remain required.
+Directives are defined once and referenced by tag — do not restate. Canonical homes:
+
+| Tag | Directive | Canonical source |
+|---|---|---|
+| D1 | Manual FSV + MCP precondition/trigger; never automated; no `*_fsv` tests/harnesses/scripts | `AGENTS.md` §D1 (steps expanded in `00_methodology.md` §5) |
+| D2 | Delta-of-reality: baseline → ordered deltas → periodic drift audit (#536; tools #537-#543) | `AGENTS.md` §D2 |
+| D3 | No GitHub Actions/CI shipping gate; commits carry `[skip ci]` (#351; #246/#247/#350) | `AGENTS.md` §D3 |
+| D4 | Missing configured-host prereq = acquisition work, never `status:blocked` | `AGENTS.md` §D4 |
+| D5 | No backwards compatibility pre-v1; fail fast with `error_codes::*` + tracing line | `00_methodology.md` §"Operator directives" |
+| D6 | No mocks gate completion; OS-bound item needs real-OS test + separate SoT read | `00_methodology.md` §"Operator directives" |
+| D7 | Natural-only motion `FAST` default (50 ms `Snap`, ~190 WPM, `mean_iki_ms=32, stddev=10, bigram_bias=true`); `Instant`/`Burst` opt-in only (OQ-004 DECIDED 2026-05-22) | `07_cross_cutting.md` §12 |
 
 ---
 
