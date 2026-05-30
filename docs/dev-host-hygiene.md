@@ -72,13 +72,21 @@ Authoritative local readbacks:
 * `C:\Users\hotra\.codex\bin\exa-mcp-server.cmd` is the shared Windows MCP
   launcher. It clears any inherited process `EXA_API_KEY`, resolves the
   configured host secret, preserves stdin/stdout for the stdio MCP protocol,
-  then starts the global npm `exa-mcp-server.cmd`. This prevents a future agent
-  with a poisoned process environment from shadowing the verified host-global
-  key.
+  then starts the global npm package. This prevents a future agent with a
+  poisoned process environment from shadowing the verified host-global key.
 * `C:\Users\hotra\.codex\bin\exa-mcp-server.ps1` is the key resolver used by
   the launcher. The shared CMD launcher invokes it after clearing inherited
   process state, so the effective MCP resolution order is User environment,
-  Machine environment, then current-user DPAPI fallback.
+  Machine environment, then current-user DPAPI fallback. Use its `-Probe` mode
+  for non-secret readback evidence; reserve `-EmitKey` for launchers that are
+  about to exec the MCP server.
+* `C:\Users\hotra\.codex\bin\exa-api-key.cmd` is the narrow Windows interop
+  helper for WSL shell startup. It emits the resolved key to its caller but
+  stores nothing; WSL profiles pipe it directly into `EXA_API_KEY`.
+* The global npm shims under `%APPDATA%\npm\exa-mcp-server*` also resolve the
+  same host secret before starting the node package. Plain
+  `exa-mcp-server.cmd` therefore works even when an agent does not call the
+  Codex absolute wrapper path.
 * `C:\Users\hotra\.codex\config.toml` points `[mcp_servers.exa]` at
   `C:\Users\hotra\.codex\bin\exa-mcp-server.cmd` by absolute path.
 * Windows Claude Code, Claude Desktop, and Cursor MCP configs also point Exa at
@@ -87,6 +95,11 @@ Authoritative local readbacks:
   the same Windows DPAPI-backed launcher through WSL interop. WSL Claude Code
   and WSL Codex should point Exa at that wrapper and should not store
   `EXA_API_KEY` in their active MCP config.
+* `HKCU\Environment\WSLENV` includes `EXA_API_KEY/u` for Windows-launched WSL
+  processes, and `/home/cabdru/.profile` plus `/home/cabdru/.bashrc` derive
+  `EXA_API_KEY` from the Windows DPAPI-backed resolver for WSL login and
+  interactive shells through `/mnt/c/Users/hotra/.codex/bin/exa-api-key.cmd`.
+  The raw key is not stored in WSL dotfiles.
 * `C:\Users\hotra\.codex\bin` should be first in the User `Path`, and
   `%APPDATA%\npm` should be present for the global `exa-mcp-server` npm package.
 
