@@ -439,7 +439,7 @@ firmware range check still prevents overlarge mouse payloads.
 | Test | How |
 |---|---|
 | Protocol roundtrip | `cd firmware/pico-hid; cargo test --tests` (host-side parser tests with hand-crafted frames) |
-| Firmware loopback | Build with `--features loopback`; firmware echoes every command back as `PONG`. Host driver sends 1000 commands, asserts all return. |
+| Firmware loopback | Build with `.\scripts\release\firmware\build_pico_hid.ps1 -Features loopback`; firmware echoes every command back as `PONG`. Host driver sends 1000 commands, asserts all return. |
 | Watchdog | Connect, send commands, stop >1s, observe `RELEASE_ALL` via internal telemetry. |
 | Stress | Send 10,000 mouse-move-rel commands at full rate; assert no drops, all acked. |
 | Re-enumeration | Trigger `RESET_TO_BOOTLOADER`, observe device drops, mass storage appears, reflash, reconnect. |

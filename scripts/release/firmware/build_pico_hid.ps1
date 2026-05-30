@@ -1,5 +1,6 @@
 param(
     [string]$Version = "",
+    [string[]]$Features = @(),
     [switch]$SkipBuild
 )
 
@@ -11,6 +12,7 @@ $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..\..")
 $firmwareDir = Join-Path $repoRoot "firmware\pico-hid"
 $cargoToml = Join-Path $firmwareDir "Cargo.toml"
 $elfPath = Join-Path $firmwareDir "target\thumbv6m-none-eabi\release\pico-hid"
+$featureList = @($Features | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $versionLine = Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
@@ -28,9 +30,13 @@ if ($null -eq $elf2uf2) {
 if (-not $SkipBuild) {
     Push-Location $firmwareDir
     try {
-        cargo build --release
+        $cargoArgs = @("build", "--release")
+        if ($featureList.Count -gt 0) {
+            $cargoArgs += @("--features", ($featureList -join ","))
+        }
+        cargo @cargoArgs
         if ($LASTEXITCODE -ne 0) {
-            throw "cargo build --release failed with exit code $LASTEXITCODE"
+            throw "cargo $($cargoArgs -join ' ') failed with exit code $LASTEXITCODE"
         }
     }
     finally {
@@ -44,7 +50,12 @@ if (-not (Test-Path -LiteralPath $elfPath)) {
 
 $outDir = Join-Path $repoRoot "scripts\release\firmware"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-$uf2Path = Join-Path $outDir "pico-hid-$Version.uf2"
+$featureSuffix = ""
+if ($featureList.Count -gt 0) {
+    $featureSuffix = "-" + (($featureList | Sort-Object) -join "-")
+    $featureSuffix = $featureSuffix -replace '[^A-Za-z0-9_.-]', '-'
+}
+$uf2Path = Join-Path $outDir "pico-hid$featureSuffix-$Version.uf2"
 
 & $elf2uf2.Source $elfPath $uf2Path
 if ($LASTEXITCODE -ne 0) {
@@ -58,6 +69,7 @@ $hash = Get-FileHash -LiteralPath $uf2Path -Algorithm SHA256
     FirmwareElf = $elfPath
     Uf2Path = $uf2.FullName
     Version = $Version
+    Features = if ($featureList.Count -gt 0) { $featureList -join "," } else { "default" }
     Bytes = $uf2.Length
     Sha256 = $hash.Hash
 }

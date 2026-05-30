@@ -32,6 +32,16 @@ converts the release ELF with `elf2uf2-rs`, and writes the versioned artifact to
 `scripts\release\firmware\pico-hid-<version>.uf2`. The script prints the UF2
 path, byte length, and SHA-256 hash for manual source-of-truth readback.
 
+Loopback/debug firmware uses the same helper with a distinct artifact name:
+
+```powershell
+.\scripts\release\firmware\build_pico_hid.ps1 -Features loopback
+```
+
+That writes `scripts\release\firmware\pico-hid-loopback-<version>.uf2` so a
+physical loopback-PONG board can be flashed without overwriting the default HID
+firmware release artifact.
+
 For a local conversion while already inside `firmware\pico-hid`, the lower
 level command remains:
 
