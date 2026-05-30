@@ -16,7 +16,7 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
-pub use schema::{ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse};
+pub use schema::{ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend};
 
 pub async fn act_press_with_handle(
     handle: ActionHandle,

@@ -30,8 +30,8 @@ pub use drag::{ActDragParams, ActDragResponse, act_drag_with_handle};
 pub use pad::{ActPadParams, ActPadResponse, act_pad_with_handle};
 pub use press::action_from_press_params;
 pub use press::{
-    ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, act_keymap_with_handle,
-    act_press_with_handle,
+    ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
+    act_keymap_with_handle, act_press_with_handle,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
 pub use scroll::{ActScrollParams, ActScrollResponse, act_scroll_with_handle};

@@ -513,7 +513,9 @@ impl SynapseService {
 }
 
 impl SynapseService {
-    fn build_survival_readiness_row(&self) -> Result<EverQuestSurvivalReadinessRow, ErrorData> {
+    pub(super) fn build_survival_readiness_row(
+        &self,
+    ) -> Result<EverQuestSurvivalReadinessRow, ErrorData> {
         let mut input = {
             let state = self.m1_state()?;
             current_input(&state, 2)?
@@ -648,7 +650,10 @@ impl SynapseService {
         })
     }
 
-    fn ensure_active_everquest_profile(&self, tool_name: &'static str) -> Result<(), ErrorData> {
+    pub(super) fn ensure_active_everquest_profile(
+        &self,
+        tool_name: &'static str,
+    ) -> Result<(), ErrorData> {
         let runtime = self.profile_runtime()?;
         let active_profile_id = runtime
             .active_profile_id()
@@ -667,7 +672,7 @@ impl SynapseService {
         ))
     }
 
-    fn ensure_literal_command_chat_guard(
+    pub(super) fn ensure_literal_command_chat_guard(
         &self,
         tool_name: &'static str,
         command: &str,
