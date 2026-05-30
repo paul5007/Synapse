@@ -12,6 +12,7 @@ use synapse_storage::cf;
 use super::{
     Json, Parameters, SynapseService,
     everquest_log::{ActiveEverQuestLog, EVERQUEST_PROFILE_ID},
+    everquest_ui_context::{EverQuestUiContextReadback, everquest_ui_context_from_input},
     tool, tool_router,
 };
 use crate::m1::{current_input, mcp_error};
@@ -181,14 +182,15 @@ impl SynapseService {
             current_input(&state, 2)?
         };
         self.resolve_input_profile_and_hud(&mut input, true);
+        let ui_context = everquest_ui_context_from_input(&input);
         let focus = focus_state(&input.foreground);
 
         let (active, batch, graph) = self.current_state_log_sources()?;
         let latest_actions = self.latest_everquest_action_summaries()?;
 
-        let zone = latest_zone_field(&batch.events, &batch);
-        let zone_short_name = zone_short_name_field(zone.value.as_deref(), &graph, &zone);
-        let location = latest_location_field(&batch.events, &batch);
+        let mut zone = latest_zone_field(&batch.events, &batch);
+        let mut zone_short_name = zone_short_name_field(zone.value.as_deref(), &graph, &zone);
+        let mut location = latest_location_field(&batch.events, &batch);
         let nearest_landmarks = nearest_landmarks(
             &graph,
             zone_short_name.value.as_deref(),
@@ -196,20 +198,29 @@ impl SynapseService {
         );
         let level = level_field(&input.hud);
         let xp_percent = xp_percent_field(&input.hud);
-        let target = latest_summary_field(
+        let mut target = latest_summary_field(
             &batch.events,
             &batch,
             &[EverQuestLogKind::TargetNpc, EverQuestLogKind::TargetPlayer],
             "no target log event in sampled log window",
         );
-        let consider = latest_summary_field(
+        let mut consider = latest_summary_field(
             &batch.events,
             &batch,
             &[EverQuestLogKind::Consider],
             "no consider log event in sampled log window",
         );
+        if ui_context.login_screen_visible {
+            let reason = "visible EverQuest login screen; value is last-known log state and is not actionable current gameplay state";
+            mark_field_not_actionable(&mut zone, reason);
+            mark_field_not_actionable(&mut zone_short_name, reason);
+            mark_field_not_actionable(&mut location, reason);
+            mark_field_not_actionable(&mut target, reason);
+            mark_field_not_actionable(&mut consider, reason);
+        }
         let mut hazards = hazards_for_state(
             &focus,
+            &ui_context,
             &zone,
             &zone_short_name,
             &location,
@@ -671,6 +682,7 @@ fn latest_summary_field(
 
 fn hazards_for_state(
     focus: &EverQuestFocusState,
+    ui_context: &EverQuestUiContextReadback,
     zone: &EverQuestStateField<String>,
     zone_short_name: &EverQuestStateField<String>,
     location: &EverQuestStateField<EverQuestStateLocation>,
@@ -686,6 +698,25 @@ fn hazards_for_state(
             detail: format!(
                 "foreground is {} title {:?}",
                 focus.process_name, focus.window_title
+            ),
+        });
+    }
+    if ui_context.login_screen_visible {
+        hazards.push(EverQuestStateHazard {
+            code: "login_screen_visible".to_owned(),
+            severity: "blocker".to_owned(),
+            detail: format!(
+                "visible EverQuest UI is login_screen with signals {}; log-derived world fields are last-known only",
+                ui_context.login_signal_names.join(",")
+            ),
+        });
+    } else if !ui_context.in_world {
+        hazards.push(EverQuestStateHazard {
+            code: "ui_context_ambiguous".to_owned(),
+            severity: "warning".to_owned(),
+            detail: format!(
+                "visible EverQuest UI status={} has no in-world signals",
+                ui_context.status
             ),
         });
     }
@@ -715,6 +746,17 @@ fn hazards_for_state(
         });
     }
     hazards
+}
+
+fn mark_field_not_actionable<T>(field: &mut EverQuestStateField<T>, reason: &str) {
+    if field.value.is_none() {
+        return;
+    }
+    field.confidence = field.confidence.min(0.25);
+    field.note = Some(match field.note.take() {
+        Some(note) => format!("{note}; {reason}"),
+        None => reason.to_owned(),
+    });
 }
 
 fn field_hazard<T>(code: &str, field: &EverQuestStateField<T>) -> EverQuestStateHazard {
@@ -855,5 +897,102 @@ mod tests {
         });
         assert!(action_row_matches_everquest(&everquest));
         assert!(!action_row_matches_everquest(&notepad));
+    }
+
+    #[test]
+    fn login_screen_hazard_blocks_current_state_as_actionable() {
+        let focus = EverQuestFocusState {
+            is_everquest_foreground: true,
+            confidence: 1.0,
+            hwnd: 100,
+            process_name: "eqgame.exe".to_owned(),
+            process_path: r"C:\EverQuest\eqgame.exe".to_owned(),
+            window_title: "EverQuest".to_owned(),
+            profile_id: Some(EVERQUEST_PROFILE_ID.to_owned()),
+        };
+        let ui_context = EverQuestUiContextReadback {
+            status: "login_screen".to_owned(),
+            in_world: false,
+            login_screen_visible: true,
+            login_signal_names: vec!["login_button".to_owned(), "password_label".to_owned()],
+            in_world_signal_names: Vec::new(),
+            focused_text_role: Some("Edit".to_owned()),
+            focused_text_name: Some("Username".to_owned()),
+            focused_text_value_len: Some(0),
+            focused_text_selected_len: Some(0),
+            source_mode: "test".to_owned(),
+        };
+        let zone = field_some("Nektulos Forest".to_owned(), 0.25, test_source(), None);
+        let zone_short_name = field_some("nektulos".to_owned(), 0.25, test_source(), None);
+        let location = field_some(
+            EverQuestStateLocation {
+                display_y: 1.0,
+                display_x: 2.0,
+                display_z: 3.0,
+                map_x: -2.0,
+                map_y: -1.0,
+                map_z: 3.0,
+                log_timestamp: "2026-05-29T23:02:52".to_owned(),
+            },
+            0.25,
+            test_source(),
+            None,
+        );
+        let batch = EverQuestLogTailBatch {
+            path: "eqlog_Thenumberone_frostreaver.txt".into(),
+            start_offset: 0,
+            next_offset: 100,
+            file_len_bytes: 100,
+            bytes_read: 100,
+            truncated_by_bytes: false,
+            truncated_by_events: false,
+            events: Vec::new(),
+        };
+
+        let hazards = hazards_for_state(
+            &focus,
+            &ui_context,
+            &zone,
+            &zone_short_name,
+            &location,
+            &field_none("HUD level unavailable"),
+            &field_none("HUD XP percent unavailable"),
+            &batch,
+        );
+
+        assert!(hazards.iter().any(|hazard| {
+            hazard.code == "login_screen_visible"
+                && hazard.severity == "blocker"
+                && hazard.detail.contains("last-known only")
+        }));
+    }
+
+    #[test]
+    fn login_screen_marks_log_fields_last_known_not_actionable() {
+        let mut zone = field_some("Nektulos Forest".to_owned(), 0.95, test_source(), None);
+
+        mark_field_not_actionable(
+            &mut zone,
+            "visible EverQuest login screen; value is last-known log state",
+        );
+
+        assert_eq!(zone.value.as_deref(), Some("Nektulos Forest"));
+        assert_eq!(zone.confidence, 0.25);
+        assert!(
+            zone.note
+                .as_deref()
+                .is_some_and(|note| { note.contains("last-known log state") })
+        );
+    }
+
+    fn test_source() -> EverQuestStateSource {
+        EverQuestStateSource {
+            kind: "test".to_owned(),
+            path: None,
+            start_offset: None,
+            next_offset: None,
+            log_timestamp: None,
+            summary: None,
+        }
     }
 }
