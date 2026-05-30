@@ -1,6 +1,6 @@
 use std::sync::Once;
 
-use enigo::{Button as EnigoButton, Direction, Enigo, Mouse};
+use enigo::Enigo;
 use synapse_core::{AimCurve, AimStyle, AimTarget, ButtonAction, MouseButton, MouseTarget, Point};
 use windows::Win32::{
     Foundation::{E_ACCESSDENIED, POINT as WinPoint},
@@ -10,8 +10,10 @@ use windows::Win32::{
             SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
         },
         Input::KeyboardAndMouse::{
-            INPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_MOVE,
-            MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+            INPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+            MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
         },
         WindowsAndMessaging::{
             GetPhysicalCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -22,12 +24,14 @@ use windows::Win32::{
 
 use super::{
     input::{mouse_input, send_input_batch},
-    utils::{enigo, enigo_error, sleep_ms},
+    utils::sleep_ms,
 };
 use crate::backend::mouse_coordinates::{VirtualDesktop, normalize_absolute_mouse_point};
 use crate::{ActionError, EmitState, sample_curve};
 
 const WHEEL_DELTA: i32 = 120;
+const XBUTTON1_DATA: u32 = 0x0001;
+const XBUTTON2_DATA: u32 = 0x0002;
 static DPI_AWARENESS: Once = Once::new();
 
 pub(super) fn cursor_position() -> Result<Point, ActionError> {
@@ -46,13 +50,21 @@ pub(super) fn cursor_position() -> Result<Point, ActionError> {
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_move"))]
-pub(super) fn mouse_move(target: &MouseTarget) -> Result<(), ActionError> {
+pub(super) fn mouse_move(
+    target: &MouseTarget,
+    curve: &AimCurve,
+    duration_ms: u32,
+) -> Result<(), ActionError> {
     let MouseTarget::Screen { point } = target else {
         return Err(ActionError::TargetInvalid {
             detail: "software backend requires a resolved screen point for mouse movement"
                 .to_owned(),
         });
     };
+    if duration_ms > 0 && !matches!(curve, AimCurve::Instant) {
+        let from = cursor_position()?;
+        mouse_move_curve(from, *point, curve, duration_ms)?;
+    }
     send_absolute_mouse_move(*point, "absolute mouse move")
 }
 
@@ -77,31 +89,22 @@ pub(super) fn mouse_button(
     hold_ms: u32,
     state: &mut EmitState,
 ) -> Result<(), ActionError> {
-    let mut enigo = enigo()?;
-    let enigo_button = enigo_button(button);
     match action {
         ButtonAction::Down => {
+            send_mouse_button_event(button, ButtonAction::Down)?;
             state.apply_mouse_button(button, ButtonAction::Down);
-            enigo
-                .button(enigo_button, Direction::Press)
-                .map_err(enigo_error("emit mouse button"))
+            Ok(())
         }
         ButtonAction::Up => {
-            enigo
-                .button(enigo_button, Direction::Release)
-                .map_err(enigo_error("emit mouse button"))?;
+            send_mouse_button_event(button, ButtonAction::Up)?;
             state.apply_mouse_button(button, ButtonAction::Up);
             Ok(())
         }
         ButtonAction::Press => {
+            send_mouse_button_event(button, ButtonAction::Down)?;
             state.apply_mouse_button(button, ButtonAction::Down);
-            enigo
-                .button(enigo_button, Direction::Press)
-                .map_err(enigo_error("emit mouse button"))?;
             let _interrupted = sleep_ms(hold_ms);
-            enigo
-                .button(enigo_button, Direction::Release)
-                .map_err(enigo_error("emit mouse button"))?;
+            send_mouse_button_event(button, ButtonAction::Up)?;
             state.apply_mouse_button(button, ButtonAction::Up);
             Ok(())
         }
@@ -160,17 +163,19 @@ pub(super) fn aim_at(target: &AimTarget, style: AimStyle) -> Result<(), ActionEr
             detail: "software aim requires a resolved screen point".to_owned(),
         });
     };
-    mouse_move(&MouseTarget::Screen { point: *point })
+    mouse_move(
+        &MouseTarget::Screen { point: *point },
+        &AimCurve::Instant,
+        0,
+    )
 }
 
 pub(super) fn release_buttons_with(
-    enigo: &mut Enigo,
+    _enigo: &mut Enigo,
     buttons: &[MouseButton],
 ) -> Result<(), ActionError> {
     for button in buttons.iter().rev() {
-        enigo
-            .button(enigo_button(*button), Direction::Release)
-            .map_err(enigo_error("release held mouse button"))?;
+        send_mouse_button_event(*button, ButtonAction::Up)?;
     }
     Ok(())
 }
@@ -190,16 +195,6 @@ fn mouse_move_curve(
     send_input_batch(&inputs, "drag curve absolute mouse move")
 }
 
-const fn enigo_button(button: MouseButton) -> EnigoButton {
-    match button {
-        MouseButton::Left => EnigoButton::Left,
-        MouseButton::Right => EnigoButton::Right,
-        MouseButton::Middle => EnigoButton::Middle,
-        MouseButton::X1 => EnigoButton::Back,
-        MouseButton::X2 => EnigoButton::Forward,
-    }
-}
-
 fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), ActionError> {
     activate_thread_dpi_awareness();
     // Physical cursor APIs avoid DPI virtualization drift between the MCP
@@ -209,7 +204,50 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
         ActionError::BackendUnavailable {
             detail: format!("SetPhysicalCursorPos failed for {detail}: {error}"),
         }
-    })
+    })?;
+    let desktop = virtual_desktop()?;
+    send_input_batch(&[absolute_mouse_input_for_desktop(point, desktop)], detail)
+}
+
+fn send_mouse_button_event(button: MouseButton, action: ButtonAction) -> Result<(), ActionError> {
+    let (flags, data) = mouse_button_event_parts(button, action);
+    send_input_batch(
+        &[mouse_input(0, 0, data, flags)],
+        match action {
+            ButtonAction::Down => "mouse button down",
+            ButtonAction::Up => "mouse button up",
+            ButtonAction::Press => "mouse button press",
+        },
+    )
+}
+
+fn mouse_button_event_parts(
+    button: MouseButton,
+    action: ButtonAction,
+) -> (
+    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    u32,
+) {
+    match (button, action) {
+        (MouseButton::Left, ButtonAction::Down | ButtonAction::Press) => (MOUSEEVENTF_LEFTDOWN, 0),
+        (MouseButton::Left, ButtonAction::Up) => (MOUSEEVENTF_LEFTUP, 0),
+        (MouseButton::Right, ButtonAction::Down | ButtonAction::Press) => {
+            (MOUSEEVENTF_RIGHTDOWN, 0)
+        }
+        (MouseButton::Right, ButtonAction::Up) => (MOUSEEVENTF_RIGHTUP, 0),
+        (MouseButton::Middle, ButtonAction::Down | ButtonAction::Press) => {
+            (MOUSEEVENTF_MIDDLEDOWN, 0)
+        }
+        (MouseButton::Middle, ButtonAction::Up) => (MOUSEEVENTF_MIDDLEUP, 0),
+        (MouseButton::X1, ButtonAction::Down | ButtonAction::Press) => {
+            (MOUSEEVENTF_XDOWN, XBUTTON1_DATA)
+        }
+        (MouseButton::X1, ButtonAction::Up) => (MOUSEEVENTF_XUP, XBUTTON1_DATA),
+        (MouseButton::X2, ButtonAction::Down | ButtonAction::Press) => {
+            (MOUSEEVENTF_XDOWN, XBUTTON2_DATA)
+        }
+        (MouseButton::X2, ButtonAction::Up) => (MOUSEEVENTF_XUP, XBUTTON2_DATA),
+    }
 }
 
 fn absolute_mouse_input_for_desktop(point: Point, desktop: VirtualDesktop) -> INPUT {

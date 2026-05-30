@@ -36,6 +36,7 @@ async fn coordinate_click_leaves_actor_held_state_empty() {
             modifiers: Vec::new(),
             curve: default_click_curve(),
             duration_ms: default_click_duration_ms(),
+            hold_ms: super::schema::default_click_hold_ms(),
             backend: default_click_backend(),
             use_invoke_pattern: default_use_invoke_pattern(),
         },
@@ -56,6 +57,7 @@ async fn coordinate_click_leaves_actor_held_state_empty() {
     assert!(response.ok);
     assert!(!response.used_invoke_pattern);
     assert_eq!(response.backend_used, "software");
+    assert_eq!(response.press_hold_ms, 120);
     assert!(after.held_buttons.is_empty());
     assert!(after.held_keys.is_empty());
     cancel.cancel();

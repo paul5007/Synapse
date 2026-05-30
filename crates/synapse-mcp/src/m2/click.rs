@@ -15,6 +15,8 @@ mod tests;
 use schema::ActClickTarget;
 pub use schema::{ActClickParams, ActClickResponse};
 
+const MAX_CLICK_HOLD_MS: u32 = 30_000;
+
 pub async fn act_click_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
@@ -46,7 +48,7 @@ pub async fn act_click_with_handle(
         actions.push(Action::MouseButton {
             button: params.button,
             action: ButtonAction::Press,
-            hold_ms: 0,
+            hold_ms: params.hold_ms,
             backend: params.backend,
         });
     }
@@ -61,6 +63,7 @@ pub async fn act_click_with_handle(
         ok: true,
         used_invoke_pattern: false,
         backend_used: backend_used_name(params.backend).to_owned(),
+        press_hold_ms: params.hold_ms,
         double_click_window_ms: double_click_timing.window_ms,
         inter_click_delay_ms: double_click_timing.inter_click_delay_ms,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
@@ -73,6 +76,20 @@ fn validate_click_params(params: &ActClickParams) -> Result<(), ErrorData> {
             error_codes::TOOL_PARAMS_INVALID,
             format!("act_click clicks must be in 1..=3, got {}", params.clicks),
         ));
+    }
+    if params.hold_ms == 0 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_click hold_ms must be at least 1",
+        ));
+    }
+    if params.hold_ms > MAX_CLICK_HOLD_MS {
+        return Err(action_error_to_mcp(&ActionError::HoldExceededMax {
+            detail: format!(
+                "act_click hold_ms {} exceeds max {MAX_CLICK_HOLD_MS}",
+                params.hold_ms
+            ),
+        }));
     }
     if !params.modifiers.is_empty() {
         return Err(action_error_to_mcp(&ActionError::BackendUnavailable {

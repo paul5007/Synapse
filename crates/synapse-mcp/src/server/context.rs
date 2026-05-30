@@ -153,8 +153,13 @@ impl SynapseService {
             active_profile_id_before,
             initial_foreground,
         )?;
-        self.reevaluate_profile_for_foreground(&foreground)
+        let transition = self
+            .reevaluate_profile_for_foreground(&foreground)
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
+        if let Some(profile_id) = transition.active_profile_id.as_deref() {
+            self.apply_backend_resolution_for_profile(profile_id)
+                .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
+        }
         ensure_profile_scope_allows_action(&runtime, tool, self.allow_unknown_profile()?)
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
         super::target_policy::ensure_supported_use_allows(&runtime, &foreground, tool)

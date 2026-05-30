@@ -39,7 +39,12 @@ impl ActionBackend for SoftwareBackend {
             Action::KeyUp { key, .. } => keyboard::key_up(key, state),
             Action::KeyChord { keys, hold_ms, .. } => keyboard::key_chord(keys, *hold_ms, state),
             Action::TypeText { text, dynamics, .. } => text::type_text(text, dynamics),
-            Action::MouseMove { to, .. } => mouse::mouse_move(to),
+            Action::MouseMove {
+                to,
+                curve,
+                duration_ms,
+                ..
+            } => mouse::mouse_move(to, curve, *duration_ms),
             Action::MouseMoveRelative { dx, dy, .. } => mouse::mouse_move_relative(*dx, *dy),
             Action::MouseButton {
                 button,

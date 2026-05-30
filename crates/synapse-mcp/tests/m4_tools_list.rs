@@ -182,6 +182,13 @@ fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     read_default(
         &mut readbacks,
         tools,
+        "act_click",
+        "inputSchema.properties.hold_ms.default",
+        &json!(120),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
         "act_combo",
         "inputSchema.properties.backend.default",
         &json!("auto"),

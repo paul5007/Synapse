@@ -170,6 +170,13 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
     read_default(
         readbacks,
         tools,
+        "act_click",
+        "inputSchema.properties.hold_ms.default",
+        &json!(120),
+    )?;
+    read_default(
+        readbacks,
+        tools,
         "subscribe",
         "inputSchema.properties.kinds.default",
         &json!([]),

@@ -16,6 +16,11 @@ expression: snapshot
       "tool": "act_keymap"
     },
     {
+      "actual": 120,
+      "path": "inputSchema.properties.hold_ms.default",
+      "tool": "act_click"
+    },
+    {
       "actual": [],
       "path": "inputSchema.properties.kinds.default",
       "tool": "subscribe"

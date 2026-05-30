@@ -171,6 +171,7 @@ fn bundled_everquest_profile_targets_inventory_panel() -> Result<(), Box<dyn std
     assert!(
         profile.metadata["capability.observe.hud"].contains("visible Inventory character panel")
     );
+    assert_eq!(profile.backends.mouse_default, Backend::Hardware);
     Ok(())
 }
 

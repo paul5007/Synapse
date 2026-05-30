@@ -10,7 +10,7 @@ use super::{
 };
 use crate::m1::mcp_error;
 use serde_json::{Value, json};
-use synapse_core::error_codes;
+use synapse_core::{Backend, error_codes};
 
 #[tool_router(router = m2_tool_router, vis = "pub(super)")]
 impl SynapseService {
@@ -19,6 +19,7 @@ impl SynapseService {
         &self,
         params: Parameters<ActClickParams>,
     ) -> Result<Json<ActClickResponse>, ErrorData> {
+        let params = params.0;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_click",
@@ -32,8 +33,13 @@ impl SynapseService {
             }
         };
         self.audit_action_started_with_details("act_click", &action_preflight_details(&preflight))?;
+        if let Err(error) = ensure_everquest_click_backend(&params, &preflight) {
+            let result: Result<ActClickResponse, ErrorData> = Err(error);
+            self.audit_action_result("act_click", &result)?;
+            return result.map(Json);
+        }
         let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
-        let result = act_click_with_handle(handle, recording, params.0).await;
+        let result = act_click_with_handle(handle, recording, params).await;
         self.audit_action_result("act_click", &result)?;
         result.map(Json)
     }
@@ -302,4 +308,19 @@ fn action_preflight_details(preflight: &ActionPreflightReadback) -> Value {
     json!({
         "preflight": preflight,
     })
+}
+
+fn ensure_everquest_click_backend(
+    params: &ActClickParams,
+    preflight: &ActionPreflightReadback,
+) -> Result<(), ErrorData> {
+    if preflight.target_profile_id.as_deref() == Some("everquest.live")
+        && params.backend == Backend::Software
+    {
+        return Err(mcp_error(
+            error_codes::ACTION_BACKEND_UNAVAILABLE,
+            "everquest.live software mouse clicks are not FSV-accepted; use backend=hardware through the configured HID path or a keyboard keymap equivalent",
+        ));
+    }
+    Ok(())
 }

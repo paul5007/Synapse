@@ -70,6 +70,7 @@ pub(super) async fn execute_element_click(
         ok: true,
         used_invoke_pattern,
         backend_used: backend_used.to_owned(),
+        press_hold_ms: params.hold_ms,
         double_click_window_ms: timing.window_ms,
         inter_click_delay_ms: timing.inter_click_delay_ms,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),

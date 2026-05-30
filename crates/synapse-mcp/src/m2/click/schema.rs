@@ -2,6 +2,8 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use synapse_core::{AimCurve, AimNaturalParams, Backend, ElementId, MouseButton};
 
+const DEFAULT_CLICK_HOLD_MS: u32 = 120;
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActClickParams {
@@ -20,6 +22,9 @@ pub struct ActClickParams {
     #[serde(default = "default_click_duration_ms")]
     #[schemars(default = "default_click_duration_ms")]
     pub duration_ms: u32,
+    #[serde(default = "default_click_hold_ms")]
+    #[schemars(default = "default_click_hold_ms", range(min = 1, max = 30000))]
+    pub hold_ms: u32,
     #[serde(default = "default_click_backend")]
     #[schemars(default = "default_click_backend")]
     pub backend: Backend,
@@ -73,6 +78,7 @@ pub struct ActClickResponse {
     pub ok: bool,
     pub used_invoke_pattern: bool,
     pub backend_used: String,
+    pub press_hold_ms: u32,
     pub double_click_window_ms: u32,
     pub inter_click_delay_ms: u32,
     pub elapsed_ms: u32,
@@ -105,6 +111,10 @@ pub(in crate::m2::click) const fn default_click_curve() -> ClickCurve {
 
 pub(in crate::m2::click) const fn default_click_duration_ms() -> u32 {
     50
+}
+
+pub(in crate::m2::click) const fn default_click_hold_ms() -> u32 {
+    DEFAULT_CLICK_HOLD_MS
 }
 
 pub(in crate::m2::click) const fn default_click_backend() -> Backend {
