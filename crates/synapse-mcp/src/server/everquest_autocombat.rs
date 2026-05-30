@@ -1,12 +1,19 @@
 //! Server-side autonomous combat loop for the level-1 `EverQuest` wizard (#550).
 //!
-//! One MCP call runs many bounded game ticks (target -> consider -> cast ->
-//! confirm kill -> recover -> retarget) so the agent does not pay a stdio
-//! round-trip per keystroke. Every emitted key still flows through the audited
-//! `act_keymap` action path and the #517 foreground/profile/scope/UI gates.
-//! Looting is intentionally out of scope for the L1->L2 MVP; XP comes from
-//! kills + sit-recover. The loop emits keymap aliases (`target_nearest_npc`,
-//! `con`, `hotbar4`, `sit`) rather than free text.
+//! One MCP call runs many bounded game engagements (acquire -> consider ->
+//! melee auto-attack + nuke-when-mana-allows -> confirm kill -> recover ->
+//! re-acquire) so the agent does not pay a stdio round-trip per keystroke.
+//! Every emitted key still flows through the audited `act_keymap` action path
+//! and the #517 foreground/profile/scope/UI gates.
+//!
+//! Combat model (live-test finding): a level-1 wizard (≈28 mana, ≈30 HP) cannot
+//! kill mobs with a single `hotbar4` Blast of Cold nuke — one cast empties the
+//! bar and can be resisted. So the loop fights like a player: it starts melee
+//! auto-attack on a con-safe target and keeps meleeing through the fight, only
+//! casting the nuke when mana% is at/above a threshold, and persists on ONE
+//! target until it dies or a stop condition fires. `resisted`/`fizzled`/`miss`
+//! are "keep fighting", not "abandon target". Looting is intentionally out of
+//! scope for the L1->L2 MVP; XP comes from kills + sit-recover.
 
 use std::time::{Duration, Instant};
 
@@ -33,8 +40,8 @@ const RUN_ROW_PREFIX: &str = "everquest/autocombat/v1/everquest.live";
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const MAX_LOG_EVENTS: usize = 128;
 const KEY_HOLD_MS: u32 = 33;
-const CONSIDER_TIMEOUT: Duration = Duration::from_millis(1800);
-const CAST_TIMEOUT: Duration = Duration::from_secs(8);
+const CONSIDER_TIMEOUT: Duration = Duration::from_millis(2600);
+const FIGHT_TICK: Duration = Duration::from_millis(900);
 const RECOVER_TIMEOUT: Duration = Duration::from_secs(45);
 const POLL_INTERVAL: Duration = Duration::from_millis(120);
 const INTER_KEY_DELAY: Duration = Duration::from_millis(250);
@@ -56,6 +63,10 @@ pub struct ActAutocombatParams {
     pub target_level_max: u32,
     #[serde(default = "default_stop_at_level")]
     pub stop_at_level: u32,
+    #[serde(default = "default_cast_mana_cost")]
+    pub cast_mana_cost_percent: u32,
+    #[serde(default = "default_engagement_timeout_s")]
+    pub engagement_timeout_s: u32,
     #[serde(default = "default_hotbar_alias")]
     pub hotbar_alias: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +91,12 @@ const fn default_target_level_max() -> u32 {
 const fn default_stop_at_level() -> u32 {
     2
 }
+const fn default_cast_mana_cost() -> u32 {
+    70
+}
+const fn default_engagement_timeout_s() -> u32 {
+    30
+}
 fn default_hotbar_alias() -> String {
     DEFAULT_HOTBAR_ALIAS.to_owned()
 }
@@ -93,6 +110,8 @@ struct Policy {
     mana_floor: u32,
     target_level_max: u32,
     stop_at_level: u32,
+    cast_mana_cost: u32,
+    engagement_timeout: Duration,
     hotbar_alias: String,
     run_id: String,
 }
@@ -103,6 +122,11 @@ pub struct ActAutocombatIteration {
     pub target_summary: Option<String>,
     pub target_level: Option<u32>,
     pub con_decision: String,
+    /// Whether melee auto-attack was asserted for this engagement.
+    pub melee_started: bool,
+    /// Nuke casts emitted during this engagement.
+    pub casts: u32,
+    /// Whether at least one nuke cast was emitted (kept for back-compat).
     pub cast: bool,
     pub outcome: String,
 }
@@ -188,24 +212,39 @@ impl ConDecision {
     }
 }
 
-/// Parsed result of polling the EQ log after a cast.
+/// How a single fight tick should be interpreted from the latest log window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CastOutcome {
+enum FightSignal {
+    /// `<mob> has been slain by ...` — engagement won.
     Slain,
-    Resisted,
-    Fizzled,
-    OutOfRange,
-    NoOutcome,
+    /// Target lost / fled / no target (auto-attack can no longer reach it).
+    TargetLost,
+    /// Combat ongoing (hits exchanged, resist, fizzle, miss) — keep fighting.
+    Continue,
+    /// No combat-relevant lines parsed in this window.
+    Idle,
 }
 
-impl CastOutcome {
+/// Terminal outcome of one engagement (one iteration).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngagementOutcome {
+    Slain,
+    Fled,
+    HpFloor,
+    Timeout,
+    NoTarget,
+    OperatorPanic,
+}
+
+impl EngagementOutcome {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Slain => "slain",
-            Self::Resisted => "resisted",
-            Self::Fizzled => "fizzled",
-            Self::OutOfRange => "out_of_range",
-            Self::NoOutcome => "no_outcome",
+            Self::Fled => "fled",
+            Self::HpFloor => "hp_floor",
+            Self::Timeout => "timeout",
+            Self::NoTarget => "no_target",
+            Self::OperatorPanic => "operator_panic",
         }
     }
 }
@@ -213,7 +252,7 @@ impl CastOutcome {
 #[tool_router(router = everquest_autocombat_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Run a bounded, operator-attended, server-side EverQuest combat loop for the level-1 wizard (target -> consider -> cast -> confirm -> recover)"
+        description = "Run a bounded, operator-attended, server-side EverQuest combat loop for the level-1 wizard (acquire -> consider -> melee + nuke-when-mana -> confirm kill -> recover -> re-acquire)"
     )]
     pub async fn everquest_autocombat(
         &self,
@@ -278,10 +317,24 @@ impl SynapseService {
                 self.handle_stop_recovery(reason, profile).await;
                 break;
             }
-            let iteration = self.run_iteration(index, policy, profile, &mut state).await?;
-            let is_kill = iteration.outcome == CastOutcome::Slain.as_str();
+            let iteration = self
+                .run_engagement(index, policy, profile, panic_epoch, started, &mut state)
+                .await?;
+            let outcome = iteration.outcome.clone();
             state.iterations.push(iteration);
-            if is_kill && self.read_level().is_some_and(|lvl| lvl >= policy.stop_at_level) {
+            if outcome == EngagementOutcome::OperatorPanic.as_str() {
+                stop = StopReason::OperatorPanic;
+                self.handle_stop_recovery(StopReason::OperatorPanic, profile).await;
+                break;
+            }
+            if outcome == EngagementOutcome::HpFloor.as_str() {
+                stop = StopReason::HpFloor;
+                self.handle_stop_recovery(StopReason::HpFloor, profile).await;
+                break;
+            }
+            if outcome == EngagementOutcome::Slain.as_str()
+                && self.read_level().is_some_and(|lvl| lvl >= policy.stop_at_level)
+            {
                 stop = StopReason::ReachedTargetLevel;
                 break;
             }
@@ -296,7 +349,7 @@ impl SynapseService {
         Ok(self.finalize(policy, started_level, stop, state))
     }
 
-    /// Stop conditions checked BEFORE emitting any input each iteration.
+    /// Stop conditions checked BEFORE emitting any input each engagement.
     fn evaluate_stop(
         &self,
         policy: &Policy,
@@ -323,76 +376,204 @@ impl SynapseService {
     }
 
     async fn handle_stop_recovery(&self, reason: StopReason, profile: &Profile) {
-        if matches!(reason, StopReason::OperatorPanic) {
-            let _ = self.release_all_best_effort().await;
-        } else if matches!(reason, StopReason::HpFloor) {
-            let _ = self.press_alias("sit", profile).await;
+        match reason {
+            StopReason::OperatorPanic => {
+                let _ = self.release_all_best_effort().await;
+            }
+            // HP-floor flee: stop auto-attack (toggle off) then sit is unsafe while
+            // being hit, so only drop melee and let the operator take over.
+            StopReason::HpFloor => {
+                let _ = self.press_alias("auto_attack", profile).await;
+            }
+            _ => {}
         }
     }
 
-    async fn run_iteration(
+    /// Acquire (or continue with) a single target and fight it to a terminal
+    /// outcome. One engagement counts as one "iteration".
+    async fn run_engagement(
         &self,
         index: u32,
         policy: &Policy,
         profile: &Profile,
+        panic_epoch: u64,
+        run_started: Instant,
         state: &mut LoopState,
     ) -> Result<ActAutocombatIteration, ErrorData> {
-        self.press_alias("target_nearest_npc", profile).await?;
-        sleep(INTER_KEY_DELAY).await;
         let log_path = self.autocombat_log_path()?;
-        let offset = file_len(&log_path);
-        self.press_alias("con", profile).await?;
-        let consider = self.poll_consider(&log_path, offset).await;
-        let decision = classify_con(consider.as_deref(), policy.target_level_max);
-        let target_level = parse_target_level(consider.as_deref());
+
+        // If we are already trading blows with a living mob, skip the fresh
+        // target+con (the live run saw `con_decision: unknown` on a mob that was
+        // already engaged) and keep attacking the current target.
+        let recent_combat = recent_combat_active(&log_path);
+
+        let acquire_offset = file_len(&log_path);
+        let (consider, decision, target_level) = if recent_combat {
+            (None, ConDecision::Safe, None)
+        } else {
+            self.press_alias("target_nearest_npc", profile).await?;
+            sleep(INTER_KEY_DELAY).await;
+            let con_offset = file_len(&log_path);
+            self.press_alias("con", profile).await?;
+            let summary = self.poll_consider(&log_path, con_offset).await;
+            let decision = classify_con(summary.as_deref(), policy.target_level_max);
+            let level = parse_target_level(summary.as_deref());
+            (summary, decision, level)
+        };
+
         let mut iteration = ActAutocombatIteration {
             index,
             target_summary: consider.clone(),
             target_level,
             con_decision: decision.as_str().to_owned(),
+            melee_started: false,
+            casts: 0,
             cast: false,
-            outcome: CastOutcome::NoOutcome.as_str().to_owned(),
+            outcome: EngagementOutcome::NoTarget.as_str().to_owned(),
         };
+
         if decision != ConDecision::Safe {
             state.consecutive_no_target += 1;
+            // No live mob, safe to sit and recover toward mana floor for the next pull.
+            self.recover_mana(policy, profile, panic_epoch).await;
             return Ok(iteration);
         }
         state.consecutive_no_target = 0;
-        iteration.cast = true;
-        state.casts += 1;
-        let cast_offset = file_len(&log_path);
-        self.press_alias(&policy.hotbar_alias, profile).await?;
-        let outcome = self.poll_cast_outcome(&log_path, cast_offset).await;
+
+        // Engage: assert melee auto-attack ONCE for this fight (it is a toggle in
+        // EQ and drops when the target dies). We track it on per-engagement.
+        self.press_alias("auto_attack", profile).await?;
+        iteration.melee_started = true;
+
+        let ctx = FightContext {
+            log_path: &log_path,
+            engage_offset: acquire_offset,
+            panic_epoch,
+            run_started,
+        };
+        let (outcome, tally) = self.fight_target(&ctx, policy, profile, &mut iteration).await?;
         outcome.as_str().clone_into(&mut iteration.outcome);
-        self.apply_outcome(outcome, policy, profile, state).await;
+        state.resisted += tally.resisted;
+        state.fizzled += tally.fizzled;
+
+        match outcome {
+            EngagementOutcome::Slain => {
+                state.kills += 1;
+                // Auto-attack drops on death (no target); recover mana before next pull.
+                self.recover_mana(policy, profile, panic_epoch).await;
+            }
+            EngagementOutcome::Fled | EngagementOutcome::NoTarget | EngagementOutcome::Timeout => {
+                // Drop melee toggle so we don't carry it into the next pull, then recover.
+                let _ = self.press_alias("auto_attack", profile).await;
+                self.recover_mana(policy, profile, panic_epoch).await;
+            }
+            EngagementOutcome::HpFloor | EngagementOutcome::OperatorPanic => {}
+        }
         Ok(iteration)
     }
 
-    async fn apply_outcome(
+    /// Sustained single-target fight. Melee auto-attack is already on; here we
+    /// only add nuke casts when mana allows and poll the log for the outcome.
+    async fn fight_target(
         &self,
-        outcome: CastOutcome,
+        ctx: &FightContext<'_>,
         policy: &Policy,
         profile: &Profile,
-        state: &mut LoopState,
-    ) {
-        match outcome {
-            CastOutcome::Slain => {
-                state.kills += 1;
-                self.recover_mana(policy, profile).await;
+        iteration: &mut ActAutocombatIteration,
+    ) -> Result<(EngagementOutcome, CastTally), ErrorData> {
+        let FightContext { log_path, engage_offset, panic_epoch, run_started } = *ctx;
+        let engage_started = Instant::now();
+        // `read_fight_window` always reads from `engage_offset`, so the latest
+        // window returned holds the full set of engagement events; tally
+        // resist/fizzle once from it at fight end to avoid double-counting.
+        let mut last_window: Vec<String> = Vec::new();
+        loop {
+            if synapse_action::operator_release_requested_since(panic_epoch) {
+                return Ok((EngagementOutcome::OperatorPanic, tally_window(&last_window)));
             }
-            CastOutcome::Resisted => state.resisted += 1,
-            CastOutcome::Fizzled => state.fizzled += 1,
-            CastOutcome::OutOfRange | CastOutcome::NoOutcome => {}
+            if run_started.elapsed() >= policy.max_duration
+                || engage_started.elapsed() >= policy.engagement_timeout
+            {
+                return Ok((EngagementOutcome::Timeout, tally_window(&last_window)));
+            }
+
+            // Per-tick HUD safety: HP-floor flee still fires mid-fight.
+            let row = self.build_survival_readiness_row().ok();
+            if let Some(row) = &row {
+                if !row.foreground.is_everquest_foreground
+                    || row.ui_context.login_screen_visible
+                    || !chat_safe(&row.chat_input_state.decision)
+                {
+                    return Ok((EngagementOutcome::Timeout, tally_window(&last_window)));
+                }
+                if row.hud.hp_percent.is_some_and(|hp| hp < policy.hp_floor) {
+                    return Ok((EngagementOutcome::HpFloor, tally_window(&last_window)));
+                }
+            }
+            let mana = row.and_then(|row| row.hud.mana_percent);
+
+            // Nuke when mana% is at/above the cast-cost threshold; otherwise melee.
+            if should_cast_nuke(mana, policy.cast_mana_cost) {
+                self.press_alias(&policy.hotbar_alias, profile).await?;
+                iteration.casts += 1;
+                iteration.cast = true;
+            }
+
+            // Poll the fight window for an outcome over one tick.
+            last_window = self.read_fight_window(log_path, engage_offset).await;
+            let refs: Vec<&str> = last_window.iter().map(String::as_str).collect();
+            match classify_fight_signal(&refs) {
+                FightSignal::Slain => {
+                    return Ok((EngagementOutcome::Slain, tally_window(&last_window)));
+                }
+                FightSignal::TargetLost => {
+                    let tally = tally_window(&last_window);
+                    // Distinguish "fled/cleared" (was fighting) from "never engaged".
+                    if iteration.casts > 0 || tally.has_combat {
+                        return Ok((EngagementOutcome::Fled, tally));
+                    }
+                    return Ok((EngagementOutcome::NoTarget, tally));
+                }
+                // Resisted/fizzled/miss/hits-exchanged -> keep fighting.
+                FightSignal::Continue | FightSignal::Idle => {}
+            }
         }
     }
 
+    /// Read the current fight log window summaries (one fight tick of polling).
+    async fn read_fight_window(&self, log_path: &std::path::Path, offset: u64) -> Vec<String> {
+        let started = Instant::now();
+        let mut latest: Vec<String> = Vec::new();
+        while started.elapsed() < FIGHT_TICK {
+            if let Ok(batch) = tail_log(log_path, offset, MAX_LOG_BYTES, MAX_LOG_EVENTS) {
+                latest = batch.events.iter().map(|event| event.summary.clone()).collect();
+                let refs: Vec<&str> = latest.iter().map(String::as_str).collect();
+                if matches!(
+                    classify_fight_signal(&refs),
+                    FightSignal::Slain | FightSignal::TargetLost
+                ) {
+                    return latest;
+                }
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+        latest
+    }
+
     /// Sit to recover mana to the floor, bounded by `RECOVER_TIMEOUT`, then stand.
-    async fn recover_mana(&self, policy: &Policy, profile: &Profile) {
+    /// Only call this when NOT in active combat (sitting breaks under damage).
+    async fn recover_mana(&self, policy: &Policy, profile: &Profile, panic_epoch: u64) {
+        // Do not sit if a mob is currently meleeing us — that is unsafe and the
+        // sit is interrupted anyway.
+        if let Ok(log_path) = self.autocombat_log_path()
+            && recent_combat_active(&log_path)
+        {
+            return;
+        }
         if self.press_alias("sit", profile).await.is_err() {
             return;
         }
         let started = Instant::now();
-        let panic_epoch = synapse_action::operator_release_epoch();
         while started.elapsed() < RECOVER_TIMEOUT {
             if synapse_action::operator_release_requested_since(panic_epoch) {
                 let _ = self.release_all_best_effort().await;
@@ -407,6 +588,7 @@ impl SynapseService {
             }
             sleep(POLL_INTERVAL).await;
         }
+        // Stand before the next pull.
         let _ = self.press_alias("sit", profile).await;
     }
 
@@ -421,24 +603,6 @@ impl SynapseService {
             sleep(POLL_INTERVAL).await;
         }
         None
-    }
-
-    async fn poll_cast_outcome(&self, log_path: &std::path::Path, offset: u64) -> CastOutcome {
-        let started = Instant::now();
-        let mut last = CastOutcome::NoOutcome;
-        while started.elapsed() < CAST_TIMEOUT {
-            if let Ok(batch) = tail_log(log_path, offset, MAX_LOG_BYTES, MAX_LOG_EVENTS) {
-                let summaries: Vec<&str> =
-                    batch.events.iter().map(|event| event.summary.as_str()).collect();
-                last = classify_cast_outcome(&summaries);
-                if matches!(last, CastOutcome::Slain | CastOutcome::Resisted | CastOutcome::Fizzled)
-                {
-                    return last;
-                }
-            }
-            sleep(POLL_INTERVAL).await;
-        }
-        last
     }
 
     async fn press_alias(&self, alias: &str, profile: &Profile) -> Result<(), ErrorData> {
@@ -483,11 +647,12 @@ impl SynapseService {
         let final_level = final_row
             .as_ref()
             .and_then(|row| parse_level(row.hud.level_raw.as_deref()));
+        let casts = state.iterations.iter().map(|it| it.casts).sum();
         ActAutocombatResponse {
             ok: stop.is_success(),
             iterations: u32::try_from(state.iterations.len()).unwrap_or(u32::MAX),
             kills: state.kills,
-            casts: state.casts,
+            casts,
             casts_resisted: state.resisted,
             casts_fizzled: state.fizzled,
             started_level,
@@ -535,11 +700,19 @@ impl SynapseService {
     }
 }
 
+/// Per-engagement timing/log context for the sustained fight loop.
+#[derive(Clone, Copy)]
+struct FightContext<'a> {
+    log_path: &'a std::path::Path,
+    engage_offset: u64,
+    panic_epoch: u64,
+    run_started: Instant,
+}
+
 #[derive(Debug, Default)]
 struct LoopState {
     iterations: Vec<ActAutocombatIteration>,
     kills: u32,
-    casts: u32,
     resisted: u32,
     fizzled: u32,
     consecutive_no_target: u32,
@@ -553,6 +726,8 @@ fn normalize_policy(params: ActAutocombatParams) -> Policy {
         mana_floor: params.mana_floor_percent.min(100),
         target_level_max: params.target_level_max,
         stop_at_level: params.stop_at_level.max(1),
+        cast_mana_cost: params.cast_mana_cost_percent.min(100),
+        engagement_timeout: Duration::from_secs(u64::from(params.engagement_timeout_s.clamp(1, 300))),
         hotbar_alias: normalize_alias(&params.hotbar_alias),
         run_id: params.idempotency_key.map_or_else(default_run_id, |value| {
             sanitize_run_id(&value)
@@ -594,6 +769,8 @@ fn policy_details(policy: &Policy) -> serde_json::Value {
         "mana_floor_percent": policy.mana_floor,
         "target_level_max": policy.target_level_max,
         "stop_at_level": policy.stop_at_level,
+        "cast_mana_cost_percent": policy.cast_mana_cost,
+        "engagement_timeout_s": policy.engagement_timeout.as_secs(),
         "hotbar_alias": policy.hotbar_alias,
     })
 }
@@ -635,6 +812,53 @@ fn parse_level(level_raw: Option<&str>) -> Option<u32> {
     level_raw?
         .split_ascii_whitespace()
         .find_map(|token| token.parse::<u32>().ok())
+}
+
+/// Heuristic: are we already in an active melee engagement with a living mob?
+/// Reads the tail of the log and inspects recent combat lines.
+fn recent_combat_active(log_path: &std::path::Path) -> bool {
+    let offset = file_len(log_path).saturating_sub(MAX_LOG_BYTES as u64);
+    let Ok(batch) = tail_log(log_path, offset, MAX_LOG_BYTES, MAX_LOG_EVENTS) else {
+        return false;
+    };
+    let summaries: Vec<&str> = batch.events.iter().map(|e| e.summary.as_str()).collect();
+    detect_active_combat(&summaries)
+}
+
+/// Counts of resist/fizzle (and whether any combat occurred) in a fight window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CastTally {
+    resisted: u32,
+    fizzled: u32,
+    has_combat: bool,
+}
+
+/// Count resist/fizzle events and detect combat from a full engagement window.
+fn tally_window(window: &[String]) -> CastTally {
+    let mut tally = CastTally::default();
+    for line in window {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("resist") {
+            tally.resisted += 1;
+        }
+        if lower.contains("fizzle") {
+            tally.fizzled += 1;
+        }
+        if line_combat_active(&lower) {
+            tally.has_combat = true;
+        }
+    }
+    tally
+}
+
+/// Decide whether to cast the nuke this fight tick. Cast only when mana% is
+/// known AND at/above the cast-cost threshold (one Blast of Cold ~ most of a L1
+/// mana bar). Unknown mana -> rely on melee, do not cast.
+const fn should_cast_nuke(mana_percent: Option<u32>, cast_mana_cost_percent: u32) -> bool {
+    match mana_percent {
+        Some(mana) => mana >= cast_mana_cost_percent,
+        None => false,
+    }
 }
 
 /// Classify a consider line for a level-1 wizard. Safe = NPC, level within cap,
@@ -694,24 +918,83 @@ fn con_phrase_safe(lower: &str) -> bool {
         || lower.contains("worthy opponent")
 }
 
-/// Classify the cast outcome from a window of log summaries (newest wins).
-fn classify_cast_outcome(summaries: &[&str]) -> CastOutcome {
+/// Whether a single log line means the target is gone (slain/fled/cleared).
+fn line_target_lost(lower: &str) -> bool {
+    lower.contains("has fled")
+        || lower.contains("flees in terror")
+        || lower.contains("you have no target")
+        || lower.contains("you no longer have a target")
+        || lower.contains("must first select a target")
+        || lower.contains("must target")
+}
+
+/// Whether a single log line indicates ongoing melee/spell combat with a mob.
+fn line_combat_active(lower: &str) -> bool {
+    // Mob hitting us, or us hitting the mob (melee verbs + "for N points").
+    (lower.contains(" you for ") && lower.contains("points of damage"))
+        || (lower.contains(" for ") && lower.contains("points of damage") && melee_verb(lower))
+        || lower.contains("auto attack is on")
+        || lower.contains("you begin casting")
+        || lower.contains("resisted your")
+        || lower.contains("your target resisted")
+}
+
+fn melee_verb(lower: &str) -> bool {
+    lower.contains(" pierce")
+        || lower.contains(" slash")
+        || lower.contains(" crush")
+        || lower.contains(" hit ")
+        || lower.contains(" bash")
+        || lower.contains(" kick")
+        || lower.contains(" bites")
+        || lower.contains(" hits ")
+        || lower.contains(" maul")
+        || lower.contains(" claws")
+}
+
+/// Detect whether the recent log window shows an active melee engagement with a
+/// living mob: combat lines are present and the most recent terminal line (if
+/// any) is NOT a slain/target-lost line. Used to decide whether to keep
+/// attacking the current target instead of re-acquiring.
+fn detect_active_combat(summaries: &[&str]) -> bool {
+    let mut combat_seen = false;
+    for summary in summaries.iter().rev() {
+        let lower = summary.to_ascii_lowercase();
+        if lower.contains("has been slain by") || line_target_lost(&lower) {
+            // Most recent terminal event ends the engagement — not active.
+            return false;
+        }
+        if line_combat_active(&lower) {
+            combat_seen = true;
+        }
+    }
+    combat_seen
+}
+
+/// Classify the current fight tick from a window of log summaries (newest wins
+/// for terminal signals). `resisted`/`fizzled`/`miss`/hits -> Continue.
+fn classify_fight_signal(summaries: &[&str]) -> FightSignal {
     for summary in summaries.iter().rev() {
         let lower = summary.to_ascii_lowercase();
         if lower.contains("has been slain by") {
-            return CastOutcome::Slain;
+            return FightSignal::Slain;
         }
-        if lower.contains("resist") {
-            return CastOutcome::Resisted;
-        }
-        if lower.contains("fizzle") {
-            return CastOutcome::Fizzled;
-        }
-        if lower.contains("too far away") || lower.contains("out of range") {
-            return CastOutcome::OutOfRange;
+        if line_target_lost(&lower) {
+            return FightSignal::TargetLost;
         }
     }
-    CastOutcome::NoOutcome
+    // No terminal signal: is the mob still being fought?
+    for summary in summaries {
+        let lower = summary.to_ascii_lowercase();
+        if line_combat_active(&lower)
+            || lower.contains("fizzle")
+            || lower.contains("resist")
+            || lower.contains(" miss")
+        {
+            return FightSignal::Continue;
+        }
+    }
+    FightSignal::Idle
 }
 
 #[cfg(test)]
@@ -783,33 +1066,111 @@ mod tests {
     }
 
     #[test]
-    fn classifies_cast_outcomes_from_log_summaries() {
-        assert_eq!(
-            classify_cast_outcome(&["a decaying skeleton has been slain by Thenumberone!"]),
-            CastOutcome::Slain
-        );
-        assert_eq!(
-            classify_cast_outcome(&["Your target resisted the Blast of Cold spell!"]),
-            CastOutcome::Resisted
-        );
-        assert_eq!(
-            classify_cast_outcome(&["Your Blast of Cold spell fizzles!"]),
-            CastOutcome::Fizzled
-        );
-        assert_eq!(
-            classify_cast_outcome(&["Your target is too far away."]),
-            CastOutcome::OutOfRange
-        );
-        assert_eq!(classify_cast_outcome(&["You begin casting Blast of Cold."]), CastOutcome::NoOutcome);
+    fn mana_cast_threshold_decision() {
+        // Cast only when known mana% >= threshold.
+        assert!(should_cast_nuke(Some(70), 70));
+        assert!(should_cast_nuke(Some(100), 70));
+        assert!(!should_cast_nuke(Some(69), 70));
+        assert!(!should_cast_nuke(Some(0), 70));
+        // Unknown mana -> rely on melee, do not cast.
+        assert!(!should_cast_nuke(None, 70));
     }
 
     #[test]
-    fn newest_slain_wins_over_earlier_resist() {
-        let summaries = [
-            "Your target resisted the Blast of Cold spell!",
-            "a decaying skeleton has been slain by Thenumberone!",
+    fn detects_active_combat_from_recent_hits() {
+        let mob_hits_us = ["A moss snake bites YOU for 5 points of damage."];
+        assert!(detect_active_combat(&mob_hits_us));
+
+        let we_hit_mob = ["You pierce a moss snake for 5 points of damage."];
+        assert!(detect_active_combat(&we_hit_mob));
+
+        let auto_attack_on = ["Auto attack is on."];
+        assert!(detect_active_combat(&auto_attack_on));
+    }
+
+    #[test]
+    fn active_combat_false_after_slain_or_no_target() {
+        let then_slain = [
+            "You pierce a moss snake for 5 points of damage.",
+            "a moss snake has been slain by Thenumberone!",
         ];
-        assert_eq!(classify_cast_outcome(&summaries), CastOutcome::Slain);
+        assert!(!detect_active_combat(&then_slain));
+
+        let no_target = ["You must first select a target for this spell!"];
+        assert!(!detect_active_combat(&no_target));
+
+        let empty: [&str; 0] = [];
+        assert!(!detect_active_combat(&empty));
+    }
+
+    #[test]
+    fn fight_signal_slain_wins_over_earlier_combat() {
+        let summaries = [
+            "A moss snake bites YOU for 5 points of damage.",
+            "You pierce a moss snake for 5 points of damage.",
+            "a moss snake has been slain by Thenumberone!",
+        ];
+        assert_eq!(classify_fight_signal(&summaries), FightSignal::Slain);
+    }
+
+    #[test]
+    fn fight_signal_resist_and_fizzle_continue() {
+        assert_eq!(
+            classify_fight_signal(&["Your Blast of Cold spell fizzles!"]),
+            FightSignal::Continue
+        );
+        assert_eq!(
+            classify_fight_signal(&["A moss snake resisted your Blast of Cold!"]),
+            FightSignal::Continue
+        );
+        assert_eq!(
+            classify_fight_signal(&["You try to pierce a moss snake, but miss!"]),
+            FightSignal::Continue
+        );
+        assert_eq!(
+            classify_fight_signal(&["A moss snake bites YOU for 5 points of damage."]),
+            FightSignal::Continue
+        );
+    }
+
+    #[test]
+    fn fight_signal_target_lost_when_fled_or_cleared() {
+        assert_eq!(
+            classify_fight_signal(&["A moss snake flees in terror."]),
+            FightSignal::TargetLost
+        );
+        assert_eq!(
+            classify_fight_signal(&["You have no target for this attack."]),
+            FightSignal::TargetLost
+        );
+    }
+
+    #[test]
+    fn fight_signal_idle_when_no_combat_lines() {
+        assert_eq!(
+            classify_fight_signal(&["You begin to feel your mana returning."]),
+            FightSignal::Idle
+        );
+        let empty: [&str; 0] = [];
+        assert_eq!(classify_fight_signal(&empty), FightSignal::Idle);
+    }
+
+    #[test]
+    fn tally_window_counts_resist_and_fizzle() {
+        let window = vec![
+            "You pierce a moss snake for 5 points of damage.".to_owned(),
+            "A moss snake resisted your Blast of Cold!".to_owned(),
+            "Your Blast of Cold spell fizzles!".to_owned(),
+            "A moss snake bites YOU for 5 points of damage.".to_owned(),
+        ];
+        let tally = tally_window(&window);
+        assert_eq!(tally.resisted, 1);
+        assert_eq!(tally.fizzled, 1);
+        assert!(tally.has_combat);
+
+        let quiet = vec!["You begin to feel your mana returning.".to_owned()];
+        let tally = tally_window(&quiet);
+        assert_eq!(tally, CastTally::default());
     }
 
     #[test]
@@ -830,6 +1191,8 @@ mod tests {
             mana_floor_percent: 200,
             target_level_max: 2,
             stop_at_level: 0,
+            cast_mana_cost_percent: 250,
+            engagement_timeout_s: 9999,
             hotbar_alias: "  HOTBAR4 ".to_owned(),
             idempotency_key: Some("run/with:bad chars!".to_owned()),
         });
@@ -838,7 +1201,27 @@ mod tests {
         assert_eq!(policy.hp_floor, 100);
         assert_eq!(policy.mana_floor, 100);
         assert_eq!(policy.stop_at_level, 1);
+        assert_eq!(policy.cast_mana_cost, 100);
+        assert_eq!(policy.engagement_timeout.as_secs(), 300);
         assert_eq!(policy.hotbar_alias, "hotbar4");
         assert_eq!(policy.run_id, "runwithbadchars");
+    }
+
+    #[test]
+    fn policy_defaults_for_new_params() {
+        let policy = normalize_policy(ActAutocombatParams {
+            max_iterations: default_max_iterations(),
+            max_duration_s: default_max_duration_s(),
+            hp_floor_percent: default_hp_floor(),
+            mana_floor_percent: default_mana_floor(),
+            target_level_max: default_target_level_max(),
+            stop_at_level: default_stop_at_level(),
+            cast_mana_cost_percent: default_cast_mana_cost(),
+            engagement_timeout_s: default_engagement_timeout_s(),
+            hotbar_alias: default_hotbar_alias(),
+            idempotency_key: None,
+        });
+        assert_eq!(policy.cast_mana_cost, 70);
+        assert_eq!(policy.engagement_timeout.as_secs(), 30);
     }
 }
