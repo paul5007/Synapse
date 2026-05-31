@@ -84,8 +84,8 @@
 - #588 closed after #589 and #590 readback showed both concrete follow-ups closed.
 
 ## Next
-- #585 implementation and manual MCP/runtime FSV are complete.
-- Commit was created as `49359d0` but its message lacks `[skip ci]`; amend the commit message to include `[skip ci]`, force-with-lease the single HEAD rewrite, then post #585 RESOLVED evidence and close the issue.
+- All GitHub issues are closed as of the live queue read after #585 closure.
+- Final verification before ending the objective: `gh issue list --repo ChrisRoyse/Synapse --state open --limit 100` returned no rows; #585 readback is `CLOSED`; `HEAD == origin/main == 0814a41` for the #585 implementation commit.
 
 ## #585 Implementation In Working Tree
 - `synapse-a11y` now initializes one long-lived `synapse-a11y-uia-mta` worker thread on first use.
@@ -165,3 +165,9 @@
   - real MCP `release_all` returned `released_keys=0`, `released_buttons=0`, `neutralized_pads=0`.
   - final real MCP `health` returned `ok=true`.
   - repo-built daemon PID `43940` was stopped; process/socket read showed no PID and no listener on `127.0.0.1:7795`.
+
+## #585 GitHub Closure
+- #585 RESOLVED evidence comment: https://github.com/ChrisRoyse/Synapse/issues/585#issuecomment-4587147620
+- #585 closed at `2026-05-31T15:25:48Z`.
+- Implementation commit pushed as `0814a41` with `[skip ci]`.
+- Live open queue read after closure returned no open issues.
