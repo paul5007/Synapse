@@ -7,8 +7,10 @@
   - `AGENTS.md`
   - #351 manual-FSV/no-CI decision
   - open queue and active issue comments
-- Open GitHub queue at wake-up: #590, #588, #585.
-- Active work: #590 is implemented and locally verified; commit/push and RESOLVED comment are next.
+- Open GitHub queue after #590/#588 closure: #585 only.
+- #590 was committed/pushed as `e7e5b25`, RESOLVED-commented, and closed.
+- #588 was closed as a context issue after #589 and #590 were verified and closed.
+- Active work: #585 hardening(a11y), dedicated MTA UIA worker thread.
 
 ## #590 Implementation
 - Added `crates/synapse-action/benches/action_software_click.rs`.
@@ -75,8 +77,13 @@
 - `git diff --check` returned only line-ending warnings.
 - No GitHub Actions/CI were run or used.
 
+## #590 / #588 GitHub Closure
+- #590 RESOLVED evidence comment: https://github.com/ChrisRoyse/Synapse/issues/590#issuecomment-4587000980
+- #590 closed at `2026-05-31T14:26:26Z`.
+- #588 context RESOLVED comment: https://github.com/ChrisRoyse/Synapse/issues/588#issuecomment-4587002426
+- #588 closed after #589 and #590 readback showed both concrete follow-ups closed.
+
 ## Next
-- Commit and push #590 changes with `[skip ci]`.
-- Post #590 RESOLVED evidence comment and close #590.
 - Continue #585.
-- Close #588 only after #590 and #585 disposition no longer leave it open as context.
+- Read the `synapse-a11y` and MCP UIA call surfaces before changing code.
+- Preserve manual FSV discipline: repo-built MCP daemon, strict Inspector `tools/list`, real MCP trigger for any exposed behavior, then UI/process/storage SoT readback.

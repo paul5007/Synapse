@@ -8,4 +8,5 @@
 - 2026-05-31T08:24:00-05:00 iteration #589-fsv: repo-built MCP daemon PID 56908 verified on 127.0.0.1:7791; strict Inspector tools/list succeeded; act_press/storage_inspect manual SoT deltas captured for happy path plus 3 edges.
 - 2026-05-31T08:24:00-05:00 iteration #589-fsv-cleanup: stopped repo-built FSV daemon PID 56908 and verified port 7791 closed.
 - 2026-05-31T08:26:00-05:00 iteration #589-close: pushed `828eec2`, posted #589 RESOLVED evidence, closed #589, and refreshed open queue to #590/#588/#585.
-2026-05-31T09:55:00-05:00 | #590 | Implemented software input fidelity benches, completed real MCP manual FSV, ran supporting benches/checks, and stopped repo-built FSV daemon.
+2026-05-31T09:24:00-05:00 | #590 | Implemented software input fidelity benches, completed real MCP manual FSV, ran supporting benches/checks, and stopped repo-built FSV daemon.
+2026-05-31T09:27:00-05:00 | #590/#588 | Pushed #590 commit e7e5b25, posted evidence, closed #590, closed #588 context, and verified open queue is #585 only.
