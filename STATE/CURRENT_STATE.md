@@ -12,6 +12,18 @@
   - Untracked `tmp_review.txt` contains a temporary captured diff and should not be committed.
 - File-tree SoT reads now return false for `crates/synapse-hid-host`, `firmware/pico-hid`, and `crates/synapse-action/src/backend/hardware`.
 - `docs/systemspec/**` still contains stale live hardware-HID references and must be cleaned, then `docs/systemspec/bundle.ps1` rerun.
+- Follow-up after interruption: docs/systemspec sources were cleaned and `docs/systemspec/SYNAPSE_SYSTEMSPEC.md` was regenerated from `docs/systemspec/bundle.ps1`.
+- Supporting checks passed:
+  - `cargo fmt`
+  - `cargo check -p synapse-mcp` (only pre-existing `element_screen_point` dead-code warning in `synapse-action`)
+  - `scripts/check_docs.ps1`
+  - `cargo test -p synapse-mcp --test cli_modes help_lists_m4_policy_flags_and_omits_removed_hardware_hid`
+  - `cargo test -p synapse-mcp register_permissions_do_not_add_removed_hardware_backend_gate`
+  - `cargo test -p synapse-action --test hardware_unavailable`
+  - `cargo test -p synapse-core --test error_codes_literal`
+- Broad stale-reference scan is clean for live docs/code after excluding historical changelog text, retired-plan stubs, and tests that assert removed flags are absent.
+- The latest operator reminder requires #589 manual FSV to trigger and verify actual Synapse MCP tools, not only CLI/code scans.
+- Process-table read found existing `synapse-mcp` processes from installed binaries under `%USERPROFILE%\\.cargo\\bin`; do not use those as #589 FSV evidence for repo-built code.
 - #589 has a progress comment saying `firmware/pico-hid` was deleted and the robust plan is to remove the dead HID implementation/operator surface while keeping hardware enum tags routed to a clear unavailable backend error.
 - #589 resume comment posted: current SoT still contains `crates/synapse-hid-host`, `firmware/pico-hid`, `--hardware-hid`/`SYNAPSE_HARDWARE_HID`, and health HID status surfaces.
 
