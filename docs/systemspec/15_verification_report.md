@@ -46,7 +46,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 ```
 
-Crate-level lints override `unsafe_code` to `allow` in five FFI crates:
+Crate-level lints override `unsafe_code` to `allow` in four FFI crates:
 
 | Crate | Reason |
 |---|---|
@@ -54,7 +54,6 @@ Crate-level lints override `unsafe_code` to `allow` in five FFI crates:
 | `synapse-a11y` | UI Automation COM interop |
 | `synapse-audio` | WASAPI loopback FFI |
 | `synapse-capture` | DXGI / Direct3D11 FFI |
-| `synapse-hid-host` | serial-port + OS-handle interop |
 
 `synapse-mcp`, `synapse-core`, `synapse-perception`, `synapse-models`, `synapse-profiles`, `synapse-reflex`, `synapse-storage`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay` all retain `unsafe_code = forbid`.
 
@@ -68,16 +67,16 @@ Counted by walking `crates/` and slicing by path. Comments, blank lines, and `mo
 |---|---|
 | Workspace member crates | **15** |
 | Default workspace binaries (`synapse-mcp`, `synapse-overlay`) | 2 |
-| Total Rust source files (excluding tests/benches) | **160** |
-| Total Rust integration-test files | 76 |
-| Total Rust bench files | 13 |
-| MCP tools registered in `server.rs` | **79** (M1/M2/M3/M4/M5 plus EverQuest runtime tools including `/loc`, chat-input state, current-state, map sensor, outcome ingest, memory, planner guard, route plan, DynamicJEPA domain normalize, trajectory record, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model record/inspect, surprise detect, compact world-summary context rows, predictive-model fit/predict rows, action-prior scorecard, and reality baseline/delta/audit) |
-| MCP tools approved by `05_mcp_tool_surface.md` (agent surface cap) | 79 |
+| Total Rust source files (excluding tests/benches) | **294** |
+| Total Rust integration-test files | 88 |
+| Total Rust bench files | 14 |
+| MCP tools registered in `server.rs` | **80** (M1/M2/M3/M4/M5 plus EverQuest runtime tools including `/loc`, chat-input state, current-state, map sensor, outcome ingest, autocombat, memory, planner guard, route plan, DynamicJEPA domain normalize, trajectory record, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model record/inspect, surprise detect, compact world-summary context rows, predictive-model fit/predict rows, action-prior scorecard, and reality baseline/delta/audit) |
+| MCP tools approved by `05_mcp_tool_surface.md` (agent surface cap) | 80 |
 | RocksDB column families | **11** (`ALL_COLUMN_FAMILIES.len() == 11`; excludes implicit `default` CF) |
-| Stable error-code constants in `synapse_core::error_codes` | **105** |
+| Stable error-code constants in `synapse_core::error_codes` | **98** |
 | Reserved subsystem error enums (mapped to those codes) | 11 (`StorageError`, `ReflexError`, `ActionError`, `ProfileError`, `ProfileLoadError`, `AudioError`, `PerceptionError`, `CaptureError`, `ModelError`, `A11yError`, `TelemetryError` + parse errors `ElementIdParseError`/`EventFilterValidationError`) |
 | M3 metric specs declared in `synapse_telemetry::metrics::M3_METRICS` | **19** (12 counters, 5 gauges, 2 histograms) |
-| Permissions in M3 grant model | **13** (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `READ_STORAGE`, `WRITE_STORAGE`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`) |
+| Permissions in M3 grant model | **12** (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `READ_STORAGE`, `WRITE_STORAGE`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`) |
 | Reflex kinds | 5 (`AimTrack`, `HoldMove`, `HoldButton`, `Combo`, `OnEvent`) |
 | Lines of code (source, excl. tests/benches) | **~36 914** |
 | Lines of code (integration tests) | **~18 260** |
@@ -104,10 +103,9 @@ Per-crate `lib.rs`/`main.rs` size (the deepest single-file entry points):
 | `synapse-models` | `src/lib.rs` | 535 |
 | `synapse-telemetry` | `src/lib.rs` | (per source) |
 | `synapse-telemetry` | `src/metrics.rs` | (per source) |
-| `synapse-hid-host` | `src/` | multi-file serial gateway (see source map) |
 | `synapse-overlay` | `src/main.rs` | (M5 stub) |
 
-Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md` — M4 Block A.0 splits before adding hardware HID):
+Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md` — refactor debt for M5 hardening):
 
 | File | LoC | Note |
 |---|---|---|
@@ -133,7 +131,7 @@ Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impp
 | Repository | `https://github.com/ChrisRoyse/Synapse` |
 | Default release profile | `opt-level=3`, `lto="thin"`, `codegen-units=16`, `strip=true`, `panic="abort"` |
 | Release-max profile | inherits release with `lto="fat"`, `codegen-units=1` |
-| Excluded paths | `firmware/pico-hid` (M4 work; not yet in tree) |
+| Excluded paths | none (`exclude = []`) |
 | Binary outputs | `target/release/synapse-mcp[.exe]`, `target/release/synapse-overlay[.exe]` |
 
 ## 5. Schema version
@@ -208,7 +206,7 @@ Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impp
 
 | File | Topic |
 |---|---|
-| [01_system_overview.md](01_system_overview.md) | High-level architecture, tech stack, all 50 live tools |
+| [01_system_overview.md](01_system_overview.md) | High-level architecture, tech stack, live tools |
 | [02_source_code_map.md](02_source_code_map.md) | Per-file tree with descriptions + dep graph + entry-point traces |
 | [03_configuration.md](03_configuration.md) | All CLI flags, env vars, validation rules, default constants |
 | [04_storage_layer.md](04_storage_layer.md) | RocksDB CFs, schema sentinel, TTL filter, GC, disk pressure |
@@ -218,7 +216,7 @@ Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impp
 | [08_action_subsystem.md](08_action_subsystem.md) | Emitter actor, backends, rate limits, hotkey, curves/dynamics, error mapping |
 | [09_perception_and_capture.md](09_perception_and_capture.md) | Frame capture, UIA + WinEvent, perception assembler, OCR |
 | [10_audio_and_models.md](10_audio_and_models.md) | WASAPI loopback, ring + STT (Whisper-tiny), ONNX model loader |
-| [11_profiles_hid_telemetry.md](11_profiles_hid_telemetry.md) | TOML profile loader + watcher, HID stub, tracing + metrics, test utils |
+| [11_profiles_hid_telemetry.md](11_profiles_hid_telemetry.md) | TOML profile loader + watcher, tracing + metrics, test utils |
 | [12_milestones_and_roadmap.md](12_milestones_and_roadmap.md) | Milestone state, ADRs, doctrine, open questions |
 | [13_mcp_tool_reference.md](13_mcp_tool_reference.md) | Every tool's params, defaults, ranges, side effects, errors |
 | [14_test_suite.md](14_test_suite.md) | Test inventory by crate, run commands, fixtures |
@@ -247,7 +245,6 @@ The doctrine `[skip ci]` suffix is present on every agent commit, consistent wit
 
 ## 10. What is NOT covered anywhere in this systemspec
 
-- **The RP2040 firmware** (`firmware/pico-hid/`) is referenced as `Cargo.toml::exclude` but the directory is not in the repository in this snapshot. M4 work.
 - **The Florence-2 VLM `describe` tool** has no source code; reserved for M5.
 - **Installer / signing** (`docs/computergames/14_build_and_packaging.md` references a planned MSIX installer) — not yet implemented.
 - **Debug overlay UI** (`synapse-overlay` is a 1-line `fn main() {}`) — M5 work.

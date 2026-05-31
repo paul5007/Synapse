@@ -314,9 +314,9 @@ of failing to parse. It always routes to `HardwareUnavailableBackend`, which
 validates the action shape and returns `ACTION_BACKEND_UNAVAILABLE` with the
 detail `hardware backend removed; use backend=software or backend=vigem`.
 
-There is no `--hardware-hid` flag, `SYNAPSE_HARDWARE_HID` env var,
-`synapse-hid-host` crate, firmware project, hardware consent prompt, `hid
-identify`, or `hid flash` runtime path.
+There is no hardware-enabling CLI flag/env var, serial host crate, firmware
+project, hardware consent prompt, identify command, or flash command runtime
+path.
 
 ---
 

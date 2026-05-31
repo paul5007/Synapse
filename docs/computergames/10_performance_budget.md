@@ -18,7 +18,6 @@ Every PR violating a target either fixes the regression or comes with an explici
 | `act_click(element_id)` semantic invoke → element invoked | ≤ 25 ms p99 | UIA Invoke supported |
 | `act_click(x,y)` coordinate click → cursor at target | ≤ 60 ms p99 | EaseInOut curve, 80 ms travel |
 | `act_press(key)` → key down on the OS | ≤ 3 ms p99 | software backend |
-| `act_press(key)` → key down via hardware HID | ≤ 5 ms p99 | including USB poll |
 | Reflex `on_event` matched → action emitted | ≤ 5 ms p99 |  |
 | Reflex `aim_track` per-tick adjustment | ≤ 2 ms p99 |  |
 | Capture loop frame interval | 16 ms (60 fps) | configurable per profile |
@@ -289,4 +288,4 @@ Catches situations where p99 looks fine but a particular workflow is broken (e.g
 - Specific code patterns / data structure choices (lives in code review)
 - Per-PR benchmarking workflow → `13_testing_strategy.md`
 - Tracing/metrics export setup → `12_observability.md`
-- Hardware HID specific budgets → `09_hardware_hid_gateway.md` §10
+- Retired hardware HID design note → `09_hardware_hid_gateway.md`

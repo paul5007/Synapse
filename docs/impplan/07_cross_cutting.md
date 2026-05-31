@@ -45,7 +45,7 @@ Per `11_security_and_safety.md`.
 ✓ No new path bypasses redaction (synapse-core::redact applied to all 8 surfaces in 11 §5.3)
 ✓ No new permission class without default-deny + explicit `--allow-X` gate
 ✓ Forbidden capabilities still compile-time disabled (11 §7)
-✓ `unsafe` only in synapse-capture / synapse-hid-host / firmware/pico-hid
+✓ `unsafe` only in crates with documented Windows/driver FFI need
 ✓ `cargo deny check` clean for any new dep
 ✓ `cargo audit` clean
 ✓ Supported-use gates unchanged (08 §3 / §6) or extended w/ ADR
@@ -121,7 +121,6 @@ Per `14 §12`. Applies to every `vX.Y.Z` tag (and the M0-M4 archival `v0.1.0-mN`
    - synapse-overlay.exe
    - SynapseSetup-x.y.z.msi
    - synapse-portable-x.y.z-windows-x64.zip
-   - synapse-pico-hid-x.y.z.uf2
 4. Upload to GitHub Releases w/ release notes
 5. (v1.0+) cargo publish for library crates
 6. (v1.0+) winget manifest PR
@@ -181,7 +180,7 @@ Closes during the phase that hits the decision:
 | M3 (closed) | OQ-001 (RocksDB primary per ADR-0002); OQ-005 (reflex priority per ADR-0004); OQ-012 (multi-monitor per ADR-0005); OQ-015 (profile match precedence per ADR-0006); OQ-022 (recursion guard per ADR-0003); OQ-029 (per-event notifications per ADR-0007) |
 | M4 | OQ-003 (detection model default — decided in ADR-0010); OQ-013 (aim_track EMA smoothing — decided in ADR-0011); OQ-016 (hardware action coalescing — decided in ADR-0012) |
 | M5 | OQ-008 (VLM bundling); OQ-014 (Whisper-tiny vs base); OQ-017 (disk pressure thresholds); OQ-019 (telemetry split); OQ-020 (`game_screenshot_once` exposure); OQ-030 (GC cadence final) |
-| v1.x | OQ-006 (per-session permissions); OQ-007 (profile signing); OQ-021 (HRTF audio); OQ-027 (hardware HID 2FA); OQ-028 (migrations vs wipe); OQ-026 (cross-platform start trigger); OQ-018 (replay format final) |
+| v1.x | OQ-006 (per-session permissions); OQ-007 (profile signing); OQ-021 (HRTF audio); OQ-028 (migrations vs wipe); OQ-026 (cross-platform start trigger); OQ-018 (replay format final) |
 
 OQs not landing in a phase ⇒ deferred forward with explicit note in `16_open_questions.md`.
 
@@ -220,7 +219,7 @@ Do not use GitHub Actions/CI as a merge or phase-tag gate unless a later operato
 | `synapse-core` | 95% | `tarpaulin` (Linux for pure crates) |
 | `synapse-storage`, `synapse-profiles`, `synapse-reflex`, `synapse-action` | 85% | tarpaulin |
 | `synapse-capture`, `synapse-a11y`, `synapse-audio`, `synapse-perception` | 70% | OS-bound; Windows tarpaulin where supported |
-| `synapse-models`, `synapse-hid-host`, `synapse-telemetry` | 80% | tarpaulin |
+| `synapse-models`, `synapse-telemetry` | 80% | tarpaulin |
 
 > 5% drop on a PR blocks merge.
 
@@ -271,7 +270,7 @@ Every PR must preserve this. PRs that add planning, MCTS, GOAP, skill libraries,
 
 | Lesson | Source | Apply how |
 |---|---|---|
-| 500 LoC cap erodes silently — M2 closed at 6 over-cap action files; M3 reintroduced overrun (synapse-a11y/lib.rs 2087, synapse-capture/lib.rs 1798, synapse-core/types.rs 1567, synapse-mcp/server.rs 1335, synapse-mcp/m3/reflex.rs 1165, synapse-reflex/lib.rs 986, synapse-reflex/scheduler.rs 890, synapse-mcp/http/sse.rs 764, synapse-mcp/m3/replay.rs 651, synapse-models/lib.rs 535) | M2 + M3 carry-over | Reviewers enforce at ≤ 450 LoC during code review; M4 Block A.0 splits the M3 over-cap files **before** building hardware HID on top. Repeat the M2 → M3 closure pattern. |
+| 500 LoC cap erodes silently — M2 closed at 6 over-cap action files; M3 reintroduced overrun (synapse-a11y/lib.rs 2087, synapse-capture/lib.rs 1798, synapse-core/types.rs 1567, synapse-mcp/server.rs 1335, synapse-mcp/m3/reflex.rs 1165, synapse-reflex/lib.rs 986, synapse-reflex/scheduler.rs 890, synapse-mcp/http/sse.rs 764, synapse-mcp/m3/replay.rs 651, synapse-models/lib.rs 535) | M2 + M3 carry-over | Reviewers enforce at ≤ 450 LoC during code review. Repeat the M2 → M3 closure pattern. |
 | Telemetry log GC at startup only -> long-lived daemon exceeds 500 MB cap | #241/#262 | Long-running cleanup tasks need an explicit cadence and manual evidence proving mid-uptime cleanup; telemetry GC uses the `synapse-telemetry-gc` worker with `SYNAPSE_LOG_GC_INTERVAL_S` |
 | Ephemeral verification run dirs leak into the worktree | #242/#261/#351 | Do not create new FSV scripts, harnesses, or run dirs. If a supporting check writes ad-hoc artifacts, use `.runs/` (gitignored) and `scripts/clean-runs.ps1`; never write into the repo root. |
 | `bench_results/<sha>/` was committed per commit (8 dirs removed by #260) | #243/#260 | Use local `critcmp` JSON outside the repo; stop committing per-commit baselines |

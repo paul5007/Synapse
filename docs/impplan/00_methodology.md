@@ -14,8 +14,8 @@ Discipline applied across M0-M5. PRD authority: `docs/computergames/README.md` �
 
 | Rule | Mechanism |
 |---|---|
-| `#![forbid(unsafe_code)]` workspace-wide | per-crate override only for `synapse-action` (Win32 SendInput batching), `synapse-capture` (DX FFI), `synapse-hid-host` (serial OS handle), `firmware/pico-hid` |
-| File ≤ 500 LoC, function ≤ 30 LoC, cyclomatic ≤ 10 | clippy + local/reviewer check. M2 carry-over (six action/MCP files over cap) is **closed in M3** by the Block A.0 split refactors — all six are now ≤ 112 LoC on `main`. M3 introduced its own LoC overrun (see `README.md` "M3 carry-over"); the largest offenders are `synapse-a11y/src/lib.rs` 2087, `synapse-capture/src/lib.rs` 1798, `synapse-core/src/types.rs` 1567, `synapse-mcp/src/server.rs` 1335, `synapse-mcp/src/m3/reflex.rs` 1165, `synapse-reflex/src/lib.rs` 986, `synapse-reflex/src/scheduler.rs` 890. M4's first PR splits these before hardware HID is built on top. Reviewers must enforce at ≤ 450 LoC during code review to leave 50 LoC of margin. |
+| `#![forbid(unsafe_code)]` workspace-wide | per-crate override only where Windows/driver FFI requires it, such as `synapse-action`, `synapse-capture`, `synapse-a11y`, and `synapse-audio` |
+| File ≤ 500 LoC, function ≤ 30 LoC, cyclomatic ≤ 10 | clippy + local/reviewer check. M2 carry-over (six action/MCP files over cap) is **closed in M3** by the Block A.0 split refactors — all six are now ≤ 112 LoC on `main`. M3 introduced its own LoC overrun (see `README.md` "M3 carry-over"); the largest offenders are `synapse-a11y/src/lib.rs` 2087, `synapse-capture/src/lib.rs` 1798, `synapse-core/src/types.rs` 1567, `synapse-mcp/src/server.rs` 1335, `synapse-mcp/src/m3/reflex.rs` 1165, `synapse-reflex/src/lib.rs` 986, `synapse-reflex/src/scheduler.rs` 890. Reviewers must enforce at ≤ 450 LoC during code review to leave 50 LoC of margin. |
 | `unwrap()` / `expect()` forbidden outside `#[cfg(test)]` | `#[deny(clippy::unwrap_used, clippy::expect_used)]` |
 | `anyhow` forbidden in library crates | manual review + workspace dep gating |
 | No `println!` / `eprintln!` | clippy lint + grep gate |
@@ -135,7 +135,7 @@ Per `11_security_and_safety.md`:
 - Forbidden capabilities (compile-time `#[cfg(feature)]` off): DLL injection, kernel drivers, raw process memory r/w, FS writes outside profile paths, non-loopback by default
 - Panic hotkey `Ctrl+Alt+Shift+P` registered via `RegisterHotKey`; fires `ReleaseAll` + reflex disable in ≤ 50 ms
 - `cargo deny`: allow only `MIT`, `Apache-2.0`, `BSD-2/3`, `MPL-2.0`, `ISC`, `Zlib`, `Unicode-3.0`, `BSL-1.0`, `CC0-1.0`. Block GPL/AGPL/SSPL.
-- Supported-use gates: `08` §6 — explicit operator configuration for hardware HID and other sensitive capabilities
+- Supported-use gates: `08` §6 — explicit operator configuration for sensitive capabilities
 
 ---
 
@@ -217,6 +217,6 @@ Per `15_roadmap_and_milestones.md` §10 — repeated here for forcing function:
 5. Manual test plan signed off (`13_testing_strategy.md` §15)
 6. PRD docs internally consistent
 7. `cargo deny check` clean
-8. No `unsafe` outside `synapse-capture` / `synapse-hid-host` / `firmware/pico-hid`
+8. No `unsafe` outside crates with documented Windows/driver FFI need
 9. No `unwrap()` outside test code
 10. Crash dumps land on intentional panics

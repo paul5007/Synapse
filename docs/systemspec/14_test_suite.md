@@ -33,7 +33,7 @@ Source files covered:
 - `emitter_state.rs` — held bitset / pad cache after sequences
 - `error_codes_match.rs` — `ActionError::code()` mapping
 - `handle_queue.rs` — bounded mpsc + ack behavior
-- `hardware_unavailable.rs` — `HardwareUnavailableBackend` returns `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
+- `hardware_unavailable.rs` — `HardwareUnavailableBackend` returns `ACTION_BACKEND_UNAVAILABLE` with "backend removed; use software/vigem" guidance
 - `mouse_drag_validation.rs` — `MAX_DRAG_DISTANCE_PX` enforcement
 - `rate_limit_overshoot.rs` — token bucket retry_after_ms accuracy
 - `recording_backend.rs` — `RecordingBackend` event log
@@ -114,14 +114,13 @@ Source files covered:
 
 `#[test]` + `#[tokio::test]` attributes across `crates/`: **385** (counted via `awk` on the tree; includes both unit `mod tests` blocks and integration test files).
 
-## 4. Bench inventory (18 files)
+## 4. Bench inventory (14 files)
 
 | Crate | Bench | Tests budget |
 |---|---|---|
 | `synapse-a11y` | `uia_snapshot_depth2_60elem.rs` | UIA tree snapshot p99 ≤ 10 ms |
 | `synapse-action` | `action_curve_step_calc_natural.rs` | Curve sampling cost |
 | `synapse-action` | `action_software_press.rs` | Software backend key press latency (`act_press` to electrical signal ≤ 2 ms) |
-| `synapse-action` | `action_hardware_press.rs` | Hardware HID key press p99 ≤ 5 ms with baseline export |
 | `synapse-action` | `action_recording_round_trip.rs` | Recording backend overhead |
 | `synapse-capture` | `capture_loop.rs` | Frame capture p99 ≤ 3 ms |
 | `synapse-perception` | `observe_warm_a11y_only.rs` | `observe()` p99 ≤ 30 ms (a11y_only) |
@@ -132,9 +131,6 @@ Source files covered:
 | `synapse-reflex` | `reflex_combo_step_interval.rs` | Combo step accuracy |
 | `synapse-reflex` | `reflex_tick_jitter_idle.rs` | Scheduler tick jitter idle p99 ≤ 200 µs (`REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US`) |
 | `synapse-reflex` | `reflex_tick_jitter_under_load.rs` | Scheduler tick jitter under load |
-| `synapse-hid-host` | `hid_combo_timing.rs` | 3-step HID combo scheduled interval deviation ≤ 0.5 ms using firmware timing telemetry |
-| `synapse-hid-host` | `hid_high_volume.rs` | 10k relative mouse moves ≤ 15 s, zero drops/CRC errors, cursor X +10k |
-| `synapse-hid-host` | `hid_protocol_encode_1mb.rs` | HID protocol encode throughput |
 | `synapse-storage` | `batch_throughput.rs` | put_batch / flush rates |
 
 All benches use `criterion 0.8` with `harness = false`. The `scripts/check-bench-delta.ps1` script compares two `critcmp` JSON outputs and enforces a ≤20% regression on tracked benches.

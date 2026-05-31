@@ -65,8 +65,7 @@ scripts/check_docs.ps1                     (cross-doc local check)
 | `synapse-telemetry` | `tracing-subscriber` JSON file + console layer, log dir `%LOCALAPPDATA%\synapse\logs\` |
 | `synapse-test-utils` | Custom MCP client over stdio for E2E (used at M0 demo + later) |
 | `synapse-storage` | stub `Db` trait, no impl |
-| `synapse-perception`, `synapse-action`, `synapse-reflex`, `synapse-capture`, `synapse-a11y`, `synapse-audio`, `synapse-profiles`, `synapse-hid-host`, `synapse-models`, `synapse-overlay` | stub crates with `lib.rs` empty + `Cargo.toml` template |
-| `firmware/pico-hid/` | Not created at M0 (added at M4) |
+| `synapse-perception`, `synapse-action`, `synapse-reflex`, `synapse-capture`, `synapse-a11y`, `synapse-audio`, `synapse-profiles`, `synapse-models`, `synapse-overlay` | stub crates with `lib.rs` empty + `Cargo.toml` template |
 
 ### Tool
 
@@ -126,7 +125,7 @@ scripts/check_docs.ps1                     (cross-doc local check)
 - Storage — `Db` trait stub only; no RocksDB at M0
 - Profiles — bundled dir empty
 - Overlay
-- ViGEm, hardware HID
+- ViGEm
 - Models (no ONNX)
 
 ---

@@ -1,12 +1,17 @@
 # ADR-0008: Synapse Pico HID USB Identity
 
+Status: Superseded by the software-only input decision in #588 and the
+hardware-path removal in #589. This ADR is historical context only; there is no
+active physical HID firmware, host driver, USB identity source, or release
+artifact in the repository.
+
 ## Context
 
-M4 introduces `firmware/pico-hid`, an RP2040 firmware image that will enumerate
-as a composite USB device: boot mouse, boot keyboard, HID gamepad, and CDC ACM
-serial control channel. The device needs stable USB identity constants so the
-firmware, host driver, docs, and Windows source-of-truth checks all agree on
-the same VID/PID and USB strings.
+The retired M4 hardware plan introduced an RP2040 firmware image that would
+enumerate as a composite USB device: boot mouse, boot keyboard, HID gamepad,
+and CDC ACM serial control channel. The device needed stable USB identity
+constants so the firmware, host driver, docs, and Windows source-of-truth
+checks would all agree on the same VID/PID and USB strings.
 
 The previous PRD text used the pid.codes community VID `0x1209` and a
 placeholder PID `0xC0C0`. Issue #369 asked for a decision between that path,
@@ -28,11 +33,7 @@ Product:      Synapse Pico HID
 Serial prefix: SYN-PICO-HID
 ```
 
-The source constant lives in `crates/synapse-core/src/usb_identity.rs` and is
-re-exported by `synapse-core`. The no_std firmware imports that same source
-file into `firmware/pico-hid/src/usb.rs` so firmware descriptors and host-side
-code do not drift while avoiding a full `synapse-core` runtime dependency in
-the embedded target.
+This source constant has been removed with the retired hardware path.
 
 Before broad public distribution, Synapse should submit the Raspberry Pi USB
 PID application/PR for `0x1F50` or the closest available replacement. That
@@ -45,7 +46,7 @@ work use `0x1F50` unless the upstream assignment returns a different PID.
 
 Raspberry Pi's `usb-pid` list is specifically for RP2040 products and states
 that Raspberry Pi can sublicense PIDs under VID `0x2E8A` for RP2040-based
-customer products. This matches the hardware actually used by `pico-hid`.
+customer products. This matched the hardware considered by the retired plan.
 
 The device uses standard CDC ACM and HID class drivers, so Windows should not
 need a vendor driver. The product/manufacturer/serial strings still make the

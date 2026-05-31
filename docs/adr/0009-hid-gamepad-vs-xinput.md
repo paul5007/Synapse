@@ -1,10 +1,15 @@
 # ADR-0009: Pico HID Gamepad vs XInput Emulation
 
+Status: Superseded by the software-only input decision in #588 and the
+hardware-path removal in #589. This ADR is historical context only; live
+controller output uses ViGEm.
+
 ## Context
 
-M4 adds a Raspberry Pi Pico firmware image that exposes mouse, keyboard,
-gamepad, and CDC ACM interfaces to Windows. The gamepad interface needs a clear
-contract before the composite HID descriptor lands in `firmware/pico-hid`.
+The retired M4 hardware plan added a Raspberry Pi Pico firmware image that
+would expose mouse, keyboard, gamepad, and CDC ACM interfaces to Windows. The
+gamepad interface needed a clear contract before the composite HID descriptor
+landed.
 
 The PRD used "XInput-like" wording for the 14-byte pad report. That wording is
 too loose: XInput is the Windows API for XUSB controllers, while ordinary USB
@@ -13,8 +18,8 @@ game-input APIs depending on the application.
 
 ## Decision
 
-`pico-hid` emits a standard USB HID gamepad interface, not a raw XInput/XUSB
-device.
+The retired firmware plan emitted a standard USB HID gamepad interface, not a
+raw XInput/XUSB device.
 
 The firmware pad report remains the 14-byte Synapse report:
 
@@ -35,8 +40,7 @@ gamepad in Windows, and `joy.cpl` is the manual source-of-truth check for the
 pad surface.
 
 Synapse keeps ViGEm as the software XInput/X360 path. Profiles or callers that
-require an XInput-visible Xbox controller should use the ViGEm backend, not the
-Pico HID backend.
+require an XInput-visible Xbox controller should use the ViGEm backend.
 
 ## Rationale
 

@@ -7,8 +7,8 @@ Synapse is hard to test because:
 - It touches the real OS (UIA trees, real windows, real input emission)
 - It runs at frame rate (5-second fixture setups aren't useful)
 - Many bugs are timing-sensitive (reflex correct on idle CPU, races slow capture under load)
-- HID output is observable only by another OS process, not the test
-- Some components (hardware HID) require physical hardware
+- OS input output is observable only by another OS process, not the test
+- The retired physical hardware-HID path is no longer part of the verification matrix
 
 We layer tests carefully. Unit tests are cheap and ubiquitous. Integration tests scope to subsystems with OS-layer fakes. E2E exercises run against the configured Windows host for manual FSV and release candidates.
 
@@ -238,7 +238,7 @@ Test scenarios:
 | `multiwindow_focus_switch` | Open three apps, cycle focus, verify foreground events |
 | `clipboard_round_trip` | Write clipboard from agent, read in different app, verify |
 | `reflex_aim_track_static` | Track a stationary detected entity, verify aim_track stays on target |
-| `reflex_combo_frame_perfect` | Execute a 3-step combo, verify HID emission times |
+| `reflex_combo_frame_perfect` | Execute a 3-step combo, verify scheduled software input timing |
 | `safety_release_all_on_panic` | Hold keys, kill daemon, verify all keys released |
 | `disk_pressure_response` | Fill DB to soft cap, verify GC runs and cleanup happens |
 
@@ -263,19 +263,11 @@ Game E2E doesn't require GPU + game on the runner:
 
 ---
 
-## 9. Hardware-in-the-loop tests
+## 9. Retired hardware-in-the-loop tests
 
-Self-hosted runner has an RP2040 board attached. Rig:
-
-- Pico flashed with Synapse firmware
-- A second Pico configured as a **measurement device** that captures HID reports and timestamps them
-
-| Scenario | Asserts |
-|---|---|
-| `hid_mouse_move_latency` | Round-trip latency p99 ≤ 5 ms |
-| `hid_combo_timing` | 3-step combo step intervals within 0.5 ms of scheduled, using device-side timing telemetry |
-| `hid_release_all_on_disconnect` | Host disconnect → watchdog releases everything within 1 s |
-| `hid_high_volume` | 10,000 mouse-move commands at full rate, no drops |
+The RP2040 hardware-in-the-loop rig is retired with #588/#589. Software
+backend and ViGEm timing evidence now comes from the real runtime, action audit
+rows, OS-visible input state, and dedicated local benchmarks.
 | `hid_reflash` | Reset to bootloader, flash, verify new identity |
 
 Run as hardware work-items or release-candidate checks on the configured host.
@@ -315,7 +307,7 @@ fn profile_minecraft_smoke() {
 `cargo-fuzz` harnesses for protocol parsers:
 
 - MCP JSON-RPC parser
-- HID serial protocol frame parser
+- Retired HID serial parser entries are no longer part of the active fuzz surface
 - EventFilter parser
 - Profile TOML parser
 
@@ -370,7 +362,6 @@ Manual configured-host FSV is the shipping gate. Do not dispatch or wait on GitH
 | `insta review --check` | configured host | snapshot changes |
 | `e2e-real-windows` | configured Windows host | issue-specific manual FSV support |
 | `bench-regression` | configured Windows host | local `critcmp` export compare |
-| `hardware-in-loop` | self-hosted with Pico | weekly |
 | `soak` | self-hosted windows | weekly |
 | `fuzz` | configured host | parser/protocol changes, 10min per target |
 
@@ -420,7 +411,7 @@ Before tagging a release, the maintainer runs:
    tools, and at least one read tool plus one write/gated tool are exercised
    through real `tools/call` with separate SoT readback.
 3. **Live game session.** Pick one bundled game profile, play 15 minutes via agent, verify reasonable behavior and no stuck inputs.
-4. **Hardware HID flash + smoke.** Flash a Pico, connect, run hardware aim test.
+4. **Software backend smoke.** Run keyboard/mouse and ViGEm smoke tests through the real runtime.
 5. **Panic hotkey drill.** Start a long-running reflex, hit `Ctrl+Alt+Shift+P`, verify everything stops within 100 ms.
 6. **Disk pressure drill.** Fill a small DB volume, verify pressure transitions, verify operation continues degraded but not broken.
 
@@ -433,7 +424,7 @@ Maintainer signs off with a release-notes entry summarizing what they tested.
 - `synapse-core`: 95% line coverage. Pure types + small logic; exhaustive.
 - `synapse-storage`, `synapse-profiles`, `synapse-reflex`, `synapse-action`: 85%
 - `synapse-capture`, `synapse-a11y`, `synapse-audio`, `synapse-perception`: 70% (OS-bound, harder to cover)
-- `synapse-models`, `synapse-hid-host`, `synapse-telemetry`: 80%
+- `synapse-models`, `synapse-telemetry`: 80%
 
 `tarpaulin` on Linux (where possible) + Windows for OS-bound crates can provide supporting coverage deltas. A >5% drop blocks merge when reviewed locally.
 
@@ -443,5 +434,5 @@ Maintainer signs off with a release-notes entry summarizing what they tested.
 
 - Specific test fixture details → `tests/fixtures/`
 - Supporting automation configuration files → `.github/workflows/`
-- Hardware test rig wiring → `09_hardware_hid_gateway.md`
+- Retired hardware HID design note → `09_hardware_hid_gateway.md`
 - Profile authoring tutorial → community wiki (post-v1)

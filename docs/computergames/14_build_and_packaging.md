@@ -136,7 +136,6 @@ wasapi = "0.23.0"
 # Input
 enigo = "0.6.1"
 vigem-client = "0.1.4"
-serialport = "4.9.0"
 
 # ML
 ort = { version = "2.0.0-rc.12", default-features = false }
@@ -152,7 +151,6 @@ schemars = { version = "1.2.1", features = ["derive"] }
 regex = "1.12.3"
 sha2 = "0.11.0"
 ed25519-dalek = "2.2.0"
-crc16 = "0.4"
 notify = "9.0.0-rc.4"
 
 # Dev / test
@@ -459,7 +457,6 @@ We sign:
 - `synapse-mcp.exe` (daemon)
 - `synapse-overlay.exe`
 - `SynapseSetup-x.y.z.msi` (installer)
-- `synapse-pico-hid.uf2` (firmware; signature embedded in metadata payload — informational, not cryptographic)
 
 Cert: EV code-signing held by the maintainer (post-v1, when funded). Pre-v1: self-signed; operators see SmartScreen warning until trust builds.
 
@@ -482,7 +479,6 @@ Part of `scripts/release/sign.ps1`.
    - `synapse-overlay.exe` (signed)
    - `SynapseSetup-x.y.z.msi` (signed)
    - `synapse-portable-x.y.z-windows-x64.zip`
-   - `synapse-pico-hid-x.y.z.uf2`
 4. **Upload to GitHub Releases** with release notes.
 5. **Publish to crates.io** for `synapse-mcp` (cargo-installable).
 6. **Update winget manifest** PR.
@@ -592,5 +588,5 @@ Generates a skeleton crate following the template.
 
 - Supporting automation configuration → `.github/workflows/`
 - Distribution channel publishing details → `scripts/release/`
-- Firmware build details → `09_hardware_hid_gateway.md` §8
+- Retired hardware HID design note → `09_hardware_hid_gateway.md`
 - Per-feature-flag testing combinations → `13_testing_strategy.md` §14

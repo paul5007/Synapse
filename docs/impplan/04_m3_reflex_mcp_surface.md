@@ -20,7 +20,7 @@ reflex demo from §2.
   `synapse-reflex/src/scheduler.rs` 890, `synapse-mcp/src/http/sse.rs` 764,
   `synapse-mcp/src/m3/replay.rs` 651, `synapse-models/src/lib.rs` 535
   (plus several test files). M4's Block A.0 splits these before adding
-  hardware HID, mirroring the M2 → M3 Block A.0 pattern.
+  the next active feature slice, mirroring the M2 → M3 Block A.0 pattern.
 - **CHANGELOG M3 entry tool names** name `profile_get`/`profile_set_active`
   but the shipped names on `main` are `profile_list`/`profile_activate`;
   the four `storage_*` diagnostic tools are also missing from the entry.
@@ -98,11 +98,10 @@ crates/
 ├── synapse-storage/         EMPTY STUB (8 LoC; `pub trait Db {}`). M3.
 ├── synapse-profiles/        EMPTY STUB (1 LoC). M3.
 ├── synapse-audio/           EMPTY STUB (1 LoC). M3.
-├── synapse-hid-host/        EMPTY STUB. M4.
 └── synapse-overlay/         binary skeleton (3 LoC). M5.
 ```
 
-Workspace root: `Cargo.toml`. `default-members = ["crates/synapse-mcp", "crates/synapse-overlay"]`. `exclude = ["firmware/pico-hid"]`.
+Workspace root: `Cargo.toml`. `default-members = ["crates/synapse-mcp", "crates/synapse-overlay"]`.
 
 ### 1.2 Already-pinned deps you will turn on at M3 (in `[workspace.dependencies]` at the repo root)
 

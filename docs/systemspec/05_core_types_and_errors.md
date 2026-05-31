@@ -77,7 +77,7 @@ Full table in [04_storage_layer.md §6](04_storage_layer.md).
 
 | Type | Source | Notes |
 |---|---|---|
-| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire. `Auto` resolves from the active action backend policy: default session = keyboard/mouse/combo/release-all `software`, pad `vigem`; profile `default_backend = "hardware"` makes Auto resolve to `hardware` unless a class default overrides it. |
+| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire. `Hardware` is a retired compatibility value that fails closed at action dispatch. `Auto` resolves from the active action backend policy: default session = keyboard/mouse/combo/release-all `software`, pad `vigem`; profile `default_backend = "hardware"` makes Auto resolve to the fail-closed hardware slot unless a class default overrides it. |
 | `Point` | `{ x: i32, y: i32 }` | screen coords; provides `distance_to(other: Self) -> f64` |
 | `Rect` | `{ x: i32, y: i32, w: i32, h: i32 }` | `contains(point: Point)` with exclusive right/bottom edges; non-positive width/height treated as empty |
 | `Size` | `{ w: u32, h: u32 }` | |

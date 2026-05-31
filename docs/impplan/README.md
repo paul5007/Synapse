@@ -31,7 +31,7 @@ Directives are defined once and referenced by tag — do not restate. Canonical 
 | 02 | [`02_m1_perception_mvp.md`](02_m1_perception_mvp.md) | M1 — capture + UIA + `observe()` + 5 tools | §3 | **DONE** — tag `v0.1.0-m1` @ `b8ad120` (2026-05-23) |
 | 03 | [`03_m2_action_mvp.md`](03_m2_action_mvp.md) | M2 — `synapse-action` + 9 tools + `ReleaseAll` | §4 | **DONE** — tag `v0.1.0-m2` @ `51836fe` (2026-05-24) |
 | 04 | [`04_m3_reflex_mcp_surface.md`](04_m3_reflex_mcp_surface.md) | M3 — reflexes + RocksDB + profiles + HTTP/SSE + audio + 15 tools | §5 | **DONE** — tag `v0.1.0-m3` @ `97019ec` (2026-05-25) |
-| 05 | [`05_m4_hardware_hid_first_game.md`](05_m4_hardware_hid_first_game.md) | M4 — RP2040 firmware + `synapse-hid-host` + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` | §6 | **ACTIVE** — start from this file |
+| 05 | [`05_m4_hardware_hid_first_game.md`](05_m4_hardware_hid_first_game.md) | M4 — retired hardware-HID plan; compound action surfaces continue software-only | §6 | **RETIRED** by #588/#589 |
 | 06 | [`06_m5_production_polish.md`](06_m5_production_polish.md) | M5 — installer + overlay + 10+ profiles + VLM `describe` + soak + registry/audit moat | §7 | release gate blocked by M4; P1 registry/audit moat active via #454/#455-#470 |
 | 07 | [`07_cross_cutting.md`](07_cross_cutting.md) | Perf gates, security, observability, release | §10/§11/§12/§14 | active |
 
@@ -147,7 +147,7 @@ A work-item is "done" iff:
 - `cargo test --workspace` green locally on the configured host unless a focused issue-specific gate is documented
 - The work-item's specific acceptance bullet passes
 - Tracing instrumented; every error variant carries an `error_codes::*` code
-- No `unwrap()` / `expect()` outside `#[cfg(test)]`, no `unsafe` outside the allowed crates (`synapse-capture`, `synapse-hid-host`, `firmware/pico-hid`)
+- No `unwrap()` / `expect()` outside `#[cfg(test)]`, no `unsafe` outside crates with documented Windows/driver FFI need
 - Manual FSV evidence in the issue: SoT name, before read, trigger, after read, happy path, ≥3 edge cases, and actual state values. Test stdout is supporting evidence only.
 
 ---
@@ -183,15 +183,13 @@ A work-item is "done" iff:
 | `synapse-models` | `crates/synapse-models` | ORT 2.0-rc.12 session factory + sha256 verify | unchanged at M4 |
 | `synapse-telemetry` | `crates/synapse-telemetry` | JSON file + console + periodic GC + panic-to-log hook + M3 metric registry hookups | unchanged at M4 |
 | `synapse-test-utils` | `crates/synapse-test-utils` | `StdioMcpClient::launch_and_init_with_env(...)` + Notepad fixture (`launch_notepad`, `wait_for_window_title_regex`) + `notepad_process_ids` + M3 RocksDB scratch helpers + profile scratch + audio test asset loaders | M4 adds Pico/serial-port fixture |
-| `synapse-action` | `crates/synapse-action` | **FULL** — emitter actor (split per A.0a refactor) + bounded mpsc(256) + held `BitSet` + token-bucket rate limit + curve/dynamics samplers + Software/ViGEm/Recording/Hardware/HardwareUnavailable backends + InvokePattern bridge + click_timing + clipboard (with open-contention retry) + safety panic hook + operator panic hotkey (`Ctrl+Alt+Shift+P`) + auto-release backend KeyUp (#231 closed) + DPI-aware `GetCursorPos` (#234 closed) + dynamics threaded through `text_dispatch` (#233 closed) + recording mode routed through the emitter actor | Hardware backend routes to `synapse-hid-host` only when `--hardware-hid <port|auto>` is configured and connected; otherwise it fails closed |
+| `synapse-action` | `crates/synapse-action` | **FULL** — emitter actor (split per A.0a refactor) + bounded mpsc(256) + held `BitSet` + token-bucket rate limit + curve/dynamics samplers + Software/ViGEm/Recording/HardwareUnavailable backends + InvokePattern bridge + click_timing + clipboard (with open-contention retry) + safety panic hook + operator panic hotkey (`Ctrl+Alt+Shift+P`) + auto-release backend KeyUp (#231 closed) + DPI-aware `GetCursorPos` (#234 closed) + dynamics threaded through `text_dispatch` (#233 closed) + recording mode routed through the emitter actor | `Backend::Hardware` is retained only as a fail-closed compatibility token |
 | `synapse-reflex` | `crates/synapse-reflex` | **FULL** — `EventBus` (drop-oldest 4096/sub, subscription cap configurable via `--max-subscriptions`/`SYNAPSE_MAX_SUBSCRIPTIONS`), 1 ms scheduler thread at `THREAD_PRIORITY_TIME_CRITICAL` + MMCSS Pro Audio on Windows with tokio fallback, `aim_track`/`hold_move`/`hold_button`/`combo`/`on_event` kinds, recursion guard (≤4/tick), conflict resolution (priority + newer-wins + starvation log), `CF_REFLEX_AUDIT` writes via `synapse-storage` | M4 reuses scheduler for `act_combo` (compiles to a `combo` reflex) |
 | `synapse-storage` | `crates/synapse-storage` | **FULL** — RocksDB open w/ 11 CFs (per `07_storage_and_profiles.md` §4), `pub const CF_*` names, per-CF TTL compaction filter, 100 ms / 64 KB / explicit-flush write batcher, 5-min row-cap GC task, 4-level disk-pressure responder, and bounded maintenance writes for audit-retention backfill/report rows under pressure | M5 audit-retention pressure behavior shipped in #463 |
 | `synapse-profiles` | `crates/synapse-profiles` | **FULL** — TOML parser + `notify`-based watcher (debounced 200 ms) + match resolver (precedence per ADR-0006) + 4 bundled profiles (`notepad`, `vscode`, `chrome`, `terminal` — all Natural defaults) | M4 adds `minecraft.java` profile + `use_scope` field |
 | `synapse-everquest` | `crates/synapse-everquest` | **ACTIVE** — EQ log parsing/tailing, map parsing, static zone graphs, `eq-map-inspect`, `eq-zone-graph`, and #520 `eq-map-inventory` map-pack inventory/provenance manifests with archive hashes and rollback targets | Continue EverQuest world-model, map provenance, trajectory/export, and level-2 manual FSV work |
 | `synapse-audio` | `crates/synapse-audio` | **FULL** — WASAPI loopback 5 s ring + detectors (loud transient / speech start-end / Silero VAD) + Whisper-tiny-int8 STT (lazy load + sha256) + GCC-PHAT stereo direction | unchanged at M4 |
-| `synapse-hid-host` | `crates/synapse-hid-host` | **PARTIAL** — serial discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, reconnect state | M4 — remaining hardware-bound issues require real Pico/COM-device manual FSV |
 | `synapse-overlay` | `crates/synapse-overlay` | binary skeleton (`src/main.rs` 3 LoC) | M5 |
-| `firmware/pico-hid` | `firmware/` (excluded from workspace per root `Cargo.toml:21`) | standalone RP2040 firmware project | M4 — remaining firmware-bound issues require real Pico manual FSV |
 
 Toolchain: stable Rust 1.95.0 (per ADR-0001), `edition = "2024"`, MSRV `1.95`. Cargo workspace at repo root; `default-members = ["crates/synapse-mcp", "crates/synapse-overlay"]`.
 
@@ -217,7 +215,7 @@ All M2 carry-over items from the prior revision are resolved on `main`. The orig
 
 ## M3 carry-over (must address before or during M4)
 
-These are landed-but-imperfect surfaces from M3. M4 either consumes them as-is or fixes them in a one-shot PR before building hardware HID on top.
+These are landed-but-imperfect surfaces from M3. Later feature slices either consume them as-is or fix them in a one-shot PR before building on top.
 
 | # | What | Notes for M4 |
 |---|---|---|

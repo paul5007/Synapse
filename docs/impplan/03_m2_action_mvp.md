@@ -68,7 +68,6 @@ crates/
 ├── synapse-profiles/        empty stub (M3)
 ├── synapse-reflex/          empty stub (M3)
 ├── synapse-audio/           empty stub (M3)
-├── synapse-hid-host/        empty stub (M4)
 └── synapse-overlay/         binary skeleton (M5)
 ```
 
@@ -90,7 +89,7 @@ features listed at workspace root.
 `synapse_core::error_codes::*`:
 
 ```
-ACTION_QUEUE_FULL              ACTION_HID_PORT_DISCONNECTED      STUCK_KEY_AUTO_RELEASED
+ACTION_QUEUE_FULL              STUCK_KEY_AUTO_RELEASED
 ACTION_RATE_LIMITED            ACTION_VIGEM_NOT_INSTALLED        SAFETY_RELEASE_ALL_FIRED
 ACTION_BACKEND_UNAVAILABLE     ACTION_VIGEM_PLUGIN_FAILED        SAFETY_OPERATOR_HOTKEY_FIRED
 ACTION_TARGET_INVALID          ACTION_ELEMENT_NOT_RESOLVED
@@ -472,7 +471,7 @@ error response carries `data.code == "<NAME>"` (the M1 helper
 verbatim).
 
 ```
-ACTION_QUEUE_FULL                    ACTION_HID_PORT_DISCONNECTED
+ACTION_QUEUE_FULL
 ACTION_RATE_LIMITED                  ACTION_VIGEM_NOT_INSTALLED
 ACTION_BACKEND_UNAVAILABLE           ACTION_VIGEM_PLUGIN_FAILED
 ACTION_TARGET_INVALID                ACTION_ELEMENT_NOT_RESOLVED

@@ -41,13 +41,10 @@ All flags are defined in `crates/synapse-mcp/src/main.rs::Cli` (clap derive).
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | `bool` | `false` | `0`, `1`, `true`, `false` (case-insensitive); other values reject startup (`parse_bool_env` in `m3.rs`) | Disables the reflex runtime; reflex tool calls return `REFLEX_DISABLED_BY_OPERATOR`. |
 | `--enable-audio` | `SYNAPSE_ENABLE_AUDIO` | `bool` | `false` | same as above | Required to grant `READ_AUDIO` and to spawn the WASAPI loopback. `audio_tail` / `audio_transcribe` require this. |
 | `--restrict-unknown-profile` | `SYNAPSE_RESTRICT_UNKNOWN_PROFILE` | `bool` | `false` | same as above | Fail-closed switch. Off by default (permissive): unknown/unprofiled foreground apps are actionable. Set it to refuse action dispatch on `use_scope = unknown` / no-profile foregrounds. |
-| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | `Option<String>` | derived default set (see §4.4) | comma/semicolon/whitespace-separated permission names (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`; aliases `KEYBOARD`/`MOUSE`/`PAD`/`HARDWARE_HID`; sentinel values `NONE` and `DENY_ALL` produce an empty set) | M3 permission grant list. Invalid permission names refuse startup. |
+| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | `Option<String>` | derived default set (see §4.4) | comma/semicolon/whitespace-separated permission names (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`; aliases `KEYBOARD`/`MOUSE`/`PAD`; sentinel values `NONE` and `DENY_ALL` produce an empty set) | M3 permission grant list. Invalid permission names refuse startup. |
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | `bool` | `false` | same as bool flags above | Forces the reflex scheduler into degraded-latency mode (test-only knob). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | `Option<u64>` | `None` | unsigned integer | If set, applies one synthetic free-byte sample at startup to validate disk-pressure responder paths (`Db::run_pressure_check_with_free_bytes_sample`). |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | `NonZeroUsize` | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | `>=1` | SSE event subscription cap on the bus. |
-| `--hardware-hid` | `SYNAPSE_HARDWARE_HID` | `Option<String>` | `None` | `auto` or a serial port name such as `COM7` | Enables the hardware HID backend. First use requires the exact console phrase `I AUTHORIZE HARDWARE INPUT`; refusal exits 2 with `SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused` before the backend starts. Accepted consent writes `%APPDATA%/synapse/agreement.json`; `auto` enumerates matching Synapse Pico serial ports and proves identity; a port value opens that port directly. Missing/no-match fails startup with `HID_PORT_NOT_FOUND`; omission leaves `Backend::Hardware` fail-closed through `ACTION_BACKEND_UNAVAILABLE`. |
-| `--reset-hardware-consent` | — | `bool` | `false` | flag | Deletes the existing hardware HID agreement file, then requires the exact hardware consent phrase again before startup continues. |
-
 CLI examples (`README.md`):
 
 ```bash
@@ -120,9 +117,8 @@ Permission names and aliases (`crates/synapse-mcp/src/m3/permissions.rs::Permiss
 | `INPUT_KEYBOARD` | `KEYBOARD` | implicitly required by any reflex whose `then` actions touch the keyboard |
 | `INPUT_MOUSE` | `MOUSE` | reflex actions touching the mouse |
 | `INPUT_PAD` | `PAD` | reflex actions touching the gamepad |
-| `INPUT_HARDWARE_HID` | `HARDWARE_HID` | reflex actions whose `backend = Hardware` |
 
-Default permission set when `--allowed-permissions` is omitted (`default_grants` in `permissions.rs`): all the above except `READ_AUDIO` (added only when `--enable-audio`) and `INPUT_HARDWARE_HID`.
+Default permission set when `--allowed-permissions` is omitted (`default_grants` in `permissions.rs`): all the above except `READ_AUDIO` (added only when `--enable-audio`).
 
 If `--allowed-permissions` includes `READ_AUDIO` but `--enable-audio` is not passed, startup fails with `READ_AUDIO requires --enable-audio or SYNAPSE_ENABLE_AUDIO=true`.
 
@@ -150,12 +146,11 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 - Token-bucket per-backend rate limits: `SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S` (`crates/synapse-action/src/rate_limit.rs`). Over-rate emits return `ACTION_RATE_LIMITED`.
 - Action emitter queue capacity: `ACTION_QUEUE_CAPACITY = 256` (`crates/synapse-action/src/handle.rs`). Backpressure → `ACTION_QUEUE_FULL`.
 
-### 4.9 Hardware HID Consent
-- If `--hardware-hid <port|auto>` is set and `SYNAPSE_MCP_RECORDING_BACKEND` is not active, startup checks `%APPDATA%/synapse/agreement.json` (or `SYNAPSE_AGREEMENT_PATH` when set) before constructing the action backend.
-- Missing agreement triggers the startup console prompt. The response must exactly equal `I AUTHORIZE HARDWARE INPUT` after line-ending removal only; leading/trailing spaces, case changes, empty input, or EOF are refused.
-- Refusal logs and prints `SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused`, exits 2, and leaves the agreement file absent.
-- A valid agreement records schema version, `acknowledged_at`, the accepted `hardware_hid.port`, the SHA-256 of the phrase, and `supported_use_scopes=["productivity","single_player"]`; Windows readback verifies the protected ACL before continuing.
-- `--reset-hardware-consent` removes the existing agreement first, then follows the same prompt/write/ACL-readback path.
+### 4.9 Retired hardware backend token
+- There is no runtime configuration path that enables a physical hardware backend.
+- `Backend::Hardware` and profile `default_backend = "hardware"` still parse for compatibility, but action dispatch routes them to `HardwareUnavailableBackend`.
+- The fail-closed error is `ACTION_BACKEND_UNAVAILABLE` with guidance to use `backend=software` or `backend=vigem`.
+- Removed permission names or aliases are treated like any other unknown permission and refuse startup when supplied in `--allowed-permissions`.
 
 ### 4.10 Telemetry
 - Log directory must be writable: probe writes `.synapse-write-probe` and deletes it; failure → `TELEMETRY_LOG_DIR_NOT_WRITABLE`.
@@ -163,18 +158,18 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 
 ## 5. Config loading order
 
-The `Cli::m2_config` method constructs `M2ServiceConfig` from `--hardware-hid` / `SYNAPSE_HARDWARE_HID` and `SYNAPSE_MCP_RECORDING_BACKEND`; `Cli::m3_config` constructs `M3ServiceConfig` from clap fields and additionally consults `SYNAPSE_BEARER_TOKEN` at that point (`crates/synapse-mcp/src/m3.rs::from_cli_parts`). All other env vars are read at their respective construction sites:
+The `Cli::m2_config` method constructs `M2ServiceConfig` from `SYNAPSE_MCP_RECORDING_BACKEND`; `Cli::m3_config` constructs `M3ServiceConfig` from clap fields and additionally consults `SYNAPSE_BEARER_TOKEN` at that point (`crates/synapse-mcp/src/m3.rs::from_cli_parts`). All other env vars are read at their respective construction sites:
 
 ```text
 clap (CLI flag > env via clap) → Cli
         │
-        ├→ Cli::m2_config()  → M2ServiceConfig (hardware HID + recording backend)
+        ├→ Cli::m2_config()  → M2ServiceConfig (recording backend)
         └→ Cli::m3_config()  → M3ServiceConfig (also reads SYNAPSE_BEARER_TOKEN)
                 │
                 ├→ configure_telemetry()  → reads SYNAPSE_LOG_DIR + SYNAPSE_LOG_GC_INTERVAL_S
                 │
                 └→ run_stdio / http::serve
-                    ├→ M2State::try_from_config → connects hardware HID if configured; reads SYNAPSE_MCP_RECORDING_BACKEND from M2ServiceConfig
+                    ├→ M2State::try_from_config → reads SYNAPSE_MCP_RECORDING_BACKEND from M2ServiceConfig
                     ├→ M1State::from_env        → reads SYNAPSE_MCP_SYNTHETIC_FIXTURE, _FORCE_NO_PERCEPTION, _FORCE_OBSERVE_INTERNAL
                     ├→ M3State::from_*          → reads SYNAPSE_BIND, SYNAPSE_BEARER_TOKEN, SYNAPSE_AUDIO_LOOPBACK
                     │      (additional env mirrors of --reflex-disabled etc. when used via M3ServiceConfig::from_env)

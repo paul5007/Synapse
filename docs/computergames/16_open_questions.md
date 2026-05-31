@@ -79,7 +79,7 @@ interval.
 
 ## OQ-006 — Permission model: profile-level vs session-level
 
-**Q.** Permissions (`allow_launch`, `allow_shell`, `allow_hardware_hid`) per-profile, per-session, or global?
+**Q.** Permissions (`allow_launch`, `allow_shell`) per-profile, per-session, or global? The old `allow_hardware_hid` surface was retired by #588/#589.
 
 **Trade-off.** Per-profile: per-app posture, clean but verbose. Per-session: agent caller scopes itself. Global: simplest.
 
@@ -137,15 +137,16 @@ interval.
 
 ---
 
-## OQ-011 — Hardware HID firmware language
+## OQ-011 — Hardware HID firmware language — RETIRED 2026-05-31
 
 **Q.** Rust+embassy on RP2040 or C+TinyUSB?
 
 **Trade-off.** Rust+embassy: stack consistency, type safety; larger flash footprint, slower iteration on USB stack issues. C+TinyUSB: smaller, more mature USB stack, faster external-contributor onboarding.
 
-**Default.** Rust+embassy. All-Rust project; overhead worth consistency.
+**Decision.** Superseded by #588/#589. The physical hardware-HID strategy is
+retired, so there is no active firmware language choice.
 
-**Target.** Locked unless embassy USB stack bugs block M4 demo.
+**Target.** None.
 
 ---
 
@@ -343,15 +344,16 @@ Apache-2.0-friendly checkpoints.
 
 ---
 
-## OQ-027 — Operator multi-factor for hardware HID
+## OQ-027 — Operator multi-factor for hardware HID — RETIRED 2026-05-31
 
 **Q.** Should hardware HID require a second factor (physical Pico button) instead of CLI flags?
 
 **Trade-off.** Higher friction reduces accidental activation but makes legitimate hardware workflows slower.
 
-**Default.** CLI/config flag + interactive prompt + profile permission metadata is sufficient.
+**Decision.** Superseded by #588/#589. There is no physical HID activation path,
+CLI flag, or hardware consent prompt.
 
-**Target.** v2 if operator-safety feedback calls for it.
+**Target.** None.
 
 ---
 

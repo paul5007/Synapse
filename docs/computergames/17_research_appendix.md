@@ -42,7 +42,7 @@ Synapse takeaways:
 
 Common pattern: UIA tree as primary Windows perception; `windows-capture` (Graphics Capture API) for frames; `enigo` for input; WinRT `Windows.Media.Ocr` (no Tesseract dep); per-app templates for elements UIA misses.
 
-Synapse adds: pixel-CNN perception for games, hardware HID gateway, sub-frame reflex runtime, profile system, audio capture + STT, unified `observe()` fusing paths.
+Synapse adds: pixel-CNN perception for games, software-only action backends, sub-frame reflex runtime, profile system, audio capture + STT, unified `observe()` fusing paths.
 
 ---
 
@@ -104,11 +104,11 @@ Synapse uses `uiautomation` for tree walking; falls back to raw `windows-rs` UIA
 | ViGEmBus driver releases | https://github.com/nefarius/ViGEmBus/releases (current stable: 1.22.0) |
 | ViGEmBus repo | https://github.com/ViGEm/ViGEmBus/ |
 
-Decision: `enigo` for keyboard/mouse software input. `vigem-client` for virtual Xbox 360 / DualShock 4. Hardware HID via custom firmware (`09_hardware_hid_gateway.md`).
+Decision: `enigo`/Win32 for keyboard/mouse software input and `vigem-client` for virtual Xbox 360 / DualShock 4. The physical hardware-HID plan is retired by #588/#589; see `09_hardware_hid_gateway.md`.
 
 ---
 
-## 7. Hardware HID gateways
+## 7. Retired hardware HID gateways
 
 | Reference | URL | Notes |
 |---|---|---|
@@ -116,7 +116,7 @@ Decision: `enigo` for keyboard/mouse software input. `vigem-client` for virtual 
 | `jfedor2/hid-forwarder` — Pi Pico receiver, wired + Bluetooth | https://github.com/jfedor2/hid-forwarder | Protocol reference |
 | `Fenrified/Gordons-Sim-Controller` — RP2040 config-driven HID input | https://github.com/Fenrified/Gordons-Sim-Controller | Embedded HID best practices |
 
-Decision: ship firmware for RP2040 (Pi Pico, $4). Serial @ 1 Mbaud over USB CDC. Spec in `09_hardware_hid_gateway.md`.
+Decision superseded by #588/#589: do not ship RP2040 firmware or a serial HID gateway. Keep this section only as historical research context.
 
 ---
 
@@ -205,7 +205,7 @@ Chromium browsers exposed via CDP attach (foreground window is browser + CDP por
 | `usbd-hid` HID descriptors | https://docs.rs/usbd-hid |
 | TinyUSB host stack (PIO-USB for RP2040) | https://github.com/sekigon-gonnoc/Pico-PIO-USB |
 
-Firmware: `embassy-rp` cooperative async on Cortex-M0+; USB CDC for serial; custom HID descriptor for mouse + keyboard + gamepad combined device.
+Historical firmware note only: the retired plan used `embassy-rp` cooperative async on Cortex-M0+, USB CDC for serial, and a custom HID descriptor for mouse + keyboard + gamepad combined device.
 
 ---
 

@@ -1,6 +1,6 @@
 # Synapse Systemspec — Bundled Reference
 
-> Auto-generated 2026-05-30 by `docs/systemspec/bundle.ps1`. Source: the 16 individual `docs/systemspec/*.md` files, concatenated in order. In-bundle cross-references between systemspec files are rewritten to anchors; references to files outside the bundle (impplan, computergames, adr, source code) keep their original paths.
+> Auto-generated 2026-05-31 by `docs/systemspec/bundle.ps1`. Source: the 16 individual `docs/systemspec/*.md` files, concatenated in order. In-bundle cross-references between systemspec files are rewritten to anchors; references to files outside the bundle (impplan, computergames, adr, source code) keep their original paths.
 >
 > Re-run the script after editing any source file so the bundle stays in sync. The individual files remain the authoritative copies.
 
@@ -123,7 +123,6 @@ Source files covered:
 - `crates/synapse-profiles/src/lib.rs`
 - `crates/synapse-telemetry/src/lib.rs`
 - `crates/synapse-models/src/lib.rs`
-- `crates/synapse-hid-host/src/lib.rs`
 - `crates/synapse-everquest/src/lib.rs`
 - `crates/synapse-overlay/src/main.rs`
 
@@ -149,7 +148,6 @@ The repository operates under the doctrine in `AGENTS.md`: manual Full State Ver
 | Audio loopback | WASAPI loopback on default render device | `wasapi` v0.23 | Ring buffer + STT (Whisper tiny) for `audio_tail` / `audio_transcribe` tools |
 | Capture | DXGI duplication or Windows.Graphics.Capture | `windows-capture` v2.0 + `windows` v0.62 | Zero-copy GPU frame surface for OCR/CNN paths |
 | ViGEm virtual pad | ViGEmBus driver, user-space client | `vigem-client` v0.1.4 (X360 default, optional DS4) | Virtual Xbox/DualShock controller for `act_pad` |
-| Pi Pico HID gateway | USB serial, RP2040 firmware (M4) | `serialport` v4.9 + `crc16` | Hardware HID host surface; `synapse-hid-host` implements serial discovery, connect/IDENTIFY, framing, pipelined send, and reconnect paths. See `docs/computergames/09_hardware_hid_gateway.md` |
 | EverQuest local data | Daybreak install maps/logs plus `%APPDATA%/Synapse/everquest` map-pack cache | `synapse-everquest` crate + local CLI binaries | Parses EQ logs and maps, builds zone graphs, inventories base/community map sets, preserves archive hashes/manifests, and feeds the attended EverQuest world-model FSV workflow |
 | `synapse-overlay` binary | currently a placeholder (`crates/synapse-overlay/src/main.rs` is 1 line) | n/a | Future debug overlay for M5 production polish |
 
@@ -178,8 +176,6 @@ The repository operates under the doctrine in `AGENTS.md`: manual Full State Ver
 | Audio | `wasapi` | `0.23.0` |
 | Software input | `enigo` (no default features) | `0.6.1` |
 | Virtual controller | `vigem-client` (with `unstable_ds4` from `synapse-action`) | `0.1.4` |
-| Serial port | `serialport` | `4.9.0` |
-| CRC | `crc16` | `0.4.0` |
 | ONNX Runtime | `ort` (optional via `synapse-models` features `ort`/`cuda`/`directml`) | `2.0.0-rc.12` |
 | Hashing / constant-time | `sha2`, `subtle` | `0.11.0`, `2.6.1` |
 | Signatures | `ed25519-dalek` | `2.2.0` |
@@ -194,13 +190,13 @@ The repository operates under the doctrine in `AGENTS.md`: manual Full State Ver
 | Tempfiles | `tempfile` | `3.27.0` |
 | Mocking | `mockall` | `0.14.0` |
 
-Workspace-wide lints (`Cargo.toml [workspace.lints]`): `unsafe_code = forbid` at root (relaxed to `allow` in crates with FFI: `synapse-capture`, `synapse-a11y`, `synapse-action`, `synapse-audio`, `synapse-hid-host`); clippy `all = deny`, `pedantic`/`nursery = warn`, `unwrap_used`/`expect_used = deny`.
+Workspace-wide lints (`Cargo.toml [workspace.lints]`): `unsafe_code = forbid` at root (relaxed to `allow` in crates with FFI: `synapse-capture`, `synapse-a11y`, `synapse-action`, `synapse-audio`); clippy `all = deny`, `pedantic`/`nursery = warn`, `unwrap_used`/`expect_used = deny`.
 
 Release profile: `opt-level=3`, `lto="thin"`, `codegen-units=16`, `panic="abort"`, `strip=true` (`Cargo.toml [profile.release]`). A `release-max` profile inherits release with `lto="fat"` and `codegen-units=1`.
 
 ## 4. Public MCP tool surface (live)
 
-All 79 live tools live in `crates/synapse-mcp/src/server.rs` and routed
+All 80 live tools live in `crates/synapse-mcp/src/server.rs` and routed
 submodules (declared via `#[tool_router]`). Grouped by milestone:
 
 ### 4.1 M1 — perception (6 tools)
@@ -240,7 +236,7 @@ submodules (declared via `#[tool_router]`). Grouped by milestone:
 | `reflex_list` | List active reflexes (and optionally terminal ones reconstructed from `CF_REFLEX_AUDIT`) | `server.rs::reflex_list`, `m3/reflex.rs` |
 | `reflex_history` | Return persisted `StoredReflexAudit` rows (newest-first), optionally for one reflex id, capped at 1000 | `server.rs::reflex_history`, `m3/reflex.rs` |
 | `profile_list` | List loaded profiles + active id | `server.rs::profile_list`, `m3/profile.rs` |
-| `profile_activate` | Activate a known profile id (use_scope=unknown profiles require `--allow-unknown-profile`) | `server.rs::profile_activate`, `m3/profile.rs` |
+| `profile_activate` | Activate a profile id (use_scope=unknown allowed by default; `--restrict-unknown-profile` fails closed) | `server.rs::profile_activate`, `m3/profile.rs` |
 | `replay_record` | Stream observations and/or events to a JSONL file under `%LOCALAPPDATA%/synapse/replays` | `server.rs::replay_record`, `m3/replay.rs` |
 | `audio_tail` | Return the most-recent loopback audio tail as PCM s16le bytes (max 5 s; `synapse_audio::MAX_RING_SECONDS`) | `server.rs::audio_tail`, `m3/audio.rs` |
 | `audio_transcribe` | Transcribe the loopback tail via Whisper-tiny (language pinned to `"en"`) | `server.rs::audio_transcribe`, `m3/audio.rs` |
@@ -386,15 +382,13 @@ CLI flags on `synapse-mcp` (parsed in `main.rs::Cli`, full table: [03_configurat
 --log-level <LEVEL>             [env: SYNAPSE_LOG_LEVEL]       default: info
 --reflex-disabled               [env: SYNAPSE_REFLEX_DISABLED]
 --enable-audio                  [env: SYNAPSE_ENABLE_AUDIO]
---allow-unknown-profile         [env: SYNAPSE_ALLOW_UNKNOWN_PROFILE]
+--restrict-unknown-profile      [env: SYNAPSE_RESTRICT_UNKNOWN_PROFILE]
 --allowed-permissions <LIST>    [env: SYNAPSE_MCP_ALLOWED_PERMISSIONS]
 --reflex-force-degraded         [env: SYNAPSE_REFLEX_FORCE_DEGRADED]
 --storage-pressure-free-bytes-sample <BYTES>
                                 [env: SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE]
 --max-subscriptions <COUNT>     [env: SYNAPSE_MAX_SUBSCRIPTIONS]
                                 default: synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO
---hardware-hid <PORT_OR_AUTO>   [env: SYNAPSE_HARDWARE_HID]
---reset-hardware-consent
 ```
 
 ## 6. Runtime directory layout
@@ -423,13 +417,12 @@ All errors carry `SCREAMING_SNAKE_CASE` codes defined as `pub const &str` in `cr
 | Category | Examples | Source-of-truth |
 |---|---|---|
 | Perception (PRD 8.1) | `OBSERVE_NO_PERCEPTION_AVAILABLE`, `OBSERVE_INTERNAL`, `CAPTURE_GRAPHICS_API_UNSUPPORTED`, `CAPTURE_TARGET_LOST`, `CAPTURE_NO_DIRTY_REGIONS`, `A11Y_NOT_AVAILABLE`, `A11Y_ELEMENT_STALE`, `A11Y_NO_FOREGROUND`, `A11Y_CDP_UNREACHABLE`, `DETECTION_MODEL_NOT_LOADED`, `DETECTION_MODEL_INFER_FAILED`, `DETECTION_NO_FRAME`, `OCR_NO_TEXT`, `OCR_BACKEND_UNAVAILABLE`, `HUD_NO_ACTIVE_PROFILE`, `HUD_FIELD_NOT_DEFINED`, `HUD_EXTRACTION_FAILED`, `AUDIO_DEVICE_LOST`, `AUDIO_LOOPBACK_INIT_FAILED`, `AUDIO_STT_MODEL_NOT_LOADED` | `error_codes.rs` lines 2–21 |
-| Action (PRD 8.2) | `ACTION_QUEUE_FULL`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE`, `ACTION_TARGET_INVALID`, `ACTION_HOLD_EXCEEDED_MAX`, `ACTION_HID_PORT_DISCONNECTED`, `ACTION_VIGEM_NOT_INSTALLED`, `ACTION_VIGEM_PLUGIN_FAILED`, `ACTION_ELEMENT_NOT_RESOLVED`, `ACTION_FOREGROUND_LOST`, `ACTION_UNSUPPORTED_KEY`, `ACTION_DRAG_DISTANCE_EXCEEDS_LIMIT`, `STUCK_KEY_AUTO_RELEASED`, `SAFETY_RELEASE_ALL_FIRED`, `SAFETY_OPERATOR_HOTKEY_FIRED` | lines 24–38 |
+| Action (PRD 8.2) | `ACTION_QUEUE_FULL`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE`, `ACTION_TARGET_INVALID`, `ACTION_HOLD_EXCEEDED_MAX`, `ACTION_VIGEM_NOT_INSTALLED`, `ACTION_VIGEM_PLUGIN_FAILED`, `ACTION_ELEMENT_NOT_RESOLVED`, `ACTION_FOREGROUND_LOST`, `ACTION_UNSUPPORTED_KEY`, `ACTION_DRAG_DISTANCE_EXCEEDS_LIMIT`, `STUCK_KEY_AUTO_RELEASED`, `SAFETY_RELEASE_ALL_FIRED`, `SAFETY_OPERATOR_HOTKEY_FIRED` | lines 24–37 |
 | Reflex (PRD 8.3) | `REFLEX_CAP_REACHED`, `REFLEX_KIND_INVALID`, `REFLEX_PARAMS_INVALID`, `REFLEX_TARGET_INVALID`, `REFLEX_FILTER_INVALID`, `REFLEX_PRIORITY_INVALID`, `REFLEX_TICK_LATE`, `REFLEX_TRACK_LOST`, `REFLEX_STARVED`, `REFLEX_DISABLED_BY_OPERATOR`, `REFLEX_LIFETIME_EXPIRED`, `REFLEX_RECURSION_LIMIT`, `REFLEX_ACTION_PERMISSION_DENIED` | lines 41–53 |
 | Profile / config (PRD 8.4) | `PROFILE_NOT_FOUND`, `PROFILE_PARSE_ERROR`, `PROFILE_VERSION_INCOMPATIBLE`, `PROFILE_KEYMAP_INVALID`, `PROFILE_HUD_REGION_INVALID`, `CAPTURE_TARGET_INVALID`, `PERCEPTION_MODE_INVALID`, `PROFILE_TRUST_VERIFICATION_FAILED`, `PROFILE_ROLLBACK_UNAVAILABLE`, `AUDIT_EXPORT_CONSENT_REQUIRED`, `AUDIT_EXPORT_REDACTION_REQUIRED`, `AUDIT_EXPORT_PAYLOAD_TOO_LARGE`, `PROFILE_AUTHORING_INSUFFICIENT_EVIDENCE`, `PROFILE_AUTHORING_CONFLICTING_EVIDENCE`, `PROFILE_AUTHORING_UNSAFE_ESCALATION`, `PROFILE_AUTHORING_CANDIDATE_NOT_FOUND`, `PROFILE_AUTHORING_INVALID_STATE` | lines 56–72 |
 | MCP / session (PRD 8.5) | `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `SUBSCRIPTION_NOT_FOUND`, `SUBSCRIPTION_CAP_REACHED`, `TOOL_NOT_FOUND`, `TOOL_PARAMS_INVALID`, `TOOL_INTERNAL_ERROR`, `HTTP_BIND_NON_LOOPBACK_REFUSED`, `HTTP_TOKEN_INVALID`, `HTTP_ORIGIN_REFUSED`, `HTTP_SESSION_INVALID`, `REPLAY_TARGET_INVALID`, `REPLAY_FORMAT_INVALID` | lines 75–87 |
 | Storage (PRD 8.6) | `STORAGE_OPEN_FAILED`, `STORAGE_WRITE_FAILED`, `STORAGE_READ_FAILED`, `STORAGE_CORRUPTED`, `STORAGE_SCHEMA_MISMATCH`, `STORAGE_DISK_PRESSURE_LEVEL_1..4`, `STORAGE_CF_HARD_CAP_REACHED` | lines 90–99 |
 | Models (PRD 8.7) | `MODEL_DOWNLOAD_FAILED`, `MODEL_HASH_MISMATCH`, `MODEL_LOAD_FAILED`, `MODEL_BACKEND_UNAVAILABLE` | lines 102–105 |
-| Hardware HID (PRD 8.8) | `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, `HID_LINK_TIMEOUT` | lines 108–113 |
 | Safety (PRD 8.9) | `SAFETY_KILLSWITCH_ACTIVE`, `SAFETY_PROCESS_DENYLISTED`, `SAFETY_SHELL_DENIED_BY_POLICY`, `SAFETY_LAUNCH_DENIED_BY_POLICY`, `SAFETY_SECRET_REDACTED`, `SAFETY_PERMISSION_DENIED`, `SAFETY_PROFILE_ACTION_DENIED` | lines 116–122 |
 
 Cross-crate `thiserror` enums that surface these codes:
@@ -468,7 +461,7 @@ Opens RocksDB with LZ4 base, ZSTD on `CF_OBSERVATIONS`/`CF_SESSIONS`, no-compres
 `ReflexRuntime` (`crates/synapse-reflex/src/lib.rs`) owns the scheduler, `EventBus`, and a `Db` handle for audit persistence. Reflex kinds: `AimTrack` (PID-style aim controller with EMA smoothing), `HoldMove` (held key set with optional re-assert), `HoldButton` (held mouse/pad button), `Combo` (timed step list), `OnEvent` (event-filtered action firing with recursion guard, default cap `MAX_ON_EVENT_FIRINGS_PER_TICK`). Scheduler runs at 1 ms tick (default), records `TickSample` with jitter, computes p99, exposes `degraded_latency()` and `recursion_clamps_total()` for `health`. Each register/cancel/disable/fire writes a `StoredReflexAudit` row into `CF_REFLEX_AUDIT`. Subscriber bus is bounded by `SUBSCRIBER_QUEUE_CAPACITY` with drop accounting. See [07_reflex_runtime.md](#file-07).
 
 ### 9.5 synapse-action (input emission)
-The `ActionEmitter` actor (mpsc channel, `ACTION_QUEUE_CAPACITY=256`) consumes `Action` messages, applies token-bucket rate limits per backend (`SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S`), tracks held keys/buttons/pad state in a `BitSet`, and dispatches to one of: Software (`enigo`), ViGEm (`vigem-client`), Recording (in-memory buffer, used by tests), `HardwareBackend` (when `--hardware-hid <port|auto>` connects and identifies a Synapse Pico), or `HardwareUnavailable` (fail-closed `ACTION_BACKEND_UNAVAILABLE` when hardware HID is not enabled). Owns the operator panic hotkey (`Ctrl+Alt+Shift+P`) which fires a 50 ms-budgeted `ReleaseAll` (`crates/synapse-mcp/src/safety.rs`). Curve sampling, keystroke-dynamics samplers (`BIGRAMS`, `KeystrokeNaturalParams::FAST`), click-timing caches, clipboard read/write/clear, and per-action validation (`validate_action`, `MAX_DRAG_DISTANCE_PX`) all live here. See [08_action_subsystem.md](#file-08).
+The `ActionEmitter` actor (mpsc channel, `ACTION_QUEUE_CAPACITY=256`) consumes `Action` messages, applies token-bucket rate limits per backend (`SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S`), tracks held keys/buttons/pad state in a `BitSet`, and dispatches to one of: Software (`enigo`), ViGEm (`vigem-client`), Recording (in-memory buffer, used by tests), or `HardwareUnavailable` (fail-closed `ACTION_BACKEND_UNAVAILABLE` when the retired `hardware` compatibility token is selected). Owns the operator panic hotkey (`Ctrl+Alt+Shift+P`) which fires a 50 ms-budgeted `ReleaseAll` (`crates/synapse-mcp/src/safety.rs`). Curve sampling, keystroke-dynamics samplers (`BIGRAMS`, `KeystrokeNaturalParams::FAST`), click-timing caches, clipboard read/write/clear, and per-action validation (`validate_action`, `MAX_DRAG_DISTANCE_PX`) all live here. See [08_action_subsystem.md](#file-08).
 
 ### 9.6 synapse-perception (observation assembly)
 Aggregates inputs from `synapse-a11y` (UIA tree) and `synapse-capture` (frame sources, OCR) into an `Observation`. Owns the `ObservationAssembler` with per-slot include flags (`ObserveInclude`), auto perception-mode resolution (`auto_mode`, `auto_mode_with_a11y`), and `ObservationInput` (synthetic fixture or live OS data). Provides OCR with WinRT and CRNN backends (`OcrProvider`, `read_text`, `read_text_with_provider`). See [09_perception_and_capture.md](#file-09).
@@ -483,7 +476,7 @@ DXGI duplication and Windows.Graphics.Capture backends with a single `CaptureBac
 `AudioRuntime` (`crates/synapse-audio/src/lib.rs`) holds a ring buffer (default 5 s, max 5 s — `DEFAULT_RING_SECONDS = MAX_RING_SECONDS = 5`), a WASAPI loopback handle (started only when `--enable-audio` or `SYNAPSE_AUDIO_LOOPBACK=1`), optional event-emitting detectors (`detectors::DetectorProcessor`), and a Whisper-tiny STT engine (`WhisperTinyStt`). Provides `tail_seconds`, `transcribe_tail`, ring-format negotiation, direction estimate (azimuth + confidence). See [10_audio_and_models.md](#file-10).
 
 ### 9.10 synapse-profiles (TOML loader + live reload)
-`ProfileRuntime::spawn` parses every `.toml` file in the profile directory at startup, registers a `notify` recursive watcher with a 200 ms debounce, and refreshes parsed profiles on filesystem events. Bundled profile dir is auto-discovered (`bundled_profiles_dir`); operator override is `SYNAPSE_PROFILE_DIR`. Resolves the active profile against the current foreground window via `resolve_active_profile`. Profiles with `use_scope=unknown` require explicit `--allow-unknown-profile`. See [11_profiles_hid_telemetry.md](#file-11) (or section in subsystem deep-dives).
+`ProfileRuntime::spawn` parses every `.toml` file in the profile directory at startup, registers a `notify` recursive watcher with a 200 ms debounce, and refreshes parsed profiles on filesystem events. Bundled profile dir is auto-discovered (`bundled_profiles_dir`); operator override is `SYNAPSE_PROFILE_DIR`. Resolves the active profile against the current foreground window via `resolve_active_profile`. Profiles with `use_scope=unknown` (and unprofiled foregrounds) are actionable by default; pass `--restrict-unknown-profile` to fail closed. See [11_profiles_hid_telemetry.md](#file-11) (or section in subsystem deep-dives).
 
 ### 9.11 synapse-telemetry (logs + metrics registry)
 Owns the process-wide `tracing` subscriber: JSON file appender (daily rolling, lives in `%LOCALAPPDATA%/synapse/logs`), stderr console layer, and a background log-GC thread (default 6-hour interval, 7-day retention, 500 MiB ceiling, all overridable by `SYNAPSE_LOG_GC_INTERVAL_S`). Installs the panic-to-log hook (`install_panic_hook`). The `metrics` module declares 19 M3 metric specs (12 counters, 5 gauges, 2 histograms) with bounded label cardinality (`CARDINALITY_LIMIT = 1000`). Examples: `events_published_total`, `reflex_fires_total`, `reflex_tick_jitter_us`, `storage_disk_pressure_level`, `storage_cf_bytes`, `audio_loopback_underruns_total`, `sse_active_subscribers`. Spawn registers these via `metrics-exporter-prometheus` machinery.
@@ -491,8 +484,8 @@ Owns the process-wide `tracing` subscriber: JSON file appender (daily rolling, l
 ### 9.12 synapse-models (ONNX runtime wrappers)
 Holds `ModelDescriptor` (id, path, sha256, input_shape, class_map), `Detector` trait (`infer(frame, opts)`), `DetectionFrame::validate`. Wraps `ort` v2.0.0-rc.12 with optional `cuda` and `directml` features (`directml` is required by `synapse-audio` for the Whisper-tiny inference). Validates SHA-256 before loading; emits `MODEL_HASH_MISMATCH` on drift.
 
-### 9.13 synapse-hid-host
-USB-serial driver for the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the root workspace via `Cargo.toml::exclude`). The crate exposes serial discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frame encode/decode, pipelined send, reconnect state, firmware telemetry snapshots, and HID error mapping. `synapse-mcp --hardware-hid <port|auto>` uses this crate to build the live `HardwareBackend`.
+### 9.13 retired physical HID path
+The physical HID implementation was removed after the #588 software-only input decision. The `hardware` backend token remains only as a compatibility value that routes to `HardwareUnavailableBackend` and fails closed with `ACTION_BACKEND_UNAVAILABLE`; live input is `software` plus `vigem`.
 
 ### 9.14 synapse-everquest
 EverQuest-specific local data helpers. The library parses EQ log files, map
@@ -517,15 +510,15 @@ Currently `fn main() {}`. Will hold the debug overlay UI shipped at M5.
 | M1 — perception MVP | DONE | `v0.1.0-m1` (2026-05-23) | `observe` + `find` + `read_text` + `set_capture_target` + `set_perception_mode` + a11y/capture wiring |
 | M2 — action MVP | DONE | `v0.1.0-m2` (2026-05-24) | Nine action tools, Software + ViGEm + Recording backends, operator panic hotkey, `release_all` safety paths |
 | M3 — reflex / MCP surface | DONE | `v0.1.0-m3` (2026-05-25, @ `97019ec`) | SSE bus, reflex runtime + 1 ms time-critical scheduler, RocksDB (11 CFs) + GC + 4-level disk pressure, profile loader + watcher (4 bundled), WASAPI loopback + Whisper-tiny STT, replay JSONL recorder, streamable HTTP/SSE transport with Bearer + Origin/Host + Mcp-Session-Id, 15 M3 tools (incl. four `storage_*` diagnostics) |
-| M4 — hardware HID + first game | ACTIVE | — | RP2040 firmware (`firmware/pico-hid/`) + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` |
-| M5 — production polish + registry/audit moat | release gate blocked by M4; registry/audit work active | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak, and the #454/#455-#470 profile-registry/audit-data learning loop |
+| M4 — first game + compound actions | tagged/retired hardware path | `v0.1.0-m4` | `act_combo`/`act_run_shell`/`act_launch`, first-game/profile runtime work, software-only input, retired `hardware` token fail-closed |
+| M5 — production polish + registry/audit moat | active | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak, and the #454/#455-#470 profile-registry/audit-data learning loop |
 
 ## 11. What is NOT covered
 
 - **Cross-platform support.** All capture, a11y, action, audio, hotkey, and HID paths are `#[cfg(windows)]`. Non-Windows builds compile (stubs return `ACTION_BACKEND_UNAVAILABLE`/equivalent), but no perception or action paths are wired.
 - **Inner LLM / planner.** The agent (Claude / Codex / Cursor) is the brain; `synapse-mcp` is the body. There is no GOAP/MCTS/skill library inside this repo.
 - **Goal storage.** RocksDB does not persist agent goals or plans; it only stores sensor/reflex/action traces.
-- **Process manipulation / packet sniffing.** Out of scope per PRD §"Out of scope". `synapse-hid-host` and `synapse-action` only talk to OS input APIs or USB serial; no game RAM reads.
+- **Process manipulation / packet sniffing.** Out of scope per PRD §"Out of scope". `synapse-action` only talks to OS input APIs and virtual-controller APIs; no game RAM reads.
 - **HTTPS / TLS.** The HTTP transport is loopback HTTP only by default; the Origin allow-list rejects non-`http://` Origins (`http/auth.rs::validate_origin`). For non-loopback binds with TLS termination, the operator is expected to front the daemon with a local reverse proxy.
 - **Migration shims pre-v1.** Schema changes wipe-and-rebuild (`docs/computergames/README.md` §Authoring rules); there is no migration framework in `synapse-storage`.
 
@@ -560,10 +553,10 @@ synapse/
 ├── tests/                          # Repo-level fixtures only (audio WAV samples)
 │   └── fixtures/audio/             # Test-shared WAV fixtures
 ├── target/                         # Cargo build output (gitignored)
-└── crates/                         # 16 workspace member crates (see §2)
+└── crates/                         # 15 workspace member crates (see §2)
 ```
 
-`firmware/pico-hid/` is referenced in `Cargo.toml::exclude` and reserved for the M4 RP2040 firmware. It is not present in the current tree.
+The retired physical HID firmware and host-driver paths are no longer present in the workspace; `Cargo.toml::exclude` is empty.
 
 ## 2. Crate tree (with per-file one-line descriptions)
 
@@ -765,14 +758,7 @@ crates/synapse-action/
         ├── mod.rs                  # ActionBackend trait, BackendResolutionPolicy, ResolvedBackend, resolve_backend
         ├── mouse_coordinates.rs    # Screen→virtual desktop coord conversion
         ├── text_dispatch.rs        # Text-input dispatch (clipboard paste vs synthesized keystrokes)
-        ├── hardware.rs             # HardwareBackend public facade
-        ├── hardware/keyboard.rs    # Keyboard action helpers
-        ├── hardware/keymap.rs      # Synapse key to USB HID Keyboard/Keypad usage mapping
-        ├── hardware/keymap_tests.rs # HID usage mapping regression checks
-        ├── hardware/mouse.rs       # Relative mouse/button/wheel command encoding
-        ├── hardware/pad.rs         # Gamepad report command encoding
-        ├── hardware/tests.rs       # HardwareBackend command/state tests
-        ├── unavailable.rs          # Fail-closed hardware slot when --hardware-hid is absent
+        ├── unavailable.rs          # Fail-closed retired hardware compatibility slot
         ├── recording.rs            # RecordingBackend (in-memory event log)
         ├── recording/state.rs      # RecordingBackend internal state
         ├── software.rs             # SoftwareBackend (Windows SendInput)
@@ -883,24 +869,7 @@ crates/synapse-everquest/
     └── map_inventory.rs            # Focused map-inventory regression checks; supporting evidence only
 ```
 
-### 2.12 `crates/synapse-hid-host/`
-
-```
-crates/synapse-hid-host/
-├── Cargo.toml
-└── src/
-    ├── discover.rs                 # Synapse Pico serial-port discovery / auto-detect
-    ├── error.rs                    # HidError + code mapping
-    ├── handshake.rs                # IDENTIFY parsing and expected-version checks
-    ├── lib.rs                      # Public exports
-    ├── pipeline.rs                 # ACK/NAK pipeline, retries, backpressure
-    ├── protocol.rs                 # CRC16 frame encoding/parsing
-    ├── reconnect.rs                # Reconnect state machine and snapshots
-    ├── telemetry.rs                # GET_TELEMETRY request + snapshot parsing
-    └── transport.rs                # Serialport-backed HidGateway
-```
-
-### 2.13 `crates/synapse-models/` — ONNX runtime wrapper
+### 2.12 `crates/synapse-models/` — ONNX runtime wrapper
 
 ```
 crates/synapse-models/
@@ -909,7 +878,7 @@ crates/synapse-models/
     └── lib.rs                      # ModelDescriptor, Detector trait, DetectionFrame, ort feature-gated session loader
 ```
 
-### 2.14 `crates/synapse-telemetry/` — tracing + metrics
+### 2.13 `crates/synapse-telemetry/` — tracing + metrics
 
 ```
 crates/synapse-telemetry/
@@ -919,7 +888,7 @@ crates/synapse-telemetry/
     └── metrics.rs                  # M3_METRICS array (19 specs), describe_metric, CARDINALITY_LIMIT=1000
 ```
 
-### 2.15 `crates/synapse-test-utils/` — shared test rig
+### 2.14 `crates/synapse-test-utils/` — shared test rig
 
 ```
 crates/synapse-test-utils/
@@ -930,7 +899,7 @@ crates/synapse-test-utils/
     └── stdio_mcp_client.rs         # StdioMcpClient: launches synapse-mcp, drives initialize + tools/call
 ```
 
-### 2.16 `crates/synapse-overlay/` — M5 placeholder
+### 2.15 `crates/synapse-overlay/` — M5 placeholder
 
 ```
 crates/synapse-overlay/
@@ -954,7 +923,7 @@ crates/synapse-overlay/
 
 | Path | Description |
 |---|---|
-| `docs/computergames/` | Product Requirements Document (PRD) — 24 numbered files covering architecture, perception, action, reflex, MCP surface, schemas, storage, supported use, hardware HID, perf budget, security, observability, testing, build, roadmap, open questions, research appendix, Luanti benchmark/runbook, profile-registry governance, optional registry protocol, local registry data model, and profile package manifests |
+| `docs/computergames/` | Product Requirements Document (PRD) — 24 numbered files covering architecture, perception, action, reflex, MCP surface, schemas, storage, supported use, retired physical HID notes, perf budget, security, observability, testing, build, roadmap, open questions, research appendix, Luanti benchmark/runbook, profile-registry governance, optional registry protocol, local registry data model, and profile package manifests |
 | `docs/impplan/` | Implementation plan — methodology + per-milestone work-item ledger (M0 through M5) + cross-cutting concerns |
 | `docs/adr/0001-current-rust-and-dependencies.md` | ADR: pinned to current stable Rust, no MSRV downgrade |
 | `docs/adr/0002-rocksdb-primary-storage.md` | ADR: RocksDB chosen over LMDB/sled for primary storage |
@@ -983,8 +952,7 @@ synapse-core            (no synapse-* deps; standalone shared types)
   ├── synapse-audio         (synapse-core, synapse-models{directml})
   ├── synapse-action        (synapse-core; cfg(windows): synapse-a11y, synapse-capture)
   ├── synapse-perception    (synapse-core; cfg(windows): synapse-a11y, synapse-capture, synapse-models)
-  ├── synapse-reflex        (synapse-core, synapse-storage, synapse-action)
-  └── synapse-hid-host      (synapse-core; serialport + crc16 HID gateway)
+  └── synapse-reflex        (synapse-core, synapse-storage, synapse-action)
 
 synapse-mcp (binary)
   ↑
@@ -1095,7 +1063,7 @@ SynapseService::observe
 
 | File | Purpose |
 |---|---|
-| `Cargo.toml` (workspace) | Declares 15 workspace members (`crates/synapse-*`), default-members `[synapse-mcp, synapse-overlay]`, `exclude = ["firmware/pico-hid"]`. Workspace package metadata: `version = "0.1.0"`, `edition = 2024`, `rust-version = "1.95"`, `license = "MIT OR Apache-2.0"`, `repository = "https://github.com/ChrisRoyse/Synapse"`. |
+| `Cargo.toml` (workspace) | Declares 15 workspace members (`crates/synapse-*`), default-members `[synapse-mcp, synapse-overlay]`, `exclude = []`. Workspace package metadata: `version = "0.1.0"`, `edition = 2024`, `rust-version = "1.95"`, `license = "MIT OR Apache-2.0"`, `repository = "https://github.com/ChrisRoyse/Synapse"`. |
 | `Cargo.toml [workspace.dependencies]` | Pins all third-party deps (38 entries) at the workspace level; child crates use `<dep>.workspace = true` |
 | `Cargo.toml [workspace.lints.rust]` | `unsafe_code = forbid`, `unused = warn` |
 | `Cargo.toml [workspace.lints.clippy]` | `all = deny`, `pedantic/nursery = warn`, `unwrap_used = deny`, `expect_used = deny` |
@@ -1103,7 +1071,7 @@ SynapseService::observe
 | `Cargo.toml [profile.release]` | `opt-level=3`, `lto="thin"`, `codegen-units=16`, `strip=true`, `panic="abort"` |
 | `Cargo.toml [profile.release-max]` | inherits release, `lto="fat"`, `codegen-units=1` |
 | `Cargo.toml [profile.bench]` | inherits release with line-only debug |
-| Per-crate `Cargo.toml` | All workspace members override `[lints.rust]::unsafe_code` to `allow` only in: `synapse-action`, `synapse-a11y`, `synapse-capture`, `synapse-audio`, `synapse-hid-host` (anywhere doing FFI). Default-binary in `synapse-mcp/Cargo.toml`: `[[bin]] name = "synapse-mcp" path = "src/main.rs"`. Bench harness flags (`harness = false`) declare each `criterion` bench. |
+| Per-crate `Cargo.toml` | Workspace members override `[lints.rust]::unsafe_code` to `allow` only where FFI requires it: `synapse-action`, `synapse-a11y`, `synapse-capture`, and `synapse-audio`. Default-binary in `synapse-mcp/Cargo.toml`: `[[bin]] name = "synapse-mcp" path = "src/main.rs"`. Bench harness flags (`harness = false`) declare each `criterion` bench. |
 | `deny.toml` | cargo-deny configuration (advisory/licensing checks). Repo policy bans GitHub Actions as a shipping gate (`AGENTS.md`), so this is used locally only. |
 
 The release binary path on Windows is `target/release/synapse-mcp.exe` (linux/wsl variant `target/release/synapse-mcp`).
@@ -1161,14 +1129,11 @@ All flags are defined in `crates/synapse-mcp/src/main.rs::Cli` (clap derive).
 | `--log-level` | `SYNAPSE_LOG_LEVEL` | `String` (parsed `LevelFilter`) | `info` | `trace`/`debug`/`info`/`warn`/`error`/`off` | Sets both file and console layer filters (`crates/synapse-mcp/src/main.rs::configure_telemetry`) |
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | `bool` | `false` | `0`, `1`, `true`, `false` (case-insensitive); other values reject startup (`parse_bool_env` in `m3.rs`) | Disables the reflex runtime; reflex tool calls return `REFLEX_DISABLED_BY_OPERATOR`. |
 | `--enable-audio` | `SYNAPSE_ENABLE_AUDIO` | `bool` | `false` | same as above | Required to grant `READ_AUDIO` and to spawn the WASAPI loopback. `audio_tail` / `audio_transcribe` require this. |
-| `--allow-unknown-profile` | `SYNAPSE_ALLOW_UNKNOWN_PROFILE` | `bool` | `false` | same as above | Permits activating profiles whose `use_scope = unknown`. |
-| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | `Option<String>` | derived default set (see §4.4) | comma/semicolon/whitespace-separated permission names (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`; aliases `KEYBOARD`/`MOUSE`/`PAD`/`HARDWARE_HID`; sentinel values `NONE` and `DENY_ALL` produce an empty set) | M3 permission grant list. Invalid permission names refuse startup. |
+| `--restrict-unknown-profile` | `SYNAPSE_RESTRICT_UNKNOWN_PROFILE` | `bool` | `false` | same as above | Fail-closed switch. Off by default (permissive): unknown/unprofiled foreground apps are actionable. Set it to refuse action dispatch on `use_scope = unknown` / no-profile foregrounds. |
+| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | `Option<String>` | derived default set (see §4.4) | comma/semicolon/whitespace-separated permission names (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`; aliases `KEYBOARD`/`MOUSE`/`PAD`; sentinel values `NONE` and `DENY_ALL` produce an empty set) | M3 permission grant list. Invalid permission names refuse startup. |
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | `bool` | `false` | same as bool flags above | Forces the reflex scheduler into degraded-latency mode (test-only knob). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | `Option<u64>` | `None` | unsigned integer | If set, applies one synthetic free-byte sample at startup to validate disk-pressure responder paths (`Db::run_pressure_check_with_free_bytes_sample`). |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | `NonZeroUsize` | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | `>=1` | SSE event subscription cap on the bus. |
-| `--hardware-hid` | `SYNAPSE_HARDWARE_HID` | `Option<String>` | `None` | `auto` or a serial port name such as `COM7` | Enables the hardware HID backend. First use requires the exact console phrase `I AUTHORIZE HARDWARE INPUT`; refusal exits 2 with `SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused` before the backend starts. Accepted consent writes `%APPDATA%/synapse/agreement.json`; `auto` enumerates matching Synapse Pico serial ports and proves identity; a port value opens that port directly. Missing/no-match fails startup with `HID_PORT_NOT_FOUND`; omission leaves `Backend::Hardware` fail-closed through `ACTION_BACKEND_UNAVAILABLE`. |
-| `--reset-hardware-consent` | — | `bool` | `false` | flag | Deletes the existing hardware HID agreement file, then requires the exact hardware consent phrase again before startup continues. |
-
 CLI examples (`README.md`):
 
 ```bash
@@ -1241,9 +1206,8 @@ Permission names and aliases (`crates/synapse-mcp/src/m3/permissions.rs::Permiss
 | `INPUT_KEYBOARD` | `KEYBOARD` | implicitly required by any reflex whose `then` actions touch the keyboard |
 | `INPUT_MOUSE` | `MOUSE` | reflex actions touching the mouse |
 | `INPUT_PAD` | `PAD` | reflex actions touching the gamepad |
-| `INPUT_HARDWARE_HID` | `HARDWARE_HID` | reflex actions whose `backend = Hardware` |
 
-Default permission set when `--allowed-permissions` is omitted (`default_grants` in `permissions.rs`): all the above except `READ_AUDIO` (added only when `--enable-audio`) and `INPUT_HARDWARE_HID`.
+Default permission set when `--allowed-permissions` is omitted (`default_grants` in `permissions.rs`): all the above except `READ_AUDIO` (added only when `--enable-audio`).
 
 If `--allowed-permissions` includes `READ_AUDIO` but `--enable-audio` is not passed, startup fails with `READ_AUDIO requires --enable-audio or SYNAPSE_ENABLE_AUDIO=true`.
 
@@ -1254,7 +1218,7 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 - Default name when `path` is omitted: `replay-<uuid-v7>.jsonl`.
 
 ### 4.6 Profiles
-- Activating a profile whose `use_scope = unknown` without `--allow-unknown-profile` → `SAFETY_PROFILE_ACTION_DENIED`. (`crates/synapse-mcp/src/m3/profile.rs::activate_profile`)
+- Action dispatch on a `use_scope = unknown` / unprofiled foreground is allowed by default (permissive). With `--restrict-unknown-profile` it returns `SAFETY_PROFILE_ACTION_DENIED`. (`crates/synapse-mcp/src/m3/profile.rs::activate_profile`, `server/context.rs::ensure_profile_scope_allows_action`)
 
 ### 4.7 Audio
 - `audio_tail.seconds` ≤ `synapse_audio::MAX_RING_SECONDS = 5`; larger → `TOOL_PARAMS_INVALID`.
@@ -1271,12 +1235,11 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 - Token-bucket per-backend rate limits: `SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S` (`crates/synapse-action/src/rate_limit.rs`). Over-rate emits return `ACTION_RATE_LIMITED`.
 - Action emitter queue capacity: `ACTION_QUEUE_CAPACITY = 256` (`crates/synapse-action/src/handle.rs`). Backpressure → `ACTION_QUEUE_FULL`.
 
-### 4.9 Hardware HID Consent
-- If `--hardware-hid <port|auto>` is set and `SYNAPSE_MCP_RECORDING_BACKEND` is not active, startup checks `%APPDATA%/synapse/agreement.json` (or `SYNAPSE_AGREEMENT_PATH` when set) before constructing the action backend.
-- Missing agreement triggers the startup console prompt. The response must exactly equal `I AUTHORIZE HARDWARE INPUT` after line-ending removal only; leading/trailing spaces, case changes, empty input, or EOF are refused.
-- Refusal logs and prints `SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused`, exits 2, and leaves the agreement file absent.
-- A valid agreement records schema version, `acknowledged_at`, the accepted `hardware_hid.port`, the SHA-256 of the phrase, and `supported_use_scopes=["productivity","single_player"]`; Windows readback verifies the protected ACL before continuing.
-- `--reset-hardware-consent` removes the existing agreement first, then follows the same prompt/write/ACL-readback path.
+### 4.9 Retired hardware backend token
+- There is no runtime configuration path that enables a physical hardware backend.
+- `Backend::Hardware` and profile `default_backend = "hardware"` still parse for compatibility, but action dispatch routes them to `HardwareUnavailableBackend`.
+- The fail-closed error is `ACTION_BACKEND_UNAVAILABLE` with guidance to use `backend=software` or `backend=vigem`.
+- Removed permission names or aliases are treated like any other unknown permission and refuse startup when supplied in `--allowed-permissions`.
 
 ### 4.10 Telemetry
 - Log directory must be writable: probe writes `.synapse-write-probe` and deletes it; failure → `TELEMETRY_LOG_DIR_NOT_WRITABLE`.
@@ -1284,18 +1247,18 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 
 ## 5. Config loading order
 
-The `Cli::m2_config` method constructs `M2ServiceConfig` from `--hardware-hid` / `SYNAPSE_HARDWARE_HID` and `SYNAPSE_MCP_RECORDING_BACKEND`; `Cli::m3_config` constructs `M3ServiceConfig` from clap fields and additionally consults `SYNAPSE_BEARER_TOKEN` at that point (`crates/synapse-mcp/src/m3.rs::from_cli_parts`). All other env vars are read at their respective construction sites:
+The `Cli::m2_config` method constructs `M2ServiceConfig` from `SYNAPSE_MCP_RECORDING_BACKEND`; `Cli::m3_config` constructs `M3ServiceConfig` from clap fields and additionally consults `SYNAPSE_BEARER_TOKEN` at that point (`crates/synapse-mcp/src/m3.rs::from_cli_parts`). All other env vars are read at their respective construction sites:
 
 ```text
 clap (CLI flag > env via clap) → Cli
         │
-        ├→ Cli::m2_config()  → M2ServiceConfig (hardware HID + recording backend)
+        ├→ Cli::m2_config()  → M2ServiceConfig (recording backend)
         └→ Cli::m3_config()  → M3ServiceConfig (also reads SYNAPSE_BEARER_TOKEN)
                 │
                 ├→ configure_telemetry()  → reads SYNAPSE_LOG_DIR + SYNAPSE_LOG_GC_INTERVAL_S
                 │
                 └→ run_stdio / http::serve
-                    ├→ M2State::try_from_config → connects hardware HID if configured; reads SYNAPSE_MCP_RECORDING_BACKEND from M2ServiceConfig
+                    ├→ M2State::try_from_config → reads SYNAPSE_MCP_RECORDING_BACKEND from M2ServiceConfig
                     ├→ M1State::from_env        → reads SYNAPSE_MCP_SYNTHETIC_FIXTURE, _FORCE_NO_PERCEPTION, _FORCE_OBSERVE_INTERNAL
                     ├→ M3State::from_*          → reads SYNAPSE_BIND, SYNAPSE_BEARER_TOKEN, SYNAPSE_AUDIO_LOOPBACK
                     │      (additional env mirrors of --reflex-disabled etc. when used via M3ServiceConfig::from_env)
@@ -1778,7 +1741,7 @@ Full table in [04_storage_layer.md §6](#file-04).
 
 | Type | Source | Notes |
 |---|---|---|
-| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire. `Auto` resolves from the active action backend policy: default session = keyboard/mouse/combo/release-all `software`, pad `vigem`; profile `default_backend = "hardware"` makes Auto resolve to `hardware` unless a class default overrides it. |
+| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire. `Hardware` is a retired compatibility value that fails closed at action dispatch. `Auto` resolves from the active action backend policy: default session = keyboard/mouse/combo/release-all `software`, pad `vigem`; profile `default_backend = "hardware"` makes Auto resolve to the fail-closed hardware slot unless a class default overrides it. |
 | `Point` | `{ x: i32, y: i32 }` | screen coords; provides `distance_to(other: Self) -> f64` |
 | `Rect` | `{ x: i32, y: i32, w: i32, h: i32 }` | `contains(point: Point)` with exclusive right/bottom edges; non-positive width/height treated as empty |
 | `Size` | `{ w: u32, h: u32 }` | |
@@ -2776,7 +2739,6 @@ The action subsystem is an actor-style emitter with an Tokio mpsc producer (`Act
 | Symbol | Source |
 |---|---|
 | `ActionBackend`, `BackendResolutionPolicy`, `ResolvedBackend`, `resolve_backend`, `resolve_backend_with_policy` | `backend::mod` |
-| `HardwareBackend` | `backend::hardware` |
 | `RecordedInput`, `RecordingBackend` | `backend::recording` |
 | `HardwareUnavailableBackend` | `backend::unavailable` |
 | `VigemBackend` | `backend::vigem` |
@@ -2784,7 +2746,7 @@ The action subsystem is an actor-style emitter with an Tokio mpsc producer (`Act
 | `ClipboardFormat`, `clear_clipboard`, `read_clipboard_text`, `write_clipboard_text` | `clipboard` |
 | `sample_curve` | `curve` |
 | `BIGRAMS`, `KeystrokeEvent`, `ModifierMask`, `sample_typing_schedule` | `dynamics` |
-| `ActionEmitter`, `ActionEmitterSnapshotHandle`, `ActionSnapshotMessage`, `ActionStateSnapshot`, `Backends`, `EmitState`, `HardwareHidConfig`, `HELD_KEY_MAX_DURATION_MS` | `emitter` |
+| `ActionEmitter`, `ActionEmitterSnapshotHandle`, `ActionSnapshotMessage`, `ActionStateSnapshot`, `Backends`, `EmitState`, `HELD_KEY_MAX_DURATION_MS` | `emitter` |
 | `ActionError`, `ActionResult` | `error` |
 | `ACTION_QUEUE_CAPACITY`, `ActionHandle`, `ActionMessage`, `RELEASE_ALL_HANDLE` | `handle` |
 | `OperatorHotkeyGuard`, `install_operator_hotkey`, `operator_release_epoch`, `operator_release_requested_since` | `hotkey` |
@@ -2837,7 +2799,7 @@ For each `(Action, oneshot::Sender)` pulled from the channel:
 2. **Resolve backend.** `routing.rs` reads the emitter's active `BackendResolutionPolicy` and calls `backend::resolve_backend_with_policy(action.backend(), &action, policy)`:
    - `Software` → `ResolvedBackend::Software`
    - `Vigem` → `ResolvedBackend::Vigem`
-   - `Hardware` → `ResolvedBackend::Hardware`; the selected backend is `HardwareBackend` only when `synapse-mcp` was started with `--hardware-hid <port|auto>` and the HID connection/IDENTIFY succeeded. Otherwise the hardware slot is `HardwareUnavailableBackend`.
+   - `Hardware` → `ResolvedBackend::Hardware`; the selected backend is always `HardwareUnavailableBackend`, because the physical hardware implementation is retired.
    - `Auto` with the global default policy → `ResolvedBackend::Vigem` for `Pad*` actions and `Software` for keyboard, mouse, combo, and release-all.
    - `Auto` after activating a profile with `[backends] default_backend = "hardware"` → `ResolvedBackend::Hardware` for keyboard, mouse, pad, combo, and release-all unless `keyboard_default`, `mouse_default`, or `pad_default` is explicitly set for that class.
    - The active policy and resolved table are readable at `health.subsystems.action.backend_resolution`.
@@ -2849,10 +2811,9 @@ For each `(Action, oneshot::Sender)` pulled from the channel:
    - **`SoftwareBackend`** (`backend/software/*`): SendInput-based keyboard/mouse/text, see §4
    - **`VigemBackend`** (`backend/vigem/*`): X360/DS4 controller report via `vigem-client`
    - **`RecordingBackend`** (`backend/recording/*`): appends a `RecordedInput` to an in-memory log (used in tests and via `SYNAPSE_MCP_RECORDING_BACKEND=1`)
-   - **`HardwareBackend`** (`backend/hardware/*`): serializes supported key, mouse-relative, absolute-mouse-to-relative batch, pad, combo, and release commands through `synapse-hid-host::HidGateway`
-   - **`HardwareUnavailableBackend`** (`backend/unavailable`): fail-closed response when hardware HID is not enabled, returning `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
+   - **`HardwareUnavailableBackend`** (`backend/unavailable`): fail-closed response when the retired `hardware` compatibility token is selected, returning `ACTION_BACKEND_UNAVAILABLE` with guidance to use `backend=software` or `backend=vigem`
 5. **Auto-release timers.** `emitter::keyboard` enforces `HELD_KEY_MAX_DURATION_MS` per `(Key, ResolvedBackend)` held key. After the limit, the emitter inserts a synthetic `KeyUp` for the backend that owns the hold and emits a `STUCK_KEY_AUTO_RELEASED` warn-log + event with `backend=<software|vigem|hardware>`.
-6. **ReleaseAll**: reads the full `EmitState` union, aborts held-key timers, and dispatches `Action::ReleaseAll` through every backend that owns releasable state. Each backend sees only its own `held_keys`/`held_buttons` snapshot while executing, so software release cannot claim hardware-held inputs and hardware release cannot claim software-held inputs. ViGEm pad state is released through the ViGEm backend when pads are held. When a real hardware HID backend was configured at startup, the emitter also dispatches `Action::ReleaseAll` to `HardwareBackend`, which sends one firmware `RELEASE_ALL (0x40)` command and clears the hardware host mirror. The safety log records `code=SAFETY_RELEASE_ALL_FIRED`, `backend="hardware"`, `primary_backend`, `release_backends`, and `hardware_release_ok` for this path. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
+6. **ReleaseAll**: reads the full `EmitState` union, aborts held-key timers, and dispatches `Action::ReleaseAll` through every backend that owns releasable state. Each backend sees only its own `held_keys`/`held_buttons` snapshot while executing, so software release cannot claim another backend's held inputs. ViGEm pad state is released through the ViGEm backend when pads are held. The retired hardware slot cannot create held input state because every selected hardware action fails before state mutation. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
 7. **Ack.** Send `Ok(())` or the `ActionError` back on the oneshot.
 
 ### 3.3 Lifecycle (`emitter::lifecycle`)
@@ -2962,7 +2923,6 @@ Algorithm:
 | `BackendUnavailable { detail }` | `ACTION_BACKEND_UNAVAILABLE` | Emitter channel closed, unsupported feature, non-Windows stub |
 | `TargetInvalid { detail }` | `ACTION_TARGET_INVALID` | Invalid `AimTarget`/`MouseTarget` resolution |
 | `HoldExceededMax { detail }` | `ACTION_HOLD_EXCEEDED_MAX` | hold_ms > 30000 (per-tool guard) |
-| `HidPortDisconnected { detail }` | `ACTION_HID_PORT_DISCONNECTED` | HID gateway disconnected, reconnecting, or timed out after startup |
 | `VigemNotInstalled { detail }` | `ACTION_VIGEM_NOT_INSTALLED` | Driver missing |
 | `VigemPluginFailed { detail }` | `ACTION_VIGEM_PLUGIN_FAILED` | vigem-client plug error |
 | `ElementNotResolved { detail }` | `ACTION_ELEMENT_NOT_RESOLVED` | UIA re_resolve returned None |
@@ -3001,7 +2961,7 @@ Each M2 tool wrapper builds one or more `synapse_core::Action`s and dispatches t
 
 ## 17. What is NOT covered
 
-- **Remaining hardware HID gaps.** The live `Backend::Hardware` path is enabled by `--hardware-hid <port|auto>` and maps Synapse keys to USB HID Keyboard/Keypad usage IDs with boot-report modifier byte handling, 6KRO limit enforcement, shifted US-layout text, and absolute mouse fallback by converting screen or resolved-element targets into batched `MOUSE_MOVE_REL` commands. Curve-generated hardware mouse batches coalesce adjacent same-direction deltas within a `<= 2 ms` implied window when the merged payload stays inside the firmware `-127..=127` axis range (ADR-0012); software and standalone direct `MouseMoveRelative` actions are unchanged. Broader supported-use gates remain M4 work.
+- **Retired hardware token.** `Backend::Hardware` remains on the wire only as a compatibility token for older profiles/packages. It fails closed with `ACTION_BACKEND_UNAVAILABLE`; there is no live physical HID backend to tune or extend.
 - **Modifiers on `act_click`.** The schema accepts `Vec<ClickModifier>` but emitting a non-empty list currently returns `ACTION_BACKEND_UNAVAILABLE` with the message "act_click modifiers are not wired in the M2 click schema slice".
 - **Element-target aim and drag**. `act_aim` with an `Element` target returns `ACTION_BACKEND_UNAVAILABLE` ("requires the dedicated target resolution issue"); same for `Track` targets. `act_drag` supports `Element` targets via UIA bbox resolution.
 
@@ -3617,7 +3577,7 @@ See `tests/fixtures/audio/README.md` for the synthesis recipe.
 
 > Source: `docs/systemspec/11_profiles_hid_telemetry.md`
 
-# 11 — Profiles, Hardware HID, Telemetry, Test Utilities
+# 11 — Profiles, Telemetry, Test Utilities
 
 Source files covered:
 - `crates/synapse-profiles/src/lib.rs`
@@ -3630,7 +3590,6 @@ Source files covered:
 - `crates/synapse-profiles/src/resolver.rs`
 - `crates/synapse-profiles/src/toml_format.rs`
 - `crates/synapse-profiles/src/watcher.rs`
-- `crates/synapse-hid-host/src/lib.rs`
 - `crates/synapse-telemetry/src/lib.rs`
 - `crates/synapse-telemetry/src/metrics.rs`
 - `crates/synapse-test-utils/src/lib.rs`
@@ -3805,29 +3764,17 @@ match does not activate the profile or overwrite a manual `profile_activate`.
 | Tool | Behavior |
 |---|---|
 | `profile_list { include_inactive: bool default true }` | calls `runtime.list(include_inactive)` and `runtime.active_profile_id()`; permission: `READ_PROFILE` |
-| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--allow-unknown-profile` is not set, return `SAFETY_PROFILE_ACTION_DENIED`; activate the profile (or return `changed = false` if already active); then apply `Profile.backends` to M2's `BackendResolutionPolicy`; permission: `WRITE_PROFILE_ACTIVE` |
+| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--restrict-unknown-profile` IS set, return `SAFETY_PROFILE_ACTION_DENIED` (default is permissive — unknown scopes are allowed); activate the profile (or return `changed = false` if already active); then apply `Profile.backends` to M2's `BackendResolutionPolicy`; permission: `WRITE_PROFILE_ACTIVE` |
 
 Activating a profile updates the action emitter's shared backend-resolution
 policy. `[backends] default_backend = "hardware"` is accepted as a TOML alias
-for `default = "hardware"` and causes `Backend::Auto` actions to resolve to
-hardware for that profile unless a class-specific default overrides it. The
+for `default = "hardware"` for compatibility, but `Backend::Auto` actions that
+resolve to that slot fail closed with `ACTION_BACKEND_UNAVAILABLE`. The
 separate source-of-truth readback is `health.subsystems.action.backend_resolution`.
 
-## 2. `synapse-hid-host`
+## 2. `synapse-telemetry`
 
-```text
-crates/synapse-hid-host/src/
-  discover.rs, error.rs, handshake.rs, lib.rs, pipeline.rs,
-  protocol.rs, reconnect.rs, telemetry.rs, transport.rs
-```
-
-Direct dependencies (`Cargo.toml`): `crc16`, `serde`, `serialport`, `synapse-core`, `thiserror`, `tokio`, `tracing`. The crate implements the host-side serial gateway used by `HardwareBackend`: port discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frames, pipelined send, reconnect state, and structured HID errors.
-
-The live driver talks to the RP2040 firmware over USB CDC at 1 Mbaud, with CRC16 frames and a firmware version handshake. `HidGateway::get_telemetry` and `HidReconnectGateway::get_telemetry` issue `GET_TELEMETRY` and parse the 28-byte base `TELEMETRY_RESP` payload into `HidTelemetrySnapshot { uptime_ms, frames_received, frames_dropped, link_errors, commands_executed, watchdog_fires, crc_errors }`. Current firmware extends that payload to 44 bytes with optional device-clock timing fields: `timed_commands`, `previous_command_delta_us`, `last_command_delta_us`, and `last_timed_command_uptime_us`. Host parsing accepts the old 28-byte payload for diagnostic compatibility, but hardware timing benchmarks require the 44-byte timing extension and fail closed when it is absent. Error codes surfaced by the driver include `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, and `HID_LINK_TIMEOUT`.
-
-## 3. `synapse-telemetry`
-
-### 3.1 `TelemetryConfig`
+### 2.1 `TelemetryConfig`
 
 ```rust
 pub struct TelemetryConfig {
@@ -3849,25 +3796,25 @@ Constants:
 | `DEFAULT_GC_INTERVAL` | `6 hours` |
 | `GC_INTERVAL_ENV` | `"SYNAPSE_LOG_GC_INTERVAL_S"` |
 
-### 3.2 `init_tracing(cfg)` algorithm
+### 2.2 `init_tracing(cfg)` algorithm
 
 1. Resolve `log_dir`. `default_log_dir()`:
    - Windows: `%LOCALAPPDATA%/synapse/logs`
    - else: `$XDG_STATE_HOME/synapse/logs` or `$HOME/.local/state/synapse/logs` or `.synapse-state/synapse/logs`
 2. `prepare_log_dir(log_dir)`: `fs::create_dir_all`, then write+delete a `.synapse-write-probe` file. Failure → `TelemetryError::LogDirNotWritable`.
-3. Run an immediate `run_log_gc` pass (see §3.4).
+3. Run an immediate `run_log_gc` pass (see §2.4).
 4. Build `tracing_appender::rolling::daily(log_dir, "synapse.log")` → non-blocking writer + `WorkerGuard`.
 5. Layer composition:
    - File layer: JSON, includes target, file, line number, thread id/name, current span + span list. Filtered to `cfg.file_level`.
    - Console layer: stderr writer, no ANSI, filtered by `EnvFilter::builder().with_default_directive(cfg.console_level.into()).from_env_lossy()` so the operator's `RUST_LOG` overrides remain effective.
 6. `Registry::default().with(file_layer).with(console_layer).try_init()` (returns `SubscriberInit` if another global subscriber is installed).
 7. `install_panic_hook()` (idempotent via `Once`): wraps any prior hook and emits a `tracing::error!(code = "TELEMETRY_PANIC_HOOK_FIRED", payload, location, ...)` before delegating.
-8. `metrics::register_m3_metrics()` (see §3.5).
-9. Spawn the GC worker (§3.4) and store in the `TelemetryGuard`.
+8. `metrics::register_m3_metrics()` (see §2.5).
+9. Spawn the GC worker (§2.4) and store in the `TelemetryGuard`.
 
 Returned `TelemetryGuard` ties: `_file_guard: WorkerGuard` (flushes on drop) and `_gc_worker: Option<GcWorker>` (shuts down on drop).
 
-### 3.3 `effective_gc_interval`
+### 2.3 `effective_gc_interval`
 
 `SYNAPSE_LOG_GC_INTERVAL_S` env var overrides the configured `gc_interval` at startup:
 
@@ -3875,7 +3822,7 @@ Returned `TelemetryGuard` ties: `_file_guard: WorkerGuard` (flushes on drop) and
 - `0` or `Some(Duration::ZERO)` → disable GC.
 - Otherwise interpret as seconds.
 
-### 3.4 `run_log_gc(log_dir, keep_days, max_dir_bytes)`
+### 2.4 `run_log_gc(log_dir, keep_days, max_dir_bytes)`
 
 1. Walk `log_dir` (non-recursive). For each file:
    - If older than `keep_days * 86_400 s`, delete and continue.
@@ -3885,7 +3832,7 @@ Returned `TelemetryGuard` ties: `_file_guard: WorkerGuard` (flushes on drop) and
 
 The background `GcWorker` thread re-runs this on `recv_timeout(interval)`; channel disconnect (parent guard dropped) breaks the loop cleanly.
 
-### 3.5 Metrics registry (`metrics.rs`)
+### 2.5 Metrics registry (`metrics.rs`)
 
 `M3_METRICS: &[MetricSpec; 19]` declares all M3-era metrics with bounded label cardinality. `register_m3_metrics()` calls `describe_metric` per spec and emits one `tracing::info!(code = "M3_METRIC_REGISTERED", ...)` per metric. Recorded `Once` so repeat calls are no-ops.
 
@@ -3913,7 +3860,7 @@ The background `GcWorker` thread re-runs this on `recv_timeout(interval)`; chann
 
 Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert every spec stays under the limit.
 
-### 3.6 Errors
+### 2.6 Errors
 
 `TelemetryError` variants and codes:
 
@@ -3925,9 +3872,9 @@ Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert eve
 
 (These error names are crate-private constants — they are not in `synapse_core::error_codes` because telemetry initialization happens before that module is reachable.)
 
-## 4. `synapse-test-utils`
+## 3. `synapse-test-utils`
 
-### 4.1 `StdioMcpClient`
+### 3.1 `StdioMcpClient`
 
 `crates/synapse-test-utils/src/stdio_mcp_client.rs`:
 
@@ -3936,7 +3883,7 @@ Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert eve
 - `tools_list() -> Result<serde_json::Value>`: lists available tools.
 - On `Drop`, terminates the child process (used by `drop_kills_child.rs` integration test).
 
-### 4.2 Fixtures
+### 3.2 Fixtures
 
 `crates/synapse-test-utils/src/fixtures.rs` includes:
 
@@ -3946,15 +3893,14 @@ Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert eve
 
 These are gated behind `cfg(windows)` and the Notepad fixture is the basis for the `m2_notepad_type_save.rs` end-to-end test in `synapse-mcp`.
 
-## 5. Cross-references
+## 4. Cross-references
 
 - Permission gates that consult profile use-scope: [03_configuration.md §4.4](#file-03), [06_mcp_service_and_transports.md §1.5](#file-06).
 - Profile schema types: [05_core_types_and_errors.md §5.5](#file-05).
 - Metric usage: [07_reflex_runtime.md §10](#file-07), [10_audio_and_models.md §4](#file-10), [04_storage_layer.md §7](#file-04).
 
-## 6. What is NOT covered
+## 5. What is NOT covered
 
-- **Physical `synapse-hid-host` runtime FSV.** Source inspection covers the host driver shape; issue closure still requires real Pico/COM-device source-of-truth evidence on the configured host.
 - **OTLP export.** `opentelemetry` and `opentelemetry-otlp` are in workspace deps but not wired in `synapse-telemetry::init_tracing` — the file/console layers are the only sinks.
 - **Prometheus exporter binding.** `metrics-exporter-prometheus` is referenced in workspace deps but not bound to an HTTP port by `synapse-telemetry`; the `register_m3_metrics` path only describes the metrics so the `metrics` crate global recorder can hold them.
 - **Profile activation persistence.** Activating a profile updates in-memory state only; nothing is persisted to `CF_PROFILES` in this build (PRD §7 reserves that CF for future use).
@@ -3999,7 +3945,7 @@ Per `docs/impplan/README.md` §"State-tracking", the authority order is:
 2. **`main` branch** — what is in code now (impplan is wrong if it disagrees; patch the impplan in the same PR).
 3. **GitHub Issues** — every PR-sized task, `[DECISION]`, `[DISCOVERY]`, bug, risk, context (labels: `phase:m{N}`, `area:*`).
 
-## 2. Milestone state (as of 2026-05-26, HEAD `e54ca57`)
+## 2. Milestone state (as of 2026-05-31)
 
 | # | Milestone | Tag | Date | Source |
 |---|---|---|---|---|
@@ -4007,8 +3953,8 @@ Per `docs/impplan/README.md` §"State-tracking", the authority order is:
 | M1 | Perception MVP — capture + UIA + `observe()` + 5 tools | `v0.1.0-m1` | 2026-05-23 | `docs/impplan/README.md` |
 | M2 | Action MVP — `synapse-action` + 9 tools + `release_all` | `v0.1.0-m2` | 2026-05-24 | `CHANGELOG.md::v0.1.0-m2` |
 | M3 | Reflex + RocksDB + profiles + HTTP/SSE + audio + 15 tools | `v0.1.0-m3` (@ `97019ec`) | 2026-05-25 | `CHANGELOG.md::v0.1.0-m3` + `docs/impplan/04_m3_reflex_mcp_surface.md` |
-| **M4** | **RP2040 firmware + `synapse-hid-host` serial driver + operator-attended EverQuest first-game evaluation + `act_combo`/`act_run_shell`/`act_launch`** | — | **ACTIVE** | `docs/impplan/05_m4_hardware_hid_first_game.md` |
-| M5 | Production polish — installer, overlay, ≥10 profiles, profile-registry/audit-data moat, VLM `describe`, soak | — | release gate blocked by M4; #454/#455-#470 registry/audit moat active as P1 | `docs/impplan/06_m5_production_polish.md` |
+| **M4** | **First-game/profile runtime + compound actions; physical HID path retired by #588/#589** | `v0.1.0-m4` | tagged / retired hardware plan | `docs/impplan/05_m4_hardware_hid_first_game.md` |
+| M5 | Production polish — installer, overlay, ≥10 profiles, profile-registry/audit-data moat, VLM `describe`, soak | — | active; #454/#455-#470 registry/audit moat active as P1 | `docs/impplan/06_m5_production_polish.md` |
 
 M3 closed 2026-05-25 (`v0.1.0-m3` @ `97019ec`). What landed on `main`:
 
@@ -4059,15 +4005,13 @@ rows for restoring only prior trusted/local-validated packages.
 
 M3 carry-over open for M4 to address:
 
-- **LoC overrun** — 500-LoC file cap was violated during M3. On `main` (HEAD `e54ca57`): `synapse-a11y/src/lib.rs` (2087), `synapse-capture/src/lib.rs` (1798), `synapse-core/src/types.rs` (1567), `synapse-mcp/src/server.rs` (1335), `synapse-mcp/src/m3/reflex.rs` (1165), `synapse-reflex/src/lib.rs` (986), `synapse-reflex/src/scheduler.rs` (890), `synapse-mcp/src/http/sse.rs` (764), `synapse-mcp/src/m3/replay.rs` (651), `synapse-models/src/lib.rs` (535). M4's Block A.0 splits these before adding hardware HID. Several test files also exceed cap.
+- **LoC overrun** — 500-LoC file cap was violated during M3. On `main` (HEAD `e54ca57`): `synapse-a11y/src/lib.rs` (2087), `synapse-capture/src/lib.rs` (1798), `synapse-core/src/types.rs` (1567), `synapse-mcp/src/server.rs` (1335), `synapse-mcp/src/m3/reflex.rs` (1165), `synapse-reflex/src/lib.rs` (986), `synapse-reflex/src/scheduler.rs` (890), `synapse-mcp/src/http/sse.rs` (764), `synapse-mcp/src/m3/replay.rs` (651), `synapse-models/src/lib.rs` (535). These remain refactor debt for M5 hardening and should be split or covered by per-file ADRs when touched. Several test files also exceed cap.
 - **CHANGELOG M3 entry tool-name drift** — the `v0.1.0-m3` entry names `profile_get`/`profile_set_active`; shipped names are `profile_list`/`profile_activate`. The four `storage_*` diagnostic tools are also missing from the entry. First M4 docs sweep fixes both.
 
-Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
+M4/M5 current work:
 
-- `firmware/pico-hid/` — standalone RP2040 firmware project excluded from the root Cargo workspace; remaining firmware issues close only with real device evidence.
-- `synapse-hid-host` — serial driver with discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, and reconnect paths. `Backend::Hardware` uses `HardwareBackend` when `--hardware-hid <port|auto>` connects successfully, otherwise it fails closed through `HardwareUnavailableBackend`.
-- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#524/#510/#525/#526/#527/#528/#514/#511/#512/#521/#529/#513/#515/#516/#520/#522/#531 add the EverQuest `/loc`, visible chat-input state, current-state, map-sensor, outcome, route, memory, planner-guard, DynamicJEPA domain normalization, linked trajectory, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model rows/readback, surprise detection, compact world-summary context rows, map-pack inventory/provenance via local CLI, predictive-model fit/predict rows, and action-prior tools; #538 adds the delta-first reality baseline/delta/audit tools, bringing the live MCP surface to 79 plus EverQuest local support binaries.
-- `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
+- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools are live; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#524/#510/#525/#526/#527/#528/#514/#511/#512/#521/#529/#513/#515/#516/#520/#522/#531 add the EverQuest `/loc`, visible chat-input state, current-state, map-sensor, outcome, route, memory, planner-guard, DynamicJEPA domain normalization, linked trajectory, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model rows/readback, surprise detection, compact world-summary context rows, map-pack inventory/provenance via local CLI, predictive-model fit/predict rows, action-prior tools, and autocombat; #538 adds the delta-first reality baseline/delta/audit tools, bringing the live MCP surface to 80 plus EverQuest local support binaries.
+- The physical HID strategy was retired by #588/#589. Live input remains `software` and `vigem`; the `hardware` backend token parses only to fail closed through `HardwareUnavailableBackend`.
 - M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_PROCESS_HISTORY`/`CF_KV` (`CF_REFLEX_AUDIT` and `CF_ACTION_LOG` have live writers); audio detector → SSE-bus sink integration. Profile HUD fields now run through `observe`; standalone `read_hud` remains deferred. VLM `describe` and Florence-2 remain M5.
 
 ## 3. Tools delivered vs planned
@@ -4102,7 +4046,7 @@ delta-first reality tools. Current build:
 | 21 | `reflex_list` | M3 | live | |
 | 22 | `reflex_history` | M3 | live | |
 | 23 | `profile_list` | M3 | live | |
-| 24 | `profile_activate` | M3 | live | use_scope=unknown requires `--allow-unknown-profile` |
+| 24 | `profile_activate` | M3 | live | use_scope=unknown allowed by default; `--restrict-unknown-profile` fails closed |
 | 25 | `replay_record` | M3 | live | JSONL only |
 | 26 | `audio_tail` | M3 | live | |
 | 27 | `audio_transcribe` | M3 | live (en only) | |
@@ -4156,17 +4100,18 @@ delta-first reality tools. Current build:
 | 74 | `everquest_predictive_model_predict` | M4/M5 (EverQuest) | live | calibrated prediction rows with abstention |
 | 75 | `everquest_action_prior_record` | M4/M5 (EverQuest) | live | prediction/outcome sample rows |
 | 76 | `everquest_action_prior_scorecard` | M4/M5 (EverQuest) | live | floor-not-ceiling competence scorecard rows |
-| 77 | `reality_baseline` | M4/#538 (reality) | live | compact baseline/head rows with exact readback |
-| 78 | `observe_delta` | M4/#538 (reality) | live | ordered reality deltas, head updates, and `reality_delta` SSE events |
-| 79 | `reality_audit` | M4/#538 (reality) | live | physical drift audit row with rebase guidance |
+| 77 | `everquest_autocombat` | M4/M5 (EverQuest) | live | bounded attended L1 wizard combat loop with action/log/storage audit |
+| 78 | `reality_baseline` | M4/#538 (reality) | live | compact baseline/head rows with exact readback |
+| 79 | `observe_delta` | M4/#538 (reality) | live | ordered reality deltas, head updates, and `reality_delta` SSE events |
+| 80 | `reality_audit` | M4/#538 (reality) | live | physical drift audit row with rebase guidance |
 | — | `describe` | M5 (VLM) | not live | Florence-2 |
 
-Live count in `crates/synapse-mcp/src/server.rs`: **79** (M1: 6,
+Live count in `crates/synapse-mcp/src/server.rs`: **80** (M1: 6,
 M2/action: 10, M3/M5 module stubs: 33 including
 `profile_quality_refresh`, six `profile_authoring_*` tools, eight
 `profile_registry_*` tools, `audit_intelligence_query`,
 `audit_export_consent_set`, `audit_export_bundle`, and 4 operator storage
-diagnostics, plus M4 `act_combo`/`act_run_shell`/`act_launch`, plus 24
+diagnostics, plus M4 `act_combo`/`act_run_shell`/`act_launch`, plus 25
 EverQuest runtime/world-model tools, plus three delta-first reality tools).
 
 EverQuest local support binaries live in `crates/synapse-everquest`: `eq-map-inspect`,
@@ -4245,7 +4190,7 @@ The 500-LoC file cap is violated in the following places per current code (HEAD 
 | Full `observe()` response | ≤ 30 ms (`REFERENCE_OBSERVE_WARM_HYBRID_P99_MS`) |
 | Event push from underlying frame/UIA event to subscriber | ≤ 50 ms (`REFERENCE_EVENT_TO_SUBSCRIBER_P99_MS`) |
 | `act_aim` start-of-motion latency | ≤ 5 ms |
-| `act_press` to electrical signal on USB | ≤ 2 ms (software) / ≤ 4 ms (hardware HID) |
+| `act_press` dispatch latency | ≤ 2 ms through the software backend |
 | Reflex `on_event` action emission | ≤ 5 ms from event |
 | Reflex scheduler tick jitter idle | ≤ 200 µs (`REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US`) |
 | MCP idle-tick CPU usage | ≤ 1% on one core |
@@ -4270,7 +4215,7 @@ The PRD's "Open Questions" file enumerates roughly 30 numbered items (OQ-001 …
 | OQ-009/010/023/024 | M1 perception closures (max_elements default, CDP auto-attach, element_id stability, token budget) | M1 source |
 | operator decisions 2026-05-24 (issues #246/#247/#350/#351) | No GitHub Actions / CI as a shipping gate | `AGENTS.md` |
 
-Open items remaining (PRD §16): OQ-013 (aim_track EMA smoothing, decided in ADR-0011) and OQ-016 (hardware action coalescing, decided in ADR-0012) closed in M4; OQ-008 (VLM bundling), OQ-014 (Whisper-tiny vs base), OQ-017 (disk-pressure thresholds final), OQ-019 (telemetry split), OQ-020 (`game_screenshot_once` exposure), OQ-030 (GC cadence final) closed in M5; OQ-006/007/021/027/028/026/018 remain v1.x.
+Open items remaining (PRD §16): OQ-013 (aim_track EMA smoothing, decided in ADR-0011) closed in M4; the former hardware action coalescing question is retired by #588/#589; OQ-008 (VLM bundling), OQ-014 (Whisper-tiny vs base), OQ-017 (disk-pressure thresholds final), OQ-019 (telemetry split), OQ-020 (`game_screenshot_once` exposure), OQ-030 (GC cadence final) closed in M5; OQ-006/007/021/027/028/026/018 remain v1.x.
 
 ## 9. Doctrine documents
 
@@ -4286,7 +4231,7 @@ Open items remaining (PRD §16): OQ-013 (aim_track EMA smoothing, decided in ADR
 | `docs/computergames/06_data_schemas.md` | Wire schemas + error code catalog |
 | `docs/computergames/07_storage_and_profiles.md` | RocksDB CFs, retention defaults, profile TOML |
 | `docs/computergames/08_supported_use_policy.md` | Allowed/disallowed contexts, operator acknowledgments |
-| `docs/computergames/09_hardware_hid_gateway.md` | M4 Pi Pico HID firmware + serial protocol + host driver |
+| `docs/computergames/09_hardware_hid_gateway.md` | Retired physical HID plan note |
 | `docs/computergames/10_performance_budget.md` | Per-stage p99 targets + optimization rules |
 | `docs/computergames/11_security_and_safety.md` | Threat model, permissions, redaction, kill switches |
 | `docs/computergames/12_observability.md` | Logging, tracing, metrics, debug overlay, replay tool |
@@ -4323,7 +4268,7 @@ From `docs/impplan/04_m3_reflex_mcp_surface.md::§2`, validated for the `v0.1.0-
    - The reflex priority and lifetime evolved correctly.
 6. Operator hotkey `Ctrl+Alt+Shift+P` cleanly disables all reflexes and fires `release_all` within 50 ms.
 
-The M4 demo gate is defined in `docs/impplan/05_m4_hardware_hid_first_game.md` and exercises the RP2040 firmware + `synapse-hid-host` serial driver + Minecraft single-player creative world via `act_press`/`act_aim`/`act_combo` over `Backend::Hardware`.
+The M4 plan file is now a retired-plan stub. Current action demo evidence uses real MCP action tools with `software` or `vigem`; a selected `hardware` backend must fail closed with `ACTION_BACKEND_UNAVAILABLE` and a separate source-of-truth readback proving no fallback input occurred.
 
 ## 11. What is NOT covered in this doc
 
@@ -4367,7 +4312,7 @@ Source files covered:
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 79 live tools are registered on `SynapseService` via
+All 80 live tools are registered on `SynapseService` via
 `#[tool(description=...)]` in `server.rs` and routed submodules. Tool
 descriptions are taken verbatim from the source. Every tool returns through
 `Json<T>` so the response shape exactly matches the deserialized response
@@ -4583,7 +4528,7 @@ size_bytes, size_estimate_tokens }`.
 ## 7. `act_click`
 
 **Description:** "Click a screen coordinate or UI Automation element"
-**Permissions:** `INPUT_MOUSE` (via reflex registration paths; tool itself doesn't gate at server.rs); the action's `backend` adds `INPUT_HARDWARE_HID` if `Hardware` is chosen.
+**Permissions:** `INPUT_MOUSE` (via reflex registration paths; tool itself doesn't gate at server.rs).
 **Side effects:** mouse movement + button click(s); appends to `RecordingBackend` if enabled
 
 | Parameter | Type | Required | Default | Range | Description |
@@ -4641,7 +4586,7 @@ preflight ran.
 | `backend` | `PressBackend` | no | `Auto` | `Software`/`Hardware`/`Auto` | |
 
 **Returns:** `ActPressResponse { ok, keys_pressed: u32, elapsed_ms: u32, backend_used: String }`.
-**Errors:** `ACTION_UNSUPPORTED_KEY`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE` (`Hardware` until M4).
+**Errors:** `ACTION_UNSUPPORTED_KEY`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE` (including the retired `Hardware` backend token).
 
 ## 9a. `act_keymap`
 
@@ -5105,6 +5050,31 @@ Manual FSV for both #522 tools must read trajectory/domain/state/model/predictio
 
 Manual FSV for both tools must read storage state before the trigger, call the real MCP tool with known synthetic prediction/outcome data, then separately inspect the durable `CF_KV` rows afterward. Scorecards support planning quality only and never replace runtime FSV against game UI/log/process/storage SoT.
 
+## 9v. `everquest_autocombat`
+
+**Description:** "Run a bounded, operator-attended, server-side EverQuest combat loop for the level-1 wizard (acquire -> consider -> melee + nuke-when-mana -> confirm kill -> recover -> re-acquire)"
+**Side effects:** requires the active `everquest.live` profile, chat-input safety, active EQ log, and supported-use foreground preflight; emits audited `act_keymap` actions for target/consider, melee auto-attack, and bounded nuke casts; persists an `everquest_autocombat_run` row under `CF_KV/everquest/autocombat/v1/everquest.live/<run_id>`.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `max_iterations` | `u32` | no | `8` | Combat-loop iteration cap |
+| `max_duration_s` | `u32` | no | `120` | Wall-clock cap |
+| `hp_floor_percent` | `u32` | no | `50` | Stop when observed HP falls below this floor |
+| `mana_floor_percent` | `u32` | no | `30` | Recovery/engagement floor |
+| `target_level_max` | `u32` | no | `2` | Highest safe target level |
+| `stop_at_level` | `u32` | no | `2` | Stop when the character reaches this level |
+| `cast_mana_cost_percent` | `u32` | no | `70` | Minimum mana threshold for the configured nuke |
+| `engagement_timeout_s` | `u32` | no | `30` | Per-target fight timeout |
+| `hotbar_alias` | `String` | no | `hotbar4` | Active-profile keymap alias for the nuke |
+| `max_roam_steps` | `u32` | no | `6` | Bounded roam/search scaffold |
+| `max_chase_s` | `u32` | no | `12` | Bounded chase scaffold |
+| `idempotency_key` | `Option<String>` | no | generated | Run id seed |
+
+**Returns:** `ActAutocombatResponse { ok, iterations, kills, casts, casts_resisted, casts_fizzled, started_level, final_level, final_xp_percent, stop_reason, run_row_key, looting_note, per_iteration }`.
+**Errors:** supported-use/profile/foreground/chat-input/action-preflight errors, `ACTION_TARGET_INVALID` for missing active log/runtime inputs, storage write/read errors, and `ACTION_BACKEND_UNAVAILABLE` from any failed keymap/action dispatch.
+
+Manual FSV must read the EQ foreground/chat-input/log/HUD/action-log/storage SoTs before the trigger, call the real MCP tool, then separately inspect the EQ log offsets/outcomes, `CF_ACTION_LOG`, and the persisted autocombat run row afterward. The tool is a gameplay loop surface, not a substitute for physical level/XP/log verification.
+
 ## 10. `act_aim`
 
 **Description:** "Move the pointer toward a screen, element, or track target"
@@ -5232,7 +5202,7 @@ Manual FSV for both tools must read storage state before the trigger, call the r
 ## 18. `reflex_register`
 
 **Description:** "Register a reflex"
-**Permissions:** `WRITE_REFLEX` plus any input permissions implied by `then` actions (`INPUT_KEYBOARD`/`INPUT_MOUSE`/`INPUT_PAD`/`INPUT_HARDWARE_HID`).
+**Permissions:** `WRITE_REFLEX` plus any input permissions implied by `then` actions (`INPUT_KEYBOARD`/`INPUT_MOUSE`/`INPUT_PAD`).
 **Side effects:** opens RocksDB on first call; persists a `reflex_registered` audit row; starts the scheduler thread on first reflex.
 
 | Parameter | Type | Required | Default | Range | Description |
@@ -5840,7 +5810,7 @@ For convenience the M3 tool-call gating is summarized here (live source: `crates
 | `storage_inspect` | `READ_STORAGE` |
 | `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | `WRITE_STORAGE` |
 
-`reflex_register`'s effective permission set is computed by `add_action_permissions` over the compiled `Vec<Action>` (e.g., `Action::PadReport` requires `INPUT_PAD`; any action with `Backend::Hardware` adds `INPUT_HARDWARE_HID`).
+`reflex_register`'s effective permission set is computed by `add_action_permissions` over the compiled `Vec<Action>` (e.g., `Action::PadReport` requires `INPUT_PAD`; keyboard and mouse actions require the matching input permissions). The retired `hardware` backend token does not add a separate permission; it fails closed during action dispatch.
 
 M1/M2 tools (`health`, `observe`, `find`, `read_text`, `set_capture_target`, `set_perception_mode`, `act_*`, `release_all`) do not gate at the M3 permission layer because they predate M3; the M3 permission layer applies only to the M3 tool surface. (For reflex-driven action emission, the reflex-register permission check is the gating point.)
 
@@ -5897,7 +5867,7 @@ Source files covered:
 - `emitter_state.rs` — held bitset / pad cache after sequences
 - `error_codes_match.rs` — `ActionError::code()` mapping
 - `handle_queue.rs` — bounded mpsc + ack behavior
-- `hardware_unavailable.rs` — `HardwareUnavailableBackend` returns `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
+- `hardware_unavailable.rs` — `HardwareUnavailableBackend` returns `ACTION_BACKEND_UNAVAILABLE` with "backend removed; use software/vigem" guidance
 - `mouse_drag_validation.rs` — `MAX_DRAG_DISTANCE_PX` enforcement
 - `rate_limit_overshoot.rs` — token bucket retry_after_ms accuracy
 - `recording_backend.rs` — `RecordingBackend` event log
@@ -5978,14 +5948,13 @@ Source files covered:
 
 `#[test]` + `#[tokio::test]` attributes across `crates/`: **385** (counted via `awk` on the tree; includes both unit `mod tests` blocks and integration test files).
 
-## 4. Bench inventory (18 files)
+## 4. Bench inventory (14 files)
 
 | Crate | Bench | Tests budget |
 |---|---|---|
 | `synapse-a11y` | `uia_snapshot_depth2_60elem.rs` | UIA tree snapshot p99 ≤ 10 ms |
 | `synapse-action` | `action_curve_step_calc_natural.rs` | Curve sampling cost |
 | `synapse-action` | `action_software_press.rs` | Software backend key press latency (`act_press` to electrical signal ≤ 2 ms) |
-| `synapse-action` | `action_hardware_press.rs` | Hardware HID key press p99 ≤ 5 ms with baseline export |
 | `synapse-action` | `action_recording_round_trip.rs` | Recording backend overhead |
 | `synapse-capture` | `capture_loop.rs` | Frame capture p99 ≤ 3 ms |
 | `synapse-perception` | `observe_warm_a11y_only.rs` | `observe()` p99 ≤ 30 ms (a11y_only) |
@@ -5996,9 +5965,6 @@ Source files covered:
 | `synapse-reflex` | `reflex_combo_step_interval.rs` | Combo step accuracy |
 | `synapse-reflex` | `reflex_tick_jitter_idle.rs` | Scheduler tick jitter idle p99 ≤ 200 µs (`REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US`) |
 | `synapse-reflex` | `reflex_tick_jitter_under_load.rs` | Scheduler tick jitter under load |
-| `synapse-hid-host` | `hid_combo_timing.rs` | 3-step HID combo scheduled interval deviation ≤ 0.5 ms using firmware timing telemetry |
-| `synapse-hid-host` | `hid_high_volume.rs` | 10k relative mouse moves ≤ 15 s, zero drops/CRC errors, cursor X +10k |
-| `synapse-hid-host` | `hid_protocol_encode_1mb.rs` | HID protocol encode throughput |
 | `synapse-storage` | `batch_throughput.rs` | put_batch / flush rates |
 
 All benches use `criterion 0.8` with `harness = false`. The `scripts/check-bench-delta.ps1` script compares two `critcmp` JSON outputs and enforces a ≤20% regression on tracked benches.
@@ -6136,7 +6102,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 ```
 
-Crate-level lints override `unsafe_code` to `allow` in five FFI crates:
+Crate-level lints override `unsafe_code` to `allow` in four FFI crates:
 
 | Crate | Reason |
 |---|---|
@@ -6144,7 +6110,6 @@ Crate-level lints override `unsafe_code` to `allow` in five FFI crates:
 | `synapse-a11y` | UI Automation COM interop |
 | `synapse-audio` | WASAPI loopback FFI |
 | `synapse-capture` | DXGI / Direct3D11 FFI |
-| `synapse-hid-host` | serial-port + OS-handle interop |
 
 `synapse-mcp`, `synapse-core`, `synapse-perception`, `synapse-models`, `synapse-profiles`, `synapse-reflex`, `synapse-storage`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay` all retain `unsafe_code = forbid`.
 
@@ -6158,16 +6123,16 @@ Counted by walking `crates/` and slicing by path. Comments, blank lines, and `mo
 |---|---|
 | Workspace member crates | **15** |
 | Default workspace binaries (`synapse-mcp`, `synapse-overlay`) | 2 |
-| Total Rust source files (excluding tests/benches) | **160** |
-| Total Rust integration-test files | 76 |
-| Total Rust bench files | 13 |
-| MCP tools registered in `server.rs` | **79** (M1/M2/M3/M4/M5 plus EverQuest runtime tools including `/loc`, chat-input state, current-state, map sensor, outcome ingest, memory, planner guard, route plan, DynamicJEPA domain normalize, trajectory record, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model record/inspect, surprise detect, compact world-summary context rows, predictive-model fit/predict rows, action-prior scorecard, and reality baseline/delta/audit) |
-| MCP tools approved by `05_mcp_tool_surface.md` (agent surface cap) | 79 |
+| Total Rust source files (excluding tests/benches) | **294** |
+| Total Rust integration-test files | 88 |
+| Total Rust bench files | 14 |
+| MCP tools registered in `server.rs` | **80** (M1/M2/M3/M4/M5 plus EverQuest runtime tools including `/loc`, chat-input state, current-state, map sensor, outcome ingest, autocombat, memory, planner guard, route plan, DynamicJEPA domain normalize, trajectory record, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model record/inspect, surprise detect, compact world-summary context rows, predictive-model fit/predict rows, action-prior scorecard, and reality baseline/delta/audit) |
+| MCP tools approved by `05_mcp_tool_surface.md` (agent surface cap) | 80 |
 | RocksDB column families | **11** (`ALL_COLUMN_FAMILIES.len() == 11`; excludes implicit `default` CF) |
-| Stable error-code constants in `synapse_core::error_codes` | **105** |
+| Stable error-code constants in `synapse_core::error_codes` | **98** |
 | Reserved subsystem error enums (mapped to those codes) | 11 (`StorageError`, `ReflexError`, `ActionError`, `ProfileError`, `ProfileLoadError`, `AudioError`, `PerceptionError`, `CaptureError`, `ModelError`, `A11yError`, `TelemetryError` + parse errors `ElementIdParseError`/`EventFilterValidationError`) |
 | M3 metric specs declared in `synapse_telemetry::metrics::M3_METRICS` | **19** (12 counters, 5 gauges, 2 histograms) |
-| Permissions in M3 grant model | **13** (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `READ_STORAGE`, `WRITE_STORAGE`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`) |
+| Permissions in M3 grant model | **12** (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `READ_STORAGE`, `WRITE_STORAGE`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`) |
 | Reflex kinds | 5 (`AimTrack`, `HoldMove`, `HoldButton`, `Combo`, `OnEvent`) |
 | Lines of code (source, excl. tests/benches) | **~36 914** |
 | Lines of code (integration tests) | **~18 260** |
@@ -6194,10 +6159,9 @@ Per-crate `lib.rs`/`main.rs` size (the deepest single-file entry points):
 | `synapse-models` | `src/lib.rs` | 535 |
 | `synapse-telemetry` | `src/lib.rs` | (per source) |
 | `synapse-telemetry` | `src/metrics.rs` | (per source) |
-| `synapse-hid-host` | `src/` | multi-file serial gateway (see source map) |
 | `synapse-overlay` | `src/main.rs` | (M5 stub) |
 
-Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md` — M4 Block A.0 splits before adding hardware HID):
+Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md` — refactor debt for M5 hardening):
 
 | File | LoC | Note |
 |---|---|---|
@@ -6223,7 +6187,7 @@ Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impp
 | Repository | `https://github.com/ChrisRoyse/Synapse` |
 | Default release profile | `opt-level=3`, `lto="thin"`, `codegen-units=16`, `strip=true`, `panic="abort"` |
 | Release-max profile | inherits release with `lto="fat"`, `codegen-units=1` |
-| Excluded paths | `firmware/pico-hid` (M4 work; not yet in tree) |
+| Excluded paths | none (`exclude = []`) |
 | Binary outputs | `target/release/synapse-mcp[.exe]`, `target/release/synapse-overlay[.exe]` |
 
 ## 5. Schema version
@@ -6298,7 +6262,7 @@ Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impp
 
 | File | Topic |
 |---|---|
-| [01_system_overview.md](#file-01) | High-level architecture, tech stack, all 50 live tools |
+| [01_system_overview.md](#file-01) | High-level architecture, tech stack, live tools |
 | [02_source_code_map.md](#file-02) | Per-file tree with descriptions + dep graph + entry-point traces |
 | [03_configuration.md](#file-03) | All CLI flags, env vars, validation rules, default constants |
 | [04_storage_layer.md](#file-04) | RocksDB CFs, schema sentinel, TTL filter, GC, disk pressure |
@@ -6308,7 +6272,7 @@ Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impp
 | [08_action_subsystem.md](#file-08) | Emitter actor, backends, rate limits, hotkey, curves/dynamics, error mapping |
 | [09_perception_and_capture.md](#file-09) | Frame capture, UIA + WinEvent, perception assembler, OCR |
 | [10_audio_and_models.md](#file-10) | WASAPI loopback, ring + STT (Whisper-tiny), ONNX model loader |
-| [11_profiles_hid_telemetry.md](#file-11) | TOML profile loader + watcher, HID stub, tracing + metrics, test utils |
+| [11_profiles_hid_telemetry.md](#file-11) | TOML profile loader + watcher, tracing + metrics, test utils |
 | [12_milestones_and_roadmap.md](#file-12) | Milestone state, ADRs, doctrine, open questions |
 | [13_mcp_tool_reference.md](#file-13) | Every tool's params, defaults, ranges, side effects, errors |
 | [14_test_suite.md](#file-14) | Test inventory by crate, run commands, fixtures |
@@ -6337,7 +6301,6 @@ The doctrine `[skip ci]` suffix is present on every agent commit, consistent wit
 
 ## 10. What is NOT covered anywhere in this systemspec
 
-- **The RP2040 firmware** (`firmware/pico-hid/`) is referenced as `Cargo.toml::exclude` but the directory is not in the repository in this snapshot. M4 work.
 - **The Florence-2 VLM `describe` tool** has no source code; reserved for M5.
 - **Installer / signing** (`docs/computergames/14_build_and_packaging.md` references a planned MSIX installer) — not yet implemented.
 - **Debug overlay UI** (`synapse-overlay` is a 1-line `fn main() {}`) — M5 work.

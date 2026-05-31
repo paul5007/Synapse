@@ -8,7 +8,7 @@
 | **M1** | Perception MVP — capture + UIA + observe() | 2-3 weeks |
 | **M2** | Action MVP — kbd/mouse/pad + clipboard | 2 weeks |
 | **M3** | Reflex + MCP surface — tools, push events, profiles | 2-3 weeks |
-| **M4** | Hardware HID + first game profile | 2-3 weeks |
+| **M4** | First game profile + compound actions; hardware path retired | shipped/retired |
 | **M5** | Production polish + profile-registry/audit-data moat | 3-4 weeks |
 
 ~14 weeks solo full-time to v1.0; ~8 weeks with two engineers. Each milestone has a hard demo criterion. No demo, no milestone.
@@ -57,7 +57,6 @@ crates/synapse-capture/                (stub)
 crates/synapse-a11y/                   (stub)
 crates/synapse-audio/                  (stub)
 crates/synapse-profiles/               (stub)
-crates/synapse-hid-host/               (stub)
 crates/synapse-models/                 (stub)
 crates/synapse-telemetry/
 crates/synapse-overlay/                (stub)
@@ -109,7 +108,7 @@ Notepad focused. `observe()` returns `foreground.process_name = "notepad.exe"`, 
 
 ### Out of scope
 
-Hardware HID, combos (M3), run-shell/launch.
+Hardware HID (later retired by #588/#589), combos (M3), run-shell/launch.
 
 ### Demo criterion
 
@@ -138,7 +137,7 @@ Hardware HID, combos (M3), run-shell/launch.
 
 ### Out of scope
 
-Hardware HID, game profiles, debug overlay, VLM `describe`.
+Game profiles, debug overlay, VLM `describe`; the later hardware HID path was retired by #588/#589.
 
 ### Demo criterion
 
@@ -153,17 +152,17 @@ Agent registers `on_event` reflex: "when Save dialog appears, type path + Enter.
 
 ---
 
-## 6. M4 — Hardware HID + First Game Profile (2-3 weeks)
+## 6. M4 — First Game Profile + Compound Actions
 
-**Goal:** play one game end-to-end, including via hardware HID.
+**Goal:** add compound action/runtime surfaces and first-game profile work while
+keeping input software-only.
 
 ### Scope
 
-- `synapse-hid-host`: serial driver; identity handshake; frame protocol with CRC, ACK/NAK, watchdog; reconnect logic
-- `firmware/pico-hid/`: RP2040 firmware in Rust with `embassy-rp`; USB HID composite (mouse + keyboard + pad) + CDC ACM serial; watchdog, protocol parser, LED status, `.uf2` build pipeline
-- `synapse-mcp` adds: `act_combo` (reflex scheduler), `act_run_shell` (gated), `act_launch` (gated), `hid identify`, `hid flash`
-- First game profile: `minecraft.java` — HUD (hp_hearts, hunger, xp); keymap with Minecraft defaults; default detection `rtdetr_v2_s_coco_onnx` per ADR-0010 (no MC fine-tune yet); `event_extensions` (`creeper_nearby`, `low_hp`)
-- Supported-use policy enforcement (`08`): profile `use_scope` metadata, backend permission gating
+- `synapse-mcp` adds: `act_combo` (reflex scheduler), `act_run_shell` (gated), and `act_launch` (gated).
+- First game profile work remains profile/HUD/keymap metadata only.
+- Software input through `SendInput` and ViGEm is the supported strategy.
+- The physical hardware-HID path, firmware, host crate, and CLI surfaces were retired by #588/#589.
 
 ### Out of scope
 
@@ -171,15 +170,15 @@ Multiple game profiles (M5), VLM `describe`, debug overlay, installer.
 
 ### Demo criterion
 
-Agent + Minecraft. `observe()` returns HP and visible entities. Walks "find tree, break, plank, workbench" via `act_press`, `act_aim`, reflexes for `auto_attack_low_hp`. Runs 5 min without intervention.
-
-Bonus: same demo via hardware HID (`--hardware-hid auto`).
+Agent + game/profile target. `observe()` returns HUD and visible entities.
+Actions run through `software` or `vigem`; a requested `hardware` backend fails
+closed with `ACTION_BACKEND_UNAVAILABLE`.
 
 ### Risk areas
 
 - Detection accuracy on Minecraft (RT-DETRv2-S COCO is license-safe general detection; specialty fine-tune may be needed)
 - HUD OCR for hearts/hunger via template-match; carefully cropped assets
-- Hardware HID latency under sustained load; benchmark + tune
+- Software backend and ViGEm latency under sustained load; benchmark + tune
 
 ---
 
@@ -300,7 +299,7 @@ Not committed; v2 roadmap decided after v1 ships.
 | M2 | ViGEm install friction | Document Win11 GUI clickthrough; auto-detect; if ViGEm is absent on the configured host, acquire/install it through local workflows before treating gamepad work as blocked |
 | M3 | Time-critical thread jitter | Multimedia timer; fall back to `tokio::time` 2 ms tick if no MMCSS |
 | M3 | RocksDB Windows hiccups | pinned RocksDB version; alternate backend requires future ADR |
-| M4 | RP2040 firmware debug pain | Loopback build feature off-target; configured-host Pico checks |
+| M4 | Retired hardware path leaves stale assumptions | Keep `hardware` token fail-closed and remove stale operator surfaces/docs |
 | M4 | Minecraft detection accuracy | Mark accuracy honestly; commit to fine-tune in v1.x |
 | M5 | MSI signing cert | Self-sign at v1.0; document SmartScreen warning; cert acquisition separate workstream |
 | M5 | VLM bundle size | VLM optional download; `describe` returns `MODEL_NOT_LOADED` until downloaded |
@@ -347,7 +346,7 @@ Operator gets:
 - MCP server compatible with every major agent client
 - ≤ 30 ms p99 `observe()` for productivity apps
 - Real-time game support for ≥ 2 single-player titles
-- Documented hardware HID path for accessibility / research
+- Documented software-only input path for accessibility / research
 - Complete PRD + user guide + reference docs
 - Active GitHub Issues + Discussions community
 - v1.x roadmap

@@ -31,7 +31,7 @@ Per `docs/impplan/README.md` §"State-tracking", the authority order is:
 2. **`main` branch** — what is in code now (impplan is wrong if it disagrees; patch the impplan in the same PR).
 3. **GitHub Issues** — every PR-sized task, `[DECISION]`, `[DISCOVERY]`, bug, risk, context (labels: `phase:m{N}`, `area:*`).
 
-## 2. Milestone state (as of 2026-05-26, HEAD `e54ca57`)
+## 2. Milestone state (as of 2026-05-31)
 
 | # | Milestone | Tag | Date | Source |
 |---|---|---|---|---|
@@ -39,8 +39,8 @@ Per `docs/impplan/README.md` §"State-tracking", the authority order is:
 | M1 | Perception MVP — capture + UIA + `observe()` + 5 tools | `v0.1.0-m1` | 2026-05-23 | `docs/impplan/README.md` |
 | M2 | Action MVP — `synapse-action` + 9 tools + `release_all` | `v0.1.0-m2` | 2026-05-24 | `CHANGELOG.md::v0.1.0-m2` |
 | M3 | Reflex + RocksDB + profiles + HTTP/SSE + audio + 15 tools | `v0.1.0-m3` (@ `97019ec`) | 2026-05-25 | `CHANGELOG.md::v0.1.0-m3` + `docs/impplan/04_m3_reflex_mcp_surface.md` |
-| **M4** | **RP2040 firmware + `synapse-hid-host` serial driver + operator-attended EverQuest first-game evaluation + `act_combo`/`act_run_shell`/`act_launch`** | — | **ACTIVE** | `docs/impplan/05_m4_hardware_hid_first_game.md` |
-| M5 | Production polish — installer, overlay, ≥10 profiles, profile-registry/audit-data moat, VLM `describe`, soak | — | release gate blocked by M4; #454/#455-#470 registry/audit moat active as P1 | `docs/impplan/06_m5_production_polish.md` |
+| **M4** | **First-game/profile runtime + compound actions; physical HID path retired by #588/#589** | `v0.1.0-m4` | tagged / retired hardware plan | `docs/impplan/05_m4_hardware_hid_first_game.md` |
+| M5 | Production polish — installer, overlay, ≥10 profiles, profile-registry/audit-data moat, VLM `describe`, soak | — | active; #454/#455-#470 registry/audit moat active as P1 | `docs/impplan/06_m5_production_polish.md` |
 
 M3 closed 2026-05-25 (`v0.1.0-m3` @ `97019ec`). What landed on `main`:
 
@@ -91,15 +91,13 @@ rows for restoring only prior trusted/local-validated packages.
 
 M3 carry-over open for M4 to address:
 
-- **LoC overrun** — 500-LoC file cap was violated during M3. On `main` (HEAD `e54ca57`): `synapse-a11y/src/lib.rs` (2087), `synapse-capture/src/lib.rs` (1798), `synapse-core/src/types.rs` (1567), `synapse-mcp/src/server.rs` (1335), `synapse-mcp/src/m3/reflex.rs` (1165), `synapse-reflex/src/lib.rs` (986), `synapse-reflex/src/scheduler.rs` (890), `synapse-mcp/src/http/sse.rs` (764), `synapse-mcp/src/m3/replay.rs` (651), `synapse-models/src/lib.rs` (535). M4's Block A.0 splits these before adding hardware HID. Several test files also exceed cap.
+- **LoC overrun** — 500-LoC file cap was violated during M3. On `main` (HEAD `e54ca57`): `synapse-a11y/src/lib.rs` (2087), `synapse-capture/src/lib.rs` (1798), `synapse-core/src/types.rs` (1567), `synapse-mcp/src/server.rs` (1335), `synapse-mcp/src/m3/reflex.rs` (1165), `synapse-reflex/src/lib.rs` (986), `synapse-reflex/src/scheduler.rs` (890), `synapse-mcp/src/http/sse.rs` (764), `synapse-mcp/src/m3/replay.rs` (651), `synapse-models/src/lib.rs` (535). These remain refactor debt for M5 hardening and should be split or covered by per-file ADRs when touched. Several test files also exceed cap.
 - **CHANGELOG M3 entry tool-name drift** — the `v0.1.0-m3` entry names `profile_get`/`profile_set_active`; shipped names are `profile_list`/`profile_activate`. The four `storage_*` diagnostic tools are also missing from the entry. First M4 docs sweep fixes both.
 
-Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
+M4/M5 current work:
 
-- `firmware/pico-hid/` — standalone RP2040 firmware project excluded from the root Cargo workspace; remaining firmware issues close only with real device evidence.
-- `synapse-hid-host` — serial driver with discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, and reconnect paths. `Backend::Hardware` uses `HardwareBackend` when `--hardware-hid <port|auto>` connects successfully, otherwise it fails closed through `HardwareUnavailableBackend`.
-- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#524/#510/#525/#526/#527/#528/#514/#511/#512/#521/#529/#513/#515/#516/#520/#522/#531 add the EverQuest `/loc`, visible chat-input state, current-state, map-sensor, outcome, route, memory, planner-guard, DynamicJEPA domain normalization, linked trajectory, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model rows/readback, surprise detection, compact world-summary context rows, map-pack inventory/provenance via local CLI, predictive-model fit/predict rows, and action-prior tools; #538 adds the delta-first reality baseline/delta/audit tools, bringing the live MCP surface to 79 plus EverQuest local support binaries.
-- `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
+- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools are live; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#524/#510/#525/#526/#527/#528/#514/#511/#512/#521/#529/#513/#515/#516/#520/#522/#531 add the EverQuest `/loc`, visible chat-input state, current-state, map-sensor, outcome, route, memory, planner-guard, DynamicJEPA domain normalization, linked trajectory, ContextGraph/DynamicJEPA episode export, ContextGraph ingest/search bridge rows, approved-prefix world-model rows/readback, surprise detection, compact world-summary context rows, map-pack inventory/provenance via local CLI, predictive-model fit/predict rows, action-prior tools, and autocombat; #538 adds the delta-first reality baseline/delta/audit tools, bringing the live MCP surface to 80 plus EverQuest local support binaries.
+- The physical HID strategy was retired by #588/#589. Live input remains `software` and `vigem`; the `hardware` backend token parses only to fail closed through `HardwareUnavailableBackend`.
 - M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_PROCESS_HISTORY`/`CF_KV` (`CF_REFLEX_AUDIT` and `CF_ACTION_LOG` have live writers); audio detector → SSE-bus sink integration. Profile HUD fields now run through `observe`; standalone `read_hud` remains deferred. VLM `describe` and Florence-2 remain M5.
 
 ## 3. Tools delivered vs planned
@@ -188,17 +186,18 @@ delta-first reality tools. Current build:
 | 74 | `everquest_predictive_model_predict` | M4/M5 (EverQuest) | live | calibrated prediction rows with abstention |
 | 75 | `everquest_action_prior_record` | M4/M5 (EverQuest) | live | prediction/outcome sample rows |
 | 76 | `everquest_action_prior_scorecard` | M4/M5 (EverQuest) | live | floor-not-ceiling competence scorecard rows |
-| 77 | `reality_baseline` | M4/#538 (reality) | live | compact baseline/head rows with exact readback |
-| 78 | `observe_delta` | M4/#538 (reality) | live | ordered reality deltas, head updates, and `reality_delta` SSE events |
-| 79 | `reality_audit` | M4/#538 (reality) | live | physical drift audit row with rebase guidance |
+| 77 | `everquest_autocombat` | M4/M5 (EverQuest) | live | bounded attended L1 wizard combat loop with action/log/storage audit |
+| 78 | `reality_baseline` | M4/#538 (reality) | live | compact baseline/head rows with exact readback |
+| 79 | `observe_delta` | M4/#538 (reality) | live | ordered reality deltas, head updates, and `reality_delta` SSE events |
+| 80 | `reality_audit` | M4/#538 (reality) | live | physical drift audit row with rebase guidance |
 | — | `describe` | M5 (VLM) | not live | Florence-2 |
 
-Live count in `crates/synapse-mcp/src/server.rs`: **79** (M1: 6,
+Live count in `crates/synapse-mcp/src/server.rs`: **80** (M1: 6,
 M2/action: 10, M3/M5 module stubs: 33 including
 `profile_quality_refresh`, six `profile_authoring_*` tools, eight
 `profile_registry_*` tools, `audit_intelligence_query`,
 `audit_export_consent_set`, `audit_export_bundle`, and 4 operator storage
-diagnostics, plus M4 `act_combo`/`act_run_shell`/`act_launch`, plus 24
+diagnostics, plus M4 `act_combo`/`act_run_shell`/`act_launch`, plus 25
 EverQuest runtime/world-model tools, plus three delta-first reality tools).
 
 EverQuest local support binaries live in `crates/synapse-everquest`: `eq-map-inspect`,
@@ -277,7 +276,7 @@ The 500-LoC file cap is violated in the following places per current code (HEAD 
 | Full `observe()` response | ≤ 30 ms (`REFERENCE_OBSERVE_WARM_HYBRID_P99_MS`) |
 | Event push from underlying frame/UIA event to subscriber | ≤ 50 ms (`REFERENCE_EVENT_TO_SUBSCRIBER_P99_MS`) |
 | `act_aim` start-of-motion latency | ≤ 5 ms |
-| `act_press` to electrical signal on USB | ≤ 2 ms (software) / ≤ 4 ms (hardware HID) |
+| `act_press` dispatch latency | ≤ 2 ms through the software backend |
 | Reflex `on_event` action emission | ≤ 5 ms from event |
 | Reflex scheduler tick jitter idle | ≤ 200 µs (`REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US`) |
 | MCP idle-tick CPU usage | ≤ 1% on one core |
@@ -302,7 +301,7 @@ The PRD's "Open Questions" file enumerates roughly 30 numbered items (OQ-001 …
 | OQ-009/010/023/024 | M1 perception closures (max_elements default, CDP auto-attach, element_id stability, token budget) | M1 source |
 | operator decisions 2026-05-24 (issues #246/#247/#350/#351) | No GitHub Actions / CI as a shipping gate | `AGENTS.md` |
 
-Open items remaining (PRD §16): OQ-013 (aim_track EMA smoothing, decided in ADR-0011) and OQ-016 (hardware action coalescing, decided in ADR-0012) closed in M4; OQ-008 (VLM bundling), OQ-014 (Whisper-tiny vs base), OQ-017 (disk-pressure thresholds final), OQ-019 (telemetry split), OQ-020 (`game_screenshot_once` exposure), OQ-030 (GC cadence final) closed in M5; OQ-006/007/021/027/028/026/018 remain v1.x.
+Open items remaining (PRD §16): OQ-013 (aim_track EMA smoothing, decided in ADR-0011) closed in M4; the former hardware action coalescing question is retired by #588/#589; OQ-008 (VLM bundling), OQ-014 (Whisper-tiny vs base), OQ-017 (disk-pressure thresholds final), OQ-019 (telemetry split), OQ-020 (`game_screenshot_once` exposure), OQ-030 (GC cadence final) closed in M5; OQ-006/007/021/027/028/026/018 remain v1.x.
 
 ## 9. Doctrine documents
 
@@ -318,7 +317,7 @@ Open items remaining (PRD §16): OQ-013 (aim_track EMA smoothing, decided in ADR
 | `docs/computergames/06_data_schemas.md` | Wire schemas + error code catalog |
 | `docs/computergames/07_storage_and_profiles.md` | RocksDB CFs, retention defaults, profile TOML |
 | `docs/computergames/08_supported_use_policy.md` | Allowed/disallowed contexts, operator acknowledgments |
-| `docs/computergames/09_hardware_hid_gateway.md` | M4 Pi Pico HID firmware + serial protocol + host driver |
+| `docs/computergames/09_hardware_hid_gateway.md` | Retired physical HID plan note |
 | `docs/computergames/10_performance_budget.md` | Per-stage p99 targets + optimization rules |
 | `docs/computergames/11_security_and_safety.md` | Threat model, permissions, redaction, kill switches |
 | `docs/computergames/12_observability.md` | Logging, tracing, metrics, debug overlay, replay tool |
@@ -355,7 +354,7 @@ From `docs/impplan/04_m3_reflex_mcp_surface.md::§2`, validated for the `v0.1.0-
    - The reflex priority and lifetime evolved correctly.
 6. Operator hotkey `Ctrl+Alt+Shift+P` cleanly disables all reflexes and fires `release_all` within 50 ms.
 
-The M4 demo gate is defined in `docs/impplan/05_m4_hardware_hid_first_game.md` and exercises the RP2040 firmware + `synapse-hid-host` serial driver + Minecraft single-player creative world via `act_press`/`act_aim`/`act_combo` over `Backend::Hardware`.
+The M4 plan file is now a retired-plan stub. Current action demo evidence uses real MCP action tools with `software` or `vigem`; a selected `hardware` backend must fail closed with `ACTION_BACKEND_UNAVAILABLE` and a separate source-of-truth readback proving no fallback input occurred.
 
 ## 11. What is NOT covered in this doc
 

@@ -25,7 +25,6 @@ The action subsystem is an actor-style emitter with an Tokio mpsc producer (`Act
 | Symbol | Source |
 |---|---|
 | `ActionBackend`, `BackendResolutionPolicy`, `ResolvedBackend`, `resolve_backend`, `resolve_backend_with_policy` | `backend::mod` |
-| `HardwareBackend` | `backend::hardware` |
 | `RecordedInput`, `RecordingBackend` | `backend::recording` |
 | `HardwareUnavailableBackend` | `backend::unavailable` |
 | `VigemBackend` | `backend::vigem` |
@@ -33,7 +32,7 @@ The action subsystem is an actor-style emitter with an Tokio mpsc producer (`Act
 | `ClipboardFormat`, `clear_clipboard`, `read_clipboard_text`, `write_clipboard_text` | `clipboard` |
 | `sample_curve` | `curve` |
 | `BIGRAMS`, `KeystrokeEvent`, `ModifierMask`, `sample_typing_schedule` | `dynamics` |
-| `ActionEmitter`, `ActionEmitterSnapshotHandle`, `ActionSnapshotMessage`, `ActionStateSnapshot`, `Backends`, `EmitState`, `HardwareHidConfig`, `HELD_KEY_MAX_DURATION_MS` | `emitter` |
+| `ActionEmitter`, `ActionEmitterSnapshotHandle`, `ActionSnapshotMessage`, `ActionStateSnapshot`, `Backends`, `EmitState`, `HELD_KEY_MAX_DURATION_MS` | `emitter` |
 | `ActionError`, `ActionResult` | `error` |
 | `ACTION_QUEUE_CAPACITY`, `ActionHandle`, `ActionMessage`, `RELEASE_ALL_HANDLE` | `handle` |
 | `OperatorHotkeyGuard`, `install_operator_hotkey`, `operator_release_epoch`, `operator_release_requested_since` | `hotkey` |
@@ -86,7 +85,7 @@ For each `(Action, oneshot::Sender)` pulled from the channel:
 2. **Resolve backend.** `routing.rs` reads the emitter's active `BackendResolutionPolicy` and calls `backend::resolve_backend_with_policy(action.backend(), &action, policy)`:
    - `Software` → `ResolvedBackend::Software`
    - `Vigem` → `ResolvedBackend::Vigem`
-   - `Hardware` → `ResolvedBackend::Hardware`; the selected backend is `HardwareBackend` only when `synapse-mcp` was started with `--hardware-hid <port|auto>` and the HID connection/IDENTIFY succeeded. Otherwise the hardware slot is `HardwareUnavailableBackend`.
+   - `Hardware` → `ResolvedBackend::Hardware`; the selected backend is always `HardwareUnavailableBackend`, because the physical hardware implementation is retired.
    - `Auto` with the global default policy → `ResolvedBackend::Vigem` for `Pad*` actions and `Software` for keyboard, mouse, combo, and release-all.
    - `Auto` after activating a profile with `[backends] default_backend = "hardware"` → `ResolvedBackend::Hardware` for keyboard, mouse, pad, combo, and release-all unless `keyboard_default`, `mouse_default`, or `pad_default` is explicitly set for that class.
    - The active policy and resolved table are readable at `health.subsystems.action.backend_resolution`.
@@ -98,10 +97,9 @@ For each `(Action, oneshot::Sender)` pulled from the channel:
    - **`SoftwareBackend`** (`backend/software/*`): SendInput-based keyboard/mouse/text, see §4
    - **`VigemBackend`** (`backend/vigem/*`): X360/DS4 controller report via `vigem-client`
    - **`RecordingBackend`** (`backend/recording/*`): appends a `RecordedInput` to an in-memory log (used in tests and via `SYNAPSE_MCP_RECORDING_BACKEND=1`)
-   - **`HardwareBackend`** (`backend/hardware/*`): serializes supported key, mouse-relative, absolute-mouse-to-relative batch, pad, combo, and release commands through `synapse-hid-host::HidGateway`
-   - **`HardwareUnavailableBackend`** (`backend/unavailable`): fail-closed response when hardware HID is not enabled, returning `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
+   - **`HardwareUnavailableBackend`** (`backend/unavailable`): fail-closed response when the retired `hardware` compatibility token is selected, returning `ACTION_BACKEND_UNAVAILABLE` with guidance to use `backend=software` or `backend=vigem`
 5. **Auto-release timers.** `emitter::keyboard` enforces `HELD_KEY_MAX_DURATION_MS` per `(Key, ResolvedBackend)` held key. After the limit, the emitter inserts a synthetic `KeyUp` for the backend that owns the hold and emits a `STUCK_KEY_AUTO_RELEASED` warn-log + event with `backend=<software|vigem|hardware>`.
-6. **ReleaseAll**: reads the full `EmitState` union, aborts held-key timers, and dispatches `Action::ReleaseAll` through every backend that owns releasable state. Each backend sees only its own `held_keys`/`held_buttons` snapshot while executing, so software release cannot claim hardware-held inputs and hardware release cannot claim software-held inputs. ViGEm pad state is released through the ViGEm backend when pads are held. When a real hardware HID backend was configured at startup, the emitter also dispatches `Action::ReleaseAll` to `HardwareBackend`, which sends one firmware `RELEASE_ALL (0x40)` command and clears the hardware host mirror. The safety log records `code=SAFETY_RELEASE_ALL_FIRED`, `backend="hardware"`, `primary_backend`, `release_backends`, and `hardware_release_ok` for this path. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
+6. **ReleaseAll**: reads the full `EmitState` union, aborts held-key timers, and dispatches `Action::ReleaseAll` through every backend that owns releasable state. Each backend sees only its own `held_keys`/`held_buttons` snapshot while executing, so software release cannot claim another backend's held inputs. ViGEm pad state is released through the ViGEm backend when pads are held. The retired hardware slot cannot create held input state because every selected hardware action fails before state mutation. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
 7. **Ack.** Send `Ok(())` or the `ActionError` back on the oneshot.
 
 ### 3.3 Lifecycle (`emitter::lifecycle`)
@@ -211,7 +209,6 @@ Algorithm:
 | `BackendUnavailable { detail }` | `ACTION_BACKEND_UNAVAILABLE` | Emitter channel closed, unsupported feature, non-Windows stub |
 | `TargetInvalid { detail }` | `ACTION_TARGET_INVALID` | Invalid `AimTarget`/`MouseTarget` resolution |
 | `HoldExceededMax { detail }` | `ACTION_HOLD_EXCEEDED_MAX` | hold_ms > 30000 (per-tool guard) |
-| `HidPortDisconnected { detail }` | `ACTION_HID_PORT_DISCONNECTED` | HID gateway disconnected, reconnecting, or timed out after startup |
 | `VigemNotInstalled { detail }` | `ACTION_VIGEM_NOT_INSTALLED` | Driver missing |
 | `VigemPluginFailed { detail }` | `ACTION_VIGEM_PLUGIN_FAILED` | vigem-client plug error |
 | `ElementNotResolved { detail }` | `ACTION_ELEMENT_NOT_RESOLVED` | UIA re_resolve returned None |
@@ -250,6 +247,6 @@ Each M2 tool wrapper builds one or more `synapse_core::Action`s and dispatches t
 
 ## 17. What is NOT covered
 
-- **Remaining hardware HID gaps.** The live `Backend::Hardware` path is enabled by `--hardware-hid <port|auto>` and maps Synapse keys to USB HID Keyboard/Keypad usage IDs with boot-report modifier byte handling, 6KRO limit enforcement, shifted US-layout text, and absolute mouse fallback by converting screen or resolved-element targets into batched `MOUSE_MOVE_REL` commands. Curve-generated hardware mouse batches coalesce adjacent same-direction deltas within a `<= 2 ms` implied window when the merged payload stays inside the firmware `-127..=127` axis range (ADR-0012); software and standalone direct `MouseMoveRelative` actions are unchanged. Broader supported-use gates remain M4 work.
+- **Retired hardware token.** `Backend::Hardware` remains on the wire only as a compatibility token for older profiles/packages. It fails closed with `ACTION_BACKEND_UNAVAILABLE`; there is no live physical HID backend to tune or extend.
 - **Modifiers on `act_click`.** The schema accepts `Vec<ClickModifier>` but emitting a non-empty list currently returns `ACTION_BACKEND_UNAVAILABLE` with the message "act_click modifiers are not wired in the M2 click schema slice".
 - **Element-target aim and drag**. `act_aim` with an `Element` target returns `ACTION_BACKEND_UNAVAILABLE` ("requires the dedicated target resolution issue"); same for `Track` targets. `act_drag` supports `Element` targets via UIA bbox resolution.

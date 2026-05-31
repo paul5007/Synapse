@@ -93,10 +93,9 @@ Total token cost ≤ 30 K across the whole sequence.
 
 | Artifact | Tooling | Notes |
 |---|---|---|
-| `SynapseSetup-x.y.z.msi` | WiX | bundled models (optional checkboxes) + profiles + `pico-hid.uf2` + ViGEmBus install option (calls Nefarius signed installer) |
+| `SynapseSetup-x.y.z.msi` | WiX | bundled models (optional checkboxes) + profiles + ViGEmBus install option (calls Nefarius signed installer) |
 | `synapse-mcp.exe`, `synapse-overlay.exe` | `cargo build --release` + `signtool` w/ SHA256 + timestamp authority | per `14 §11` |
 | `synapse-portable-x.y.z-windows-x64.zip` | manual zip | air-gapped install |
-| `synapse-pico-hid-x.y.z.uf2` | `firmware/pico-hid` build pipeline | release asset |
 | winget manifest PR | manual | post v1.0.0 |
 | crates.io publish | `cargo publish -p synapse-core ...` per library crate | binary crate `synapse-mcp` also installable via `cargo install --git ...` |
 
@@ -271,7 +270,7 @@ STORAGE_DISK_PRESSURE_LEVEL_4
 ✓ Manual test plan signed off (13 §15)
 ✓ PRD docs internally consistent (`scripts/check_docs.ps1 -CheckAnchors` green)
 ✓ cargo deny check clean (14 §14)
-✓ No unsafe outside synapse-capture / synapse-hid-host / firmware/pico-hid
+✓ No unsafe outside crates with documented Windows/driver FFI need
 ✓ No unwrap() outside test code
 ✓ Crash dumps land on intentional panic (12 §9)
 ✓ MSI installs + uninstalls cleanly on fresh Win11 VM
@@ -322,7 +321,7 @@ v1.0.0 cut when:
 2. Every acceptance gate above green; **manual FSV with source-of-truth read-back on every row** of `13 §15`.
 3. Soak 8 h clean — no memory growth > 50 MB, no deadlocks, no held-key leaks after `release_all`, p99 latencies stable across the run.
 4. Manual happy-path + edge-case table filled in by operator in the v1.0.0 release PR (mirror the M2 §9 structure; expand to cover the 5-app M5 scenario + installer + setup wizard + overlay + VLM describe).
-5. `CHANGELOG.md` updated; tag `v1.0.0` published with all release artifacts (MSI, portable zip, pico-hid `.uf2`, source tarball).
+5. `CHANGELOG.md` updated; tag `v1.0.0` published with all release artifacts (MSI, portable zip, source tarball).
 6. `cargo publish` for library crates; winget manifest PR opened.
 
 **FSV reminder for v1.0:** the installer test reads back via `Get-Package`/`Get-WmiObject` to confirm the MSI registered; the setup wizard test reads back the actual files written to `%APPDATA%\synapse\` and asserts contents byte-by-byte; the overlay test screenshots the window and asserts FPS counter present and incrementing; the `describe` test downloads the model, sha256-verifies it on disk, then calls the tool and asserts a non-empty `description` field. No row is "ok by inspection."

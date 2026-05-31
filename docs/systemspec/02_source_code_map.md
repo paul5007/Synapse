@@ -22,10 +22,10 @@ synapse/
 ├── tests/                          # Repo-level fixtures only (audio WAV samples)
 │   └── fixtures/audio/             # Test-shared WAV fixtures
 ├── target/                         # Cargo build output (gitignored)
-└── crates/                         # 16 workspace member crates (see §2)
+└── crates/                         # 15 workspace member crates (see §2)
 ```
 
-`firmware/pico-hid/` is referenced in `Cargo.toml::exclude` and reserved for the M4 RP2040 firmware. It is not present in the current tree.
+The retired physical HID firmware and host-driver paths are no longer present in the workspace; `Cargo.toml::exclude` is empty.
 
 ## 2. Crate tree (with per-file one-line descriptions)
 
@@ -227,14 +227,7 @@ crates/synapse-action/
         ├── mod.rs                  # ActionBackend trait, BackendResolutionPolicy, ResolvedBackend, resolve_backend
         ├── mouse_coordinates.rs    # Screen→virtual desktop coord conversion
         ├── text_dispatch.rs        # Text-input dispatch (clipboard paste vs synthesized keystrokes)
-        ├── hardware.rs             # HardwareBackend public facade
-        ├── hardware/keyboard.rs    # Keyboard action helpers
-        ├── hardware/keymap.rs      # Synapse key to USB HID Keyboard/Keypad usage mapping
-        ├── hardware/keymap_tests.rs # HID usage mapping regression checks
-        ├── hardware/mouse.rs       # Relative mouse/button/wheel command encoding
-        ├── hardware/pad.rs         # Gamepad report command encoding
-        ├── hardware/tests.rs       # HardwareBackend command/state tests
-        ├── unavailable.rs          # Fail-closed hardware slot when --hardware-hid is absent
+        ├── unavailable.rs          # Fail-closed retired hardware compatibility slot
         ├── recording.rs            # RecordingBackend (in-memory event log)
         ├── recording/state.rs      # RecordingBackend internal state
         ├── software.rs             # SoftwareBackend (Windows SendInput)
@@ -345,24 +338,7 @@ crates/synapse-everquest/
     └── map_inventory.rs            # Focused map-inventory regression checks; supporting evidence only
 ```
 
-### 2.12 `crates/synapse-hid-host/`
-
-```
-crates/synapse-hid-host/
-├── Cargo.toml
-└── src/
-    ├── discover.rs                 # Synapse Pico serial-port discovery / auto-detect
-    ├── error.rs                    # HidError + code mapping
-    ├── handshake.rs                # IDENTIFY parsing and expected-version checks
-    ├── lib.rs                      # Public exports
-    ├── pipeline.rs                 # ACK/NAK pipeline, retries, backpressure
-    ├── protocol.rs                 # CRC16 frame encoding/parsing
-    ├── reconnect.rs                # Reconnect state machine and snapshots
-    ├── telemetry.rs                # GET_TELEMETRY request + snapshot parsing
-    └── transport.rs                # Serialport-backed HidGateway
-```
-
-### 2.13 `crates/synapse-models/` — ONNX runtime wrapper
+### 2.12 `crates/synapse-models/` — ONNX runtime wrapper
 
 ```
 crates/synapse-models/
@@ -371,7 +347,7 @@ crates/synapse-models/
     └── lib.rs                      # ModelDescriptor, Detector trait, DetectionFrame, ort feature-gated session loader
 ```
 
-### 2.14 `crates/synapse-telemetry/` — tracing + metrics
+### 2.13 `crates/synapse-telemetry/` — tracing + metrics
 
 ```
 crates/synapse-telemetry/
@@ -381,7 +357,7 @@ crates/synapse-telemetry/
     └── metrics.rs                  # M3_METRICS array (19 specs), describe_metric, CARDINALITY_LIMIT=1000
 ```
 
-### 2.15 `crates/synapse-test-utils/` — shared test rig
+### 2.14 `crates/synapse-test-utils/` — shared test rig
 
 ```
 crates/synapse-test-utils/
@@ -392,7 +368,7 @@ crates/synapse-test-utils/
     └── stdio_mcp_client.rs         # StdioMcpClient: launches synapse-mcp, drives initialize + tools/call
 ```
 
-### 2.16 `crates/synapse-overlay/` — M5 placeholder
+### 2.15 `crates/synapse-overlay/` — M5 placeholder
 
 ```
 crates/synapse-overlay/
@@ -416,7 +392,7 @@ crates/synapse-overlay/
 
 | Path | Description |
 |---|---|
-| `docs/computergames/` | Product Requirements Document (PRD) — 24 numbered files covering architecture, perception, action, reflex, MCP surface, schemas, storage, supported use, hardware HID, perf budget, security, observability, testing, build, roadmap, open questions, research appendix, Luanti benchmark/runbook, profile-registry governance, optional registry protocol, local registry data model, and profile package manifests |
+| `docs/computergames/` | Product Requirements Document (PRD) — 24 numbered files covering architecture, perception, action, reflex, MCP surface, schemas, storage, supported use, retired physical HID notes, perf budget, security, observability, testing, build, roadmap, open questions, research appendix, Luanti benchmark/runbook, profile-registry governance, optional registry protocol, local registry data model, and profile package manifests |
 | `docs/impplan/` | Implementation plan — methodology + per-milestone work-item ledger (M0 through M5) + cross-cutting concerns |
 | `docs/adr/0001-current-rust-and-dependencies.md` | ADR: pinned to current stable Rust, no MSRV downgrade |
 | `docs/adr/0002-rocksdb-primary-storage.md` | ADR: RocksDB chosen over LMDB/sled for primary storage |
@@ -445,8 +421,7 @@ synapse-core            (no synapse-* deps; standalone shared types)
   ├── synapse-audio         (synapse-core, synapse-models{directml})
   ├── synapse-action        (synapse-core; cfg(windows): synapse-a11y, synapse-capture)
   ├── synapse-perception    (synapse-core; cfg(windows): synapse-a11y, synapse-capture, synapse-models)
-  ├── synapse-reflex        (synapse-core, synapse-storage, synapse-action)
-  └── synapse-hid-host      (synapse-core; serialport + crc16 HID gateway)
+  └── synapse-reflex        (synapse-core, synapse-storage, synapse-action)
 
 synapse-mcp (binary)
   ↑
@@ -557,7 +532,7 @@ SynapseService::observe
 
 | File | Purpose |
 |---|---|
-| `Cargo.toml` (workspace) | Declares 15 workspace members (`crates/synapse-*`), default-members `[synapse-mcp, synapse-overlay]`, `exclude = ["firmware/pico-hid"]`. Workspace package metadata: `version = "0.1.0"`, `edition = 2024`, `rust-version = "1.95"`, `license = "MIT OR Apache-2.0"`, `repository = "https://github.com/ChrisRoyse/Synapse"`. |
+| `Cargo.toml` (workspace) | Declares 15 workspace members (`crates/synapse-*`), default-members `[synapse-mcp, synapse-overlay]`, `exclude = []`. Workspace package metadata: `version = "0.1.0"`, `edition = 2024`, `rust-version = "1.95"`, `license = "MIT OR Apache-2.0"`, `repository = "https://github.com/ChrisRoyse/Synapse"`. |
 | `Cargo.toml [workspace.dependencies]` | Pins all third-party deps (38 entries) at the workspace level; child crates use `<dep>.workspace = true` |
 | `Cargo.toml [workspace.lints.rust]` | `unsafe_code = forbid`, `unused = warn` |
 | `Cargo.toml [workspace.lints.clippy]` | `all = deny`, `pedantic/nursery = warn`, `unwrap_used = deny`, `expect_used = deny` |
@@ -565,7 +540,7 @@ SynapseService::observe
 | `Cargo.toml [profile.release]` | `opt-level=3`, `lto="thin"`, `codegen-units=16`, `strip=true`, `panic="abort"` |
 | `Cargo.toml [profile.release-max]` | inherits release, `lto="fat"`, `codegen-units=1` |
 | `Cargo.toml [profile.bench]` | inherits release with line-only debug |
-| Per-crate `Cargo.toml` | All workspace members override `[lints.rust]::unsafe_code` to `allow` only in: `synapse-action`, `synapse-a11y`, `synapse-capture`, `synapse-audio`, `synapse-hid-host` (anywhere doing FFI). Default-binary in `synapse-mcp/Cargo.toml`: `[[bin]] name = "synapse-mcp" path = "src/main.rs"`. Bench harness flags (`harness = false`) declare each `criterion` bench. |
+| Per-crate `Cargo.toml` | Workspace members override `[lints.rust]::unsafe_code` to `allow` only where FFI requires it: `synapse-action`, `synapse-a11y`, `synapse-capture`, and `synapse-audio`. Default-binary in `synapse-mcp/Cargo.toml`: `[[bin]] name = "synapse-mcp" path = "src/main.rs"`. Bench harness flags (`harness = false`) declare each `criterion` bench. |
 | `deny.toml` | cargo-deny configuration (advisory/licensing checks). Repo policy bans GitHub Actions as a shipping gate (`AGENTS.md`), so this is used locally only. |
 
 The release binary path on Windows is `target/release/synapse-mcp.exe` (linux/wsl variant `target/release/synapse-mcp`).

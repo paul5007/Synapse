@@ -27,7 +27,7 @@ Source files covered:
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 79 live tools are registered on `SynapseService` via
+All 80 live tools are registered on `SynapseService` via
 `#[tool(description=...)]` in `server.rs` and routed submodules. Tool
 descriptions are taken verbatim from the source. Every tool returns through
 `Json<T>` so the response shape exactly matches the deserialized response
@@ -243,7 +243,7 @@ size_bytes, size_estimate_tokens }`.
 ## 7. `act_click`
 
 **Description:** "Click a screen coordinate or UI Automation element"
-**Permissions:** `INPUT_MOUSE` (via reflex registration paths; tool itself doesn't gate at server.rs); the action's `backend` adds `INPUT_HARDWARE_HID` if `Hardware` is chosen.
+**Permissions:** `INPUT_MOUSE` (via reflex registration paths; tool itself doesn't gate at server.rs).
 **Side effects:** mouse movement + button click(s); appends to `RecordingBackend` if enabled
 
 | Parameter | Type | Required | Default | Range | Description |
@@ -301,7 +301,7 @@ preflight ran.
 | `backend` | `PressBackend` | no | `Auto` | `Software`/`Hardware`/`Auto` | |
 
 **Returns:** `ActPressResponse { ok, keys_pressed: u32, elapsed_ms: u32, backend_used: String }`.
-**Errors:** `ACTION_UNSUPPORTED_KEY`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE` (`Hardware` until M4).
+**Errors:** `ACTION_UNSUPPORTED_KEY`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE` (including the retired `Hardware` backend token).
 
 ## 9a. `act_keymap`
 
@@ -765,6 +765,31 @@ Manual FSV for both #522 tools must read trajectory/domain/state/model/predictio
 
 Manual FSV for both tools must read storage state before the trigger, call the real MCP tool with known synthetic prediction/outcome data, then separately inspect the durable `CF_KV` rows afterward. Scorecards support planning quality only and never replace runtime FSV against game UI/log/process/storage SoT.
 
+## 9v. `everquest_autocombat`
+
+**Description:** "Run a bounded, operator-attended, server-side EverQuest combat loop for the level-1 wizard (acquire -> consider -> melee + nuke-when-mana -> confirm kill -> recover -> re-acquire)"
+**Side effects:** requires the active `everquest.live` profile, chat-input safety, active EQ log, and supported-use foreground preflight; emits audited `act_keymap` actions for target/consider, melee auto-attack, and bounded nuke casts; persists an `everquest_autocombat_run` row under `CF_KV/everquest/autocombat/v1/everquest.live/<run_id>`.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `max_iterations` | `u32` | no | `8` | Combat-loop iteration cap |
+| `max_duration_s` | `u32` | no | `120` | Wall-clock cap |
+| `hp_floor_percent` | `u32` | no | `50` | Stop when observed HP falls below this floor |
+| `mana_floor_percent` | `u32` | no | `30` | Recovery/engagement floor |
+| `target_level_max` | `u32` | no | `2` | Highest safe target level |
+| `stop_at_level` | `u32` | no | `2` | Stop when the character reaches this level |
+| `cast_mana_cost_percent` | `u32` | no | `70` | Minimum mana threshold for the configured nuke |
+| `engagement_timeout_s` | `u32` | no | `30` | Per-target fight timeout |
+| `hotbar_alias` | `String` | no | `hotbar4` | Active-profile keymap alias for the nuke |
+| `max_roam_steps` | `u32` | no | `6` | Bounded roam/search scaffold |
+| `max_chase_s` | `u32` | no | `12` | Bounded chase scaffold |
+| `idempotency_key` | `Option<String>` | no | generated | Run id seed |
+
+**Returns:** `ActAutocombatResponse { ok, iterations, kills, casts, casts_resisted, casts_fizzled, started_level, final_level, final_xp_percent, stop_reason, run_row_key, looting_note, per_iteration }`.
+**Errors:** supported-use/profile/foreground/chat-input/action-preflight errors, `ACTION_TARGET_INVALID` for missing active log/runtime inputs, storage write/read errors, and `ACTION_BACKEND_UNAVAILABLE` from any failed keymap/action dispatch.
+
+Manual FSV must read the EQ foreground/chat-input/log/HUD/action-log/storage SoTs before the trigger, call the real MCP tool, then separately inspect the EQ log offsets/outcomes, `CF_ACTION_LOG`, and the persisted autocombat run row afterward. The tool is a gameplay loop surface, not a substitute for physical level/XP/log verification.
+
 ## 10. `act_aim`
 
 **Description:** "Move the pointer toward a screen, element, or track target"
@@ -892,7 +917,7 @@ Manual FSV for both tools must read storage state before the trigger, call the r
 ## 18. `reflex_register`
 
 **Description:** "Register a reflex"
-**Permissions:** `WRITE_REFLEX` plus any input permissions implied by `then` actions (`INPUT_KEYBOARD`/`INPUT_MOUSE`/`INPUT_PAD`/`INPUT_HARDWARE_HID`).
+**Permissions:** `WRITE_REFLEX` plus any input permissions implied by `then` actions (`INPUT_KEYBOARD`/`INPUT_MOUSE`/`INPUT_PAD`).
 **Side effects:** opens RocksDB on first call; persists a `reflex_registered` audit row; starts the scheduler thread on first reflex.
 
 | Parameter | Type | Required | Default | Range | Description |
@@ -1500,7 +1525,7 @@ For convenience the M3 tool-call gating is summarized here (live source: `crates
 | `storage_inspect` | `READ_STORAGE` |
 | `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | `WRITE_STORAGE` |
 
-`reflex_register`'s effective permission set is computed by `add_action_permissions` over the compiled `Vec<Action>` (e.g., `Action::PadReport` requires `INPUT_PAD`; any action with `Backend::Hardware` adds `INPUT_HARDWARE_HID`).
+`reflex_register`'s effective permission set is computed by `add_action_permissions` over the compiled `Vec<Action>` (e.g., `Action::PadReport` requires `INPUT_PAD`; keyboard and mouse actions require the matching input permissions). The retired `hardware` backend token does not add a separate permission; it fails closed during action dispatch.
 
 M1/M2 tools (`health`, `observe`, `find`, `read_text`, `set_capture_target`, `set_perception_mode`, `act_*`, `release_all`) do not gate at the M3 permission layer because they predate M3; the M3 permission layer applies only to the M3 tool surface. (For reflex-driven action emission, the reflex-register permission check is the gating point.)
 

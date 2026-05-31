@@ -1,4 +1,4 @@
-# 11 — Profiles, Hardware HID, Telemetry, Test Utilities
+# 11 — Profiles, Telemetry, Test Utilities
 
 Source files covered:
 - `crates/synapse-profiles/src/lib.rs`
@@ -11,7 +11,6 @@ Source files covered:
 - `crates/synapse-profiles/src/resolver.rs`
 - `crates/synapse-profiles/src/toml_format.rs`
 - `crates/synapse-profiles/src/watcher.rs`
-- `crates/synapse-hid-host/src/lib.rs`
 - `crates/synapse-telemetry/src/lib.rs`
 - `crates/synapse-telemetry/src/metrics.rs`
 - `crates/synapse-test-utils/src/lib.rs`
@@ -190,25 +189,13 @@ match does not activate the profile or overwrite a manual `profile_activate`.
 
 Activating a profile updates the action emitter's shared backend-resolution
 policy. `[backends] default_backend = "hardware"` is accepted as a TOML alias
-for `default = "hardware"` and causes `Backend::Auto` actions to resolve to
-hardware for that profile unless a class-specific default overrides it. The
+for `default = "hardware"` for compatibility, but `Backend::Auto` actions that
+resolve to that slot fail closed with `ACTION_BACKEND_UNAVAILABLE`. The
 separate source-of-truth readback is `health.subsystems.action.backend_resolution`.
 
-## 2. `synapse-hid-host`
+## 2. `synapse-telemetry`
 
-```text
-crates/synapse-hid-host/src/
-  discover.rs, error.rs, handshake.rs, lib.rs, pipeline.rs,
-  protocol.rs, reconnect.rs, telemetry.rs, transport.rs
-```
-
-Direct dependencies (`Cargo.toml`): `crc16`, `serde`, `serialport`, `synapse-core`, `thiserror`, `tokio`, `tracing`. The crate implements the host-side serial gateway used by `HardwareBackend`: port discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frames, pipelined send, reconnect state, and structured HID errors.
-
-The live driver talks to the RP2040 firmware over USB CDC at 1 Mbaud, with CRC16 frames and a firmware version handshake. `HidGateway::get_telemetry` and `HidReconnectGateway::get_telemetry` issue `GET_TELEMETRY` and parse the 28-byte base `TELEMETRY_RESP` payload into `HidTelemetrySnapshot { uptime_ms, frames_received, frames_dropped, link_errors, commands_executed, watchdog_fires, crc_errors }`. Current firmware extends that payload to 44 bytes with optional device-clock timing fields: `timed_commands`, `previous_command_delta_us`, `last_command_delta_us`, and `last_timed_command_uptime_us`. Host parsing accepts the old 28-byte payload for diagnostic compatibility, but hardware timing benchmarks require the 44-byte timing extension and fail closed when it is absent. Error codes surfaced by the driver include `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, and `HID_LINK_TIMEOUT`.
-
-## 3. `synapse-telemetry`
-
-### 3.1 `TelemetryConfig`
+### 2.1 `TelemetryConfig`
 
 ```rust
 pub struct TelemetryConfig {
@@ -230,25 +217,25 @@ Constants:
 | `DEFAULT_GC_INTERVAL` | `6 hours` |
 | `GC_INTERVAL_ENV` | `"SYNAPSE_LOG_GC_INTERVAL_S"` |
 
-### 3.2 `init_tracing(cfg)` algorithm
+### 2.2 `init_tracing(cfg)` algorithm
 
 1. Resolve `log_dir`. `default_log_dir()`:
    - Windows: `%LOCALAPPDATA%/synapse/logs`
    - else: `$XDG_STATE_HOME/synapse/logs` or `$HOME/.local/state/synapse/logs` or `.synapse-state/synapse/logs`
 2. `prepare_log_dir(log_dir)`: `fs::create_dir_all`, then write+delete a `.synapse-write-probe` file. Failure → `TelemetryError::LogDirNotWritable`.
-3. Run an immediate `run_log_gc` pass (see §3.4).
+3. Run an immediate `run_log_gc` pass (see §2.4).
 4. Build `tracing_appender::rolling::daily(log_dir, "synapse.log")` → non-blocking writer + `WorkerGuard`.
 5. Layer composition:
    - File layer: JSON, includes target, file, line number, thread id/name, current span + span list. Filtered to `cfg.file_level`.
    - Console layer: stderr writer, no ANSI, filtered by `EnvFilter::builder().with_default_directive(cfg.console_level.into()).from_env_lossy()` so the operator's `RUST_LOG` overrides remain effective.
 6. `Registry::default().with(file_layer).with(console_layer).try_init()` (returns `SubscriberInit` if another global subscriber is installed).
 7. `install_panic_hook()` (idempotent via `Once`): wraps any prior hook and emits a `tracing::error!(code = "TELEMETRY_PANIC_HOOK_FIRED", payload, location, ...)` before delegating.
-8. `metrics::register_m3_metrics()` (see §3.5).
-9. Spawn the GC worker (§3.4) and store in the `TelemetryGuard`.
+8. `metrics::register_m3_metrics()` (see §2.5).
+9. Spawn the GC worker (§2.4) and store in the `TelemetryGuard`.
 
 Returned `TelemetryGuard` ties: `_file_guard: WorkerGuard` (flushes on drop) and `_gc_worker: Option<GcWorker>` (shuts down on drop).
 
-### 3.3 `effective_gc_interval`
+### 2.3 `effective_gc_interval`
 
 `SYNAPSE_LOG_GC_INTERVAL_S` env var overrides the configured `gc_interval` at startup:
 
@@ -256,7 +243,7 @@ Returned `TelemetryGuard` ties: `_file_guard: WorkerGuard` (flushes on drop) and
 - `0` or `Some(Duration::ZERO)` → disable GC.
 - Otherwise interpret as seconds.
 
-### 3.4 `run_log_gc(log_dir, keep_days, max_dir_bytes)`
+### 2.4 `run_log_gc(log_dir, keep_days, max_dir_bytes)`
 
 1. Walk `log_dir` (non-recursive). For each file:
    - If older than `keep_days * 86_400 s`, delete and continue.
@@ -266,7 +253,7 @@ Returned `TelemetryGuard` ties: `_file_guard: WorkerGuard` (flushes on drop) and
 
 The background `GcWorker` thread re-runs this on `recv_timeout(interval)`; channel disconnect (parent guard dropped) breaks the loop cleanly.
 
-### 3.5 Metrics registry (`metrics.rs`)
+### 2.5 Metrics registry (`metrics.rs`)
 
 `M3_METRICS: &[MetricSpec; 19]` declares all M3-era metrics with bounded label cardinality. `register_m3_metrics()` calls `describe_metric` per spec and emits one `tracing::info!(code = "M3_METRIC_REGISTERED", ...)` per metric. Recorded `Once` so repeat calls are no-ops.
 
@@ -294,7 +281,7 @@ The background `GcWorker` thread re-runs this on `recv_timeout(interval)`; chann
 
 Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert every spec stays under the limit.
 
-### 3.6 Errors
+### 2.6 Errors
 
 `TelemetryError` variants and codes:
 
@@ -306,9 +293,9 @@ Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert eve
 
 (These error names are crate-private constants — they are not in `synapse_core::error_codes` because telemetry initialization happens before that module is reachable.)
 
-## 4. `synapse-test-utils`
+## 3. `synapse-test-utils`
 
-### 4.1 `StdioMcpClient`
+### 3.1 `StdioMcpClient`
 
 `crates/synapse-test-utils/src/stdio_mcp_client.rs`:
 
@@ -317,7 +304,7 @@ Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert eve
 - `tools_list() -> Result<serde_json::Value>`: lists available tools.
 - On `Drop`, terminates the child process (used by `drop_kills_child.rs` integration test).
 
-### 4.2 Fixtures
+### 3.2 Fixtures
 
 `crates/synapse-test-utils/src/fixtures.rs` includes:
 
@@ -327,15 +314,14 @@ Cardinality limit: `CARDINALITY_LIMIT = 1000`. Tests in the same file assert eve
 
 These are gated behind `cfg(windows)` and the Notepad fixture is the basis for the `m2_notepad_type_save.rs` end-to-end test in `synapse-mcp`.
 
-## 5. Cross-references
+## 4. Cross-references
 
 - Permission gates that consult profile use-scope: [03_configuration.md §4.4](03_configuration.md), [06_mcp_service_and_transports.md §1.5](06_mcp_service_and_transports.md).
 - Profile schema types: [05_core_types_and_errors.md §5.5](05_core_types_and_errors.md).
 - Metric usage: [07_reflex_runtime.md §10](07_reflex_runtime.md), [10_audio_and_models.md §4](10_audio_and_models.md), [04_storage_layer.md §7](04_storage_layer.md).
 
-## 6. What is NOT covered
+## 5. What is NOT covered
 
-- **Physical `synapse-hid-host` runtime FSV.** Source inspection covers the host driver shape; issue closure still requires real Pico/COM-device source-of-truth evidence on the configured host.
 - **OTLP export.** `opentelemetry` and `opentelemetry-otlp` are in workspace deps but not wired in `synapse-telemetry::init_tracing` — the file/console layers are the only sinks.
 - **Prometheus exporter binding.** `metrics-exporter-prometheus` is referenced in workspace deps but not bound to an HTTP port by `synapse-telemetry`; the `register_m3_metrics` path only describes the metrics so the `metrics` crate global recorder can hold them.
 - **Profile activation persistence.** Activating a profile updates in-memory state only; nothing is persisted to `CF_PROFILES` in this build (PRD §7 reserves that CF for future use).

@@ -31,7 +31,6 @@ Source files covered:
 - `crates/synapse-profiles/src/lib.rs`
 - `crates/synapse-telemetry/src/lib.rs`
 - `crates/synapse-models/src/lib.rs`
-- `crates/synapse-hid-host/src/lib.rs`
 - `crates/synapse-everquest/src/lib.rs`
 - `crates/synapse-overlay/src/main.rs`
 
@@ -57,7 +56,6 @@ The repository operates under the doctrine in `AGENTS.md`: manual Full State Ver
 | Audio loopback | WASAPI loopback on default render device | `wasapi` v0.23 | Ring buffer + STT (Whisper tiny) for `audio_tail` / `audio_transcribe` tools |
 | Capture | DXGI duplication or Windows.Graphics.Capture | `windows-capture` v2.0 + `windows` v0.62 | Zero-copy GPU frame surface for OCR/CNN paths |
 | ViGEm virtual pad | ViGEmBus driver, user-space client | `vigem-client` v0.1.4 (X360 default, optional DS4) | Virtual Xbox/DualShock controller for `act_pad` |
-| Pi Pico HID gateway | USB serial, RP2040 firmware (M4) | `serialport` v4.9 + `crc16` | Hardware HID host surface; `synapse-hid-host` implements serial discovery, connect/IDENTIFY, framing, pipelined send, and reconnect paths. See `docs/computergames/09_hardware_hid_gateway.md` |
 | EverQuest local data | Daybreak install maps/logs plus `%APPDATA%/Synapse/everquest` map-pack cache | `synapse-everquest` crate + local CLI binaries | Parses EQ logs and maps, builds zone graphs, inventories base/community map sets, preserves archive hashes/manifests, and feeds the attended EverQuest world-model FSV workflow |
 | `synapse-overlay` binary | currently a placeholder (`crates/synapse-overlay/src/main.rs` is 1 line) | n/a | Future debug overlay for M5 production polish |
 
@@ -86,8 +84,6 @@ The repository operates under the doctrine in `AGENTS.md`: manual Full State Ver
 | Audio | `wasapi` | `0.23.0` |
 | Software input | `enigo` (no default features) | `0.6.1` |
 | Virtual controller | `vigem-client` (with `unstable_ds4` from `synapse-action`) | `0.1.4` |
-| Serial port | `serialport` | `4.9.0` |
-| CRC | `crc16` | `0.4.0` |
 | ONNX Runtime | `ort` (optional via `synapse-models` features `ort`/`cuda`/`directml`) | `2.0.0-rc.12` |
 | Hashing / constant-time | `sha2`, `subtle` | `0.11.0`, `2.6.1` |
 | Signatures | `ed25519-dalek` | `2.2.0` |
@@ -102,13 +98,13 @@ The repository operates under the doctrine in `AGENTS.md`: manual Full State Ver
 | Tempfiles | `tempfile` | `3.27.0` |
 | Mocking | `mockall` | `0.14.0` |
 
-Workspace-wide lints (`Cargo.toml [workspace.lints]`): `unsafe_code = forbid` at root (relaxed to `allow` in crates with FFI: `synapse-capture`, `synapse-a11y`, `synapse-action`, `synapse-audio`, `synapse-hid-host`); clippy `all = deny`, `pedantic`/`nursery = warn`, `unwrap_used`/`expect_used = deny`.
+Workspace-wide lints (`Cargo.toml [workspace.lints]`): `unsafe_code = forbid` at root (relaxed to `allow` in crates with FFI: `synapse-capture`, `synapse-a11y`, `synapse-action`, `synapse-audio`); clippy `all = deny`, `pedantic`/`nursery = warn`, `unwrap_used`/`expect_used = deny`.
 
 Release profile: `opt-level=3`, `lto="thin"`, `codegen-units=16`, `panic="abort"`, `strip=true` (`Cargo.toml [profile.release]`). A `release-max` profile inherits release with `lto="fat"` and `codegen-units=1`.
 
 ## 4. Public MCP tool surface (live)
 
-All 79 live tools live in `crates/synapse-mcp/src/server.rs` and routed
+All 80 live tools live in `crates/synapse-mcp/src/server.rs` and routed
 submodules (declared via `#[tool_router]`). Grouped by milestone:
 
 ### 4.1 M1 — perception (6 tools)
@@ -301,8 +297,6 @@ CLI flags on `synapse-mcp` (parsed in `main.rs::Cli`, full table: [03_configurat
                                 [env: SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE]
 --max-subscriptions <COUNT>     [env: SYNAPSE_MAX_SUBSCRIPTIONS]
                                 default: synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO
---hardware-hid <PORT_OR_AUTO>   [env: SYNAPSE_HARDWARE_HID]
---reset-hardware-consent
 ```
 
 ## 6. Runtime directory layout
@@ -331,13 +325,12 @@ All errors carry `SCREAMING_SNAKE_CASE` codes defined as `pub const &str` in `cr
 | Category | Examples | Source-of-truth |
 |---|---|---|
 | Perception (PRD 8.1) | `OBSERVE_NO_PERCEPTION_AVAILABLE`, `OBSERVE_INTERNAL`, `CAPTURE_GRAPHICS_API_UNSUPPORTED`, `CAPTURE_TARGET_LOST`, `CAPTURE_NO_DIRTY_REGIONS`, `A11Y_NOT_AVAILABLE`, `A11Y_ELEMENT_STALE`, `A11Y_NO_FOREGROUND`, `A11Y_CDP_UNREACHABLE`, `DETECTION_MODEL_NOT_LOADED`, `DETECTION_MODEL_INFER_FAILED`, `DETECTION_NO_FRAME`, `OCR_NO_TEXT`, `OCR_BACKEND_UNAVAILABLE`, `HUD_NO_ACTIVE_PROFILE`, `HUD_FIELD_NOT_DEFINED`, `HUD_EXTRACTION_FAILED`, `AUDIO_DEVICE_LOST`, `AUDIO_LOOPBACK_INIT_FAILED`, `AUDIO_STT_MODEL_NOT_LOADED` | `error_codes.rs` lines 2–21 |
-| Action (PRD 8.2) | `ACTION_QUEUE_FULL`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE`, `ACTION_TARGET_INVALID`, `ACTION_HOLD_EXCEEDED_MAX`, `ACTION_HID_PORT_DISCONNECTED`, `ACTION_VIGEM_NOT_INSTALLED`, `ACTION_VIGEM_PLUGIN_FAILED`, `ACTION_ELEMENT_NOT_RESOLVED`, `ACTION_FOREGROUND_LOST`, `ACTION_UNSUPPORTED_KEY`, `ACTION_DRAG_DISTANCE_EXCEEDS_LIMIT`, `STUCK_KEY_AUTO_RELEASED`, `SAFETY_RELEASE_ALL_FIRED`, `SAFETY_OPERATOR_HOTKEY_FIRED` | lines 24–38 |
+| Action (PRD 8.2) | `ACTION_QUEUE_FULL`, `ACTION_RATE_LIMITED`, `ACTION_BACKEND_UNAVAILABLE`, `ACTION_TARGET_INVALID`, `ACTION_HOLD_EXCEEDED_MAX`, `ACTION_VIGEM_NOT_INSTALLED`, `ACTION_VIGEM_PLUGIN_FAILED`, `ACTION_ELEMENT_NOT_RESOLVED`, `ACTION_FOREGROUND_LOST`, `ACTION_UNSUPPORTED_KEY`, `ACTION_DRAG_DISTANCE_EXCEEDS_LIMIT`, `STUCK_KEY_AUTO_RELEASED`, `SAFETY_RELEASE_ALL_FIRED`, `SAFETY_OPERATOR_HOTKEY_FIRED` | lines 24–37 |
 | Reflex (PRD 8.3) | `REFLEX_CAP_REACHED`, `REFLEX_KIND_INVALID`, `REFLEX_PARAMS_INVALID`, `REFLEX_TARGET_INVALID`, `REFLEX_FILTER_INVALID`, `REFLEX_PRIORITY_INVALID`, `REFLEX_TICK_LATE`, `REFLEX_TRACK_LOST`, `REFLEX_STARVED`, `REFLEX_DISABLED_BY_OPERATOR`, `REFLEX_LIFETIME_EXPIRED`, `REFLEX_RECURSION_LIMIT`, `REFLEX_ACTION_PERMISSION_DENIED` | lines 41–53 |
 | Profile / config (PRD 8.4) | `PROFILE_NOT_FOUND`, `PROFILE_PARSE_ERROR`, `PROFILE_VERSION_INCOMPATIBLE`, `PROFILE_KEYMAP_INVALID`, `PROFILE_HUD_REGION_INVALID`, `CAPTURE_TARGET_INVALID`, `PERCEPTION_MODE_INVALID`, `PROFILE_TRUST_VERIFICATION_FAILED`, `PROFILE_ROLLBACK_UNAVAILABLE`, `AUDIT_EXPORT_CONSENT_REQUIRED`, `AUDIT_EXPORT_REDACTION_REQUIRED`, `AUDIT_EXPORT_PAYLOAD_TOO_LARGE`, `PROFILE_AUTHORING_INSUFFICIENT_EVIDENCE`, `PROFILE_AUTHORING_CONFLICTING_EVIDENCE`, `PROFILE_AUTHORING_UNSAFE_ESCALATION`, `PROFILE_AUTHORING_CANDIDATE_NOT_FOUND`, `PROFILE_AUTHORING_INVALID_STATE` | lines 56–72 |
 | MCP / session (PRD 8.5) | `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `SUBSCRIPTION_NOT_FOUND`, `SUBSCRIPTION_CAP_REACHED`, `TOOL_NOT_FOUND`, `TOOL_PARAMS_INVALID`, `TOOL_INTERNAL_ERROR`, `HTTP_BIND_NON_LOOPBACK_REFUSED`, `HTTP_TOKEN_INVALID`, `HTTP_ORIGIN_REFUSED`, `HTTP_SESSION_INVALID`, `REPLAY_TARGET_INVALID`, `REPLAY_FORMAT_INVALID` | lines 75–87 |
 | Storage (PRD 8.6) | `STORAGE_OPEN_FAILED`, `STORAGE_WRITE_FAILED`, `STORAGE_READ_FAILED`, `STORAGE_CORRUPTED`, `STORAGE_SCHEMA_MISMATCH`, `STORAGE_DISK_PRESSURE_LEVEL_1..4`, `STORAGE_CF_HARD_CAP_REACHED` | lines 90–99 |
 | Models (PRD 8.7) | `MODEL_DOWNLOAD_FAILED`, `MODEL_HASH_MISMATCH`, `MODEL_LOAD_FAILED`, `MODEL_BACKEND_UNAVAILABLE` | lines 102–105 |
-| Hardware HID (PRD 8.8) | `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, `HID_LINK_TIMEOUT` | lines 108–113 |
 | Safety (PRD 8.9) | `SAFETY_KILLSWITCH_ACTIVE`, `SAFETY_PROCESS_DENYLISTED`, `SAFETY_SHELL_DENIED_BY_POLICY`, `SAFETY_LAUNCH_DENIED_BY_POLICY`, `SAFETY_SECRET_REDACTED`, `SAFETY_PERMISSION_DENIED`, `SAFETY_PROFILE_ACTION_DENIED` | lines 116–122 |
 
 Cross-crate `thiserror` enums that surface these codes:
@@ -376,7 +369,7 @@ Opens RocksDB with LZ4 base, ZSTD on `CF_OBSERVATIONS`/`CF_SESSIONS`, no-compres
 `ReflexRuntime` (`crates/synapse-reflex/src/lib.rs`) owns the scheduler, `EventBus`, and a `Db` handle for audit persistence. Reflex kinds: `AimTrack` (PID-style aim controller with EMA smoothing), `HoldMove` (held key set with optional re-assert), `HoldButton` (held mouse/pad button), `Combo` (timed step list), `OnEvent` (event-filtered action firing with recursion guard, default cap `MAX_ON_EVENT_FIRINGS_PER_TICK`). Scheduler runs at 1 ms tick (default), records `TickSample` with jitter, computes p99, exposes `degraded_latency()` and `recursion_clamps_total()` for `health`. Each register/cancel/disable/fire writes a `StoredReflexAudit` row into `CF_REFLEX_AUDIT`. Subscriber bus is bounded by `SUBSCRIBER_QUEUE_CAPACITY` with drop accounting. See [07_reflex_runtime.md](07_reflex_runtime.md).
 
 ### 9.5 synapse-action (input emission)
-The `ActionEmitter` actor (mpsc channel, `ACTION_QUEUE_CAPACITY=256`) consumes `Action` messages, applies token-bucket rate limits per backend (`SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S`), tracks held keys/buttons/pad state in a `BitSet`, and dispatches to one of: Software (`enigo`), ViGEm (`vigem-client`), Recording (in-memory buffer, used by tests), `HardwareBackend` (when `--hardware-hid <port|auto>` connects and identifies a Synapse Pico), or `HardwareUnavailable` (fail-closed `ACTION_BACKEND_UNAVAILABLE` when hardware HID is not enabled). Owns the operator panic hotkey (`Ctrl+Alt+Shift+P`) which fires a 50 ms-budgeted `ReleaseAll` (`crates/synapse-mcp/src/safety.rs`). Curve sampling, keystroke-dynamics samplers (`BIGRAMS`, `KeystrokeNaturalParams::FAST`), click-timing caches, clipboard read/write/clear, and per-action validation (`validate_action`, `MAX_DRAG_DISTANCE_PX`) all live here. See [08_action_subsystem.md](08_action_subsystem.md).
+The `ActionEmitter` actor (mpsc channel, `ACTION_QUEUE_CAPACITY=256`) consumes `Action` messages, applies token-bucket rate limits per backend (`SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S`), tracks held keys/buttons/pad state in a `BitSet`, and dispatches to one of: Software (`enigo`), ViGEm (`vigem-client`), Recording (in-memory buffer, used by tests), or `HardwareUnavailable` (fail-closed `ACTION_BACKEND_UNAVAILABLE` when the retired `hardware` compatibility token is selected). Owns the operator panic hotkey (`Ctrl+Alt+Shift+P`) which fires a 50 ms-budgeted `ReleaseAll` (`crates/synapse-mcp/src/safety.rs`). Curve sampling, keystroke-dynamics samplers (`BIGRAMS`, `KeystrokeNaturalParams::FAST`), click-timing caches, clipboard read/write/clear, and per-action validation (`validate_action`, `MAX_DRAG_DISTANCE_PX`) all live here. See [08_action_subsystem.md](08_action_subsystem.md).
 
 ### 9.6 synapse-perception (observation assembly)
 Aggregates inputs from `synapse-a11y` (UIA tree) and `synapse-capture` (frame sources, OCR) into an `Observation`. Owns the `ObservationAssembler` with per-slot include flags (`ObserveInclude`), auto perception-mode resolution (`auto_mode`, `auto_mode_with_a11y`), and `ObservationInput` (synthetic fixture or live OS data). Provides OCR with WinRT and CRNN backends (`OcrProvider`, `read_text`, `read_text_with_provider`). See [09_perception_and_capture.md](09_perception_and_capture.md).
@@ -399,8 +392,8 @@ Owns the process-wide `tracing` subscriber: JSON file appender (daily rolling, l
 ### 9.12 synapse-models (ONNX runtime wrappers)
 Holds `ModelDescriptor` (id, path, sha256, input_shape, class_map), `Detector` trait (`infer(frame, opts)`), `DetectionFrame::validate`. Wraps `ort` v2.0.0-rc.12 with optional `cuda` and `directml` features (`directml` is required by `synapse-audio` for the Whisper-tiny inference). Validates SHA-256 before loading; emits `MODEL_HASH_MISMATCH` on drift.
 
-### 9.13 synapse-hid-host
-USB-serial driver for the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the root workspace via `Cargo.toml::exclude`). The crate exposes serial discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frame encode/decode, pipelined send, reconnect state, firmware telemetry snapshots, and HID error mapping. `synapse-mcp --hardware-hid <port|auto>` uses this crate to build the live `HardwareBackend`.
+### 9.13 retired physical HID path
+The physical HID implementation was removed after the #588 software-only input decision. The `hardware` backend token remains only as a compatibility value that routes to `HardwareUnavailableBackend` and fails closed with `ACTION_BACKEND_UNAVAILABLE`; live input is `software` plus `vigem`.
 
 ### 9.14 synapse-everquest
 EverQuest-specific local data helpers. The library parses EQ log files, map
@@ -425,14 +418,14 @@ Currently `fn main() {}`. Will hold the debug overlay UI shipped at M5.
 | M1 — perception MVP | DONE | `v0.1.0-m1` (2026-05-23) | `observe` + `find` + `read_text` + `set_capture_target` + `set_perception_mode` + a11y/capture wiring |
 | M2 — action MVP | DONE | `v0.1.0-m2` (2026-05-24) | Nine action tools, Software + ViGEm + Recording backends, operator panic hotkey, `release_all` safety paths |
 | M3 — reflex / MCP surface | DONE | `v0.1.0-m3` (2026-05-25, @ `97019ec`) | SSE bus, reflex runtime + 1 ms time-critical scheduler, RocksDB (11 CFs) + GC + 4-level disk pressure, profile loader + watcher (4 bundled), WASAPI loopback + Whisper-tiny STT, replay JSONL recorder, streamable HTTP/SSE transport with Bearer + Origin/Host + Mcp-Session-Id, 15 M3 tools (incl. four `storage_*` diagnostics) |
-| M4 — hardware HID + first game | ACTIVE | — | RP2040 firmware (`firmware/pico-hid/`) + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` |
-| M5 — production polish + registry/audit moat | release gate blocked by M4; registry/audit work active | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak, and the #454/#455-#470 profile-registry/audit-data learning loop |
+| M4 — first game + compound actions | tagged/retired hardware path | `v0.1.0-m4` | `act_combo`/`act_run_shell`/`act_launch`, first-game/profile runtime work, software-only input, retired `hardware` token fail-closed |
+| M5 — production polish + registry/audit moat | active | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak, and the #454/#455-#470 profile-registry/audit-data learning loop |
 
 ## 11. What is NOT covered
 
 - **Cross-platform support.** All capture, a11y, action, audio, hotkey, and HID paths are `#[cfg(windows)]`. Non-Windows builds compile (stubs return `ACTION_BACKEND_UNAVAILABLE`/equivalent), but no perception or action paths are wired.
 - **Inner LLM / planner.** The agent (Claude / Codex / Cursor) is the brain; `synapse-mcp` is the body. There is no GOAP/MCTS/skill library inside this repo.
 - **Goal storage.** RocksDB does not persist agent goals or plans; it only stores sensor/reflex/action traces.
-- **Process manipulation / packet sniffing.** Out of scope per PRD §"Out of scope". `synapse-hid-host` and `synapse-action` only talk to OS input APIs or USB serial; no game RAM reads.
+- **Process manipulation / packet sniffing.** Out of scope per PRD §"Out of scope". `synapse-action` only talks to OS input APIs and virtual-controller APIs; no game RAM reads.
 - **HTTPS / TLS.** The HTTP transport is loopback HTTP only by default; the Origin allow-list rejects non-`http://` Origins (`http/auth.rs::validate_origin`). For non-loopback binds with TLS termination, the operator is expected to front the daemon with a local reverse proxy.
 - **Migration shims pre-v1.** Schema changes wipe-and-rebuild (`docs/computergames/README.md` §Authoring rules); there is no migration framework in `synapse-storage`.
