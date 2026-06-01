@@ -57,6 +57,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(REFLEX_LIFETIME_EXPIRED);
     assert_literal!(REFLEX_RECURSION_LIMIT);
     assert_literal!(REFLEX_ACTION_PERMISSION_DENIED);
+    assert_literal!(REFLEX_DEBOUNCED);
 
     assert_literal!(PROFILE_NOT_FOUND);
     assert_literal!(PROFILE_PARSE_ERROR);
@@ -115,6 +116,10 @@ fn m3_error_codes_snapshot_with_readback() {
         (
             "REFLEX_ACTION_PERMISSION_DENIED",
             synapse_core::error_codes::REFLEX_ACTION_PERMISSION_DENIED,
+        ),
+        (
+            "REFLEX_DEBOUNCED",
+            synapse_core::error_codes::REFLEX_DEBOUNCED,
         ),
         (
             "HTTP_BIND_NON_LOOPBACK_REFUSED",

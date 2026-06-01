@@ -13,6 +13,7 @@ use synapse_storage::Db;
 use crate::{
     EventBus, ReflexActionGateHandle,
     error::{ReflexError, ReflexResult},
+    kinds::hold_lifetime::validate_lifetime,
     kinds::on_event::OnEventState,
     kinds::{
         aim_track::{AimTrackParams, AimTrackTargetSourceHandle},
@@ -570,6 +571,7 @@ pub(crate) fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()
             });
         }
         reflex.trigger.validate()?;
+        validate_lifetime(&reflex.lifetime)?;
     }
     Ok(())
 }

@@ -15,7 +15,7 @@ use synapse_core::{
 use synapse_reflex::{
     AimTrackParams, AimTrackTarget, AimTrackTargetSnapshot, AimTrackTargetSource,
     DEFAULT_REFLEX_PRIORITY, EventBus, HoldMoveParams, REFLEX_ACTION_DENIED_STEP_STATUS,
-    REFLEX_ACTION_PERMISSION_DENIED_KIND, REFLEX_AIM_TRACK_CORRECTION_KIND,
+    REFLEX_ACTION_PERMISSION_DENIED_KIND, REFLEX_AIM_TRACK_CORRECTION_KIND, REFLEX_DEBOUNCED_KIND,
     REFLEX_LIFETIME_EXPIRED_KIND, REFLEX_RECURSION_LIMIT_KIND, REFLEX_STARVED_KIND,
     REFLEX_TICK_LATE_KIND, REFLEX_TRACK_LOST_KIND, ReflexActionGate, ReflexActionPermissionDenied,
     ReflexScheduler, ScheduledReflex, ScheduledReflexDriver, SchedulerConfig, SchedulerTrigger,
@@ -190,7 +190,16 @@ fn on_event_recursion_guard_limits_same_tick_firings_and_audits() -> Result<(), 
 
 #[test]
 fn on_event_debounce_suppresses_same_tick_duplicates() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let db = std::sync::Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
     let bus = EventBus::default();
+    let debounced_events = bus.subscribe(
+        EventFilter::Kind {
+            kind: REFLEX_DEBOUNCED_KIND.to_owned(),
+        },
+        Vec::new(),
+        false,
+    )?;
     let (action_handle, action_rx) = ActionHandle::channel();
     let reflex = ScheduledReflex::on_event_with_debounce(
         "reflex-debounced",
@@ -200,19 +209,169 @@ fn on_event_debounce_suppresses_same_tick_duplicates() -> Result<(), Box<dyn Err
         vec![Action::ReleaseAll],
         Duration::from_secs(1),
     );
-    let mut scheduler = ReflexScheduler::spawn(
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db(
         bus.clone(),
         action_handle,
         vec![reflex],
         slow_one_tick_config(),
+        std::sync::Arc::clone(&db),
     )?;
     let _report = bus.publish(event(1, "debounced"));
     let _report = bus.publish(event(2, "debounced"));
     let samples = scheduler.wait_for_samples(1, WAIT_TIMEOUT);
     scheduler.stop()?;
+    db.flush()?;
+
+    let audits = read_audits(&db)?;
+    let fired = audits
+        .iter()
+        .filter(|audit| audit.details["kind"].as_str() == Some(synapse_reflex::REFLEX_FIRED_KIND))
+        .count();
+    let debounced = audits
+        .iter()
+        .find(|audit| audit.details["kind"].as_str() == Some(REFLEX_DEBOUNCED_KIND))
+        .ok_or_else(|| io::Error::other("missing debounce audit"))?;
 
     assert_eq!(samples.len(), 1);
     assert_eq!(action_rx.len(), 1);
+    assert_eq!(debounced_events.drain().len(), 1);
+    assert_eq!(fired, 1);
+    assert_eq!(
+        debounced.error_code.as_deref(),
+        Some(error_codes::REFLEX_DEBOUNCED)
+    );
+    assert_eq!(debounced.details["reason"], "same_tick");
+    assert_eq!(debounced.details["suppressed_count"], 1);
+    Ok(())
+}
+
+#[test]
+fn on_event_debounce_audits_later_window_suppression() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let db = std::sync::Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+    let bus = EventBus::default();
+    let (action_handle, action_rx) = ActionHandle::channel();
+    let reflex = ScheduledReflex::on_event_with_debounce(
+        "reflex-debounce-window",
+        EventFilter::Kind {
+            kind: "debounce-window".to_owned(),
+        },
+        vec![Action::ReleaseAll],
+        Duration::from_secs(5),
+    );
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db(
+        bus.clone(),
+        action_handle,
+        vec![reflex],
+        slow_ticks_config(8),
+        std::sync::Arc::clone(&db),
+    )?;
+    let _report = bus.publish(event(1, "debounce-window"));
+    assert!(wait_for_fire_count(
+        &scheduler,
+        "reflex-debounce-window",
+        1,
+        WAIT_TIMEOUT
+    ));
+    let _report = bus.publish(event(2, "debounce-window"));
+    let samples = scheduler.wait_for_samples(8, WAIT_TIMEOUT);
+    scheduler.stop()?;
+    db.flush()?;
+
+    let audits = read_audits(&db)?;
+    let debounced = audits
+        .iter()
+        .find(|audit| {
+            audit.details["kind"].as_str() == Some(REFLEX_DEBOUNCED_KIND)
+                && audit.details["reason"].as_str() == Some("debounce_window")
+        })
+        .ok_or_else(|| io::Error::other("missing debounce-window audit"))?;
+
+    assert_eq!(samples.len(), 8);
+    assert_eq!(action_rx.len(), 1);
+    assert_eq!(
+        debounced.error_code.as_deref(),
+        Some(error_codes::REFLEX_DEBOUNCED)
+    );
+    assert_eq!(debounced.details["suppressed_count"], 1);
+    Ok(())
+}
+
+#[test]
+fn on_event_until_event_lifetime_expires_before_future_triggers() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let db = std::sync::Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+    let bus = EventBus::default();
+    let lifetime_events = bus.subscribe(
+        EventFilter::Kind {
+            kind: REFLEX_LIFETIME_EXPIRED_KIND.to_owned(),
+        },
+        Vec::new(),
+        false,
+    )?;
+    let (action_handle, action_rx) = ActionHandle::channel();
+    let reflex = ScheduledReflex::on_event(
+        "reflex-until-event",
+        EventFilter::Kind {
+            kind: "fire".to_owned(),
+        },
+        vec![Action::ReleaseAll],
+    )
+    .with_lifetime(ReflexLifetime::UntilEvent {
+        filter: EventFilter::Kind {
+            kind: "stop".to_owned(),
+        },
+    });
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db(
+        bus.clone(),
+        action_handle,
+        vec![reflex],
+        slow_ticks_config(10),
+        std::sync::Arc::clone(&db),
+    )?;
+    let _report = bus.publish(event(1, "fire"));
+    assert!(wait_for_fire_count(
+        &scheduler,
+        "reflex-until-event",
+        1,
+        WAIT_TIMEOUT
+    ));
+    let _report = bus.publish(event(2, "stop"));
+    assert!(wait_for_status(
+        &scheduler,
+        "reflex-until-event",
+        ReflexState::Expired,
+        WAIT_TIMEOUT
+    ));
+    let _report = bus.publish(event(3, "fire"));
+    let samples = scheduler.wait_for_samples(10, WAIT_TIMEOUT);
+    scheduler.stop()?;
+    db.flush()?;
+
+    let statuses = scheduler.statuses();
+    let status = status(&statuses, "reflex-until-event")?;
+    let audits = read_audits(&db)?;
+    let lifetime_audit = audits
+        .iter()
+        .find(|audit| {
+            audit.error_code.as_deref() == Some(error_codes::REFLEX_LIFETIME_EXPIRED)
+                && audit.details["reason"].as_str() == Some("event")
+        })
+        .ok_or_else(|| io::Error::other("missing UntilEvent lifetime audit"))?;
+    let lifetime_event = lifetime_events
+        .drain()
+        .into_iter()
+        .find(|event| event.data["reason"] == "event")
+        .ok_or_else(|| io::Error::other("missing UntilEvent lifetime bus event"))?;
+
+    assert_eq!(samples.len(), 10);
+    assert_eq!(action_rx.len(), 1);
+    assert_eq!(status.state, ReflexState::Expired);
+    assert_eq!(lifetime_audit.details["kind"], REFLEX_LIFETIME_EXPIRED_KIND);
+    assert_eq!(
+        lifetime_event.data["code"],
+        error_codes::REFLEX_LIFETIME_EXPIRED
+    );
     Ok(())
 }
 
@@ -939,6 +1098,35 @@ fn scheduler_rejects_invalid_trigger_filter() {
 }
 
 #[test]
+fn scheduler_rejects_invalid_lifetime_filter() {
+    let bus = EventBus::default();
+    let (action_handle, action_rx) = ActionHandle::channel();
+    let reflex = ScheduledReflex::on_event(
+        "reflex-invalid-lifetime-filter",
+        EventFilter::Kind {
+            kind: "fire".to_owned(),
+        },
+        vec![Action::ReleaseAll],
+    )
+    .with_lifetime(ReflexLifetime::UntilEvent {
+        filter: EventFilter::And { args: Vec::new() },
+    });
+
+    let error = match ReflexScheduler::spawn(
+        bus,
+        action_handle,
+        vec![reflex],
+        SchedulerConfig::default(),
+    ) {
+        Ok(_scheduler) => panic!("invalid lifetime filter must prevent scheduler spawn"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), error_codes::REFLEX_FILTER_INVALID);
+    assert_eq!(action_rx.len(), 0);
+}
+
+#[test]
 fn scheduler_rejects_duplicate_reflex_ids() {
     let bus = EventBus::default();
     let (action_handle, action_rx) = ActionHandle::channel();
@@ -1143,6 +1331,28 @@ fn wait_for_status(
             .statuses()
             .iter()
             .any(|status| status.id == id && status.state == expected)
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_fire_count(
+    scheduler: &synapse_reflex::SchedulerHandle,
+    id: &str,
+    expected: u64,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if scheduler
+            .statuses()
+            .iter()
+            .any(|status| status.id == id && status.fire_count >= expected)
         {
             return true;
         }

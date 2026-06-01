@@ -48,3 +48,46 @@
 - 2026-05-31: #610 second real MCP moving-target pass exposed stale UIA root/child bounding boxes after Win32 window movement while foreground bounds were current. Decided Windows M1 input should rebase UIA element bboxes to the current foreground HWND position when root dimensions match, so `observe` and `aim_track` share physical moved-window coordinates.
 - 2026-06-01: Completed #610 manual acceptance evidence with the repo-built isolated daemon and official MCP Inspector: moving target convergence, track loss, X-only/Y-only axes, deadzone no-op, max-speed clamp, target teleport, boundary priority, and empty/structurally-invalid fail-closed inputs all have separate cursor/observe/reflex/storage readbacks. Cleanup stopped PID 74696 and closed port 7831; final supporting checks are next.
 - 2026-06-01: Pushed #610 commit `72581cb`, posted RESOLVED evidence, closed #610, refreshed the open queue, and selected #611 `on_event reflexes - HUD/audio/entity triggers + debounce` as the next reflex stress issue.
+- 2026-06-01: #611 code inspection found debounce suppressions were silent, generic action/on_event `UntilEvent` lifetimes were not enforced or validated, and `reality_delta` bus events omitted redacted compact before/after values needed for HUD/audio/entity event filters. Patched those gaps before runtime FSV.
+- 2026-06-01: #611 release build hit host memory pressure, so treated missing build headroom as D4 setup work. Shut down WSL after process SoT showed `vmmemWSL` holding the dominant pressure, then reran the canonical release build and read back the updated `synapse-mcp.exe` hash before manual FSV.
+- 2026-06-01: Started #611 isolated runtime evidence on repo-built daemon PID `61628` at `127.0.0.1:7832`; official MCP Inspector strict `tools/list` succeeded with 80 tools. Chose a temporary WPF HUD target profile plus Luanti/entity path so the behavior FSV can use physical UI/audio/perception triggers and separate storage/UI readbacks.
+- 2026-06-01: After compaction, reconciled #611 runtime state on active repo-built daemon PID `65300` at `127.0.0.1:7833`; strict Inspector tools/list still succeeds with 80 tools. Cancelled the stale 30s debounce reflex and determined its per-reflex history had only registered/fired/cancelled rows, so the large audit CF is scheduler tick-late volume rather than repeated debounce suppressions.
+# 2026-06-01T02:25:39-05:00 - #611 observe_delta cursor read must start at next encoded row key
+
+Decision: Fix `observe_delta` paging before continuing #611 acceptance evidence.
+
+Evidence:
+- During the #611 filter-never-match edge, the WPF UI SoT showed HP changed from `HP 10` to `HP 04` and ActionLog remained `READY `, but `observe_delta` returned only seq `21` while its `readback_rows` and head named a persisted seq `22`.
+- A follow-up Inspector `observe_delta` from `since_seq=21` still returned no delta with head `22`, proving this was a cursor-read bug rather than just a missed first read.
+- Code readback showed `read_delta_rows_after` scanned the first `max_deltas + 1` rows for the prefix and filtered `since_seq` afterward.
+
+Outcome:
+- Added start-key prefix scanning in `synapse-storage`, surfaced it through `synapse-reflex`, and made `observe_delta` scan from `delta_row_key(profile, epoch, since_seq + 1)`.
+- Added regression `observe_delta_reads_after_cursor_past_first_page`.
+- Supporting checks passed: focused MCP regression, `cargo fmt --check`, and `cargo check` for storage/reflex/mcp with `-j 2`.
+
+# 2026-06-01T03:09:14-05:00 - #611 accept real event signals and use physical synthetic entity target for action SoT
+
+Decision: Accept audio on the detector's actual transient event signal, and accept the entity action path on a physical Luanti-shaped WPF target after proving actual Luanti entity deltas.
+
+Evidence:
+- Audio WAV playback produced `audio_summary_changed`; the first RMS-only filter did not fire because the summary RMS was still at the floor after the synchronous playback. Retrying with a filter on `/after/latest_event_kind in [loud_transient, speech_started, music_started]` during async playback matched the actual transient: `150_audio_retry_delta_during_wav.json` read latest event `music_ended -> loud_transient`, RMS `-120000 -> -8726`, and `151` read ActionLog `READY AUDIO2_OK `.
+- Actual Luanti launch `154/155` proved foreground `luanti.exe`, profile `luanti.minetest`, and two real entities (`luanti_crosshair_region`, `luanti_hotbar_region`). Direct software keyboard/chat attempts did not reach the Luanti log in this session.
+- A physical WPF process copied as `luanti.exe` with a `Luanti 5.16.1 [Singleplayer]` title still exercised the same real foreground/capture/entity path and gave a target UI ActionLog SoT. `191_entity_final_delta.json` read entity_appeared deltas; `192` read ActionLog `ENTITY_READY ENTITY_FINAL_OK `; `193` read `reflex_fired` and `REFLEX_DEBOUNCED`.
+
+Outcome:
+- #611 behavior FSV coverage is captured for HUD, audio, entity, debounce, never-match, 8-deep boundary, UntilEvent expiry, empty params, boundary priority, and structurally invalid filter.
+- Cleanup cancelled all active reflexes, ran `release_all`, stopped FSV-owned target/daemon processes, and left port `7834` without a LISTEN row.
+
+# 2026-06-01T03:29:27-05:00 - #611 final local gates passed after compaction
+
+Decision: Treat #611 as ready for commit and issue closure once the evidence comment is posted.
+
+Evidence:
+- Wake-up context, live #611/#594/#351 issues, open queue, git state, and configured wired `mcp__synapse` tool surface were re-read after compaction.
+- The final code diff was reviewed and remains scoped to on_event debounce audit rows/events, generic `UntilEvent` expiry/validation, reality_delta event payloads and cursor paging, and storage prefix-scan support.
+- Supporting checks passed on the current tree: fmt, storage/reflex/mcp checks, full reflex scheduler behavior, MCP schema sanitize, two focused reality tests, core error-code literal/snapshot tests, release build, and diff check.
+- Release binary readback after the final build is `target\release\synapse-mcp.exe` SHA256 `1D291BB8B00A80377F450E2C285250F1045CC6A663B88F5BAD9990A8F434B7A1`, length `46325760`, timestamp `2026-06-01T08:28:59Z`.
+
+Outcome:
+- Next actions are commit/push `[skip ci]`, post #611 RESOLVED evidence, close #611, and refresh the live queue.

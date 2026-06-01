@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::{EventBus, write_audit};
 
 pub const MAX_ON_EVENT_FIRINGS_PER_TICK: usize = 4;
+pub const REFLEX_DEBOUNCED_KIND: &str = "reflex_debounced";
 pub const REFLEX_FIRED_KIND: &str = "reflex_fired";
 pub const REFLEX_RECURSION_LIMIT_KIND: &str = "reflex_recursion_limit";
 
@@ -103,6 +104,60 @@ pub(crate) fn publish_fired(
     );
 }
 
+pub(crate) fn publish_debounced(
+    event_bus: &EventBus,
+    audit_db: Option<&Db>,
+    reflex_id: &ReflexId,
+    tick_index: u64,
+    trigger_event: &Event,
+    debounce: Duration,
+    suppressed_count: usize,
+    reason: &str,
+    audit_context: Option<&StoredAuditContext>,
+) {
+    let debounce_ms = u64::try_from(debounce.as_millis()).unwrap_or(u64::MAX);
+    let suppressed_count = u64::try_from(suppressed_count).unwrap_or(u64::MAX);
+    let event = Event {
+        seq: tick_index,
+        at: Utc::now(),
+        source: EventSource::Reflex,
+        kind: REFLEX_DEBOUNCED_KIND.to_owned(),
+        data: json!({
+            "code": error_codes::REFLEX_DEBOUNCED,
+            "reflex_id": reflex_id,
+            "tick_index": tick_index,
+            "trigger_seq": trigger_event.seq,
+            "trigger_kind": trigger_event.kind.as_str(),
+            "debounce_ms": debounce_ms,
+            "suppressed_count": suppressed_count,
+            "reason": reason,
+        }),
+        correlations: trigger_correlation(trigger_event),
+    };
+    let _report = event_bus.publish(event);
+    let audit = debounced_audit(
+        reflex_id,
+        tick_index,
+        trigger_event,
+        debounce_ms,
+        suppressed_count,
+        reason,
+        audit_context,
+    );
+    write_audit_if_configured(audit_db, &audit);
+    tracing::info!(
+        code = error_codes::REFLEX_DEBOUNCED,
+        reflex_id = %reflex_id,
+        trigger_seq = trigger_event.seq,
+        trigger_kind = %trigger_event.kind,
+        debounce_ms,
+        suppressed_count,
+        reason,
+        tick_index,
+        "reflex trigger suppressed by debounce"
+    );
+}
+
 fn publish_limit_event(
     event_bus: &EventBus,
     reflex_id: &ReflexId,
@@ -125,6 +180,38 @@ fn publish_limit_event(
         correlations: trigger_correlation(trigger_event),
     };
     let _report = event_bus.publish(event);
+}
+
+fn debounced_audit(
+    reflex_id: &ReflexId,
+    tick_index: u64,
+    trigger_event: &Event,
+    debounce_ms: u64,
+    suppressed_count: u64,
+    reason: &str,
+    audit_context: Option<&StoredAuditContext>,
+) -> StoredReflexAudit {
+    StoredReflexAudit {
+        schema_version: SCHEMA_VERSION,
+        audit_id: Uuid::now_v7().to_string(),
+        reflex_id: reflex_id.clone(),
+        ts_ns: now_ts_ns(),
+        status: ReflexState::Active,
+        event_id: Some(trigger_event.seq.to_string()),
+        audit_context: audit_context.cloned(),
+        steps: Vec::new(),
+        error_code: Some(error_codes::REFLEX_DEBOUNCED.to_owned()),
+        details: json!({
+            "kind": REFLEX_DEBOUNCED_KIND,
+            "tick_index": tick_index,
+            "trigger_kind": trigger_event.kind.as_str(),
+            "debounce_ms": debounce_ms,
+            "suppressed_count": suppressed_count,
+            "reason": reason,
+        }),
+        redacted: false,
+        redactions: Vec::new(),
+    }
 }
 
 fn fired_audit(

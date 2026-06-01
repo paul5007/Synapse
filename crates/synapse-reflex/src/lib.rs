@@ -45,7 +45,8 @@ pub use kinds::hold_lifetime::{
 };
 pub use kinds::hold_move::{HoldMoveController, HoldMoveOutput, HoldMoveParams, HoldMovePhase};
 pub use kinds::on_event::{
-    MAX_ON_EVENT_FIRINGS_PER_TICK, REFLEX_FIRED_KIND, REFLEX_RECURSION_LIMIT_KIND,
+    MAX_ON_EVENT_FIRINGS_PER_TICK, REFLEX_DEBOUNCED_KIND, REFLEX_FIRED_KIND,
+    REFLEX_RECURSION_LIMIT_KIND,
 };
 pub use runtime::ReflexRuntime;
 pub use scheduler::{

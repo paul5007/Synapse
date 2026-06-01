@@ -1007,6 +1007,7 @@ impl SynapseService {
         max_deltas: usize,
     ) -> Result<(Vec<RealityDelta>, Vec<RealityRowReadback>, bool), ErrorData> {
         let prefix = delta_prefix(profile_key, epoch_id);
+        let start_key = delta_row_key(profile_key, epoch_id, since_seq.saturating_add(1));
         let rows = {
             let runtime = self.reflex_runtime()?;
             let runtime = runtime.lock().map_err(|_| {
@@ -1016,7 +1017,12 @@ impl SynapseService {
                 )
             })?;
             runtime
-                .storage_cf_prefix_rows(cf::CF_KV, prefix.as_bytes(), max_deltas + 1)
+                .storage_cf_prefix_rows_from(
+                    cf::CF_KV,
+                    prefix.as_bytes(),
+                    start_key.as_bytes(),
+                    max_deltas + 1,
+                )
                 .map_err(|error| mcp_error(error.code(), error.to_string()))?
         };
         let mut deltas = Vec::new();
@@ -1127,7 +1133,7 @@ impl SynapseService {
         let event = Event {
             seq: NEXT_REALITY_EVENT_SEQ.fetch_add(1, Ordering::Relaxed),
             at: delta.at,
-            source: EventSource::System,
+            source: EventSource::Perception,
             kind: REALITY_EVENT_KIND.to_owned(),
             data: json!({
                 "profile_key": profile_key,
@@ -1138,6 +1144,8 @@ impl SynapseService {
                 "delta_kind": delta.kind,
                 "path": delta.path,
                 "target": delta.target,
+                "before": &delta.before,
+                "after": &delta.after,
                 "confidence": delta.confidence,
                 "redacted": true,
             }),
@@ -3169,7 +3177,74 @@ mod tests {
         );
         assert!(deltas.0.published_sse_events > 0);
         let events = subscription.drain();
-        assert!(events.iter().any(|event| event.kind == REALITY_EVENT_KIND));
+        let event = events
+            .iter()
+            .find(|event| event.kind == REALITY_EVENT_KIND)
+            .ok_or_else(|| anyhow::anyhow!("missing reality_delta event"))?;
+        assert_eq!(event.source, EventSource::Perception);
+        assert_eq!(event.data["delta_kind"], "foreground_changed");
+        assert!(
+            event
+                .data
+                .get("before")
+                .is_some_and(|value| !value.is_null())
+        );
+        assert!(
+            event
+                .data
+                .get("after")
+                .is_some_and(|value| !value.is_null())
+        );
+        assert_eq!(event.data["redacted"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observe_delta_reads_after_cursor_past_first_page() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        install_synthetic_input(&service, synthetic_input("Window A"))?;
+        service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: Some("synthetic".to_owned()),
+                epoch_id: Some("paged-epoch".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await?;
+
+        for title in ["Window B", "Window C", "Window D"] {
+            install_synthetic_input(&service, synthetic_input(title))?;
+            service
+                .observe_delta(Parameters(ObserveDeltaParams {
+                    profile_id: Some("synthetic".to_owned()),
+                    since_epoch: Some("paged-epoch".to_owned()),
+                    since_seq: Some(0),
+                    include: Vec::new(),
+                    depth: DEFAULT_DEPTH,
+                    max_elements: DEFAULT_MAX_ELEMENTS,
+                    max_deltas: DEFAULT_MAX_DELTAS,
+                }))
+                .await?;
+        }
+
+        let paged = service
+            .observe_delta(Parameters(ObserveDeltaParams {
+                profile_id: Some("synthetic".to_owned()),
+                since_epoch: Some("paged-epoch".to_owned()),
+                since_seq: Some(2),
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+                max_deltas: 1,
+            }))
+            .await?;
+        assert_eq!(paged.0.deltas.len(), 1);
+        assert_eq!(paged.0.deltas[0].seq, 3);
+        assert_eq!(paged.0.to_seq, Some(3));
+        assert_eq!(paged.0.reason.as_deref(), Some("deltas_returned"));
         Ok(())
     }
 

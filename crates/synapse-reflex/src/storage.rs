@@ -84,6 +84,27 @@ impl ReflexRuntime {
         Ok(rows)
     }
 
+    /// Returns rows in one storage column family starting at `start_key` whose
+    /// keys still match `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the column family cannot be scanned.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, prefix_len = prefix.len(), start_key_len = start_key.len(), limit))]
+    pub fn storage_cf_prefix_rows_from(
+        &self,
+        cf_name: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        limit: usize,
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut rows = self.db.scan_cf_prefix_from(cf_name, prefix, start_key)?;
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
+    }
+
     /// Writes a bounded diagnostic batch to storage and flushes it immediately.
     ///
     /// # Errors

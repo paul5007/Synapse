@@ -7,8 +7,8 @@ use std::{
 use chrono::Utc;
 use serde_json::json;
 use synapse_core::{
-    Action, Event, EventSource, ReflexId, ReflexState, SCHEMA_VERSION, StoredReflexAudit,
-    error_codes,
+    Action, Event, EventSource, ReflexId, ReflexLifetime, ReflexState, SCHEMA_VERSION,
+    StoredReflexAudit, error_codes,
 };
 use uuid::Uuid;
 
@@ -20,12 +20,16 @@ use super::{
 use crate::{
     ReflexError, ReflexResult,
     conflict::{ConflictCandidate, ConflictLoser, REFLEX_STARVED_KIND, resolve_conflicts},
-    kinds::on_event::{OnEventTickGuard, publish_fired},
+    kinds::{
+        hold_lifetime::{HoldReleaseReason, emit_lifetime_expired},
+        on_event::{OnEventTickGuard, publish_debounced, publish_fired},
+    },
     write_audit,
 };
 
 pub(super) fn tick(runtime: &mut RuntimeState, elapsed: Duration, degraded: bool) {
     let events = runtime.subscription.drain();
+    expire_action_until_event_lifetimes(runtime, &events);
     let mut dispatched_actions = 0_usize;
     let mut dispatch_blocked = false;
     let mut starvation_losers = Vec::new();
@@ -197,10 +201,19 @@ fn collect_triggered_reflexes(
                 });
             }
             SchedulerTrigger::OnEvent(filter) => {
+                let mut accepted_this_tick = false;
+                let mut same_tick_suppression = DebounceSuppression::default();
+                let mut window_suppression = DebounceSuppression::default();
                 for event in events {
-                    if !filter.matches(event)
-                        || !runtime.on_event_states[index].allows_fire(now, reflex.debounce)
-                    {
+                    if !filter.matches(event) {
+                        continue;
+                    }
+                    if accepted_this_tick {
+                        same_tick_suppression.record(event);
+                        continue;
+                    }
+                    if !runtime.on_event_states[index].allows_fire(now, reflex.debounce) {
+                        window_suppression.record(event);
                         continue;
                     }
                     triggered.push(TriggeredReflex {
@@ -209,14 +222,98 @@ fn collect_triggered_reflexes(
                         actions: reflex.then.clone(),
                         trigger_event: Some(event.clone()),
                     });
-                    if !reflex.debounce.is_zero() {
-                        break;
-                    }
+                    accepted_this_tick = !reflex.debounce.is_zero();
                 }
+                publish_debounce_suppression(runtime, reflex, same_tick_suppression, "same_tick");
+                publish_debounce_suppression(
+                    runtime,
+                    reflex,
+                    window_suppression,
+                    "debounce_window",
+                );
             }
         }
     }
     triggered
+}
+
+#[derive(Clone, Debug, Default)]
+struct DebounceSuppression {
+    first_event: Option<Event>,
+    count: usize,
+}
+
+impl DebounceSuppression {
+    fn record(&mut self, event: &Event) {
+        if self.first_event.is_none() {
+            self.first_event = Some(event.clone());
+        }
+        self.count = self.count.saturating_add(1);
+    }
+}
+
+fn publish_debounce_suppression(
+    runtime: &RuntimeState,
+    reflex: &super::ScheduledReflex,
+    suppression: DebounceSuppression,
+    reason: &str,
+) {
+    let Some(first_event) = suppression.first_event else {
+        return;
+    };
+    publish_debounced(
+        &runtime.event_bus,
+        runtime.audit_db.as_deref(),
+        &reflex.reflex_id,
+        runtime.tick_index,
+        &first_event,
+        reflex.debounce,
+        suppression.count,
+        reason,
+        runtime.audit_context.as_ref(),
+    );
+}
+
+fn expire_action_until_event_lifetimes(runtime: &mut RuntimeState, events: &[Event]) {
+    if events.is_empty() {
+        return;
+    }
+    let controls = super::lock_controls(&runtime.controls).clone();
+    for index in 0..runtime.reflexes.len() {
+        let Some(reflex_id) = until_event_lifetime_expired(runtime, index, events, &controls)
+        else {
+            continue;
+        };
+        emit_lifetime_expired(
+            &runtime.event_bus,
+            &reflex_id,
+            HoldReleaseReason::Event,
+            Duration::ZERO,
+        );
+        super::mark_reflex_lifetime_expired(runtime, index, HoldReleaseReason::Event.as_str());
+    }
+}
+
+fn until_event_lifetime_expired(
+    runtime: &RuntimeState,
+    index: usize,
+    events: &[Event],
+    controls: &[super::ReflexControl],
+) -> Option<ReflexId> {
+    if !controls.get(index).is_some_and(|control| control.active) {
+        return None;
+    }
+    let reflex = &runtime.reflexes[index].reflex;
+    if !matches!(reflex.driver, ScheduledReflexDriver::Actions) {
+        return None;
+    }
+    let ReflexLifetime::UntilEvent { filter } = &reflex.lifetime else {
+        return None;
+    };
+    events
+        .iter()
+        .any(|event| filter.matches(event))
+        .then(|| reflex.reflex_id.clone())
 }
 
 fn record_starvation(

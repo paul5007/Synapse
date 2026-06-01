@@ -1,10 +1,93 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T03:29:27-05:00
+- Active issue: #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
+- Manual behavior FSV evidence is captured in `.runs\611\on-event-fsv-20260601T012006`; the isolated acceptance daemon PID `47056` / port `7834` and FSV-owned target processes were already cleaned up.
+- Post-compaction wake-up, live queue readback, git readback, configured wired `mcp__synapse` client health/storage/reflex/observe calls, diff review, and final local supporting checks are complete.
+- Final supporting checks passed: `cargo fmt --check`; `cargo check -p synapse-storage -j 2`; `cargo check -p synapse-reflex -j 2`; `cargo check -p synapse-mcp -j 2`; full `scheduler_behavior` (24 passed); MCP `schema_sanitize`; focused reality tests `reality_tools_persist_delta_and_publish_event` and `observe_delta_reads_after_cursor_past_first_page`; `cargo test -p synapse-core error_codes -- --nocapture`; `cargo build --release -p synapse-mcp -j 2`; `git diff --check` with only LF/CRLF warnings.
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46325760`, SHA256 `1D291BB8B00A80377F450E2C285250F1045CC6A663B88F5BAD9990A8F434B7A1`, timestamp `2026-06-01T08:28:59Z`.
+- Resume by committing/pushing `[skip ci]`, posting #611 RESOLVED evidence, closing #611, refreshing the live open queue, then selecting #612 or the next live issue.
+
+## Current Resume Point - 2026-06-01T03:09:14-05:00
+- Active issue: #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
+- Manual behavior FSV evidence is captured in `.runs\611\on-event-fsv-20260601T012006` on the patched isolated daemon that was PID `47056` / `127.0.0.1:7834` / DB `db3`.
+- Do not relaunch or reuse PID `47056`: cleanup already stopped it and the port has no LISTEN row. Evidence files `141` through `198` record the post-compaction precondition, audio retry, entity path, and cleanup.
+- Key acceptance evidence:
+  - strict Inspector `tools/list`: `141_tools_list_recheck_7834.json`, count 80, required tools present.
+  - HUD: `67` through `72`.
+  - Debounce: `73` through `87`.
+  - Never-match: `88` through `96`.
+  - 8-deep/boundary priority: `97` through `105`.
+  - UntilEvent expiry: `106` through `121`.
+  - Empty/structurally-invalid: `122` through `126b`.
+  - Audio transient accepted on retry: `148` baseline, `149` register, `150` delta showing `music_ended -> loud_transient` and RMS `-120000 -> -8726`, `151` ActionLog `READY AUDIO2_OK `, `152` `reflex_fired`.
+  - Entity appear accepted on final physical synthetic Luanti-shaped target: `189` baseline without entities, `190` register, `191` entity_appeared deltas for crosshair/hotbar, `192` ActionLog `ENTITY_READY ENTITY_FINAL_OK `, `193` `reflex_fired` plus `REFLEX_DEBOUNCED`.
+  - Cleanup: `196` release_all zero held inputs, `197` active reflexes zero, `198` storage counts.
+- Actual Luanti was also launched in `154/155` and proved the real profile emits `luanti_crosshair_region`/`luanti_hotbar_region`; actual Luanti ignored software keyboard/direct chat actions in this session, so the final target-app action SoT used a copied `luanti.exe` WPF target with the same real foreground/capture/entity path and an ActionLog UI readback.
+- Resume by running final supporting checks:
+  1. `cargo fmt --check`
+  2. `cargo check -p synapse-storage -j 2`
+  3. `cargo check -p synapse-reflex -j 2`
+  4. `cargo check -p synapse-mcp -j 2`
+  5. `cargo test -p synapse-reflex --test scheduler_behavior -- --nocapture`
+  6. `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  7. focused MCP reality tests for `reality_tools_persist_delta_and_publish_event` and `observe_delta_reads_after_cursor_past_first_page`
+  8. `cargo test -p synapse-core error_codes -- --nocapture`
+  9. `cargo build --release -p synapse-mcp -j 2`
+  10. `git diff --check`
+  11. inspect diff.
+- If checks pass: update state, commit/push with `[skip ci]`, post #611 RESOLVED evidence, close #611, refresh queue, and continue to #612 or the next open issue. If a check fails, fix the root cause and rerun manual affected evidence as needed.
+
+## Current Resume Point - 2026-06-01T02:25:39-05:00
+- Active issue: #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
+- Do not use the currently running isolated daemon PID `65300` / port `7833` as final acceptance evidence after the latest patch; it is old relative to the cursor-read fix.
+- Freshly discovered/fixed #611 blocker: `observe_delta` persisted/published HUD seq `22` but could not return it after `since_seq=21` because the reader limited the first rows under the reality journal prefix before applying `since_seq`. The fix adds start-key prefix scanning in `synapse-storage` / `synapse-reflex` and uses it in `read_delta_rows_after`.
+- Checks already passed after the cursor fix: `cargo test -p synapse-mcp observe_delta_reads_after_cursor_past_first_page -- --nocapture`, `cargo fmt --check`, `cargo check -p synapse-storage -j 2`, `cargo check -p synapse-reflex -j 2`, and `cargo check -p synapse-mcp -j 2`.
+- Resume sequence:
+  1. Cancel/stop old isolated daemon PID `65300` and verify `127.0.0.1:7833` closes.
+  2. Keep WPF target PID `43360` if responding, otherwise relaunch `.runs\611\on-event-fsv-20260601T012006\target-app\synapse611_target.ps1`.
+  3. Run `cargo build --release -p synapse-mcp -j 2`, then read binary size/hash/timestamp.
+  4. Launch a fresh isolated repo-built daemon on a new port with the same temp profile dir and fresh DB.
+  5. Prove process/socket/auth/health and official MCP Inspector strict `tools/list`.
+  6. Start a fresh `reality_baseline` and rerun #611 FSV evidence from HUD happy path through debounce, never-match, 8-deep, UntilEvent, empty/boundary/invalid, audio transient, and entity-appear.
+
 Current resume point:
+- #611 post-compaction recheck completed at 2026-06-01T01:37:37-05:00:
+  - Active daemon is PID `65300`, bind `127.0.0.1:7833`, token `synapse-611-token`, DB `.runs\611\on-event-fsv-20260601T012006\db2`.
+  - WPF target is PID `43360`, title `Synapse611 HUD FSV`, currently HP `04` and ActionLog `READY DEB_OK `.
+  - Auth health recheck saved to `26_health_recheck_7833.json`; strict Inspector tools/list recheck saved to `32_tools_list_recheck_7833.json` and listed 80 tools.
+  - Stale debounce reflex `019e81e1-aa50-7572-98ad-f25f1e8b03ba` was cancelled (`27_reflex_cancel_stale_debounce.json`); per-reflex history shows registered/fired/cancelled only.
+  - Resume with real Inspector `tools/call` triggers. Reset ActionLog with F7, reset HP with F8, publish `observe_delta` from current head seq 6, then run a new long-window debounce reflex.
+- #611 isolated daemon precondition is live:
+  - PID `61628`, bind `127.0.0.1:7832`, token `synapse-611-token`, run dir `.runs\611\on-event-fsv-20260601T012006`.
+  - Release binary hash `D7F6DD4A11A3A0C7353DDFA1B40BF21F73537B99735645AD5C1F15AC6118C61B`.
+  - Unauth `/health` = 401, auth `/health` = 200.
+  - Official MCP Inspector strict `tools/list` succeeded with 80 tools and required tools present; JSON saved to `.runs\611\on-event-fsv-20260601T012006\inspector_tools_list.json`.
+  - Temporary profile dir contains `synapse611.hud.toml`; WPF target script is `.runs\611\on-event-fsv-20260601T012006\target-app\synapse611_target.ps1`.
+- Resume by using Inspector `tools/call`, not hand-rolled HTTP, for:
+  1. `act_launch` PowerShell WPF target and read `observe`/UI text SoT.
+  2. `reality_baseline` and `observe_delta` HUD action path.
+  3. Audio transient path with `audio_tail`/UI/storage readback.
+  4. Luanti or equivalent real entity path, debounce, 8-deep filter, UntilEvent lifetime, and invalid/empty/boundary cases.
 - #610 is closed with commit `72581cb` and RESOLVED evidence at https://github.com/ChrisRoyse/Synapse/issues/610#issuecomment-4589812724.
 - Active issue: #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
 - START comment: https://github.com/ChrisRoyse/Synapse/issues/611#issuecomment-4589814953
-- Resume by inspecting on_event filter/debounce/lifetime implementation and MCP event/perception surfaces, then launch a repo-built isolated daemon for #611 with official Inspector strict tools/list and real MCP tools/call triggers.
+- Current #611 patch is in the worktree. Resume by running broader supporting checks, then launch a repo-built isolated daemon for #611 with official Inspector strict tools/list and real MCP tools/call triggers.
+- Patch summary:
+  - `crates/synapse-reflex/src/kinds/on_event.rs`: added `REFLEX_DEBOUNCED_KIND` and persisted/published debounce suppression audit evidence.
+  - `crates/synapse-reflex/src/scheduler_tick.rs`: coalesces same-tick/window debounce suppressions into audit rows and enforces generic action/on_event `UntilEvent` lifetimes from drained bus events.
+  - `crates/synapse-reflex/src/scheduler.rs`: validates `ReflexLifetime::UntilEvent` filters at spawn.
+  - `crates/synapse-mcp/src/server/reality.rs`: `reality_delta` bus events are `source=perception` and carry redacted compact `before`/`after` payloads for on_event filters.
+  - `crates/synapse-core/src/error_codes.rs`: added `REFLEX_DEBOUNCED`.
+- Supporting checks already passed after the patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-reflex --test scheduler_behavior on_event_ -- --nocapture`
+  - `cargo test -p synapse-reflex --test scheduler_behavior scheduler_rejects_invalid_lifetime_filter -- --nocapture`
+  - `cargo test -p synapse-mcp reality_tools_persist_delta_and_publish_event -- --nocapture`
+  - `cargo test -p synapse-core error_codes -- --nocapture`
+- Next supporting checks before FSV: `cargo check -p synapse-reflex`, full `scheduler_behavior`, `cargo check -p synapse-mcp`, `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`, `cargo build --release -p synapse-mcp`, and `git diff --check`.
+- These broader checks now passed. Release build required local pressure cleanup: `wsl.exe --shutdown` was run after `rustc-LLVM ERROR: out of memory`; final release binary is `target\release\synapse-mcp.exe`, length `46322176`, SHA256 `D7F6DD4A11A3A0C7353DDFA1B40BF21F73537B99735645AD5C1F15AC6118C61B`, timestamp `2026-06-01T06:10:44Z`.
+- Resume by launching the isolated #611 daemon from that binary on a fresh port, proving process/socket/auth/health/strict Inspector `tools/list`, and running manual FSV.
 - #611 must cover: HUD threshold event -> action, audio transient -> action, entity-appear -> action, debounce coalescing, filter never matches, 8-deep filter, UntilEvent lifetime expiry, plus empty/boundary/structurally invalid params.
 - #611 SoTs: target app/UI state, `reflex_history` / `CF_REFLEX_AUDIT`, `CF_EVENTS` / `CF_OBSERVATIONS`, storage counts, daemon logs, process/socket state, and cleanup state.
 
@@ -126,3 +209,17 @@ Update 2026-05-31T18:49:37-05:00:
   2. Done: removed agent-created untracked EverQuest artifacts `Logs/` and `eqclient.ini` after verifying they were under `C:\code\Synapse`.
   3. Done: final checks passed: `cargo fmt --check`, `cargo check -p synapse-a11y`, `cargo check -p synapse-mcp`, `cargo check -p synapse-profiles`, bundled profile parse test, `cargo clippy -p synapse-mcp --all-targets -- -D warnings`, `cargo test -p synapse-mcp launch_ -- --nocapture`, `cargo test -p synapse-mcp process_history_has_retention_class -- --nocapture`, `cargo build --release -p synapse-mcp`, and `git diff --check` (line-ending warnings only).
   4. Next: commit with `[skip ci]`, post #607 RESOLVED evidence, close #607, then refresh queue.
+# Recovery Notes - Synapse
+
+## 2026-06-01T02:25:39-05:00
+- Active issue: #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
+- Important interruption: the prior isolated daemon PID `65300` / port `7833` is running old code relative to the new cursor fix. Do not continue FSV on that daemon as acceptance evidence.
+- The just-patched cursor bug: `observe_delta` read rows from the start of the `reality/delta/v1/<profile>/<epoch>/` prefix and filtered `since_seq` after limiting, causing later rows to disappear when the prefix had more older rows than `max_deltas`. Fix adds start-key prefix scanning and regression `observe_delta_reads_after_cursor_past_first_page`.
+- Checks already passed after this patch: focused MCP regression, `cargo fmt --check`, `cargo check -p synapse-storage -j 2`, `cargo check -p synapse-reflex -j 2`, and `cargo check -p synapse-mcp -j 2`.
+- Resume:
+  1. Cancel/stop old isolated daemon PID `65300` and verify `127.0.0.1:7833` closes.
+  2. Keep WPF target PID `43360` if still responding; otherwise relaunch from `.runs\611\on-event-fsv-20260601T012006\target-app\synapse611_target.ps1`.
+  3. Run `cargo build --release -p synapse-mcp -j 2`, read binary size/hash/timestamp.
+  4. Launch fresh isolated daemon on a new port with the same temp profile dir and a fresh DB.
+  5. Prove process/socket/auth/health and official Inspector strict `tools/list`.
+  6. Start a fresh baseline and rerun #611 FSV evidence from HUD happy path or, at minimum, rerun every edge after the cursor fix before posting acceptance.
