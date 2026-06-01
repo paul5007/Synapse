@@ -64,3 +64,4 @@
 - 2026-06-01T04:51:40-05:00 iteration #612-reassert-throttle: real MCP reassert cancel evidence exposed per-tick KeyDown queue flooding; patched reassert to a 50 ms interval, passed focused checks, and rebuilt release synapse-mcp SHA256 8D9AFDC19BD14594C0B42877B6D2DE8F06DB6B7AA354F83709783C4E7701856D.
 - 2026-06-01T05:33:52-05:00 iteration #612-cancel-expired-fix: patched reflex_cancel to read persisted terminal audit status, passed focused/schema/build checks, and captured fresh MCP evidence showing expired combo cancel now returns already_expired.
 - 2026-06-01T05:41:10-05:00 iteration #612-final-checks: final fmt/check/reflex/MCP regression set and release build passed; final synapse-mcp SHA256 is 6898E30AE4FAE8519499B0BB91436E3C0B44D218BE03539EA1D60957C1281BF1.
+- 2026-06-01T05:44:31-05:00 iteration #612-close-613-start: pushed #612 commit db761fe, posted RESOLVED evidence, closed #612, refreshed queue to #594 plus #595-#604/#613-#634, and posted #613 START.

@@ -1,5 +1,18 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T05:44:31-05:00
+- #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes` is closed.
+  - Commit: `db761fe fix(reflex): resolve hold lifetime stress path (#612) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/612#issuecomment-4591828569
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T10:43:56Z`.
+- Post-close git readback: `main...origin/main`, clean, HEAD `db761fe`.
+- Refreshed live open queue now lists #594 plus #595-#604 and #613-#634.
+- Active issue is now #613 `scenario(stress): subscribe firehose - 4096 ring, EVENTS_DROPPED, one-per-event, deep filters`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/613#issuecomment-4591831842
+  - Issue requires proving the real event stream under storm conditions: snapshot_first, many event kinds, one notification per event, 4096 ring bound, `EVENTS_DROPPED`, 8-level-deep filters, filter-depth-9 rejection, subscribe/immediate cancel, slow consumer backpressure drops, and empty filter/All.
+  - Required SoTs include the real MCP daemon process/socket/auth/session/tools-list, SSE or MCP event delivery state, delivered event counts, event bus drop accounting, storage/event rows, and physical causes such as clipboard changes, filesystem writes, process churn, and UIA changes.
+  - Next: inspect subscribe/SSE/event-bus implementation and existing tests before patching or launching an isolated #613 daemon.
+
 ## 2026-06-01T05:33:52-05:00
 - Active issue remains #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
 - Patched the final #612 defect found in manual cancel-expired evidence:

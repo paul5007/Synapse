@@ -137,3 +137,5 @@ Outcome:
 - Expired/action-denied historical statuses now return `AlreadyExpired`; historical cancelled statuses retain the existing cancelled outcome.
 - Added supporting regression `cancel_expired_reflex_restored_from_audit_reports_already_expired`.
 - Fresh repo-built manual MCP rerun under `.runs\612\hold-lifetime-fsv-20260601T0530-cancel-expired` proved the edge: expired combo `019e82be-1a45-7d00-a817-22a9d7248818`, real Inspector `reflex_cancel`, response `already_expired`, OS P false before/after, recovery ledger absent, `reflex_history` lifecycle rows intact, `CF_REFLEX_AUDIT=2`.
+
+- 2026-06-01: Pushed #612 commit `db761fe`, posted RESOLVED evidence, closed #612, refreshed the open queue, and selected #613 `subscribe firehose - 4096 ring, EVENTS_DROPPED, one-per-event, deep filters` as the next event-stream stress issue.
