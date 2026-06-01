@@ -1,5 +1,33 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T10:53:00-05:00
+- #617 `scenario(stress): storage CF saturation to hard cap + GC eviction` is closed.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/617#issuecomment-4594236079
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T15:52:11Z`.
+  - No code patch was required; worktree stayed clean after #617 FSV and final checks.
+  - Manual FSV run directory: `.runs\617\storage-fsv-20260601T1024`.
+  - Repo-built daemon evidence: PID `73864`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, bind `127.0.0.1:7845`, isolated DB `.runs\617\storage-fsv-20260601T1024\db`, token `synapse-617-token`.
+  - Process/socket/auth/client-parity readbacks passed: process path matched repo release binary; socket listened on `127.0.0.1:7845`; unauth `/health=401`; auth `/health ok=true`; official MCP Inspector `0.21.2` strict `tools/list` returned 80 tools including `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample`, and `release_all`.
+  - Initial `storage_inspect` read all CF counts/sizes as 0, pressure `Normal`, and 12 audit-retention policies.
+  - Happy path: real Inspector `tools/call storage_put_probe_rows` wrote 12 rows x 256 bytes to `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`, and `CF_KV`; separate `storage_inspect` read counts 12 for all five CFs and nonzero sizes.
+  - GC path: real Inspector `tools/call storage_gc_once soft_cap_rows=9 hard_cap_rows=20` on each writable CF evicted 3 rows; separate `storage_inspect` read counts 9 for all five CFs and reduced sizes.
+  - Edge coverage:
+    - hard cap warning continued: `CF_EVENTS` before-read 25 rows, `storage_gc_once soft=10 hard=20` returned `STORAGE_CF_HARD_CAP_REACHED` and evicted 15; after-read 10 rows.
+    - invalid `soft_cap_rows > hard_cap_rows` failed closed and left CF counts unchanged.
+    - max value size wrote one `65536`-byte row to `CF_OBSERVATIONS`; after-read tail sample had `value_len_bytes=65536`.
+    - 128-byte key-prefix boundary wrote one `CF_SESSIONS` row and after-read tail sample contained the long-prefix key.
+    - empty/no-op `rows=0 value_bytes=0` left `CF_KV` count/size unchanged.
+    - 129-byte prefix failed closed and left `CF_SESSIONS` unchanged.
+    - `AUDIT_RETENTION` mode wrote report key `audit_retention/v1/report/issue617-audit-report`; separate `storage_inspect` showed `CF_KV` 9 -> 10.
+  - Cleanup readback: real `release_all` returned zero held state; stopped PID `73864`; port `7845` no longer listens.
+  - Supporting checks passed: `cargo fmt --check`; `cargo check -p synapse-mcp -j 2`; `cargo test -p synapse-storage gc_soft_cap_hard_cap_edges_and_metrics -- --nocapture`; `cargo test -p synapse-mcp --test m3_storage_tool -- --nocapture`; `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`; `cargo build --release -p synapse-mcp -j 2`; `git diff --check`.
+  - Final release binary readback: `target\release\synapse-mcp.exe`, length `46380544`, SHA256 `5E24CC28BB709688209215531A590283A9AA54AF959D9CEC1CDC6A58E5EEC5C5`, `LastWriteTimeUtc=2026-06-01T15:51:19.2177043Z`.
+- Active issue is now #618 `scenario(stress): storage pressure ladder — 5 levels + write-gating`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/618#issuecomment-4594238857
+  - Live queue after #617 closure: #594 plus #595-#604 and #618-#634.
+  - #618 requires real MCP `storage_pressure_sample`, `storage_put_probe_rows`, and `storage_inspect` triggers proving pressure transitions Normal/L1/L2/L3/L4, write gating by pressure level, recovery to Normal, threshold boundaries, explicit refusal errors, and at least three edge cases.
+  - Next: inspect storage pressure/write-gating implementation and tests, then launch a repo-built isolated daemon for #618 manual MCP FSV.
+
 ## 2026-06-01T10:21:23-05:00
 - #616 `scenario(stress): reality drift injection -> reality_audit rebase` is closed.
   - Commit: `79f735f fix(mcp): classify reality audit drift (#616) [skip ci]`.

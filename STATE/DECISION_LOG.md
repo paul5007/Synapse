@@ -289,3 +289,16 @@ Evidence:
 
 Outcome:
 - Next action is code/test inspection for storage pressure, probe rows, and GC cap behavior before launching a repo-built isolated daemon for manual MCP FSV.
+
+# 2026-06-01T10:53:00-05:00 - #618 follows #617 in the storage campaign
+
+Decision: Take #618 next after closing #617 because it is the next open storage child under #594.
+
+Evidence:
+- `gh issue view 617` read back `state=CLOSED`, `closedAt=2026-06-01T15:52:11Z`.
+- Live queue after #617 closure lists #594 plus #595-#604 and #618-#634 open.
+- #618 is open, has no prior comments, and requires the storage pressure ladder/write-gating path.
+- Posted #618 START comment at https://github.com/ChrisRoyse/Synapse/issues/618#issuecomment-4594238857.
+
+Outcome:
+- Next action is code/test inspection for storage pressure levels, transition codes, compaction, and write-gating behavior before launching a repo-built isolated daemon for manual MCP FSV.

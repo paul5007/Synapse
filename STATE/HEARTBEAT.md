@@ -79,3 +79,4 @@
 - 2026-06-01T10:12:14-05:00 iteration #616-manual-fsv: completed manual MCP evidence for source-unavailable, baseline+delta in-sync, minor drift, immediate rebase, major UI-structure drift, stale epoch, and invalid depth; cleaned target windows and daemon.
 - 2026-06-01T10:20:00-05:00 iteration #616-final-checks: final fmt/check/reality tests/schema sanitize/release build/diff check passed and diff review completed; release synapse-mcp SHA256 86D55735BD2FA893E22B16E955D431474147B5F3CE1F616BCBD4EB1E047B201B.
 - 2026-06-01T10:21:23-05:00 iteration #616-close-617-start: pushed #616 commit 79f735f, posted RESOLVED evidence, closed #616, refreshed queue, and posted #617 START.
+- 2026-06-01T10:53:00-05:00 iteration #617-close-618-start: completed manual MCP FSV for storage CF writes/GC/hard-cap/edges, posted RESOLVED evidence, closed #617, refreshed queue, and posted #618 START.

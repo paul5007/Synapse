@@ -1,5 +1,20 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T10:53:00-05:00
+- #617 is closed.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/617#issuecomment-4594236079
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T15:52:11Z`.
+  - No code patch was required; worktree stayed clean after FSV.
+  - Manual FSV run directory: `.runs\617\storage-fsv-20260601T1024`.
+  - Repo-built daemon PID `73864`, bind `127.0.0.1:7845`, isolated DB, strict Inspector tools-list 80 tools.
+  - Covered: per-CF write growth on `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`, `CF_KV`; per-CF row-cap GC 12 -> 9; hard-cap warning/continue 25 -> 10; invalid soft>hard; max value bytes; 128-byte prefix; empty rows=0; 129-byte invalid prefix; `AUDIT_RETENTION` report row.
+  - Cleanup stopped daemon PID `73864`; port `7845` closed.
+  - Supporting checks passed: fmt, `cargo check -p synapse-mcp -j 2`, focused storage GC regression, `m3_storage_tool`, schema sanitize, release build, and `git diff --check`.
+- Active issue is #618 `scenario(stress): storage pressure ladder — 5 levels + write-gating`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/618#issuecomment-4594238857
+  - Live queue after #617 closure: #594 plus #595-#604 and #618-#634.
+  - Current next action: inspect pressure-level/write-gating code and tests, then launch a repo-built isolated daemon for #618 manual MCP FSV.
+
 ## Current Resume Point - 2026-06-01T10:21:23-05:00
 - #616 is closed.
   - Commit: `79f735f fix(mcp): classify reality audit drift (#616) [skip ci]`.
