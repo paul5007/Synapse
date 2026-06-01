@@ -1,8 +1,18 @@
 # RECOVERY NOTES - Synapse
 
-## Current Resume Point - 2026-06-01T08:10:00-05:00
-- #614 implementation and manual MCP FSV evidence are captured. Do not relaunch FSV unless final checks or diff review expose a new defect.
-- Current next action: commit with `[skip ci]`, post #614 RESOLVED evidence, close #614, refresh the open issue queue, then continue to the next open issue.
+## Current Resume Point - 2026-06-01T08:19:00-05:00
+- #614 is closed.
+  - Commit: `72918cd fix(mcp): harden reality delta full loop (#614) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/614#issuecomment-4592935089
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T13:16:36Z`.
+- Active issue is #615 `scenario(stress): reality high-fanout delta coalescing + snapshot-budget-exceeded`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/615#issuecomment-4592942496
+  - Live queue after #614 closure: #594 plus #595-#604 and #615-#634.
+  - #615 requires high-fanout UIA structure coalescing, reused-element field-change coalescing, snapshot-budget-exceeded rebase guidance, CF_KV/source_refs readbacks, and threshold/low-fanout/mixed/empty/boundary/invalid edges through real MCP tools.
+- Current next action: inspect high-fanout/coalescing implementation and existing tests, then decide whether code needs patching before isolated daemon FSV.
+- Host note: Windows still reports an orphan `127.0.0.1:7840 LISTENING` row for non-existent PID `82340`; use another port for #615 isolated daemons unless it clears.
+
+## #614 Closure Checkpoint
 - Final supporting checks passed after FSV: `cargo fmt --check`; `cargo check -p synapse-mcp -j 2`; `cargo test -p synapse-mcp server::reality::tests --bin synapse-mcp -- --nocapture` (14 passed); `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture` (3 passed); `cargo build --release -p synapse-mcp -j 2`; `git diff --check` with line-ending warnings only.
 - Final release binary readback: `target\release\synapse-mcp.exe`, length `46350848`, SHA256 `18F213F8799AFA64ACCB31F3C3F07F98D40ADF3E081D3C05B256A8FC957BEED4`, `LastWriteTimeUtc=2026-06-01T13:14:38Z`.
 - Main evidence run: `.runs\614\reality-loop-fsv-20260601T0741-patched`.

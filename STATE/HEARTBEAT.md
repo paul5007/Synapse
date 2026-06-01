@@ -72,3 +72,4 @@
 - 2026-06-01T07:40:09-05:00 iteration #614-profile-change-fix: patched observe_delta profile-change rebase semantics, passed focused/all reality checks plus schema/check/build, stopped stale PID 75352, and rebuilt release synapse-mcp SHA256 319FC6F5942ABF272EDCCA7A1EEF7970EE7AE0C7CB6A11A515F681B74F6854A1.
 - 2026-06-01T08:10:00-05:00 iteration #614-final-fsv: completed manual MCP evidence for baseline/reuse, main delta/SSE, diagnostics, audit, required edges, and a separate FS-watch `/fs` delta subrun; stopped FSV daemons/curl/Luanti.
 - 2026-06-01T08:17:00-05:00 iteration #614-final-checks: final fmt/check/reality tests/schema sanitize/release build/diff check passed, diff review completed, and release synapse-mcp SHA256 is 18F213F8799AFA64ACCB31F3C3F07F98D40ADF3E081D3C05B256A8FC957BEED4.
+- 2026-06-01T08:19:00-05:00 iteration #614-close-615-start: pushed #614 commit 72918cd, posted RESOLVED evidence, closed #614, refreshed queue, and posted #615 START.

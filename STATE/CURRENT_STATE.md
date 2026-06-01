@@ -1,5 +1,19 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T08:19:00-05:00
+- #614 `scenario(stress): reality baseline->delta->audit full loop across all sensors` is closed.
+  - Commit: `72918cd fix(mcp): harden reality delta full loop (#614) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/614#issuecomment-4592935089
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T13:16:36Z`.
+- Post-close git readback: `main...origin/main`, clean, HEAD `72918cd`.
+- Refreshed live open queue now lists #594 plus #595-#604 and #615-#634.
+- Active issue is now #615 `scenario(stress): reality high-fanout delta coalescing + snapshot-budget-exceeded`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/615#issuecomment-4592942496
+  - #615 requires real MCP `observe_delta` triggers proving high-fanout UIA appear/disappear coalesces into one `uia_structure_changed` row, high-fanout reused-element field changes coalesce into `uia_elements_changed`, oversized coalesced batches return `delta_snapshot_budget_exceeded` rebase guidance with no bloated rows, and CF_KV/source_refs readbacks match.
+  - Required edges: exactly 7 vs 8 threshold, mixed appear+field churn, low-fanout per-element, empty/no-change, boundary, and structurally invalid params.
+  - Current host note: Windows still reports an orphan `127.0.0.1:7840 LISTENING` row for non-existent PID `82340`; use another port for #615 isolated daemons unless the kernel row clears.
+- Next: inspect #615 high-fanout/coalescing code and existing tests before launching an isolated repo-built daemon.
+
 ## 2026-06-01T08:10:00-05:00
 - Active issue remains #614 `scenario(stress): reality baseline->delta->audit full loop across all sensors`; implementation and manual MCP FSV evidence are captured, final supporting checks/commit/issue closure are next.
 - Patch in worktree remains scoped to `crates/synapse-mcp/src/server/reality.rs`:

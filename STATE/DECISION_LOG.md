@@ -209,3 +209,15 @@ Evidence:
 Outcome:
 - Launched `.runs\614\fs-watch-fsv-20260601T0805` on `127.0.0.1:7841` with `SYNAPSE_FS_WATCH_ROOT` set to the run watch directory.
 - Strict Inspector tools-list returned 80 tools; baseline/head rows were written; real MCP `act_run_shell` created a known file; separate file text/hash readback matched; `observe_delta` returned `/fs` `filesystem_summary_changed`; `storage_inspect` read CF_KV baseline/delta/head rows.
+
+# 2026-06-01T08:19:00-05:00 - #615 follows #614 in the reality-delta campaign
+
+Decision: Take #615 next after closing #614 because it is the next open reality-delta child under #594.
+
+Evidence:
+- Live queue after closing #614 lists #594 plus #595-#604 and #615-#634 open.
+- #615 is open, has no prior comments, and requires high-fanout `observe_delta` coalescing and snapshot-budget evidence.
+- Posted #615 START comment at https://github.com/ChrisRoyse/Synapse/issues/615#issuecomment-4592942496.
+
+Outcome:
+- Next action is code/test inspection for UIA high-fanout coalescing and snapshot budget behavior before launching a repo-built isolated daemon for manual MCP FSV.
