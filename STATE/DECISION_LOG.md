@@ -355,3 +355,33 @@ Evidence:
 
 Outcome:
 - Next action is code/profile-definition inspection before launching a repo-built isolated daemon for manual MCP FSV.
+
+# 2026-06-01T12:45:00-05:00 - #620 needs non-mutating M1 mode/capture readback
+
+Decision: Patch `profile_activate` to apply full profile runtime config and expose M1 mode/capture in non-mutating health plus observation diagnostics.
+
+Evidence:
+- Code readback showed `profile_activate` only called `apply_backend_resolution_for_profile`; it did not update `M1State.perception_mode` or capture config.
+- `observe` can legitimately re-resolve foreground profile state, so using `observe` alone after activating a profile whose app is not foreground can mutate/read a different foreground profile.
+- #620 requires proof that activation applies keymap/HUD/capture/mode; mode/capture needed a separate physical readback surface.
+
+Outcome:
+- Worktree patch adds M1 `active_capture_config`, `observe.diagnostics.capture_config`, and `health.subsystems.perception`.
+- `profile_activate` now applies backend + M1 mode/capture.
+- Foreground profile resolution now applies mode/capture into the observation input for matching-profile `observe`.
+- Supporting tests/checks passed; manual isolated MCP FSV remains next.
+
+# 2026-06-01T13:04:31-05:00 - #620 HUD live-slot evidence has an explained foreground-control gap
+
+Decision: Accept #620 with HUD specs proven from profile SoT and document the live HUD-slot gap, rather than widening #620 into a host cursor/focus repair issue.
+
+Evidence:
+- Profile SoTs (`profile_list` and bundled TOML) expose HUD fields for `everquest.live`, `luanti.minetest`, and `minecraft.java`.
+- Live Luanti launched from the configured host and process/window title matched the Luanti profile.
+- Foreground focus stayed on PowerShell despite Win32 foreground attempts, `Alt+Tab`, and launching from the foreground shell.
+- Both isolated and wired MCP `act_click` failed closed with `ACTION_BACKEND_UNAVAILABLE` because `SetPhysicalCursorPos` returned access denied.
+- #620 acceptance allows a documented explained gap, and action/capture focus/cursor behavior is covered by separate action/capture stress children.
+
+Outcome:
+- #620 evidence records the HUD spec SoT and foreground-control gap explicitly.
+- No extra profile-runtime patch is needed for HUD specs; final checks/commit/issue closure are next.

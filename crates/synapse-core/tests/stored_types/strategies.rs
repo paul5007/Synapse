@@ -274,6 +274,7 @@ pub fn diagnostics_strategy() -> impl Strategy<Value = ObservationDiagnostics> {
                 capture_status,
                 detection_status,
                 audio_status,
+                capture_config: None,
                 elements_truncated: false,
                 entities_truncated: false,
                 size_bytes,

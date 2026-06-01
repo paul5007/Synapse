@@ -203,7 +203,7 @@ impl SynapseService {
                 return Err(error);
             }
         };
-        self.apply_backend_resolution_for_profile(&response.active_profile_id)?;
+        self.apply_profile_runtime_config_for_profile(&response.active_profile_id)?;
         self.persist_profile_activation_success(&response.active_profile_id, response.changed)?;
         Ok(Json(response))
     }

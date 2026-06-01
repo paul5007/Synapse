@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use synapse_capture::{CaptureBackend, CaptureConfig, CaptureTarget, resolve_capture_target};
 use synapse_core::{
-    AccessibleNode, ElementId, FocusedElement, ForegroundContext, OcrBackend, PerceptionMode, Rect,
-    error_codes,
+    AccessibleNode, ElementId, FocusedElement, ForegroundContext, ObservationCaptureConfig,
+    ObservationCaptureTarget, OcrBackend, PerceptionMode, Profile, ProfileCapture,
+    ProfileCaptureTarget, Rect, error_codes,
 };
 use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode};
 
@@ -28,6 +29,7 @@ pub type SharedM1State = Arc<Mutex<M1State>>;
 pub struct M1State {
     pub capture_config: CaptureConfig,
     pub capture_generation: u64,
+    pub active_capture_config: ObservationCaptureConfig,
     pub perception_mode: PerceptionMode,
     pub synthetic: Option<ObservationInput>,
     pub force_no_perception: bool,
@@ -52,6 +54,7 @@ impl M1State {
         Self {
             capture_config: CaptureConfig::default().with_env_backend(),
             capture_generation: 0,
+            active_capture_config: default_observation_capture_config(),
             perception_mode: PerceptionMode::Auto,
             synthetic,
             force_no_perception,
@@ -297,9 +300,12 @@ pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, Er
         if state.perception_mode != PerceptionMode::Auto {
             input.mode_override = Some(state.perception_mode);
         }
+        input.capture_config = Some(state.active_capture_config.clone());
         return Ok(input);
     }
-    platform_input(depth, state.perception_mode)
+    let mut input = platform_input(depth, state.perception_mode)?;
+    input.capture_config = Some(state.active_capture_config.clone());
+    Ok(input)
 }
 
 fn input_limited_to_depth(mut input: ObservationInput, depth: u32) -> ObservationInput {
@@ -388,12 +394,50 @@ pub fn set_capture_target_in_state(
         resolve_capture_target(&config).map_err(|err| mcp_error(err.code(), err.to_string()))?;
     state.capture_config = config;
     state.capture_generation = state.capture_generation.saturating_add(1);
+    state.active_capture_config = observation_capture_from_capture_config(
+        &state.capture_config,
+        state.capture_generation,
+        "manual".to_owned(),
+    );
     Ok(SetCaptureTargetResponse {
         previous,
         current: capture_target_wire(&resolved.target),
         generation: state.capture_generation,
         backend: capture_backend_name(resolved.backend).to_owned(),
     })
+}
+
+pub fn apply_profile_runtime_config_in_state(
+    state: &mut M1State,
+    profile: &Profile,
+) -> Result<ObservationCaptureConfig, ErrorData> {
+    state.perception_mode = profile.mode;
+
+    let mut config = state.capture_config.clone();
+    config.min_update_interval_ms = u64::from(profile.capture.min_update_interval_ms.max(1));
+    config.cursor_visible = profile.capture.cursor_visible;
+    if let Some(target) = capture_target_from_profile_target(&profile.capture.target) {
+        config.target = target;
+        resolve_capture_target(&config).map_err(|err| mcp_error(err.code(), err.to_string()))?;
+        state.capture_config.target = config.target.clone();
+    }
+    state.capture_config.min_update_interval_ms = config.min_update_interval_ms;
+    state.capture_config.cursor_visible = config.cursor_visible;
+
+    let mut active_capture = observation_capture_from_profile_capture(
+        &profile.capture,
+        state.capture_config.dirty_region_only,
+        state.capture_generation,
+        format!("profile:{}", profile.id),
+    );
+    if !capture_config_without_generation_eq(&state.active_capture_config, &active_capture) {
+        state.capture_generation = state.capture_generation.saturating_add(1);
+        active_capture.generation = state.capture_generation;
+    } else {
+        active_capture.generation = state.active_capture_config.generation;
+    }
+    state.active_capture_config = active_capture.clone();
+    Ok(active_capture)
 }
 
 pub fn set_perception_mode_in_state(
@@ -418,6 +462,90 @@ pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {
         message,
         Some(json!({ "code": code })),
     )
+}
+
+fn default_observation_capture_config() -> ObservationCaptureConfig {
+    observation_capture_from_capture_config(&CaptureConfig::default(), 0, "default".to_owned())
+}
+
+fn observation_capture_from_capture_config(
+    config: &CaptureConfig,
+    generation: u64,
+    source: String,
+) -> ObservationCaptureConfig {
+    ObservationCaptureConfig {
+        target: observation_target_from_capture_target(&config.target),
+        min_update_interval_ms: u32::try_from(config.min_update_interval_ms)
+            .unwrap_or(u32::MAX)
+            .max(1),
+        cursor_visible: config.cursor_visible,
+        dirty_region_only: config.dirty_region_only,
+        generation,
+        source,
+    }
+}
+
+fn observation_capture_from_profile_capture(
+    capture: &ProfileCapture,
+    dirty_region_only: bool,
+    generation: u64,
+    source: String,
+) -> ObservationCaptureConfig {
+    ObservationCaptureConfig {
+        target: observation_target_from_profile_target(&capture.target),
+        min_update_interval_ms: capture.min_update_interval_ms.max(1),
+        cursor_visible: capture.cursor_visible,
+        dirty_region_only,
+        generation,
+        source,
+    }
+}
+
+const fn observation_target_from_capture_target(
+    target: &CaptureTarget,
+) -> ObservationCaptureTarget {
+    match target {
+        CaptureTarget::Primary => ObservationCaptureTarget::PrimaryMonitor,
+        CaptureTarget::Monitor { monitor_index } => ObservationCaptureTarget::MonitorIndex {
+            index: *monitor_index,
+        },
+        CaptureTarget::Window { hwnd } => ObservationCaptureTarget::Window { window_hwnd: *hwnd },
+    }
+}
+
+const fn observation_target_from_profile_target(
+    target: &ProfileCaptureTarget,
+) -> ObservationCaptureTarget {
+    match target {
+        ProfileCaptureTarget::ForegroundWindow => ObservationCaptureTarget::ForegroundWindow,
+        ProfileCaptureTarget::PrimaryMonitor => ObservationCaptureTarget::PrimaryMonitor,
+        ProfileCaptureTarget::MonitorIndex { index } => {
+            ObservationCaptureTarget::MonitorIndex { index: *index }
+        }
+    }
+}
+
+const fn capture_target_from_profile_target(
+    target: &ProfileCaptureTarget,
+) -> Option<CaptureTarget> {
+    match target {
+        ProfileCaptureTarget::ForegroundWindow => None,
+        ProfileCaptureTarget::PrimaryMonitor => Some(CaptureTarget::Primary),
+        ProfileCaptureTarget::MonitorIndex { index } => Some(CaptureTarget::Monitor {
+            monitor_index: *index,
+        }),
+    }
+}
+
+fn capture_config_without_generation_eq(
+    left: &ObservationCaptureConfig,
+    right: &ObservationCaptureConfig,
+) -> bool {
+    left.target == right.target
+        && left.min_update_interval_ms == right.min_update_interval_ms
+        && left.cursor_visible == right.cursor_visible
+        && left.dirty_region_only == right.dirty_region_only
+        && left.source == right.source
 }
 
 fn capture_target_from_param(param: CaptureTargetParam) -> Result<CaptureTarget, ErrorData> {

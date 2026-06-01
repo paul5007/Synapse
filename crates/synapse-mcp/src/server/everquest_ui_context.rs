@@ -256,6 +256,7 @@ mod tests {
             detection_status: SensorStatus::Disabled,
             audio_status: SensorStatus::Disabled,
             mode_override: Some(PerceptionMode::Auto),
+            capture_config: None,
         }
     }
 

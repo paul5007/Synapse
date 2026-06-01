@@ -34,6 +34,7 @@ impl SynapseService {
         subsystems.insert("storage".to_owned(), self.storage_health());
         subsystems.insert("reflex".to_owned(), self.reflex_health());
         subsystems.insert("profiles".to_owned(), self.profile_health());
+        subsystems.insert("perception".to_owned(), self.perception_health());
         subsystems.insert("action".to_owned(), self.action_health());
         subsystems.insert("audio".to_owned(), self.audio_health());
         subsystems.insert("http".to_owned(), self.http_health(active_sessions));
@@ -226,6 +227,23 @@ impl SynapseService {
                 )
             }
             Err(_err) => state_lock_health(),
+        }
+    }
+
+    fn perception_health(&self) -> SubsystemHealth {
+        match self.m1_state.lock() {
+            Ok(state) => SubsystemHealth {
+                status: "ok".to_owned(),
+                detail: Some("perception runtime initialized".to_owned()),
+                perception_mode: Some(state.perception_mode),
+                capture_config: Some(state.active_capture_config.clone()),
+                ..SubsystemHealth::default()
+            },
+            Err(_err) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some("M1 service state lock poisoned".to_owned()),
+                ..SubsystemHealth::default()
+            },
         }
     }
 

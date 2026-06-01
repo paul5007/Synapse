@@ -158,19 +158,32 @@ impl SynapseService {
                     "observed foreground matched profile"
                 );
                 input.foreground.profile_id = Some(profile_id.clone());
-                if !include_hud {
-                    return;
-                }
                 let Ok(runtime) = self.profile_runtime() else {
                     tracing::warn!(
                         code = "PROFILE_FOREGROUND_RESOLUTION_SKIPPED",
-                        "profile runtime unavailable while resolving observed foreground HUD"
+                        "profile runtime unavailable while resolving observed foreground profile config"
                     );
                     return;
                 };
                 match runtime.profile(&profile_id) {
                     Ok(Some(profile)) => {
-                        populate_profile_hud(input, &profile, runtime.profile_dir());
+                        if let Err(error) = self.apply_m1_runtime_config_for_profile(&profile) {
+                            tracing::warn!(
+                                code = "PROFILE_M1_RUNTIME_CONFIG_FAILED",
+                                profile_id = %profile_id,
+                                error = %error,
+                                "profile runtime config failed for observed foreground"
+                            );
+                        } else {
+                            input.mode_override = Some(profile.mode);
+                            input.capture_config = self
+                                .m1_state()
+                                .ok()
+                                .map(|state| state.active_capture_config.clone());
+                        }
+                        if include_hud {
+                            populate_profile_hud(input, &profile, runtime.profile_dir());
+                        }
                     }
                     Ok(None) => {
                         tracing::warn!(

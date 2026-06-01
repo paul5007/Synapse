@@ -9,6 +9,9 @@ use tempfile::TempDir;
 async fn profile_tools_list_activate_and_report_health() -> anyhow::Result<()> {
     let profiles = TempDir::new()?;
     let logs = TempDir::new()?;
+    let db = TempDir::new()?;
+    let db_path = db.path().join("db");
+    let db_path = db_path.to_string_lossy().to_string();
     write_profile(
         &profiles.path().join("alpha.toml"),
         "alpha",
@@ -27,7 +30,10 @@ async fn profile_tools_list_activate_and_report_health() -> anyhow::Result<()> {
     let profile_dir = profiles.path().to_string_lossy().to_string();
     let mut client = StdioMcpClient::launch_and_init_with_env(
         Some(logs.path()),
-        &[("SYNAPSE_PROFILE_DIR", profile_dir.as_str())],
+        &[
+            ("SYNAPSE_PROFILE_DIR", profile_dir.as_str()),
+            ("SYNAPSE_DB", db_path.as_str()),
+        ],
     )
     .await?;
 
@@ -64,6 +70,18 @@ async fn profile_tools_list_activate_and_report_health() -> anyhow::Result<()> {
     assert_eq!(
         health["subsystems"]["profiles"]["active_profile_id"],
         "beta"
+    );
+    assert_eq!(
+        health["subsystems"]["perception"]["perception_mode"],
+        "hybrid"
+    );
+    assert_eq!(
+        health["subsystems"]["perception"]["capture_config"]["target"]["kind"],
+        "foreground_window"
+    );
+    assert_eq!(
+        health["subsystems"]["perception"]["capture_config"]["source"],
+        "profile:beta"
     );
     assert_backend_resolution(
         &health,
@@ -110,11 +128,17 @@ async fn profile_tools_list_activate_and_report_health() -> anyhow::Result<()> {
 async fn observe_reports_matching_profile_without_manual_activation() -> anyhow::Result<()> {
     let profiles = TempDir::new()?;
     let logs = TempDir::new()?;
-    write_profile(
+    let db = TempDir::new()?;
+    let db_path = db.path().join("db");
+    let db_path = db_path.to_string_lossy().to_string();
+    write_profile_with_runtime(
         &profiles.path().join("synthetic-notepad.toml"),
         "synthetic-notepad",
         "Synthetic Notepad",
         "notepad.exe",
+        "pixel_only",
+        33,
+        false,
         None,
     )?;
 
@@ -124,6 +148,7 @@ async fn observe_reports_matching_profile_without_manual_activation() -> anyhow:
         &[
             ("SYNAPSE_PROFILE_DIR", profile_dir.as_str()),
             ("SYNAPSE_MCP_SYNTHETIC_FIXTURE", "notepad"),
+            ("SYNAPSE_DB", db_path.as_str()),
         ],
     )
     .await?;
@@ -132,6 +157,23 @@ async fn observe_reports_matching_profile_without_manual_activation() -> anyhow:
     let observation = structured(&response)?;
     assert_eq!(observation["foreground"]["profile_id"], "synthetic-notepad");
     assert_eq!(observation["foreground"]["process_name"], "notepad.exe");
+    assert_eq!(observation["mode"], "pixel_only");
+    assert_eq!(
+        observation["diagnostics"]["capture_config"]["target"]["kind"],
+        "foreground_window"
+    );
+    assert_eq!(
+        observation["diagnostics"]["capture_config"]["min_update_interval_ms"],
+        33
+    );
+    assert_eq!(
+        observation["diagnostics"]["capture_config"]["cursor_visible"],
+        false
+    );
+    assert_eq!(
+        observation["diagnostics"]["capture_config"]["source"],
+        "profile:synthetic-notepad"
+    );
 
     let response = client.tools_call("health", json!({})).await?;
     let health = structured(&response)?;
@@ -270,6 +312,19 @@ fn write_profile(
     exe: &str,
     default_backend: Option<&str>,
 ) -> anyhow::Result<()> {
+    write_profile_with_runtime(path, id, label, exe, "hybrid", 16, true, default_backend)
+}
+
+fn write_profile_with_runtime(
+    path: &Path,
+    id: &str,
+    label: &str,
+    exe: &str,
+    mode: &str,
+    capture_interval_ms: u32,
+    cursor_visible: bool,
+    default_backend: Option<&str>,
+) -> anyhow::Result<()> {
     let backends = default_backend.map_or(String::new(), |backend| {
         format!(
             r#"
@@ -286,11 +341,17 @@ id = "{id}"
 label = "{label}"
 schema_version = 2
 use_scope = "productivity"
+mode = "{mode}"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
 exe = "{exe}"
+
+[capture]
+target = "foreground_window"
+min_update_interval_ms = {capture_interval_ms}
+cursor_visible = {cursor_visible}
 
 [detection]
 model_id = "{id}_detector"

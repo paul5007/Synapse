@@ -7,8 +7,8 @@ use std::{
 use chrono::Utc;
 use synapse_core::{
     AccessibleNode, AudioContext, ClipboardSummary, DetectedEntity, EventSummary, FocusedElement,
-    ForegroundContext, FsEvent, HudReadings, Observation, ObservationDiagnostics, PerceptionMode,
-    SensorStatus,
+    ForegroundContext, FsEvent, HudReadings, Observation, ObservationCaptureConfig,
+    ObservationDiagnostics, PerceptionMode, SensorStatus,
 };
 
 use crate::{PerceptionError, PerceptionResult};
@@ -119,6 +119,7 @@ pub struct ObservationInput {
     pub detection_status: SensorStatus,
     pub audio_status: SensorStatus,
     pub mode_override: Option<PerceptionMode>,
+    pub capture_config: Option<ObservationCaptureConfig>,
 }
 
 impl ObservationInput {
@@ -140,6 +141,7 @@ impl ObservationInput {
             detection_status: SensorStatus::Disabled,
             audio_status: SensorStatus::Disabled,
             mode_override: None,
+            capture_config: None,
         }
     }
 }
@@ -218,6 +220,7 @@ impl ObservationAssembler {
                 capture_status: input.capture_status,
                 detection_status: input.detection_status,
                 audio_status: input.audio_status,
+                capture_config: input.capture_config,
                 elements_truncated,
                 entities_truncated,
                 size_bytes: 0,

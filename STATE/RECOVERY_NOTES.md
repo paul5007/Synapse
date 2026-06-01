@@ -1,5 +1,40 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T13:04:31-05:00
+- Active issue is #620.
+- #620 implementation is patched locally; manual MCP behavior evidence, final supporting checks, release build, and diff review are complete. Commit, RESOLVED comment, closure, and queue continuation are next.
+- Manual FSV run directory: `.runs\620\profile-fsv-20260601T1238-clean`.
+  - Repo-built daemon PID `61244`, bind `127.0.0.1:7848`, isolated DB, isolated appdata/token, strict official Inspector tools-list count 80.
+  - All 29 bundled profiles were activated through real Inspector `profile_activate`; each had separate `profile_list` + `health.subsystems.perception` readbacks matching active profile id, mode, capture target/source, min interval, and cursor setting. #620 title says 30, but live SoT has 29 profiles.
+  - Matching foreground PowerShell `observe` read `mode=a11y_only` and `diagnostics.capture_config.source=profile:powershell`.
+  - `act_keymap alias=clear` wrote `CF_ACTION_LOG` rows preserving alias `clear`, binding `ctrl+l`, keys `ctrl,l`, backend `software`, and foreground `powershell.exe`.
+  - HUD specs are present for EverQuest/Luanti/Minecraft profiles. Live Luanti launched and matched the profile process/window, but host foreground remained PowerShell and mouse focus failed with access denied, so HUD-slot live readback is a documented explained gap under the issue acceptance.
+  - Edges covered: unknown profile, same-profile reactivation, app-not-running/foreground mismatch, empty alias, unknown alias, and no bundled empty-keymap profile.
+  - Cleanup completed: release_all zero, FSV-owned Luanti/Notepad processes stopped, daemon stopped, port `7848` closed.
+- Exact next actions:
+  1. Commit with `[skip ci]`.
+  2. Post #620 RESOLVED evidence and close #620.
+  3. Refresh the live queue.
+  4. Take #621 next unless GitHub state changes.
+
+## Current Resume Point - 2026-06-01T12:45:00-05:00
+- Active issue is #620.
+- The user's `Issue615FanoutTarget` concern has been checked: no #615 target windows/processes are currently visible/running. They were only the #615 synthetic UIA target and should not be considered product UI.
+- Worktree has an uncommitted #620 patch:
+  - M1 `active_capture_config`;
+  - `observe.diagnostics.capture_config`;
+  - `health.subsystems.perception` mode/capture readback;
+  - `profile_activate` and foreground profile resolution apply profile mode/capture as well as action backend resolution;
+  - `m3_profile_tools` regression checks activation health and observe mode/capture for a synthetic matching profile.
+- Supporting checks already passed: core/perception/MCP checks, `m3_profile_tools`, core snapshots observation shape, perception regression, MCP context tests, schema sanitize, and core types.
+- Remaining exact next actions:
+  1. Run final local supporting checks as needed and `cargo build --release -p synapse-mcp -j 2`.
+  2. Launch an isolated repo-built HTTP daemon for #620 with `SYNAPSE_DB` under `.runs\620\...`.
+  3. Prove process/socket/auth/health/strict Inspector `tools/list`.
+  4. Manually FSV all 29 bundled profiles through real Inspector `profile_activate` calls with separate `profile_list` and `health.subsystems.perception` readbacks.
+  5. Manually FSV representative matching-profile `observe`, HUD, `act_keymap` + `CF_ACTION_LOG`, and required edge cases.
+  6. Post RESOLVED evidence to #620 only after FSV and final checks pass.
+
 ## Current Resume Point - 2026-06-01T11:54:30-05:00
 - #619 is closed.
   - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/619#issuecomment-4594692386

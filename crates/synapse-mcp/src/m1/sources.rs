@@ -98,6 +98,7 @@ pub fn synthetic_notepad_input() -> ObservationInput {
         detection_status: SensorStatus::Disabled,
         audio_status: SensorStatus::Disabled,
         mode_override: None,
+        capture_config: None,
     }
 }
 

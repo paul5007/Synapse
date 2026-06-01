@@ -1,5 +1,72 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T13:04:31-05:00
+- Active issue remains #620 `scenario(stress): activate all 30 profiles - keymap/HUD/capture/mode apply`.
+- #620 implementation patch is in the worktree and not yet committed. It applies profile runtime config beyond action backend resolution:
+  - `profile_activate` now applies M1 perception mode and capture config from the active profile.
+  - `M1State` tracks `active_capture_config`; `observe.diagnostics.capture_config` and `health.subsystems.perception` expose separate readback surfaces.
+  - foreground-profile `observe` applies the matched profile mode/capture before assembling the observation.
+  - regression coverage in `m3_profile_tools` checks activation health and matched-profile observe mode/capture.
+- Manual MCP evidence for #620 is captured under `.runs\620\profile-fsv-20260601T1238-clean`.
+  - Repo-built daemon: PID `61244`, bind `127.0.0.1:7848`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, isolated DB `.runs\620\profile-fsv-20260601T1238-clean\db`, isolated appdata token file, token `synapse-620-token`.
+  - Release binary before FSV: length `46406144`, SHA256 `62323B2C4025438116F18A252DA53883C7F0DD1FCEC8651DA3B91824E6D35F6D`, `LastWriteTimeUtc=2026-06-01T17:37:16Z`.
+  - MCP precondition/readback passed: process path/command line matched repo release binary; socket `127.0.0.1:7848` listened under PID `61244`; unauth `/health=401`; auth `/health=200 ok=true`; official MCP Inspector `0.21.2` strict `tools/list` exited 0 with 80 tools and required #620 tools present. Inspector stderr contained only `unknown format "uint*"` schema warnings, not schema rejection.
+  - Live profile SoT is 29 bundled TOML profiles, not the stale issue-title count of 30. `crates\synapse-profiles\profiles` file count, `profile_list`, and daemon `health` all read 29.
+  - All 29 bundled profiles were activated through official Inspector `profile_activate`, each followed by separate `profile_list` and `health` readbacks. Every readback matched the activated profile id, expected mode, `profile:<id>` capture source, foreground-window capture target, min interval/cursor settings, and exactly one active profile row. Final all-profile readback: active profile `zoom`.
+  - Matching foreground `observe` evidence: activated `powershell`; official Inspector `observe` on foreground PowerShell read `mode=a11y_only`, `foreground.profile_id=powershell`, `diagnostics.capture_config.source=profile:powershell`, target `foreground_window`, min interval 50 ms, cursor visible true, and empty HUD fields because the powershell profile defines none.
+  - Keymap evidence: activated `powershell`; SoT before `storage_inspect` read `CF_ACTION_LOG=4`; trigger `act_keymap alias=clear backend=software hold_ms=1`; after `storage_inspect` read `CF_ACTION_LOG=6` and final action row preserved alias `clear`, resolved binding `ctrl+l`, resolved keys `["ctrl","l"]`, backend `software`, status `ok`, foreground `powershell.exe`.
+  - HUD profile specs: `profile_list`/TOML show HUD fields for `everquest.live`, `luanti.minetest`, and `minecraft.java`. Live Luanti was launched and process/window title read matched the profile, but foreground stayed locked to PowerShell and both isolated/wired `act_click` failed with `SetPhysicalCursorPos ... Access is denied`; HUD-slot live readback was therefore a documented explained gap under #620 acceptance rather than a product-code verdict.
+  - Edges covered through real Inspector tools with separate SoT readbacks: unknown profile `missing620` failed closed and active/mode stayed `powershell`; same-profile reactivation returned `changed=false`; activate `acrobat` while PowerShell was foreground caused `act_keymap copy` to fail closed against the foreground `powershell` profile and action log advanced by error rows; empty alias `""` failed closed with `TOOL_PARAMS_INVALID`; unknown alias `__missing620__` failed closed with `PROFILE_KEYMAP_INVALID`; no bundled empty-keymap profile exists.
+  - Cleanup: official Inspector `release_all` returned zero held state; Luanti and the FSV-owned Notepad processes were stopped; isolated daemon PID `61244` was stopped; port `127.0.0.1:7848` no longer listens. Existing older Notepad processes were not killed because they predated this run.
+- Post-compaction wired MCP client readback passed: `health ok=true`, `storage_inspect` returned live storage rows, `reflex_list`/`reflex_history` returned, and `observe` read foreground PowerShell.
+- Final supporting checks passed after #620 FSV:
+  - `cargo fmt --check`
+  - `git diff --check` (line-ending warnings only)
+  - `cargo check -p synapse-core -j 2`
+  - `cargo check -p synapse-perception -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --test m3_profile_tools -- --nocapture`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo test -p synapse-core observation_json_shape --test snapshots -- --nocapture`
+  - `cargo test -p synapse-perception --test perception_regression -- --nocapture` (7 passed, 2 ignored WinRT-desktop tests)
+  - `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`
+  - `cargo test -p synapse-mcp server::context:: --bin synapse-mcp -- --nocapture`
+  - `cargo build --release -p synapse-mcp -j 2`
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46406144`, SHA256 `7940237DE08DB7DF92D7D79944F6DF9FF3120A001AD0FA7C991DD28FCF81F578`, `LastWriteTimeUtc=2026-06-01T18:12:44Z`.
+- Diff review completed across code, tests, benches, and state notes.
+- Next: commit with `[skip ci]`, post #620 RESOLVED evidence, close #620, refresh queue, and take #621 unless GitHub changes.
+
+## 2026-06-01T12:45:00-05:00
+- Active issue remains #620 `scenario(stress): activate all 30 profiles — keymap/HUD/capture/mode apply`.
+- User asked about lingering `Issue615FanoutTarget` windows/buttons. Fresh readback found no visible/loaded target:
+  - wired `mcp__synapse.find query=Issue615FanoutTarget` returned no results;
+  - wired `mcp__synapse.observe` foreground was Explorer taskbar, no #615 window;
+  - OS process/window readback found no `Issue615FanoutTarget` title or `issue615*` process.
+  - Explanation: those were #615 synthetic UIA fanout target controls used only to mutate a WinForms list for separate UIA readback; they were not product UI.
+- #620 implementation patch is in the worktree, not committed:
+  - `profile_activate` now applies the active profile as full runtime config, not only action backend resolution.
+  - M1 state now tracks `active_capture_config` with target/min interval/cursor/dirty/generation/source.
+  - `observe.diagnostics.capture_config` exposes the applied capture config, and `health.subsystems.perception` exposes the non-mutating M1 perception mode/capture readback.
+  - Foreground profile resolution now applies profile mode/capture before assembling observation output, so matched-profile `observe` can show profile mode/capture immediately.
+  - Supporting regression in `m3_profile_tools` asserts activated profile health readback and matched synthetic notepad observe mode/capture readback.
+- Supporting checks passed so far:
+  - `cargo check -p synapse-core -j 2`
+  - `cargo check -p synapse-perception -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --test m3_profile_tools -- --nocapture`
+  - `cargo test -p synapse-core observation_json_shape --test snapshots -- --nocapture`
+  - `cargo test -p synapse-perception --test perception_regression -- --nocapture`
+  - `cargo test -p synapse-mcp server::context:: --bin synapse-mcp -- --nocapture`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo test -p synapse-core --test types -- --nocapture`
+- Live profile count remains 29 bundled TOML profiles, not 30. `crates\synapse-profiles\profiles` file count and wired MCP `health` both read 29. Treat #620 title as stale wording and document this in FSV evidence.
+- Next: build release `synapse-mcp`, launch isolated repo-built HTTP daemon for #620, strict Inspector `tools/list`, then manual FSV:
+  - activate all 29 bundled profiles and read `profile_list` + `health.subsystems.perception` after each;
+  - representative real `observe` mode/capture/HUD readback on a matching foreground profile;
+  - `act_keymap` success for a matching foreground profile with `CF_ACTION_LOG` alias/resolved binding readback;
+  - required edges: unknown profile id, same-profile reactivation, app-not-running action denial, empty/invalid keymap alias/unknown alias, and no-empty-keymap profile gap if none exist.
+
 ## 2026-06-01T11:54:30-05:00
 - #619 `scenario(stress): storage_gc_once under concurrent writes` is closed.
   - No product-code patch was required.

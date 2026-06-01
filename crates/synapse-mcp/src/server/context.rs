@@ -2,7 +2,8 @@ use super::{
     Arc, CancellationToken, ErrorData, M1State, Mutex, MutexGuard, ProfileActivateParams,
     ProfileActivateResponse, RecordingBackend, RequiredPermissions, SseState, SynapseService,
     action_preflight::{ActionPreflightReadback, attach_action_preflight_to_error},
-    activate_profile, authorization_error, error_codes, mcp_error,
+    activate_profile, apply_profile_runtime_config_in_state, authorization_error, error_codes,
+    mcp_error,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +13,7 @@ use rmcp::model::ErrorCode;
 use serde_json::json;
 use synapse_core::{
     AccessibleNode, Action, ElementId, Event, EventSource, FocusedElement, ForegroundContext,
-    ProfileUseScope, ReflexId,
+    Profile, ProfileUseScope, ReflexId,
 };
 use synapse_profiles::ForegroundProfileTransition;
 use synapse_reflex::{
@@ -165,7 +166,7 @@ impl SynapseService {
             .reevaluate_profile_for_foreground(&foreground)
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
         if let Some(profile_id) = transition.active_profile_id.as_deref() {
-            self.apply_backend_resolution_for_profile(profile_id)
+            self.apply_profile_runtime_config_for_profile(profile_id)
                 .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
         }
         ensure_profile_scope_allows_action(&runtime, tool, self.allow_unknown_profile()?)
@@ -325,7 +326,7 @@ impl SynapseService {
         activate_profile(&runtime, params, allow_unknown_profile)
     }
 
-    pub(super) fn apply_backend_resolution_for_profile(
+    pub(super) fn apply_profile_runtime_config_for_profile(
         &self,
         profile_id: &str,
     ) -> Result<(), ErrorData> {
@@ -339,9 +340,18 @@ impl SynapseService {
                     format!("profile {profile_id} was not found after activation"),
                 )
             })?;
+        self.apply_backend_resolution_for_profile_data(&profile)?;
+        self.apply_m1_runtime_config_for_profile(&profile)?;
+        Ok(())
+    }
+
+    fn apply_backend_resolution_for_profile_data(
+        &self,
+        profile: &Profile,
+    ) -> Result<(), ErrorData> {
         let policy =
             synapse_action::BackendResolutionPolicy::from_profile_backends(profile.backends);
-        let source = format!("profile:{profile_id}");
+        let source = format!("profile:{}", profile.id);
         self.m2_state
             .lock()
             .map_err(|_err| {
@@ -359,7 +369,7 @@ impl SynapseService {
             })?;
         tracing::info!(
             code = "ACTION_BACKEND_RESOLUTION_UPDATED",
-            profile_id,
+            profile_id = %profile.id,
             source,
             default_backend = ?policy.default_backend,
             keyboard_default = ?policy.keyboard_default,
@@ -370,6 +380,26 @@ impl SynapseService {
             pad_auto = policy.pad_auto_backend().as_str(),
             release_all_auto = policy.release_all_auto_backend().as_str(),
             "action backend resolution updated from active profile"
+        );
+        Ok(())
+    }
+
+    pub(super) fn apply_m1_runtime_config_for_profile(
+        &self,
+        profile: &Profile,
+    ) -> Result<(), ErrorData> {
+        let capture = {
+            let mut state = self.m1_state()?;
+            apply_profile_runtime_config_in_state(&mut state, profile)?
+        };
+        tracing::info!(
+            code = "PROFILE_M1_RUNTIME_CONFIG_APPLIED",
+            profile_id = %profile.id,
+            mode = ?profile.mode,
+            capture_target = ?capture.target,
+            capture_generation = capture.generation,
+            capture_source = %capture.source,
+            "profile perception and capture runtime config applied"
         );
         Ok(())
     }

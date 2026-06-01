@@ -286,10 +286,32 @@ pub struct ObservationDiagnostics {
     pub capture_status: SensorStatus,
     pub detection_status: SensorStatus,
     pub audio_status: SensorStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_config: Option<ObservationCaptureConfig>,
     pub elements_truncated: bool,
     pub entities_truncated: bool,
     pub size_bytes: u32,
     pub size_estimate_tokens: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationCaptureConfig {
+    pub target: ObservationCaptureTarget,
+    pub min_update_interval_ms: u32,
+    pub cursor_visible: bool,
+    pub dirty_region_only: bool,
+    pub generation: u64,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObservationCaptureTarget {
+    ForegroundWindow,
+    PrimaryMonitor,
+    MonitorIndex { index: u32 },
+    Window { window_hwnd: i64 },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
