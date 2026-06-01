@@ -302,3 +302,17 @@ Evidence:
 
 Outcome:
 - Next action is code/test inspection for storage pressure levels, transition codes, compaction, and write-gating behavior before launching a repo-built isolated daemon for manual MCP FSV.
+
+# 2026-06-01T11:18:00-05:00 - #618 diagnostic writes must expose pressure refusal explicitly
+
+Decision: Route `storage_put_probe_rows` through pressure policy before non-empty diagnostic writes and return explicit `STORAGE_WRITE_FAILED` when the current pressure level refuses the target CF.
+
+Evidence:
+- Code readback showed the storage layer's lower-level `put_batch` suppresses pressure-blocked writes and reports success, which would make the diagnostic MCP surface report only zero rows rather than an explicit refusal.
+- #618 specifically requires write-gating proof for CFs outside the original diagnostic allowlist and requires a gated write attempt to return an explicit refusal.
+- The original diagnostic probe allowlist covered only five CFs, so real MCP FSV could not attempt writes to `CF_OCR_CACHE`, `CF_TELEMETRY`, `CF_MODEL_CACHE`, `CF_PROCESS_HISTORY`, or `CF_REFLEX_AUDIT`.
+
+Outcome:
+- Added storage/reflex pressure-permission read APIs and expanded `storage_put_probe_rows` to all 11 CFs.
+- Non-empty blocked diagnostic writes now return MCP error `STORAGE_WRITE_FAILED`; empty `rows=0` remains a no-op.
+- Manual MCP FSV with repo-built daemon PID `56980` on `127.0.0.1:7846` proved the full Normal/L1/L2/L3/L4/recovery ladder, strict thresholds, compaction counts, L3/L4 write gating, explicit refusal errors, empty/no-op, invalid CF, and recovery write reopen.

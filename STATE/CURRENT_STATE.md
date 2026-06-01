@@ -1,5 +1,40 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T11:18:00-05:00
+- Active issue #618 `scenario(stress): storage pressure ladder - 5 levels + write-gating` has implementation and manual MCP FSV evidence captured; final supporting checks, diff review, commit, RESOLVED comment, close, and queue continuation are next.
+- Patch in worktree:
+  - `crates/synapse-storage/src/lib.rs`: exposes `Db::pressure_permits_write`.
+  - `crates/synapse-reflex/src/storage.rs`: exposes `ReflexRuntime::storage_pressure_permits_write`.
+  - `crates/synapse-mcp/src/m3/storage.rs`: allows diagnostic probe writes across all 11 storage CFs, and returns explicit `STORAGE_WRITE_FAILED` when pressure policy refuses a non-empty diagnostic write.
+  - `crates/synapse-mcp/tests/m3_storage_tool.rs`: adds supporting regression coverage for pressure-gated CFs.
+- Manual FSV run directory: `.runs\618\pressure-fsv-20260601T1108-patched`.
+  - Repo-built daemon PID `56980`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, bind `127.0.0.1:7846`, isolated DB `.runs\618\pressure-fsv-20260601T1108-patched\db`, token `synapse-618-token`.
+  - Process/socket/auth/client-parity readbacks passed: process path/command line matched repo release binary and `--db`; socket listened on `127.0.0.1:7846` owned by PID `56980`; unauth `/health=401`; auth `/health ok=true`; official MCP Inspector `0.21.2` strict `tools/list` returned 80 tools including `storage_inspect`, `storage_pressure_sample`, `storage_put_probe_rows`, and `release_all`.
+  - Initial/separate `storage_inspect` readback after exact L1 threshold had pressure `Normal`, no transition codes, and all 11 CF row counts at 0.
+  - Pressure ladder evidence:
+    - exact L1 threshold `free_bytes=2000000000`: stayed `Normal`, no code, no compaction.
+    - below L1 `1999999999`: `Normal -> Level1`, emitted `STORAGE_DISK_PRESSURE_LEVEL_1`, no compaction, separate inspect pressure `Level1`.
+    - exact L2 threshold `1000000000`: stayed `Level1`, no new code, no compaction, separate inspect pressure `Level1`.
+    - below L2 `999999999`: `Level1 -> Level2`, emitted `STORAGE_DISK_PRESSURE_LEVEL_2`, compacted 11 CFs, separate inspect pressure `Level2`.
+    - exact L3 threshold `500000000`: stayed `Level2`, no new code, no compaction.
+    - below L3 `499999999`: `Level2 -> Level3`, emitted `STORAGE_DISK_PRESSURE_LEVEL_3`, compacted 11 CFs, separate inspect pressure `Level3`.
+    - exact L4 threshold `200000000`: stayed `Level3`, no new code, no compaction.
+    - below L4 `199999999`: `Level3 -> Level4`, emitted `STORAGE_DISK_PRESSURE_LEVEL_4`, compacted 11 CFs, separate inspect pressure `Level4`.
+    - recovery `2500000000`: `Level4 -> Normal`, no code, no compaction, separate inspect pressure `Normal`.
+  - Write-gating evidence:
+    - `Level2`: `CF_OBSERVATIONS` write accepted, count 0 -> 1 and sample key prefix `issue618-l2-observations`.
+    - `Level3`: writes to `CF_OBSERVATIONS`, `CF_OCR_CACHE`, `CF_TELEMETRY`, `CF_MODEL_CACHE`, and `CF_PROCESS_HISTORY` were all refused with `STORAGE_WRITE_FAILED`; separate inspect showed counts unchanged (`CF_OBSERVATIONS=1`, the other four 0). `CF_EVENTS` remained allowed and wrote 0 -> 1.
+    - `Level4`: writes to `CF_EVENTS`, `CF_ACTION_LOG`, `CF_KV`, and `CF_OBSERVATIONS` were refused with `STORAGE_WRITE_FAILED`; `CF_REFLEX_AUDIT` and `CF_SESSIONS` each wrote 0 -> 1; separate inspect confirmed only allowed CFs changed.
+    - Empty edge under `Level4`: `CF_EVENTS rows=0 value_bytes=0` succeeded as a no-op, leaving `CF_EVENTS=1`.
+    - Structurally invalid edge: `cf_name=NOT_A_CF` failed closed with MCP error `-32099` listing allowed CFs; separate inspect left counts unchanged.
+    - Recovery edge: after returning `Normal`, `CF_OBSERVATIONS` write accepted again, count 1 -> 2 and sample key prefix `issue618-recovered-observations`.
+  - Daemon log readback contained all four `STORAGE_DISK_PRESSURE_LEVEL_*` transition lines and each explicit `STORAGE_WRITE_FAILED` refusal.
+  - Cleanup readback: real Inspector `release_all` returned `released_keys=0`, `released_buttons=0`, `neutralized_pads=0`; stopped PID `56980`; port `127.0.0.1:7846` no longer listens.
+- Final supporting checks passed after FSV: `cargo fmt --check`; `git diff --check` (line-ending warnings only); `cargo check -p synapse-storage -j 2`; `cargo check -p synapse-reflex -j 2`; `cargo check -p synapse-mcp -j 2`; `cargo test -p synapse-storage pressure -- --nocapture`; `cargo test -p synapse-mcp --test m3_storage_tool -- --nocapture`; `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`; `cargo build --release -p synapse-mcp -j 2`.
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46320128`, SHA256 `8BCD4B02A37D85C40D15087C8A3B66A8963804CB8A5877CC5A349CE676EFB12B`, `LastWriteTimeUtc=2026-06-01T16:25:11.3649649Z`.
+- Diff review completed for code/test/state changes.
+- Next: commit with `[skip ci]`, post #618 RESOLVED evidence, close #618, refresh queue, and take next open child (#619 unless queue changes).
+
 ## 2026-06-01T10:53:00-05:00
 - #617 `scenario(stress): storage CF saturation to hard cap + GC eviction` is closed.
   - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/617#issuecomment-4594236079

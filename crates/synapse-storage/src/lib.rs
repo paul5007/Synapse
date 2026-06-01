@@ -291,6 +291,12 @@ impl Db {
         self.pressure.level()
     }
 
+    /// Returns whether the current pressure policy permits writes to `cf_name`.
+    #[must_use]
+    pub fn pressure_permits_write(&self, cf_name: &str) -> bool {
+        self.pressure.permits_write(cf_name)
+    }
+
     /// Returns the in-process disk-pressure transition code history.
     ///
     /// # Errors

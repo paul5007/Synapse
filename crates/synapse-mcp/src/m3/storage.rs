@@ -27,13 +27,7 @@ const MAX_KEY_PREFIX_BYTES: usize = 128;
 const MAX_ROW_CAP: u64 = 1_000_000;
 const MAX_INSPECT_SAMPLE_ROWS_PER_CF: usize = 3;
 const MAX_INSPECT_SAMPLE_VALUE_CHARS: usize = 4096;
-const PROBE_WRITABLE_CFS: [&str; 5] = [
-    cf::CF_EVENTS,
-    cf::CF_OBSERVATIONS,
-    cf::CF_SESSIONS,
-    cf::CF_ACTION_LOG,
-    cf::CF_KV,
-];
+const PROBE_WRITABLE_CFS: [&str; 11] = cf::ALL_COLUMN_FAMILIES;
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -227,6 +221,15 @@ pub fn put_probe_rows(
     let cf_name = probe_writable_cf(&params.cf_name)?;
     let rows = build_probe_rows(params);
     let runtime = lock_runtime(runtime)?;
+    let pressure = runtime.storage_pressure_level();
+    if params.rows > 0 && !runtime.storage_pressure_permits_write(cf_name) {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "storage diagnostic write refused under disk pressure: cf_name={cf_name} pressure_level={pressure:?}"
+            ),
+        ));
+    }
     let before = cf_count(
         &runtime
             .storage_cf_row_counts()

@@ -29,6 +29,12 @@ impl ReflexRuntime {
         self.db.pressure_level()
     }
 
+    /// Returns whether storage currently accepts writes to one column family.
+    #[must_use]
+    pub fn storage_pressure_permits_write(&self, cf_name: &str) -> bool {
+        self.db.pressure_permits_write(cf_name)
+    }
+
     /// Returns logical byte sizes for each storage column family.
     ///
     /// # Errors
