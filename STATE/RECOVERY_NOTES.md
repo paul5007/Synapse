@@ -1,5 +1,31 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T21:16:00-05:00
+- Active issue is #628:
+  - title `scenario(showcase): browser marathon - Chrome workflow with Playwright MCP as oracle`
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/628#issuecomment-4597523219
+  - assigned to `ChrisRoyse`, labeled `status:in-progress`, `agent:codex`.
+- User `Issue615FanoutTarget` concern:
+  - treat any `Issue615FanoutTarget` window as stale #615 fixture residue unless a new live window/readback proves otherwise;
+  - fixture buttons only mutate the old WinForms item panel or close the fixture, not product behavior.
+- #628 worktree patch compiles and release-builds:
+  - changed files: `crates/synapse-action/src/backend/software/mouse.rs`, `crates/synapse-mcp/src/m2/click.rs`, `crates/synapse-mcp/src/m2/click/element.rs`.
+  - latest release `synapse-mcp.exe`: length `46379008`, SHA256 `42FB209D71E8D2F6967D0F82D1B6A6EE70422B98361489ADCCDCD14F3F4258D1`, `LastWriteTimeUtc=2026-06-02T02:14:58.1557599Z`.
+  - checks passed: fmt, fmt-check, `cargo check -p synapse-mcp -j 2`, `cargo check -p synapse-action -j 2`, focused element-coordinate click regression, focused DPI compensation regression, focused cursor-readback tolerance regression, and release build.
+- Important #628 runtime facts:
+  - local target/server run directory: `.runs\628\browser-marathon-fsv-20260601T1915`;
+  - Node server PID `79412` is still listening on `127.0.0.1:8763`;
+  - Chrome CDP PID `77260` is still listening on `127.0.0.1:9226`;
+  - Playwright MCP PID `39204` was previously listening on `::1:8932`; recheck before using it;
+  - server `state.json` currently has no submissions and no iframe messages.
+- Old #628 isolated daemon PID `56124` / port `7857` was released and stopped before the latest release build.
+- Exact next actions:
+  1. Start a fresh isolated repo-built `synapse-mcp` daemon on a new port, e.g. `127.0.0.1:7858`, with a fresh #628 DB/log path.
+  2. Use official MCP Inspector strict `tools/list`, authenticated `health`, and a process/socket/binary readback for the new daemon.
+  3. Reset/reload the browser marathon page, making sure Synapse and Playwright observe the same Chrome/page.
+  4. Trigger through real Synapse MCP `tools/call` only, then read Playwright DOM/server/page state and Synapse storage/action log separately.
+  5. Cover happy path plus late-loaded control, moved/scroll/DPI element, modal, iframe, empty/boundary/structurally-invalid inputs.
+
 ## Current Resume Point - 2026-06-01T19:13:00-05:00
 - #627 is resolved and closed:
   - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/627#issuecomment-4597519110

@@ -1,5 +1,35 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T21:16:00-05:00
+- Active issue remains #628 `scenario(showcase): browser marathon - Chrome workflow with Playwright MCP as oracle`.
+- User's `Issue615FanoutTarget` concern was rechecked after compaction from persisted state and live reality:
+  - no live `Issue615FanoutTarget` window/button surface is currently present;
+  - `.runs\615\target\issue615_target.ps1` confirms those buttons are stale #615 WinForms fixture controls: `Show*` repopulates the item panel, `Clear` empties it, `Rename8` renames existing items, `Mixed8` renames/adds, and `Exit` closes the fixture.
+- #628 root cause found so far:
+  - Chrome UIA `Invoke` returned success for the late-loaded button but Playwright DOM stayed unchanged, so return value was a false positive.
+  - Direct coordinate clicks failed because OS cursor APIs cannot currently move the cursor from the foreground PowerShell context; separate readback showed `SetPhysicalCursorPos`/`SetCursorPos` false/no-error and Synapse `act_aim` failed the same way.
+  - DPI readback exposed a scaled-coordinate mismatch on the 150% Chrome monitor path, so cursor movement now verifies physical cursor position and fails closed on mismatch instead of claiming success.
+  - A diagnostic-only Win32 `PostMessageW` sequence to Chrome's `Chrome_RenderWidgetHostHWND` did trigger the page's late button, proving Chrome can accept a window-message fallback when physical cursor movement is unavailable. This diagnosis is not accepted as FSV until triggered through real Synapse MCP `act_click`.
+- Current local #628 patch:
+  - `crates/synapse-action/src/backend/software/mouse.rs`: physical cursor movement now has separate `GetPhysicalCursorPos` readback, monitor-DPI compensation, SendInput fallback readback, and explicit `ACTION_BACKEND_UNAVAILABLE` on mismatch.
+  - `crates/synapse-mcp/src/m2/click.rs` and `crates/synapse-mcp/src/m2/click/element.rs`: element clicks with `use_invoke_pattern=false` route through the normal coordinate actor path first, then fall back to Windows HWND mouse messages only after the action backend reports unavailable.
+- Supporting checks now passed after the latest patch:
+  - `cargo fmt`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo check -p synapse-action -j 2`
+  - `cargo test -p synapse-mcp direct_coordinate_element_click_uses_move_then_requested_presses -- --nocapture`
+  - `cargo test -p synapse-action dpi_compensation -- --nocapture`
+  - `cargo test -p synapse-action cursor_readback_tolerance -- --nocapture`
+  - `cargo fmt --check`
+  - `cargo build --release -p synapse-mcp -j 2`
+- Latest release binary readback: `target\release\synapse-mcp.exe`, length `46379008`, SHA256 `42FB209D71E8D2F6967D0F82D1B6A6EE70422B98361489ADCCDCD14F3F4258D1`, `LastWriteTimeUtc=2026-06-02T02:14:58.1557599Z`.
+- The old #628 isolated daemon PID `56124` on `127.0.0.1:7857` was released/stopped; port `7857` readback returned no listener.
+- Next:
+  1. launch a fresh isolated repo-built #628 daemon on a new port with the latest release binary;
+  2. verify process/socket/auth/health/strict Inspector `tools/list`;
+  3. reset the local browser marathon page/server state;
+  4. run manual MCP FSV for same-page Synapse `find`/`act_click`/`act_type`/`act_scroll` triggers with Playwright DOM/server/state readbacks.
+
 ## 2026-06-01T19:13:00-05:00
 - #627 is closed:
   - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/627#issuecomment-4597519110

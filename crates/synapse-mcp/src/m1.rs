@@ -21,7 +21,7 @@ use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode
 pub use ocr::read_text_in_state;
 use search::{element_match, entity_match};
 pub use sources::{FsRecentTracker, populate_clipboard_summary, populate_fs_recent};
-use sources::{platform_input, synthetic_notepad_input};
+use sources::{platform_input, window_input_from_hwnd, synthetic_notepad_input};
 
 pub type SharedM1State = Arc<Mutex<M1State>>;
 
@@ -123,6 +123,8 @@ pub struct FindParams {
     pub limit: Option<usize>,
     #[serde(default)]
     pub in_window: Option<ElementId>,
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema)]
@@ -344,7 +346,13 @@ fn focused_from_accessible_node(node: &AccessibleNode) -> FocusedElement {
 const FIND_SNAPSHOT_DEPTH: u32 = 16;
 
 pub fn find_in_state(state: &M1State, params: &FindParams) -> Result<FindResponse, ErrorData> {
-    let input = current_input(state, FIND_SNAPSHOT_DEPTH)?;
+    let input = if let Some(hwnd) = params.window_hwnd {
+        let mut input = window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, state.perception_mode)?;
+        input.capture_config = Some(state.active_capture_config.clone());
+        input
+    } else {
+        current_input(state, FIND_SNAPSHOT_DEPTH)?
+    };
     let limit = params.limit.unwrap_or(5).clamp(1, 20);
     let mut results = Vec::new();
     if matches!(

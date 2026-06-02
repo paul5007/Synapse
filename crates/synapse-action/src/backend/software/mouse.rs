@@ -4,10 +4,11 @@ use enigo::Enigo;
 use synapse_core::{AimCurve, AimStyle, AimTarget, ButtonAction, MouseButton, MouseTarget, Point};
 use windows::Win32::{
     Foundation::{E_ACCESSDENIED, POINT as WinPoint},
+    Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint},
     UI::{
         HiDpi::{
-            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-            SetThreadDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+            SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
         },
         Input::KeyboardAndMouse::{
             INPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -32,17 +33,13 @@ use crate::{ActionError, EmitState, recovery, sample_curve};
 const WHEEL_DELTA: i32 = 120;
 const XBUTTON1_DATA: u32 = 0x0001;
 const XBUTTON2_DATA: u32 = 0x0002;
+const USER_DEFAULT_DPI: u32 = 96;
+const CURSOR_READBACK_TOLERANCE_PX: i32 = 2;
 static DPI_AWARENESS: Once = Once::new();
 
 pub(super) fn cursor_position() -> Result<Point, ActionError> {
     activate_thread_dpi_awareness();
-    let mut point = WinPoint { x: 0, y: 0 };
-    // SAFETY: `point` is a valid writable POINT for the duration of the call.
-    unsafe { GetPhysicalCursorPos(&raw mut point) }.map_err(|err| {
-        ActionError::BackendUnavailable {
-            detail: format!("GetPhysicalCursorPos failed: {err}"),
-        }
-    })?;
+    let point = read_physical_cursor_position("cursor position")?;
     // PER_MONITOR_AWARE_V2: the physical cursor APIs and `observe`/a11y bboxes
     // share one physical-pixel coordinate space, so the readback passes through
     // unchanged. (Previously this divided by GetDpiForSystem/96, which
@@ -206,19 +203,245 @@ fn mouse_move_curve(
 fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), ActionError> {
     activate_thread_dpi_awareness();
     // Physical cursor APIs avoid DPI virtualization drift between the MCP
-    // process and the operator-visible screen coordinate space. The point is
-    // already in that physical space (PER_MONITOR_AWARE_V2, matching `observe`
-    // and the drag curve in `mouse_move_curve`), so it is used as-is — no DPI
-    // multiply. Scaling here previously placed the drag/click origin at
-    // `point * (GetDpiForSystem/96)`, leaving spurious strokes from the
-    // over-scaled origin on scaled displays.
-    unsafe { SetPhysicalCursorPos(point.x, point.y) }.map_err(|error| {
+    // process and the operator-visible screen coordinate space. When this
+    // succeeds, do not also send an absolute mouse-move packet: on mixed-DPI
+    // desktops Windows can map MOUSEEVENTF_ABSOLUTE through a logical desktop
+    // surface and move the cursor away from the physical UIA point.
+    if set_physical_cursor_pos(point, detail) {
+        let first_actual = read_physical_cursor_position(detail)?;
+        if cursor_readback_matches(point, first_actual) {
+            return Ok(());
+        }
+
+        if let Some(compensation) = dpi_compensation_for_point(point) {
+            tracing::warn!(
+                code = "M2_CURSOR_READBACK_DPI_COMPENSATION",
+                requested_x = point.x,
+                requested_y = point.y,
+                first_actual_x = first_actual.x,
+                first_actual_y = first_actual.y,
+                adjusted_x = compensation.adjusted.x,
+                adjusted_y = compensation.adjusted.y,
+                dpi_x = compensation.dpi_x,
+                dpi_y = compensation.dpi_y,
+                detail,
+                "physical cursor move read back a scaled coordinate; retrying with monitor-DPI compensation"
+            );
+            if set_physical_cursor_pos(compensation.adjusted, detail) {
+                let compensated_actual = read_physical_cursor_position(detail)?;
+                if cursor_readback_matches(point, compensated_actual) {
+                    return Ok(());
+                }
+                return Err(cursor_readback_mismatch_error(
+                    detail,
+                    point,
+                    first_actual,
+                    Some((compensation, compensated_actual)),
+                ));
+            }
+        }
+
+        return Err(cursor_readback_mismatch_error(
+            detail,
+            point,
+            first_actual,
+            None,
+        ));
+    }
+
+    let compensation = dpi_compensation_for_point(point);
+    if let Some(compensation) = compensation {
+        if set_physical_cursor_pos(compensation.adjusted, detail) {
+            let compensated_actual = read_physical_cursor_position(detail)?;
+            if cursor_readback_matches(point, compensated_actual) {
+                return Ok(());
+            }
+        }
+    }
+
+    let desktop = virtual_desktop()?;
+    send_input_batch(&[absolute_mouse_input_for_desktop(point, desktop)], detail)?;
+    let send_input_actual = read_physical_cursor_position(detail)?;
+    if cursor_readback_matches(point, send_input_actual) {
+        Ok(())
+    } else if let Some(compensation) = compensation {
+        tracing::warn!(
+            code = "M2_SEND_INPUT_CURSOR_DPI_COMPENSATION",
+            requested_x = point.x,
+            requested_y = point.y,
+            first_actual_x = send_input_actual.x,
+            first_actual_y = send_input_actual.y,
+            adjusted_x = compensation.adjusted.x,
+            adjusted_y = compensation.adjusted.y,
+            dpi_x = compensation.dpi_x,
+            dpi_y = compensation.dpi_y,
+            detail,
+            "SendInput cursor move read back a scaled coordinate; retrying with monitor-DPI compensation"
+        );
+        send_input_batch(
+            &[absolute_mouse_input_for_desktop(
+                compensation.adjusted,
+                desktop,
+            )],
+            detail,
+        )?;
+        let compensated_actual = read_physical_cursor_position(detail)?;
+        if cursor_readback_matches(point, compensated_actual) {
+            Ok(())
+        } else {
+            Err(cursor_readback_mismatch_error(
+                detail,
+                point,
+                send_input_actual,
+                Some((compensation, compensated_actual)),
+            ))
+        }
+    } else {
+        Err(ActionError::BackendUnavailable {
+            detail: format!(
+                "{detail} cursor readback mismatch after SendInput fallback: requested={point:?} actual={send_input_actual:?} tolerance_px={CURSOR_READBACK_TOLERANCE_PX}"
+            ),
+        })
+    }
+}
+
+fn set_physical_cursor_pos(point: Point, detail: &'static str) -> bool {
+    match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
+        Ok(()) => true,
+        Err(error) if error.code() != windows::core::HRESULT(0) => {
+            tracing::warn!(
+                code = "M2_SET_PHYSICAL_CURSOR_POS_UNAVAILABLE",
+                point_x = point.x,
+                point_y = point.y,
+                detail,
+                error = %error,
+                "SetPhysicalCursorPos failed; trying SendInput cursor move with readback"
+            );
+            false
+        }
+        Err(_error) => {
+            tracing::warn!(
+                code = "M2_SET_PHYSICAL_CURSOR_POS_FALSE_NO_ERROR",
+                point_x = point.x,
+                point_y = point.y,
+                detail,
+                "SetPhysicalCursorPos returned false without a Win32 error"
+            );
+            false
+        }
+    }
+}
+
+fn read_physical_cursor_position(detail: &'static str) -> Result<WinPoint, ActionError> {
+    let mut point = WinPoint { x: 0, y: 0 };
+    // SAFETY: `point` is a valid writable POINT for the duration of the call.
+    unsafe { GetPhysicalCursorPos(&raw mut point) }.map_err(|err| {
         ActionError::BackendUnavailable {
-            detail: format!("SetPhysicalCursorPos failed for {detail}: {error}"),
+            detail: format!("GetPhysicalCursorPos failed for {detail}: {err}"),
         }
     })?;
-    let desktop = virtual_desktop()?;
-    send_input_batch(&[absolute_mouse_input_for_desktop(point, desktop)], detail)
+    Ok(point)
+}
+
+const fn cursor_readback_matches(requested: Point, actual: WinPoint) -> bool {
+    requested.x.abs_diff(actual.x) <= CURSOR_READBACK_TOLERANCE_PX as u32
+        && requested.y.abs_diff(actual.y) <= CURSOR_READBACK_TOLERANCE_PX as u32
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct DpiCompensation {
+    adjusted: Point,
+    dpi_x: u32,
+    dpi_y: u32,
+}
+
+fn dpi_compensation_for_point(point: Point) -> Option<DpiCompensation> {
+    let monitor = unsafe {
+        MonitorFromPoint(
+            WinPoint {
+                x: point.x,
+                y: point.y,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    if monitor.0.is_null() {
+        return None;
+    }
+
+    let mut dpi_x = USER_DEFAULT_DPI;
+    let mut dpi_y = USER_DEFAULT_DPI;
+    if let Err(error) =
+        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi_x, &raw mut dpi_y) }
+    {
+        tracing::warn!(
+            code = "M2_CURSOR_DPI_READ_FAILED",
+            point_x = point.x,
+            point_y = point.y,
+            error = %error,
+            "failed to read monitor DPI for cursor compensation"
+        );
+        return None;
+    }
+    if dpi_x == 0 || dpi_y == 0 || (dpi_x == USER_DEFAULT_DPI && dpi_y == USER_DEFAULT_DPI) {
+        return None;
+    }
+
+    let adjusted = scale_point_for_dpi(point, dpi_x, dpi_y);
+    if adjusted == point {
+        None
+    } else {
+        Some(DpiCompensation {
+            adjusted,
+            dpi_x,
+            dpi_y,
+        })
+    }
+}
+
+fn cursor_readback_mismatch_error(
+    detail: &'static str,
+    requested: Point,
+    first_actual: WinPoint,
+    compensated: Option<(DpiCompensation, WinPoint)>,
+) -> ActionError {
+    let mut message = format!(
+        "{detail} cursor readback mismatch: requested={requested:?} first_actual=({},{}) tolerance_px={CURSOR_READBACK_TOLERANCE_PX}",
+        first_actual.x, first_actual.y
+    );
+    if let Some((compensation, compensated_actual)) = compensated {
+        message.push_str(&format!(
+            " compensated_request={:?} dpi=({}, {}) compensated_actual=({}, {})",
+            compensation.adjusted,
+            compensation.dpi_x,
+            compensation.dpi_y,
+            compensated_actual.x,
+            compensated_actual.y
+        ));
+    }
+    ActionError::BackendUnavailable { detail: message }
+}
+
+fn scale_point_for_dpi(point: Point, dpi_x: u32, dpi_y: u32) -> Point {
+    Point {
+        x: scale_coordinate_for_dpi(point.x, dpi_x),
+        y: scale_coordinate_for_dpi(point.y, dpi_y),
+    }
+}
+
+fn scale_coordinate_for_dpi(coord: i32, dpi: u32) -> i32 {
+    let numerator = i128::from(coord) * i128::from(dpi);
+    let denominator = i128::from(USER_DEFAULT_DPI);
+    let rounded = if numerator >= 0 {
+        (numerator + denominator / 2) / denominator
+    } else {
+        (numerator - denominator / 2) / denominator
+    };
+    match i32::try_from(rounded) {
+        Ok(value) => value,
+        Err(_err) if rounded < 0 => i32::MIN,
+        Err(_err) => i32::MAX,
+    }
 }
 
 fn send_mouse_button_event(button: MouseButton, action: ButtonAction) -> Result<(), ActionError> {
@@ -335,13 +558,11 @@ mod tests {
         clippy::expect_used,
         reason = "unit test asserts on a known-valid desktop"
     )]
-    fn drag_origin_and_curve_share_one_absolute_coordinate() {
-        // Regression for the DPI double-scaling bug (#591): the drag/click
-        // origin (`send_absolute_mouse_move`) and the drag curve waypoints
-        // (`mouse_move_curve`) must map an identical physical point to an
-        // identical absolute SendInput coordinate. Both now feed the raw point
-        // straight into `absolute_mouse_input_for_desktop` with no DPI scaling,
-        // so the same point yields the same normalized coordinate.
+    fn absolute_mouse_input_uses_raw_physical_point_without_extra_scaling() {
+        // Regression for the DPI double-scaling bug (#591): when the SendInput
+        // absolute fallback is needed, it feeds the raw point into
+        // `absolute_mouse_input_for_desktop` without an extra process-global
+        // DPI multiply.
         let desktop =
             VirtualDesktop::new(0, 0, 5120, 2160).expect("non-degenerate virtual desktop");
         let point = Point { x: 1600, y: 1000 };
@@ -361,5 +582,41 @@ mod tests {
         assert_eq!(origin.dx, normalized.dx);
         assert_eq!(origin.dy, normalized.dy);
         assert_eq!((origin.dx, origin.dy), (curve.dx, curve.dy));
+    }
+
+    #[test]
+    fn dpi_compensation_scales_requested_cursor_point_to_monitor_dpi() {
+        let requested = Point { x: 2905, y: 1165 };
+        let adjusted = scale_point_for_dpi(requested, 144, 144);
+
+        println!(
+            "readback=mouse_dpi_compensation before=requested:{requested:?} dpi=(144,144) after={adjusted:?} expected=(4358,1748)"
+        );
+        assert_eq!(adjusted, Point { x: 4358, y: 1748 });
+    }
+
+    #[test]
+    fn dpi_compensation_rounds_negative_coordinates_symmetrically() {
+        let requested = Point { x: -101, y: 101 };
+        let adjusted = scale_point_for_dpi(requested, 120, 144);
+
+        println!(
+            "readback=mouse_dpi_compensation edge=negative before=requested:{requested:?} dpi=(120,144) after={adjusted:?} expected=(-126,152)"
+        );
+        assert_eq!(adjusted, Point { x: -126, y: 152 });
+    }
+
+    #[test]
+    fn cursor_readback_tolerance_accepts_small_os_jitter_only() {
+        let requested = Point { x: 400, y: 500 };
+        let within = WinPoint { x: 402, y: 498 };
+        let outside = WinPoint { x: 403, y: 500 };
+
+        println!(
+            "readback=mouse_cursor_tolerance before=requested:{requested:?} within=({},{}) outside=({},{})",
+            within.x, within.y, outside.x, outside.y
+        );
+        assert!(cursor_readback_matches(requested, within));
+        assert!(!cursor_readback_matches(requested, outside));
     }
 }

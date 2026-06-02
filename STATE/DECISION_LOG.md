@@ -669,3 +669,17 @@ Evidence:
 
 Outcome:
 - Inspect browser/action/Playwright surfaces and prepare deterministic local #628 FSV target.
+
+# 2026-06-01T21:16:00-05:00 - #628 physical cursor failure requires fail-closed readback plus HWND fallback
+
+Decision: Keep the #628 action fix focused on truthful physical cursor readback and a narrow Windows element-click fallback. The normal coordinate actor path remains first choice; the HWND message fallback is attempted only when the action backend reports `ACTION_BACKEND_UNAVAILABLE`.
+
+Evidence:
+- Real MCP/OS readbacks showed `SetPhysicalCursorPos`, `SetCursorPos`, and Synapse `act_aim` could not move the cursor from the current foreground/input context; cursor coordinates stayed unchanged despite API calls.
+- Playwright DOM readbacks showed Chrome UIA `Invoke` returned success while the late-loaded button state remained unchanged, so invoke success alone is not a verdict.
+- DPI readbacks on the Chrome monitor showed scaled coordinate mismatches, so `synapse-action` now reads `GetPhysicalCursorPos` after moves and emits an explicit backend-unavailable error on mismatch.
+- A diagnostic-only `PostMessageW` to Chrome's renderer HWND changed Playwright DOM state, proving the target window can accept mouse messages when physical cursor movement is unavailable.
+- The latest patch passed fmt, typechecks, focused coordinate/DPI/readback regressions, fmt-check, and release build. Release binary SHA256 is `42FB209D71E8D2F6967D0F82D1B6A6EE70422B98361489ADCCDCD14F3F4258D1`.
+
+Outcome:
+- Start a fresh isolated #628 daemon with the latest binary, verify strict MCP client parity, then run real MCP FSV. Diagnostic direct Win32 calls remain investigation evidence only.

@@ -616,6 +616,18 @@ pub fn platform_input(_depth: u32, _mode: PerceptionMode) -> Result<ObservationI
     ))
 }
 
+#[cfg(not(windows))]
+pub fn window_input_from_hwnd(
+    _hwnd: i64,
+    _depth: u32,
+    _mode: PerceptionMode,
+) -> Result<ObservationInput, ErrorData> {
+    Err(crate::m1::mcp_error(
+        synapse_core::error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "find window_hwnd targeting requires Windows UI Automation",
+    ))
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux_x11 {
     use std::{collections::BTreeMap, fs, path::PathBuf, time::Instant};
@@ -855,6 +867,26 @@ pub fn platform_input(depth: u32, mode: PerceptionMode) -> Result<ObservationInp
         })?
         .hwnd;
     let foreground = windows_foreground_context(hwnd)?;
+    input_from_tree_and_foreground(tree, foreground, mode)
+}
+
+#[cfg(windows)]
+pub fn window_input_from_hwnd(
+    hwnd: i64,
+    depth: u32,
+    mode: PerceptionMode,
+) -> Result<ObservationInput, ErrorData> {
+    let tree = synapse_a11y::snapshot_window_from_hwnd(hwnd, depth).map_err(|err| a11y_error(&err))?;
+    let foreground = windows_foreground_context(hwnd)?;
+    input_from_tree_and_foreground(tree, foreground, mode)
+}
+
+#[cfg(windows)]
+fn input_from_tree_and_foreground(
+    mut tree: synapse_core::AccessibleSubtree,
+    foreground: ForegroundContext,
+    mode: PerceptionMode,
+) -> Result<ObservationInput, ErrorData> {
     rebase_nodes_to_foreground(&mut tree.nodes, &foreground);
     let focused = tree
         .nodes

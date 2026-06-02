@@ -27,6 +27,7 @@ pub async fn act_click_with_handle(
     let double_click_timing = cached_double_click_timing();
     if let ActClickTarget::Element(element) = &params.target {
         return element::execute_element_click(
+            handle,
             &params,
             element,
             recording.as_deref(),
