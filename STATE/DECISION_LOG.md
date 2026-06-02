@@ -833,3 +833,33 @@ Evidence:
 Outcome:
 - Use the crate-provided external WGC stop mechanism and record the actual callback thread priority.
 - Restart #596 FSV from a fresh daemon; the prior run remains defect evidence, not acceptance evidence.
+
+# 2026-06-02T03:04:07-05:00 - #596 element_window requires a non-empty live UIA rectangle
+
+Decision: Fail closed when an `element_window` target re-resolves to an empty/non-positive UIA bounding rectangle, instead of accepting the owning HWND.
+
+Evidence:
+- The post-WGC #596 manual run hid the deterministic edge button and a separate `find` read still returned the old element id with bbox `{x=0,y=0,w=0,h=0}`.
+- The real `set_capture_target target=element_window` call accepted that stale-looking element and switched capture to the window, leaving capture generation advanced and violating the disappeared-element edge.
+- Code inspection showed `capture_target_from_param(ElementWindow)` used `element_bounding_rect` only as a liveness check and discarded the returned rectangle.
+- Microsoft UIA documentation says BoundingRectangle uses physical screen coordinates and defaults to Empty / is NULL when an item is not currently displaying UI, so zero/non-positive bounds are not a valid capture target surface.
+- The patch validates `w > 0 && h > 0` before converting the element id to its HWND and returns `CAPTURE_TARGET_INVALID` for empty bounds.
+- Focused supporting checks, capture regressions, schema/tool-list checks, touched-crate check, and release build passed; release SHA256 is `DE9BEFF453DD5A1C45035A3F5836C6453DC1D5E824B6B2A06F9DCD9C286FAA22`.
+
+Outcome:
+- Rerun #596 manual MCP FSV from a fresh daemon on the patched release binary; prior hidden-element acceptance remains defect evidence, not acceptance evidence.
+
+# 2026-06-02T03:21:12-05:00 - #596 capture target fix accepted after manual MCP FSV
+
+Decision: Accept the #596 capture-target implementation and hidden-element hardening for commit/RESOLVED posting.
+
+Evidence:
+- Repo-built main daemon PID `47680` on `127.0.0.1:7867` and forced-DXGI daemon PID `23940` on `127.0.0.1:7868` both passed process/socket/auth health and strict Inspector `tools/list` with 80 tools.
+- Physical Win32 SoT readbacks showed primary DISPLAY2 `5120x2160` at 150% DPI, secondary monitors `2560x1440`, and WPF target DWM frame `1332x801` at `GetDpiForWindow=144`.
+- Real Inspector `set_capture_target` calls plus separate health/observe readbacks proved primary min-floor `5120x2160`, monitor0 `5120x2160`, window `1332x801`, visible `element_window` `1332x801`, and quiet-window-to-monitor1 switch `2560x1440`.
+- Edge calls failed closed and left capture state unchanged for invalid monitor, structural invalid target kind, hidden element bbox `0x0`, and closed HWND.
+- Forced-DXGI run proved monitor0 `dxgi_duplication` `5120x2160` and rejected live window HWND with `DXGI duplication supports monitor targets only`.
+- Storage readbacks showed expected observation/event rows in isolated DBs; `release_all` returned zero held state; cleanup verified daemons, ports, and target absent.
+
+Outcome:
+- Commit scoped patch/state with `[skip ci]`, post #596 RESOLVED evidence, close #596, then continue the queue.

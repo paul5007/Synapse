@@ -1,5 +1,97 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T03:21:12-05:00
+- Active issue #596 has code, supporting checks, and manual MCP/SoT FSV evidence ready for commit and RESOLVED posting.
+- Patch since HEAD:
+  - `crates/synapse-mcp/src/m1.rs` rejects `element_window` targets whose re-resolved UIA bounding rectangle is empty/non-positive before converting the element id to a window HWND.
+- Accepted manual #596 FSV evidence:
+  - main run directory: `.runs\596\capture-target-fsv-20260602T0310-hiddenfix`;
+  - DXGI subrun directory: `.runs\596\capture-target-fsv-20260602T0310-hiddenfix-dxgi`;
+  - release binary `target\release\synapse-mcp.exe`, length `46603776`, SHA256 `DE9BEFF453DD5A1C45035A3F5836C6453DC1D5E824B6B2A06F9DCD9C286FAA22`, `LastWriteTimeUtc=2026-06-02T08:03:53Z`.
+- Main repo-built daemon evidence:
+  - PID `47680`, bind `127.0.0.1:7867`, isolated DB/log/appdata/localappdata, bearer auth env;
+  - process/socket/binary SoT readbacks passed;
+  - unauth `/health` returned 401 `HTTP_TOKEN_INVALID`;
+  - auth `/health` returned ok with inactive capture runtime generation 0 and channel capacity 2;
+  - strict MCP Inspector `tools/list` returned exit 0, 80 tools, and required tools present.
+- Physical SoTs:
+  - deterministic WPF target PID `49008`, title `Issue596CaptureTarget`, old HWND `21042450`;
+  - per-monitor-v2 Win32 readback: primary DISPLAY2 `5120x2160` at 150% (`dpi=144`), DISPLAY1 `2560x1440`, DISPLAY3 `2560x1440`;
+  - target DWM frame `1332x801`, `GetDpiForWindow=144`;
+  - visible edge element id `0x1411512:000000070000bf70001b5068`, automation id `Issue596EdgeElement`, bbox `x=455,y=630,w=390,h=96`.
+- Main real Inspector `tools/call` trigger/readback results:
+  - primary with `min_update_interval_ms=1`: generation 1, health/observe latest frame `5120x2160`, min interval floored to 16 ms, channel len/cap `2/2`, thread priority `time_critical`;
+  - monitor index 0: generation 2, health/observe latest frame `5120x2160`, channel `2/2`;
+  - window HWND `21042450`: generation 3, health/observe latest frame `1332x801`, matching DWM physical bounds and proving no 150% DPI double-apply;
+  - visible `element_window`: generation 4, mapped to window HWND `21042450`, health/observe latest frame `1332x801`, no hang;
+  - switch from quiet window to monitor 1: generation 5, health/observe latest frame `2560x1440`, no hang.
+- Main edge cases:
+  - invalid monitor `9999` failed with `CAPTURE_TARGET_INVALID: Failed to find the specified monitor`, health stayed generation 5 monitor 1;
+  - structurally invalid target kind `bogus` failed deserialization, health stayed generation 5 monitor 1;
+  - hidden edge target state `edge_visible=false`; separate `find` still resolved the old id with bbox `0x0`; patched `set_capture_target element_window` failed with the non-empty UI rectangle error, health stayed generation 5 monitor 1;
+  - closed HWND: target PID absent and `IsWindow(21042450)=false`; `set_capture_target window` failed with `CAPTURE_TARGET_INVALID: HWND is not a live window`, health stayed generation 5 monitor 1.
+- Forced-DXGI evidence:
+  - second daemon PID `23940`, bind `127.0.0.1:7868`, `SYNAPSE_CAPTURE_FORCE_DXGI=1`, isolated DB/log/appdata/localappdata;
+  - unauth/auth health and strict Inspector `tools/list` passed with 80 tools;
+  - health before trigger selected backend `dxgi_duplication`;
+  - monitor0 trigger produced generation 1, backend/effective backend `dxgi_duplication`, health/observe latest frame `5120x2160`, channel `2/2`;
+  - live VS Code HWND `597092` was valid by Win32; forced-DXGI window target failed with `CAPTURE_TARGET_INVALID: DXGI duplication supports monitor targets only`, health stayed generation 1 monitor0 DXGI.
+- Storage/log/cleanup:
+  - main isolated storage grew from all zeros to `CF_OBSERVATIONS=5`, `CF_EVENTS=5`, `CF_SESSIONS=1`;
+  - DXGI isolated storage ended at `CF_OBSERVATIONS=1`, `CF_EVENTS=1`, `CF_SESSIONS=1`;
+  - real `release_all` returned zero held keys/buttons/pads on both daemons;
+  - stopped daemons PIDs `47680` and `23940`, verified ports `7867`/`7868` closed and target absent.
+- Final supporting checks after cleanup:
+  - `cargo fmt --check`;
+  - `git diff --check` with line-ending warnings only.
+- Next:
+  1. Commit scoped changes (`crates/synapse-mcp/src/m1.rs` and `STATE/*`) with `[skip ci]`.
+  2. Post #596 RESOLVED evidence, close #596, remove stale `status:in-progress` if needed.
+  3. Refresh the live issue queue and continue to the next unblocked open issue.
+
+## 2026-06-02T03:04:07-05:00
+- Active issue remains #596 `scenario(stress): capture-target thrash - Graphics->DXGI fallback, multi-monitor, DPI`.
+- Reconciled post-compaction state:
+  - live GitHub still has #596 open/in-progress with only the START comment;
+  - branch `main` is at `2784184 docs(state): record issue 596 start`, which already contains the prior #596 capture-controller/WGC patches and also includes a README change from before this checkpoint;
+  - current working tree now has one new dirty code file: `crates/synapse-mcp/src/m1.rs`.
+- Manual FSV after the WGC stop-control patch exposed another real #596 defect:
+  - hidden/collapsed `element_window` target still re-resolved through UIA but returned bbox `{x=0,y=0,w=0,h=0}`;
+  - `set_capture_target` accepted that old element id and switched capture to the owning window, violating the issue edge "element_window for an element that disappeared".
+- Root cause:
+  - `capture_target_from_param(ElementWindow)` called `synapse_a11y::element_bounding_rect` only as a liveness check and ignored the returned rectangle;
+  - Microsoft UIA docs say `BoundingRectangle` is physical screen coordinates, defaults to empty, and Empty/NULL is used when an item is not currently displaying UI; accepting non-positive bounds fails open for hidden UI.
+- Patch:
+  - `crates/synapse-mcp/src/m1.rs` now validates `element_window` re-resolved bbox is non-empty (`w > 0 && h > 0`) before converting the element id to its HWND;
+  - empty, zero-height, negative-width, and negative-height bounds fail closed with `CAPTURE_TARGET_INVALID`;
+  - added a focused helper regression `element_window_rect_validation_requires_non_empty_bounds`.
+- Supporting checks after this patch:
+  - `cargo fmt`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp element_window_rect_validation_requires_non_empty_bounds -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp capture_interval_floor -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp inactive_capture_runtime_readback -- --nocapture`;
+  - `cargo test -p synapse-capture dxgi_backend_rejects_window_targets_before_thread_spawn -- --nocapture`;
+  - `cargo test -p synapse-capture switching_capture_target_stops_previous_session -- --nocapture`;
+  - `cargo test -p synapse-capture capture_thread_priority_is_recorded -- --nocapture`;
+  - `cargo check -p synapse-core -p synapse-perception -p synapse-capture -p synapse-mcp -j 2`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`;
+  - `cargo fmt --check`;
+  - `git diff --check` with line-ending warning only;
+  - `cargo build --release -p synapse-mcp -j 2`.
+- Release binary for upcoming manual FSV:
+  - `C:\code\Synapse\target\release\synapse-mcp.exe`;
+  - length `46603776`;
+  - SHA256 `DE9BEFF453DD5A1C45035A3F5836C6453DC1D5E824B6B2A06F9DCD9C286FAA22`;
+  - `LastWriteTimeUtc=2026-06-02T08:03:53Z`.
+- Cleanup/setup:
+  - stopped stale isolated #596 daemon PID `43768` that held `target\release\synapse-mcp.exe`;
+  - verified `127.0.0.1:7866` no longer listens.
+- Next:
+  1. Launch a fresh isolated repo-built #596 daemon with issue-local DB/logs.
+  2. Verify process/binary/socket, unauth/auth health, and strict Inspector `tools/list`.
+  3. Rerun manual MCP FSV from clean SoTs: primary/min-floor, monitor0, window, element_window, monitor1, invalid monitor, hidden/disappeared element, structurally invalid target, closed HWND, forced DXGI monitor and DXGI-window reject, final storage/log/process cleanup.
+
 ## 2026-06-02T02:27:37-05:00
 - Active issue remains #596 `scenario(stress): capture-target thrash - Graphics->DXGI fallback, multi-monitor, DPI`.
 - Manual FSV after the latest-frame readback patch exposed a real shutdown defect:

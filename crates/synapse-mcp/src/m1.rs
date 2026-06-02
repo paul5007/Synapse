@@ -659,18 +659,33 @@ fn capture_target_from_param(param: CaptureTargetParam) -> Result<CaptureTarget,
             Ok(CaptureTarget::Window { hwnd: window_hwnd })
         }
         CaptureTargetParam::ElementWindow { element_id } => {
-            synapse_a11y::element_bounding_rect(&element_id).map_err(|err| {
+            let rect = synapse_a11y::element_bounding_rect(&element_id).map_err(|err| {
                 mcp_error(
                     error_codes::CAPTURE_TARGET_INVALID,
                     format!("element_window target could not be re-resolved: {err}"),
                 )
             })?;
+            validate_element_window_rect(&element_id, rect)?;
             element_id
                 .parts()
                 .map(|parts| CaptureTarget::Window { hwnd: parts.hwnd })
                 .map_err(|err| mcp_error(error_codes::CAPTURE_TARGET_INVALID, err.to_string()))
         }
     }
+}
+
+fn validate_element_window_rect(element_id: &ElementId, rect: Rect) -> Result<(), ErrorData> {
+    if rect.w <= 0 || rect.h <= 0 {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "element_window target is not displaying a non-empty UI rectangle: element_id={element_id} bbox=({}, {}, {}, {})",
+                rect.x, rect.y, rect.w, rect.h
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 const fn capture_target_wire(target: &CaptureTarget) -> CaptureTargetWire {
@@ -757,5 +772,52 @@ mod tests {
         assert_eq!(readback.channel_len, 0);
         assert_eq!(readback.channel_capacity, CAPTURE_CHANNEL_CAPACITY);
         assert!(!readback.stop_requested);
+    }
+
+    #[test]
+    fn element_window_rect_validation_requires_non_empty_bounds() {
+        let element_id = ElementId::parse("0x1:00000001").expect("valid element id");
+        let positive = Rect {
+            x: 10,
+            y: 20,
+            w: 1,
+            h: 1,
+        };
+        assert!(validate_element_window_rect(&element_id, positive).is_ok());
+
+        for rect in [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 10,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 0,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: -1,
+                h: 10,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: -1,
+            },
+        ] {
+            let error = validate_element_window_rect(&element_id, rect)
+                .expect_err("empty element_window bounds must fail closed");
+            assert!(error.message.contains("non-empty UI rectangle"));
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&json!(error_codes::CAPTURE_TARGET_INVALID))
+            );
+        }
     }
 }

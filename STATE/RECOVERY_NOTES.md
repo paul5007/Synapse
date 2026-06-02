@@ -1,5 +1,61 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T03:21:12-05:00
+- Active issue #596 is ready for commit/RESOLVED posting.
+- Patch:
+  - `crates/synapse-mcp/src/m1.rs` validates re-resolved `element_window` UIA bounds are non-empty before accepting the owning HWND.
+- Accepted manual FSV artifacts:
+  - main run `.runs\596\capture-target-fsv-20260602T0310-hiddenfix`;
+  - DXGI run `.runs\596\capture-target-fsv-20260602T0310-hiddenfix-dxgi`;
+  - release SHA256 `DE9BEFF453DD5A1C45035A3F5836C6453DC1D5E824B6B2A06F9DCD9C286FAA22`.
+- Main coverage:
+  - repo-built daemon PID `47680`, bind `127.0.0.1:7867`, unauth/auth health, strict Inspector `tools/list=80`;
+  - physical SoTs: DISPLAY2 `5120x2160`/150%, DISPLAY1/DISPLAY3 `2560x1440`, target DWM `1332x801`, target DPI 144, edge id/bbox;
+  - primary min-floor, monitor0, window, visible element_window, and switch-to-monitor1 all passed through real Inspector `tools/call` triggers with separate health/observe readbacks;
+  - invalid monitor, structural invalid, hidden element, and closed HWND all failed closed with state unchanged.
+- DXGI coverage:
+  - daemon PID `23940`, bind `127.0.0.1:7868`, `SYNAPSE_CAPTURE_FORCE_DXGI=1`, strict Inspector `tools/list=80`;
+  - monitor0 produced DXGI `5120x2160`;
+  - live window HWND under forced DXGI rejected with `DXGI duplication supports monitor targets only` and state unchanged.
+- Cleanup:
+  - release_all zero on both daemons;
+  - stopped daemons and target, verified ports `7867`/`7868` closed and target absent.
+- Supporting checks:
+  - focused M1/capture/schema/tool-list checks, touched-crate check, release build;
+  - final `cargo fmt --check` and `git diff --check` passed (line-ending warnings only).
+- Exact next actions:
+  1. Stage only `crates/synapse-mcp/src/m1.rs` and `STATE/CURRENT_STATE.md`, `STATE/DECISION_LOG.md`, `STATE/HEARTBEAT.md`, `STATE/RECOVERY_NOTES.md`.
+  2. Commit `fix(mcp): reject empty element capture targets (#596) [skip ci]`.
+  3. Push, post #596 RESOLVED evidence, close #596, remove stale `status:in-progress`, refresh queue, continue with next open unblocked issue.
+
+## Current Resume Point - 2026-06-02T03:04:07-05:00
+- Active issue remains #596.
+- Current patch since the prior WGC stop-control fix:
+  - `crates/synapse-mcp/src/m1.rs` now rejects `element_window` targets whose re-resolved UIA bounding rectangle has `w <= 0` or `h <= 0`;
+  - this fixes the observed hidden/collapsed element edge where UIA still found the old element id but returned bbox `0x0`, and `set_capture_target` incorrectly switched to the owning HWND.
+- Supporting checks passed after the hidden-element patch:
+  - `cargo fmt`;
+  - focused M1 helper regression, capture interval floor, inactive runtime readback;
+  - capture DXGI-window reject, switch stop regression, and thread-priority regression;
+  - touched-crate `cargo check`;
+  - schema sanitize and `m4_tools_list`;
+  - `cargo fmt --check`, `git diff --check` with line-ending warning only, and release build.
+- Release binary ready for manual #596 FSV:
+  - `target\release\synapse-mcp.exe`;
+  - SHA256 `DE9BEFF453DD5A1C45035A3F5836C6453DC1D5E824B6B2A06F9DCD9C286FAA22`;
+  - length `46603776`;
+  - `LastWriteTimeUtc=2026-06-02T08:03:53Z`.
+- Cleanup already done:
+  - old isolated #596 daemon PID `43768` was stopped;
+  - `127.0.0.1:7866` is closed.
+- Exact next actions:
+  1. Start a new issue-local #596 daemon from `target\release\synapse-mcp.exe` on a fresh port (use `7867` unless occupied) with fresh DB/log/appdata/localappdata/token state.
+  2. Verify process table, binary path/hash, socket listener, unauth `/health=401`, auth `/health ok=true`, and strict Inspector `tools/list` for `set_capture_target`, `observe`, `health`, `find`, `storage_inspect`, and `release_all`.
+  3. Start/restart the deterministic `Issue596CaptureTarget` WPF target, read target state file, HWND, DWM bounds, client bounds, monitor geometry/DPI, and UIA element id/bbox.
+  4. Trigger real Inspector MCP `tools/call set_capture_target` and read separate health/observe/physical SoTs after each target: primary with min interval 1, monitor0, window HWND, element_window, monitor1.
+  5. Cover edges with before/after SoT readbacks: invalid monitor, hidden/disappeared element now rejected with state unchanged, structurally invalid target, closed HWND, forced DXGI monitor path, forced DXGI window reject.
+  6. Cleanup with real `release_all`, stop target/daemon(s), verify ports/processes absent, then update issue evidence and close #596 if accepted.
+
 ## Current Resume Point - 2026-06-02T02:27:37-05:00
 - Active issue remains #596.
 - Latest accepted/rejected runtime evidence:
