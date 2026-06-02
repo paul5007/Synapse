@@ -787,3 +787,18 @@ Evidence:
 
 Outcome:
 - Commit the scoped code/state changes with `[skip ci]`, post #595 RESOLVED evidence, close #595, then continue with the next unblocked issue.
+
+# 2026-06-02T01:09:41-05:00 - #596 follows #595 as next unblocked child
+
+Decision: Take #596 after closing #595 because #596 is now the lowest-number open unblocked child under the #594 stress campaign; #624/#625 remain blocked on the operator-only Daybreak boundary.
+
+Evidence:
+- #595 closure readback shows `state=CLOSED`, `closedAt=2026-06-02T06:08:59Z`, RESOLVED evidence comment `4599193156`, and no `status:in-progress` label.
+- `git log -1` shows `098e8d5 fix(a11y): stream UIA fanout snapshots (#595) [skip ci]` at `HEAD`, `origin/main`, and `origin/HEAD`.
+- `git status --short --branch` after #595 close shows only unrelated `README.md` dirty.
+- Live open queue shows #594 parent, #596-#604, blocked #624/#625, and #629-#634.
+- #596 body requires real MCP `set_capture_target`/`observe` triggers plus separate physical capture/window/monitor/DPI SoT readbacks.
+- Posted #596 START comment at https://github.com/ChrisRoyse/Synapse/issues/596#issuecomment-4599199311 and labeled/assigned it to this agent.
+
+Outcome:
+- Begin #596 with code inspection of capture-target, fallback, and DPI paths before any implementation or FSV setup.

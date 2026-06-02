@@ -1,5 +1,29 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T01:09:41-05:00
+- #595 is closed:
+  - commit `098e8d5 fix(a11y): stream UIA fanout snapshots (#595) [skip ci]` pushed to `origin/main`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/595#issuecomment-4599193156
+  - closure readback: `state=CLOSED`, `closedAt=2026-06-02T06:08:59Z`.
+  - stale `status:in-progress` label was removed.
+  - cleanup readback showed #595 target, CalculatorApp, isolated daemon, and port `7864` absent.
+- Git state after #595:
+  - `HEAD == origin/main == 098e8d5`.
+  - `git status --short --branch` shows only unrelated/user-owned `README.md` dirty.
+- Live open queue after #595:
+  - #594 parent remains open.
+  - #624/#625 remain `status:blocked` on the Daybreak operator-only boundary.
+  - #596-#604 and #629-#634 are open/unblocked.
+- Active issue is now #596 `scenario(stress): capture-target thrash - Graphics->DXGI fallback, multi-monitor, DPI`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/596#issuecomment-4599199311
+  - assigned to `ChrisRoyse`, labeled `status:in-progress`, `agent:codex`.
+  - Goal: prove `set_capture_target` switches cleanly under rapid reconfiguration, the 2-frame capture channel, Graphics-Capture->DXGI fallback, and per-monitor DPI behavior through real MCP triggers and separate SoT readbacks.
+  - Planned SoTs: Win32 monitor geometry/DPI, foreground/window/UIA bbox/title, cursor position, Synapse `observe` foreground/diagnostics/capture target output, isolated storage rows, and daemon log bytes.
+- Next:
+  1. Inspect capture target implementation and prior DPI/fallback fixes (#591/#634 context where relevant).
+  2. Build/launch repo-built isolated daemon for #596 and verify process/socket/auth/health/strict `tools/list`.
+  3. Run manual MCP FSV for target cycles primary/monitor/window/element_window plus invalid monitor, closed HWND, disappeared element/window, min update interval floor, and DXGI fallback where locally forceable.
+
 ## 2026-06-02T01:05:39-05:00
 - Active issue remains #595, but implementation/checks/manual evidence are ready for commit and RESOLVED posting.
 - Required wake-up was re-run after compaction:

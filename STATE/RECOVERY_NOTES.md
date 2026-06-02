@@ -1,5 +1,35 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T01:09:41-05:00
+- #595 is closed with evidence:
+  - commit `098e8d5 fix(a11y): stream UIA fanout snapshots (#595) [skip ci]`;
+  - RESOLVED comment https://github.com/ChrisRoyse/Synapse/issues/595#issuecomment-4599193156;
+  - closure readback `state=CLOSED`, `closedAt=2026-06-02T06:08:59Z`;
+  - `status:in-progress` removed.
+- Current worktree:
+  - `main` is at `origin/main`.
+  - only `README.md` is dirty and unrelated/user-owned; do not stage it.
+- Active issue is #596:
+  - title `scenario(stress): capture-target thrash - Graphics->DXGI fallback, multi-monitor, DPI`;
+  - START comment https://github.com/ChrisRoyse/Synapse/issues/596#issuecomment-4599199311;
+  - assigned to `ChrisRoyse`, labeled `status:in-progress`, `agent:codex`.
+- #596 intent:
+  - prove `set_capture_target` switches primary/monitor/window/element_window cleanly under rapid reconfiguration;
+  - verify `observe` after each switch against physical SoTs;
+  - cover Graphics Capture->DXGI fallback where locally forceable;
+  - verify per-monitor DPI/bounds do not double-apply (#591 regression guard).
+- Planned SoTs:
+  - Win32 monitor geometry and DPI;
+  - target window title/HWND/bounds and UIA element bboxes;
+  - cursor position where useful;
+  - real MCP `observe` foreground/capture diagnostics;
+  - isolated storage row counts/log bytes for capture target changes.
+- Exact next actions:
+  1. Inspect `set_capture_target` and capture implementation paths before editing.
+  2. Read prior DPI/capture relevant commits/issues if needed.
+  3. Build/launch an isolated repo-built `synapse-mcp` daemon for #596 and verify process/socket/auth/health/strict Inspector `tools/list`.
+  4. Run manual MCP FSV for happy target-cycle path and edges: invalid monitor index, closed window HWND, disappeared element/window, and min update interval floor.
+
 ## Current Resume Point - 2026-06-02T01:05:39-05:00
 - #595 is ready for closeout.
 - Product patch:
