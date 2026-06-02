@@ -106,7 +106,7 @@ Out of scope. NEVER accept feature requests for these without an ADR.
 Synapse v1 is successful when:
 
 1. **An agent driving Claude via stdio MCP can open Notepad, type a paragraph, save to a path, verify file exists — ≤8 tool calls, ≤2500 tokens.** Today: ~30+ screenshot-based steps, ~30K tokens.
-2. **Agent completes a 30-minute single-player game session** (e.g., Minecraft from spawn → build shelter → kill a mob) using only Synapse, no human intervention, ≤200 tool calls.
+2. ~~**Agent completes a 30-minute single-player game session** (e.g., Minecraft from spawn → build shelter → kill a mob) using only Synapse, no human intervention, ≤200 tool calls.~~ — **Descoped 2026-06-02:** real game-session play (and the EverQuest live integration) is no longer a v1 priority. The game/EverQuest integration code remains in the repo for possible future revisit.
 3. **Agent reacts to in-game events at frame rate** for at least one supported FPS — "track that enemy and shoot if visible," reflex runtime delivers clicked shot within 33ms of enemy becoming visible.
 4. **Steady-state token cost ≤ 800 tokens/turn** for structured observation, vs. ~1800 for a screenshot of the same scene.
 5. **Detection inference + capture stays under 16ms p99** on a 5090.

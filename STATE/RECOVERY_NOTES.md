@@ -1,5 +1,72 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T16:02:40-05:00
+- Active issue #631 has code patch, accepted happy path, accepted edge cases, and cleanup. Final supporting checks/commit/GitHub closeout remain.
+- Accepted evidence:
+  - Happy path on main isolated daemon PID `38996`: target file exact marker, five audio SSE frames, `reflex_history` one `speech_started` fire with completed action, logs `AUDIO_EVENT_PUBLISHED` and `REFLEX_FIRED`.
+  - No-audio/background: no events, no target file, no reflex fire.
+  - Debounce: two `speech_started` triggers, one `reflex_fired`, one `reflex_debounced`.
+  - Below-threshold: quiet amplitude-200 WAV played, no queued events, no reflex fire.
+  - Audio disabled: separate daemon PID `35084` with `audio.status=disabled`, hidden speech produced no events/fire and `CF_EVENTS=0`.
+  - Empty/invalid/boundary: missing `on_event` pieces and malformed subscribe/bad buffer failed closed; 4096 buffer boundary accepted through strict subscriptions.
+  - Cleanup: all subscriptions cancelled, `release_all` zero, issue-local PIDs stopped, main/disabled ports closed, physical input neutral.
+- Exact next actions:
+  1. Run final support checks: fmt, diff check, focused audio event sink test, M3 audio/subscribe/reflex tests, schema sanitize, tool-list tests, touched-crate check, release build.
+  2. Review diff and token scan.
+  3. Commit code/state with `[skip ci]`, push, post RESOLVED #631 with evidence artifact paths, close issue/remove labels, refresh queue.
+
+## Current Resume Point - 2026-06-02T15:51:33-05:00
+- Active issue #631 is patched and the refocused happy path is accepted; edge cases and final closeout remain.
+- Accepted happy path:
+  - Isolated daemon PID `38996`, bind `127.0.0.1:7890`, strict Inspector `tools/list=80`.
+  - Synapse `observe` and OS foreground readback proved target HWND `37950106` / Windows PowerShell was foreground before trigger.
+  - Trigger was hidden SAPI speech; target file `target_happy.txt` changed from absent to exact marker `issue631-refocus-154721`, SHA256 `CE1CACCB9ACA6633B230F10A3F79A8A3D496934BDCFB035251D7E3C336C90991`.
+  - SSE/audio/event/log evidence shows `speech_started` and `loud_transient` from `perception_audio`; `reflex_history` shows one `speech_started` fire and completed action; storage `CF_REFLEX_AUDIT` grew to `11`, `CF_EVENTS` to `2`.
+- Exact next actions:
+  1. Edge no-audio/background: active reflex + target SoT absent, wait without trigger, verify no event/fire/action.
+  2. Edge debounce: repeated speech triggers with debounce window, verify exactly one fire/action and debounced audit/readback for the second event.
+  3. Edge below-threshold: play quiet synthetic audio, verify no `speech_started` fire/action.
+  4. Edge audio-disabled: run a separate daemon with audio disabled or disable audio precondition, verify audio event/action cannot occur.
+  5. Empty/boundary/structurally invalid params, cleanup, final supporting checks, commit/push, RESOLVED #631.
+
+## Current Resume Point - 2026-06-02T15:45:46-05:00
+- Active issue #631 is patched but not yet accepted/committed.
+- Wake-up context, GitHub queue, git status, #351/#594/#631, and wired `mcp__synapse.health` were re-read after compaction.
+- Isolated #631 daemon is still alive:
+  - PID `38996`, bind `127.0.0.1:7890`, run dir `.runs\631\audio-reflex-fsv-20260602T153541`, repo release binary.
+  - Strict Inspector `tools/list` already passed with `80` tools and required #631 tools present.
+- First runtime attempt findings:
+  - Accepted as diagnosis/support: audio detector events now reach the event bus and reflex scheduler. Artifacts show SSE `speech_started`/`loud_transient`, log `AUDIO_EVENT_PUBLISHED`, `REFLEX_FIRED`, `reflex_history` with completed `type_text`, and storage growth in `CF_REFLEX_AUDIT`/`CF_EVENTS`/`CF_ACTION_LOG`.
+  - Rejected as #631 happy-path acceptance: target file remained absent because foreground changed from PowerShell to VS Code at the firing instant, so the reflex action typed into the wrong foreground.
+- Exact next actions:
+  1. Register a new one-shot `on_event` reflex with a new marker and new target file.
+  2. Ensure target PowerShell is restored/focused immediately before the audio trigger; read focused-window SoT through Synapse `observe` just before triggering.
+  3. Trigger audio from a hidden/background helper so foreground does not move.
+  4. Read target file bytes, event frames/stats, `audio_tail`, `reflex_history`, storage counts, and logs.
+  5. Then run edge cases: background/no false fire, debounce/repeated trigger, audio disabled/no action, below-threshold/no action, plus empty/boundary/structural invalid params.
+
+## Current Resume Point - 2026-06-02T15:21:31-05:00
+- Active issue #631 has a root-cause patch in the worktree, not yet runtime-FSV accepted or committed.
+- Root cause:
+  - `synapse-audio` detectors publish `PerceptionAudio` events only through the configured `AudioEventSink`.
+  - MCP `M3State::ensure_audio_runtime` used `AudioRuntime::spawn(config)`, which installs a no-op sink.
+  - Therefore audio detectors could populate `audio_tail.recent_events`, but those events did not reach the shared `SseState`/reflex `EventBus`; `subscribe` and `on_event` reflexes could not fire from audio.
+- Patch:
+  - `crates/synapse-mcp/src/m3.rs` now starts audio with `AudioRuntime::spawn_with_event_sink(config, audio_event_sink(self.sse_state.event_bus()))`.
+  - `audio_event_sink` publishes each audio detector event to the shared event bus and logs `AUDIO_EVENT_PUBLISHED`.
+  - `crates/synapse-mcp/src/m3/tests.rs` adds a synthetic detector bridge readback test.
+- Focused supporting checks passed:
+  - `cargo fmt`;
+  - `cargo test -p synapse-mcp audio_event_sink_publishes_detector_events_to_shared_bus -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_audio_tail_tool -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_subscribe_tool -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_reflex_register_tool -- --nocapture`;
+  - `cargo test -p synapse-reflex on_event --test scheduler_behavior -- --nocapture`.
+- Exact next actions:
+  1. Run broader supporting checks and `cargo build --release -p synapse-mcp`.
+  2. Launch isolated repo-built daemon for #631 with `SYNAPSE_ENABLE_AUDIO=1` and loopback enabled.
+  3. Strict Inspector `tools/list`, then manual FSV through real MCP calls and physical audio/action/storage/log SoT readbacks.
+
 ## Current Resume Point - 2026-06-02T15:15:17-05:00
 - #629 is closed with RESOLVED evidence at https://github.com/ChrisRoyse/Synapse/issues/629#issuecomment-4606648531; closure readback is `state=CLOSED`, `closedAt=2026-06-02T20:14:43Z`, and stale claim labels are removed.
 - Git readback after #629 state push:

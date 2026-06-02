@@ -1320,3 +1320,64 @@ Evidence:
 Outcome:
 - Posted #631 START comment and added `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
 - Next step is code/path inspection for audio tools, event subscription, `on_event` reflex, debounce, action emission, audit rows, disabled audio, and cleanup.
+
+# 2026-06-02T15:21:31-05:00 - #631 audio event sink patch
+
+Decision: Patch MCP audio runtime wiring before runtime FSV because code inspection proved live audio detector events were not published to the shared event bus.
+
+Evidence:
+- `synapse-audio` detector processing creates `PerceptionAudio` events and supports `AudioRuntime::spawn_with_event_sink`.
+- `M3State::ensure_audio_runtime` called `AudioRuntime::spawn(config)`, which uses a no-op sink, so `audio_tail` could see detector summaries but `subscribe`/`on_event` reflexes could not receive those detector events.
+- #631 requires the actual audio -> event -> reflex action chain, so a no-op sink is a root-cause break in the intended runtime path.
+
+Outcome:
+- `M3State::ensure_audio_runtime` now starts audio with a sink wired to `self.sse_state.event_bus()`.
+- The sink publishes each audio detector event and logs `AUDIO_EVENT_PUBLISHED`.
+- Added a focused synthetic detector bridge regression; audio, subscribe, reflex-register, and scheduler on-event support checks passed.
+- Runtime manual FSV remains next.
+
+# 2026-06-02T15:45:46-05:00 - #631 first runtime attempt rejected for target SoT
+
+Decision: Do not accept the first #631 happy-path run as the final happy-path evidence because the target file Source of Truth did not change, even though audio event publishing and reflex firing were proven.
+
+Evidence:
+- Isolated daemon PID `38996` on `127.0.0.1:7890` remained alive; strict Inspector `tools/list` loaded `80` tools.
+- Real audio trigger produced `speech_started` and `loud_transient` event frames from `source=perception_audio`.
+- Logs show `AUDIO_EVENT_PUBLISHED` for `speech_started` and `REFLEX_FIRED` for the registered `on_event` reflex.
+- `reflex_history` persisted `details.kind=reflex_fired`, `trigger_kind=speech_started`, and a completed `type_text` step.
+- The target file SoT remained absent; logs show foreground changed from PowerShell to VS Code when the reflex fired.
+
+Outcome:
+- The patch's core audio->event->reflex bridge is behaving in the isolated runtime.
+- Final happy-path evidence must be rerun with target focus proven immediately before trigger and a hidden/non-focus-stealing audio trigger.
+
+# 2026-06-02T15:51:33-05:00 - #631 refocused happy path accepted
+
+Decision: Accept the refocused #631 happy path for the core spoken audio -> event -> reflex -> action behavior.
+
+Evidence:
+- OS foreground readback and Synapse `observe` both showed target Windows PowerShell HWND `37950106` before the hidden speech trigger.
+- Target file changed from absent to exact marker `issue631-refocus-154721` after the trigger.
+- The new audio subscription delivered five `perception_audio` event frames including `speech_started` and `loud_transient`.
+- `reflex_history` for reflex `019e8a17-8bdc-7573-b01c-f1f74d567465` recorded one `reflex_fired` from `speech_started` with a completed type action.
+- Logs show `AUDIO_EVENT_PUBLISHED seq=6 kind=speech_started` and `REFLEX_FIRED ... trigger_seq=6`.
+
+Outcome:
+- Core implementation path is runtime-proven through real MCP/SoT evidence.
+- Edge cases and cleanup/final checks remain before #631 can close.
+
+# 2026-06-02T16:02:40-05:00 - #631 edge cases and cleanup accepted
+
+Decision: Accept #631 edge evidence and proceed to final supporting checks/closeout.
+
+Evidence:
+- No-audio/background wait produced no events, no target file, and zero reflex fires.
+- Debounce repeated-trigger run produced two `speech_started` events, one `reflex_fired`, and one `reflex_debounced`.
+- Quiet below-threshold WAV playback produced no queued audio events and zero reflex fires.
+- Separate audio-disabled daemon had `audio.status=disabled`; hidden speech produced no events, no reflex fire, and `CF_EVENTS=0`.
+- Empty/malformed input calls failed closed, while the accepted subscriptions exercised the `buffer_size=4096` boundary.
+- Cleanup cancelled subscriptions, stopped issue-local target processes, stopped isolated daemons, closed ports, and left physical inputs neutral.
+
+Outcome:
+- Manual runtime evidence for #631 is complete.
+- Final support checks, diff review, commit, and GitHub closeout remain.

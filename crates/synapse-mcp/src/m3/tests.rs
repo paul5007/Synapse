@@ -1,6 +1,11 @@
-use super::{M3ServiceConfig, M3State, m3_tool_stubs};
+use super::{M3ServiceConfig, M3State, audio_event_sink, m3_tool_stubs};
 use crate::http::sse::SseState;
 use std::path::PathBuf;
+use synapse_audio::{
+    detectors::{DetectorProcessor, SharedDetectorState},
+    ring::AudioFormat,
+};
+use synapse_core::{EventFilter, EventSource};
 use synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO;
 use tokio_util::sync::CancellationToken;
 
@@ -107,4 +112,52 @@ fn m3_tool_stub_names_are_stable() {
     let actual = m3_tool_stubs().map(|stub| stub.name);
     println!("readback=m3_tool_stubs after=actual:{actual:?}");
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn audio_event_sink_publishes_detector_events_to_shared_bus() -> anyhow::Result<()> {
+    let sse_state = SseState::from_env();
+    let event_bus = sse_state.event_bus();
+    let subscriber = event_bus.subscribe(
+        EventFilter::Source {
+            source: EventSource::PerceptionAudio,
+        },
+        Vec::new(),
+        false,
+    )?;
+    println!(
+        "readback=audio_event_sink scenario=detector_bridge before_subscriber_len={}",
+        subscriber.len()
+    );
+
+    let mut detector = DetectorProcessor::new(
+        SharedDetectorState::default(),
+        audio_event_sink(event_bus.clone()),
+    );
+    let format = AudioFormat {
+        sample_rate_hz: 48_000,
+        channels: 2,
+    };
+    detector.process(&vec![0.0; 480 * 2], format);
+    detector.process(&vec![0.9; 480 * 2], format);
+
+    let events = subscriber.drain();
+    let kinds = events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect::<Vec<_>>();
+    println!(
+        "readback=audio_event_sink scenario=detector_bridge after_subscriber_len={} after_kinds={:?}",
+        events.len(),
+        kinds
+    );
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event.source == EventSource::PerceptionAudio)
+    );
+    assert!(kinds.contains(&"loud_transient"));
+    assert!(kinds.contains(&"speech_started"));
+    Ok(())
 }

@@ -22,7 +22,7 @@ use std::{
 };
 use synapse_action::ActionHandle;
 use synapse_audio::{AudioConfig, AudioError, AudioRuntime, DEFAULT_RING_SECONDS};
-use synapse_core::{SCHEMA_VERSION, SessionId, StoredProfileHistoryEntry};
+use synapse_core::{Event, SCHEMA_VERSION, SessionId, StoredProfileHistoryEntry};
 use synapse_profiles::{ProfileError, ProfileRuntime, bundled_profiles_dir};
 use synapse_reflex::{
     DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime,
@@ -397,7 +397,10 @@ impl M3State {
             detectors_enabled: start_loopback,
             stt_model_path: None,
         };
-        let runtime = match AudioRuntime::spawn(config) {
+        let runtime = match AudioRuntime::spawn_with_event_sink(
+            config,
+            audio_event_sink(self.sse_state.event_bus()),
+        ) {
             Ok(runtime) => Arc::new(runtime),
             Err(error) => {
                 self.audio_last_error = Some(error.to_string());
@@ -408,6 +411,25 @@ impl M3State {
         self.audio_runtime = Some(Arc::clone(&runtime));
         Ok(runtime)
     }
+}
+
+fn audio_event_sink(event_bus: EventBus) -> synapse_audio::AudioEventSink {
+    Arc::new(move |event: Event| {
+        let seq = event.seq;
+        let kind = event.kind.clone();
+        let source = event.source;
+        let report = event_bus.publish(event);
+        tracing::debug!(
+            code = "AUDIO_EVENT_PUBLISHED",
+            seq,
+            kind = %kind,
+            source = ?source,
+            matched = report.matched,
+            queued = report.queued,
+            dropped = report.dropped,
+            "audio detector event published to event bus"
+        );
+    })
 }
 
 fn default_db_path() -> PathBuf {
