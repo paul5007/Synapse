@@ -1,5 +1,44 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T15:12:21-05:00
+- Active issue #629 `scenario(showcase): Paint art-bot - act_drag curves verified by observe/OCR` has accepted manual MCP/SoT evidence and final supporting checks.
+- Accepted run directory: `.runs\629\paint-artbot-fsv-20260602T1443`.
+  - Repo-built daemon PID `70756`, bind `127.0.0.1:7889`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, initial release SHA256 `B6D4E0268AA6398D4610C8712F83C49411455FF6DFB38DE096AF13DEA8BD3623`, length `46848512`.
+  - Auth health ok, unauth health `401`, strict Inspector `tools/list` exit `0`, `80` tools, required tools present: `act_launch`, `act_click`, `act_drag`, `observe`, `read_text`, `act_press`, `release_all`, `storage_inspect`.
+  - Wired chat/client `mcp__synapse.health` was also rechecked after compaction and returned `ok=true`, proving the production client surface loaded.
+- Accepted happy path:
+  - Paint PID `79292`, hwnd `270888`, final title `paint_artbot_ai_pid79292 - Paint`.
+  - Real strict MCP `act_drag` strokes drew large hand-written "AI" using `linear`, `ease_in_out`, `instant`, and `natural` curves; `act_click` selected red; a later `act_drag` drew the red stroke.
+  - `61_art_sequence_after.png` changed from pre-draw SHA `58E0B916C524CB9E465D4F866F331B63B88C63C5D31F6CDFA83F7D1782CA55D7` to `D458E77EEB39FE937BA42EEA78486B9465D0B52D3EACA8A6D061C97095E050C5`; ROI readback had `5673` non-white pixels and `5199` blackish pixels.
+  - `observe` after drawing reported mspaint foreground with healthy capture/a11y and `34` elements. `read_text` on the hand-drawn thin strokes returned no text; that is documented as OCR limitation and was not used as the verdict.
+  - Red switch/stroke readback: screenshot SHA changed, ROI had `2166` redish pixels, `2173` non-white, and `0` blackish.
+  - Saved PNG SoT: `C:\code\Synapse\.runs\629\paint-artbot-fsv-20260602T1443\paint_artbot_ai_pid79292.png`, exists, `38126` bytes, SHA256 `96F41EEDDBC2EFD56B409F419C825E15C4F4490C9CDF026DE1E10F66E5E00253`, dimensions `4349x1629`, sampled pixels included `1001` non-white, `768` blackish, and `181` redish.
+- Accepted edge cases:
+  - Out-of-canvas/clamp: strict `act_drag` from `(1835,1500)` to `(1600,1500)` with `ease_in_out` succeeded; screenshot hash changed and clamp ROI had `4178` non-white pixels.
+  - Exact boundary: strict `act_drag` 4096 px from `(2000,1450)` to `(6096,1450)` succeeded with `distance_px=4096`; before/after screenshot SHA stayed `FDA9B7FD792D7330F3478F3BB9E30E88D537B56EE84EB4EBC4E7D49080D2886A` and ROI stayed zero, accepted as no-crash/no-mutation at the edge because the pointer immediately left the visible canvas/window.
+  - Undo: real `act_click` on the visible Paint Undo button succeeded; ROI went from `11` non-white / `4` redish to `0` non-white / `0` redish. A prior Ctrl+Z attempt was rejected because physical SoT did not remove the stroke.
+  - Empty/invalid: `read_text` with zero-size OCR region failed closed with `read_text OCR region must be non-empty`; `act_drag curve=spiral` failed closed with schema/deserialize error; screenshot SHA stayed unchanged and storage stayed `CF_ACTION_LOG=94`, `CF_OBSERVATIONS=24`, `CF_OCR_CACHE=0`, `CF_PROCESS_HISTORY=5`, pressure `Normal`.
+- Cleanup accepted:
+  - `release_all` returned `released_keys=0`, `released_buttons=0`, `neutralized_pads=0`.
+  - Physical input readback: Shift/Ctrl/Alt/LButton/RButton/MButton all false.
+  - Final storage: pressure `Normal`, `CF_ACTION_LOG=95`, `CF_OBSERVATIONS=24`, `CF_OCR_CACHE=0`, `CF_PROCESS_HISTORY=5`, `CF_SESSIONS=1`.
+  - Issue-local Paint PIDs `28592`, `6036`, `70792`, `79292` stopped; remaining target Paint PIDs empty.
+  - Daemon PID `70756` stopped and socket closed.
+- Final supporting checks passed:
+  - `cargo fmt --check`;
+  - `git diff --check`;
+  - `cargo test -p synapse-action --test mouse_drag_validation -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`;
+  - `cargo check -p synapse-action -p synapse-mcp -j 2`;
+  - `cargo build --release -p synapse-mcp -j 2`.
+- Final release binary readback after supporting checks: `target\release\synapse-mcp.exe`, length `46848512`, SHA256 `DD03AA73A8785796017D1491C1D97B840D0EB75819D28CBE0E2A9DD9373CAAC2`, `LastWriteTimeUtc=2026-06-02T20:12:02.3998891Z`.
+- Current next:
+  1. Commit state updates with `[skip ci]`, push.
+  2. Post #629 RESOLVED evidence, close #629, remove stale labels.
+  3. Refresh queue and continue #631 unless GitHub changed.
+
 ## 2026-06-02T14:25:33-05:00
 - #604 is closed.
   - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/604#issuecomment-4606275946.

@@ -1289,3 +1289,20 @@ Evidence:
 Outcome:
 - Posted #629 START comment and added `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
 - Next step is code/path inspection for Paint launch, act_click/act_drag, observe/read_text, image-byte verification, and cleanup.
+
+# 2026-06-02T15:12:21-05:00 - #629 Paint art-bot FSV accepted
+
+Decision: Accept #629 manual runtime evidence and proceed to GitHub closeout.
+
+Evidence:
+- Isolated repo-built daemon PID `70756` on `127.0.0.1:7889` had auth health ok, unauth health `401`, and strict Inspector `tools/list=80` with required `act_launch`, `act_click`, `act_drag`, `observe`, `read_text`, `act_press`, `release_all`, and `storage_inspect` tools present.
+- Real MCP `act_drag` strokes drew recognizable "AI" in Paint with multiple curve variants; separate screenshot SoT changed and the art ROI contained `5673` non-white and `5199` blackish pixels.
+- Red color/stroke switch was verified by a separate focused ROI readback with `2166` redish pixels and no blackish pixels.
+- Saved PNG bytes exist at the run-local path with SHA256 `96F41EEDDBC2EFD56B409F419C825E15C4F4490C9CDF026DE1E10F66E5E00253`, dimensions `4349x1629`, and sampled black/red/non-white pixels.
+- Edge SoTs covered out-of-canvas clamp mutation, exact 4096 px no-crash/no-mutation behavior, Undo-button removal, zero-size OCR fail-closed, and invalid curve fail-closed with unchanged screenshot/storage state.
+- Cleanup released inputs, stopped issue-local Paint PIDs and daemon PID `70756`, and final storage readback remained pressure `Normal`.
+
+Outcome:
+- Final supporting checks passed: fmt, diff check, mouse drag validation, schema sanitize, M3/M4 tool-list, touched-crate check, and release build.
+- Final release binary SHA256 is `DD03AA73A8785796017D1491C1D97B840D0EB75819D28CBE0E2A9DD9373CAAC2`.
+- Next: commit state with `[skip ci]`, post #629 RESOLVED evidence, close #629, refresh queue, continue #631.

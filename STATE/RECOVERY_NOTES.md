@@ -1,5 +1,42 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T15:12:21-05:00
+- Active issue #629 has accepted manual MCP/SoT evidence and final supporting checks; commit/GitHub closeout remain.
+- Accepted run: `.runs\629\paint-artbot-fsv-20260602T1443`.
+  - Repo-built daemon PID `70756`, bind `127.0.0.1:7889`, strict Inspector `tools/list=80`, required Paint/action/perception/storage tools present, auth health ok, unauth health `401`.
+  - Wired `mcp__synapse.health` also returned `ok=true` after compaction, confirming the production client surface loads.
+  - Paint final target PID `79292`, hwnd `270888`, title `paint_artbot_ai_pid79292 - Paint`.
+- Accepted happy path:
+  - Strict MCP `act_drag` strokes drew recognizable "AI" with curve variants `linear`, `ease_in_out`, `instant`, and `natural`; red color switch/stroke was verified separately.
+  - Physical screenshot SoT changed before/after; art ROI had `5673` non-white and `5199` blackish pixels.
+  - Red stroke ROI had `2166` redish pixels and `0` blackish pixels.
+  - Saved PNG SoT exists at `C:\code\Synapse\.runs\629\paint-artbot-fsv-20260602T1443\paint_artbot_ai_pid79292.png`, `38126` bytes, SHA256 `96F41EEDDBC2EFD56B409F419C825E15C4F4490C9CDF026DE1E10F66E5E00253`, dimensions `4349x1629`, sampled non-white/black/red pixels present.
+  - `observe` readback was healthy for mspaint. `read_text` returned no OCR text for thin hand-drawn strokes; this is an explained OCR limitation, not the verdict.
+- Accepted edges:
+  - Out-of-canvas/clamp changed the screenshot and created `4178` non-white pixels in the clamp ROI.
+  - Exact `4096` px boundary drag succeeded and left before/after screenshot SHA unchanged with zero ROI pixels, accepted as no-crash/no-mutation at the visible-canvas edge.
+  - Visible Undo button click removed the test stroke ROI from `11` non-white / `4` redish to `0`.
+  - Empty zero-size OCR region and invalid `curve=spiral` both failed closed; screenshot/storage SoTs stayed unchanged.
+- Cleanup accepted:
+  - `release_all` zero; physical input readback false for Shift/Ctrl/Alt/LButton/RButton/MButton.
+  - Final storage: pressure `Normal`, `CF_ACTION_LOG=95`, `CF_OBSERVATIONS=24`, `CF_OCR_CACHE=0`, `CF_PROCESS_HISTORY=5`, `CF_SESSIONS=1`.
+  - Issue-local Paint processes stopped; daemon PID `70756` stopped; socket closed.
+- Final supporting checks passed:
+  - `cargo fmt --check`;
+  - `git diff --check`;
+  - `cargo test -p synapse-action --test mouse_drag_validation -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`;
+  - `cargo check -p synapse-action -p synapse-mcp -j 2`;
+  - `cargo build --release -p synapse-mcp -j 2`.
+  - Final release binary SHA256 `DD03AA73A8785796017D1491C1D97B840D0EB75819D28CBE0E2A9DD9373CAAC2`, length `46848512`, timestamp `2026-06-02T20:12:02.3998891Z`.
+- Git status before state commit still has only unrelated user changes outside state: `docs/computergames/00_vision_and_scope.md` and untracked root docs. Do not stage them.
+- Exact next actions:
+  1. Commit only `STATE/*` updates with `[skip ci]` and push.
+  2. Post #629 RESOLVED evidence, close #629, remove `status:in-progress`/`agent:codex`.
+  3. Refresh queue; next expected issue is #631 unless GitHub changed.
+
 ## Current Resume Point - 2026-06-02T14:25:33-05:00
 - #604 is closed with RESOLVED evidence at https://github.com/ChrisRoyse/Synapse/issues/604#issuecomment-4606275946; closure readback is `state=CLOSED`, `closedAt=2026-06-02T19:24:46Z`, and stale claim labels are removed.
 - Git readback after #604 state push:
