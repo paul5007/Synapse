@@ -1,5 +1,24 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T15:15:17-05:00
+- #629 is closed.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/629#issuecomment-4606648531.
+  - Closure readback: `state=CLOSED`, `closedAt=2026-06-02T20:14:43Z`.
+  - Stale `status:in-progress` and `agent:codex` labels were removed.
+  - State evidence commit: `e9ec29d docs(state): record issue 629 verification [skip ci]`.
+- Live open queue after #629 closure:
+  - #594 parent context remains open.
+  - Remaining open child issues: #631, #632, #633, #634.
+- Active issue is now #631 `scenario(showcase): voice-reactive reflex - speak trigger -> audio -> reflex action`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/631#issuecomment-4606652559.
+  - Labels/assignee updated with `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
+  - Issue goal: prove a spoken/auditory trigger creates a real audio/perception event, that an `on_event` reflex fires from that event, and that the reflex action leaves a separately verifiable physical SoT.
+  - Planned SoTs: repo-built daemon process/socket/auth/health/strict Inspector `tools/list`; real audio/event/reflex/action MCP tool triggers; audio device/session state; `audio_tail` or event stream readback; `CF_EVENTS` and `CF_REFLEX_AUDIT`; target app/file/UI action result; logs; input-neutral cleanup and daemon/socket shutdown.
+- Current next:
+  1. Inspect audio tools, event publish/subscribe surfaces, `on_event` reflex implementation, reflex audit rows, action emission, debounce/disabled-audio behavior, and existing tests.
+  2. Patch only if code or manual FSV exposes a real gap.
+  3. Build/launch isolated repo-built daemon and perform manual MCP/SoT FSV for #631 happy path plus noise/no-false-fire, debounce/repeated trigger, audio disabled, below-threshold, and empty/boundary/structurally invalid edges.
+
 ## 2026-06-02T15:12:21-05:00
 - Active issue #629 `scenario(showcase): Paint art-bot - act_drag curves verified by observe/OCR` has accepted manual MCP/SoT evidence and final supporting checks.
 - Accepted run directory: `.runs\629\paint-artbot-fsv-20260602T1443`.

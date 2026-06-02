@@ -157,3 +157,4 @@
 - 2026-06-02T14:22:00-05:00 iteration #604-final-checks-diff: passed final fmt/diff/focused clipboard/schema/tool-list/check/release checks, read release SHA256 00AD2DED150557F67BB08F2E0DBDF5C414E6D4539ADB26EE123BF66B88C666F6, and completed tracked diff token scan.
 - 2026-06-02T14:25:33-05:00 iteration #604-close-629-start: posted #604 RESOLVED evidence, closed #604, removed stale labels, refreshed queue, claimed #629, and posted #629 START.
 - 2026-06-02T15:12:21-05:00 iteration #629-final-fsv-checks: accepted Paint art-bot manual MCP/SoT evidence, verified saved PNG/edges/cleanup, passed final support checks, read release SHA256 DD03AA73A8785796017D1491C1D97B840D0EB75819D28CBE0E2A9DD9373CAAC2, and prepared closeout.
+- 2026-06-02T15:15:17-05:00 iteration #629-close-631-start: posted #629 RESOLVED evidence, closed #629, removed stale labels, refreshed queue, claimed #631, and posted #631 START.

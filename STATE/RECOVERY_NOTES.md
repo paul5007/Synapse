@@ -1,5 +1,20 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T15:15:17-05:00
+- #629 is closed with RESOLVED evidence at https://github.com/ChrisRoyse/Synapse/issues/629#issuecomment-4606648531; closure readback is `state=CLOSED`, `closedAt=2026-06-02T20:14:43Z`, and stale claim labels are removed.
+- Git readback after #629 state push:
+  - `HEAD`/`origin/main` is `e9ec29d docs(state): record issue 629 verification [skip ci]`.
+  - Remaining dirty files are unrelated user changes: `docs/computergames/00_vision_and_scope.md` plus untracked root docs.
+- Active issue is #631 `scenario(showcase): voice-reactive reflex - speak trigger -> audio -> reflex action`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/631#issuecomment-4606652559.
+  - Labels/assignee updated with `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
+  - Body requires subscribing to PerceptionAudio events, registering an `on_event` reflex keyed on an audio transient/VAD speech event, producing the trigger sound, proving the reflex emits its action, and reading SoTs from target app/action result, `CF_REFLEX_AUDIT`, and `audio_tail`.
+  - Edge targets: background noise/no false fire, debounce on repeated triggers, audio disabled, below-VAD threshold, plus empty/boundary/structurally invalid params.
+- Exact next actions:
+  1. Inspect audio tools, event subscription/publish path, `on_event` reflex implementation, debounce logic, action emission, audit/storage rows, disabled-audio behavior, and existing tests.
+  2. Patch only if code or manual MCP FSV shows a real gap.
+  3. Build release `synapse-mcp`, launch isolated #631 daemon, verify process/socket/auth/health/strict Inspector `tools/list`, then run manual FSV with separate audio/event/reflex/action/storage/log/input cleanup SoT readbacks.
+
 ## Current Resume Point - 2026-06-02T15:12:21-05:00
 - Active issue #629 has accepted manual MCP/SoT evidence and final supporting checks; commit/GitHub closeout remain.
 - Accepted run: `.runs\629\paint-artbot-fsv-20260602T1443`.

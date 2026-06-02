@@ -1306,3 +1306,17 @@ Outcome:
 - Final supporting checks passed: fmt, diff check, mouse drag validation, schema sanitize, M3/M4 tool-list, touched-crate check, and release build.
 - Final release binary SHA256 is `DD03AA73A8785796017D1491C1D97B840D0EB75819D28CBE0E2A9DD9373CAAC2`.
 - Next: commit state with `[skip ci]`, post #629 RESOLVED evidence, close #629, refresh queue, continue #631.
+
+# 2026-06-02T15:15:17-05:00 - #629 closes and #631 starts
+
+Decision: Close #629 after accepted Paint evidence and claim #631 as the next remaining #594 child in campaign order.
+
+Evidence:
+- #629 readback shows `state=CLOSED`, `closedAt=2026-06-02T20:14:43Z`, RESOLVED evidence comment, and stale claim labels removed.
+- `e9ec29d docs(state): record issue 629 verification [skip ci]` is on `main`/`origin/main`.
+- Live open queue after closure contains #594 plus #631, #632, #633, and #634.
+- #631 requires the audio -> event -> reflex -> action path to be proven through real MCP tool calls and separate physical SoT readbacks from audio/event/reflex/action/storage surfaces.
+
+Outcome:
+- Posted #631 START comment and added `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
+- Next step is code/path inspection for audio tools, event subscription, `on_event` reflex, debounce, action emission, audit rows, disabled audio, and cleanup.
