@@ -1,5 +1,30 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T10:40:00-05:00
+- #601 is closed:
+  - commit `aa81266 fix(reflex): persist combo timing audits (#601) [skip ci]`;
+  - RESOLVED evidence https://github.com/ChrisRoyse/Synapse/issues/601#issuecomment-4604000389;
+  - closure readback `state=CLOSED`, `closedAt=2026-06-02T15:31:27Z`;
+  - stale `status:in-progress` and `agent:codex` labels removed.
+- Git state after #601 close:
+  - branch `main`;
+  - `git status --short --branch` read `## main...origin/main`;
+  - latest commit `aa81266`.
+- Live open queue after #601:
+  - #594 parent remains open;
+  - #624/#625 remain `status:blocked` on the Daybreak/operator boundary;
+  - unblocked children currently open include #602-#604 and #629-#634.
+- Active issue is #602 `scenario(stress): act_drag boundary + Paint drawing + Explorer drag-drop`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/602#issuecomment-4604006525.
+  - Labels/assignee updated with `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
+  - Issue goal: prove `act_drag` curves, 4096px distance boundary, real Paint drawing, and real drag/drop file movement.
+  - Planned SoTs: repo-built daemon process/socket/auth/health/strict Inspector `tools/list`; real `act_drag` calls; Paint image/file bytes and/or observe/read_text evidence; filesystem paths for drag/drop movement; storage/action audit rows; OS key/button state; cleanup release state.
+  - Required edges: zero-length drag, non-drop target, modifiers held, cross-monitor/DPI feasibility on this host, >4096px fail-closed, empty/boundary/structurally invalid params with before/after state.
+- Current next:
+  1. Inspect `act_drag` params, validation, action backend dispatch, curve handling, distance limit, audit logging, and tests.
+  2. Patch only if the real code path cannot satisfy #602.
+  3. Build/launch isolated repo-built daemon and perform manual MCP/SoT FSV.
+
 ## 2026-06-02T10:25:00-05:00
 - Active issue remains #601 `scenario(stress): act_combo 256-step timed precision - play a song / macro`.
 - Implementation patch is unchanged since the #601 audit patch:

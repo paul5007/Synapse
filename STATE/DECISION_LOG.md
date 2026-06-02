@@ -1144,3 +1144,17 @@ Evidence:
 
 Outcome:
 - Commit with `[skip ci]`, push, post #601 RESOLVED evidence, close #601, remove stale labels, refresh queue, and continue to #602.
+
+# 2026-06-02T10:40:00-05:00 - #602 starts after #601 closure
+
+Decision: Claim #602 as the next unblocked #594 child after closing #601.
+
+Evidence:
+- #601 GitHub readback showed `state=CLOSED`, `closedAt=2026-06-02T15:31:27Z`, and stale claim labels removed.
+- `git status --short --branch` read `## main...origin/main`.
+- Live open queue shows #602 as the next unblocked child before #603/#604 and #629-#634; #624/#625 remain blocked.
+- #602 requires real MCP `act_drag` FSV for Paint drawing, Explorer/file drag-drop, 4096px boundary, and fail-closed/physical edge cases.
+
+Outcome:
+- Posted #602 START comment and labeled/assigned the issue.
+- Inspect drag implementation next.

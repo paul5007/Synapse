@@ -1,5 +1,25 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T10:40:00-05:00
+- #601 is closed.
+  - Commit: `aa81266 fix(reflex): persist combo timing audits (#601) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/601#issuecomment-4604000389.
+  - Closure readback: `state=CLOSED`, `closedAt=2026-06-02T15:31:27Z`.
+  - Worktree was clean after push: `## main...origin/main`.
+- Active issue is #602 `scenario(stress): act_drag boundary + Paint drawing + Explorer drag-drop`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/602#issuecomment-4604006525.
+  - GitHub labels/assignee updated with `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
+- #602 acceptance target:
+  - real MCP `tools/call act_drag` through strict client-parity `tools/list`;
+  - separate SoT reads for Paint/image bytes, filesystem path movement, action/storage audit rows, OS key/button state, process/socket cleanup, and any observe/read_text evidence used;
+  - happy path Paint curve drawing and Explorer/file movement;
+  - 4096px boundary and >4096px fail-closed;
+  - zero-length drag, non-drop-target, modifier-held drag, cross-monitor/DPI feasibility, empty/structurally invalid params with before/after state.
+- Exact next actions:
+  1. Inspect `act_drag` implementation/tests and existing drag constraints.
+  2. Patch only if code or FSV exposes a real gap.
+  3. Run supporting checks, build release `synapse-mcp`, launch isolated daemon, verify process/socket/auth/health/strict Inspector tools-list, then run #602 manual FSV.
+
 ## Current Resume Point - 2026-06-02T10:25:00-05:00
 - Active issue #601 is implemented and manual MCP/SoT FSV is accepted; final checks/commit/closeout remain.
 - Patch in worktree:
