@@ -1,5 +1,35 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T11:45:00-05:00
+- Active issue #602 has implementation, accepted manual MCP/SoT FSV, cleanup, final supporting checks, release build, and diff review complete. Commit/push/RESOLVED closeout are next.
+- Patch:
+  - `crates/synapse-mcp/src/m2/drag.rs` exposes `bezier` curve and `modifiers` (`ctrl/shift/alt/super`) for `act_drag`;
+  - live modifier drags press modifiers before `MouseDrag`, keep them held for a 200 ms post-drop settle, then release in reverse order with cleanup on failures;
+  - focused recording tests cover all curve variants and modifier keydown/drag/keyup order.
+- Accepted FSV run directory: `.runs\602\drag-fsv-20260602T1105-clean`.
+  - Final daemon: PID `61420`, bind `127.0.0.1:7883`, auth health `200`, unauth `401`, strict Inspector `tools/list=80`, `act_drag` curve enum includes `bezier`, modifier enum `ctrl,shift,alt,super`.
+  - Final release binary: `target\release\synapse-mcp.exe`, length `46820864`, SHA256 `8432EEC297778C356BF0B006EABE9D0FA3AA94A6F0ADFF93BC4A3452A1D66826`, timestamp `2026-06-02T16:30:42.4786488Z`.
+  - Paint: five real `act_drag` strokes for natural/instant/linear/ease_in_out/bezier; saved PNG changed `7107/F0D46746...FC3C9E0` -> `7737/1828E656...466E23`; sampled stroke pixels black and control pixel white.
+  - Explorer move: `issue602_dragdrop.txt` moved source->dest with SHA256 `D71F53A60259BF35EFF72D3BB4DEBA460651A30F55B42BEC4C76ED6324F05016`; `CF_ACTION_LOG 20 -> 22`.
+  - Boundary/DPI: 3-monitor SoT, exact 4096px cross-monitor drag `(5120,500)->(9216,500)` succeeded and left input neutral; over-limit 4097px failed closed.
+  - Edges: zero-length OK/no mutation; non-drop target left source-only; Ctrl-modifier copy after settle left source+dest with matching SHA256 `F6209DEE7E9B5C536DA81B06D7FEFC76E71FB47E1D993DC956B0CD6C6F26E6C0`; empty and structurally-invalid params left storage/input/file SoTs unchanged.
+  - Cleanup: `release_all` returned zero keys/buttons/pads; final input read neutral; issue Explorer windows closed; daemon stopped and port `7883` closed.
+- Final supporting checks passed:
+  - `cargo fmt --check`;
+  - `git diff --check` (CRLF warning only);
+  - focused drag curve/modifier tests;
+  - `cargo test -p synapse-action --test mouse_drag_validation -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`;
+  - `cargo check -p synapse-action -p synapse-mcp -j 2`;
+  - `cargo build --release -p synapse-mcp -j 2`.
+- Exact next actions:
+  1. Run tracked diff/token scan.
+  2. Commit with `[skip ci]`, push.
+  3. Post #602 RESOLVED evidence, close #602, remove `status:in-progress`/`agent:codex`.
+  4. Refresh queue and take #603 unless GitHub changed.
+
 ## Current Resume Point - 2026-06-02T10:40:00-05:00
 - #601 is closed.
   - Commit: `aa81266 fix(reflex): persist combo timing audits (#601) [skip ci]`.

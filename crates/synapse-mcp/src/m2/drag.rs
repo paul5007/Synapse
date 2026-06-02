@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use rmcp::ErrorData;
 use rmcp::schemars::JsonSchema;
@@ -9,12 +12,14 @@ use synapse_action::{
 #[cfg(windows)]
 use synapse_core::Rect;
 use synapse_core::{
-    Action, AimCurve, AimNaturalParams, Backend, ElementId, MouseButton, MouseTarget, Point,
+    Action, AimCurve, AimNaturalParams, Backend, ElementId, Key, KeyCode, MouseButton, MouseTarget,
+    Point,
 };
 
 use crate::m1::mcp_error;
 
 const DEFAULT_DRAG_DURATION_MS: u32 = 200;
+const MODIFIER_RELEASE_SETTLE_MS: u64 = 200;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +38,9 @@ pub struct ActDragParams {
     #[serde(default = "default_drag_backend")]
     #[schemars(default = "default_drag_backend")]
     pub backend: DragBackend,
+    #[serde(default)]
+    #[schemars(default)]
+    pub modifiers: Vec<DragModifier>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -71,6 +79,7 @@ pub enum DragCurve {
     Instant,
     Linear,
     EaseInOut,
+    Bezier,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -81,6 +90,15 @@ pub enum DragBackend {
     Auto,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DragModifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Super,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActDragResponse {
@@ -89,6 +107,7 @@ pub struct ActDragResponse {
     pub curve_used: DragCurve,
     pub duration_ms: u32,
     pub distance_px: f64,
+    pub modifiers_used: Vec<DragModifier>,
     pub backend_used: String,
     pub elapsed_ms: u32,
 }
@@ -111,13 +130,16 @@ pub async fn act_drag_with_handle(
         backend,
     };
 
+    let modifier_keys: Vec<_> = params
+        .modifiers
+        .iter()
+        .map(|modifier| modifier.to_key())
+        .collect();
+
     if let Some(recording) = recording {
-        execute_recording(&recording, &action)?;
+        execute_recording(&recording, &modifier_keys, &action, backend)?;
     } else {
-        handle
-            .execute(action)
-            .await
-            .map_err(|error| action_error_to_mcp(&error))?;
+        execute_with_modifiers(&handle, &modifier_keys, action, backend).await?;
     }
 
     Ok(ActDragResponse {
@@ -126,6 +148,7 @@ pub async fn act_drag_with_handle(
         curve_used: params.curve,
         duration_ms: params.duration_ms,
         distance_px: from.distance_to(to),
+        modifiers_used: params.modifiers,
         backend_used: backend_used_name(backend).to_owned(),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
@@ -150,6 +173,10 @@ impl DragCurve {
             Self::Instant => AimCurve::Instant,
             Self::Linear => AimCurve::Linear,
             Self::EaseInOut => AimCurve::EaseInOut,
+            Self::Bezier => AimCurve::Bezier {
+                p1: (0.25, 0.10),
+                p2: (0.75, 0.90),
+            },
         }
     }
 }
@@ -160,6 +187,23 @@ impl DragBackend {
             Self::Software => Backend::Software,
             Self::Hardware => Backend::Hardware,
             Self::Auto => Backend::Auto,
+        }
+    }
+}
+
+impl DragModifier {
+    fn to_key(self) -> Key {
+        let value = match self {
+            Self::Ctrl => "ctrl",
+            Self::Shift => "shift",
+            Self::Alt => "alt",
+            Self::Super => "super",
+        };
+        Key {
+            code: KeyCode::Named {
+                value: value.to_owned(),
+            },
+            use_scancode: false,
         }
     }
 }
@@ -237,13 +281,98 @@ fn center_from_rect_edges(rect: RectEdges) -> Result<Point, ActionError> {
     })
 }
 
-fn execute_recording(recording: &RecordingBackend, action: &Action) -> Result<(), ErrorData> {
+async fn execute_with_modifiers(
+    handle: &ActionHandle,
+    modifier_keys: &[Key],
+    drag_action: Action,
+    backend: Backend,
+) -> Result<(), ErrorData> {
+    let mut pressed = Vec::with_capacity(modifier_keys.len());
+    for key in modifier_keys {
+        if let Err(error) = handle
+            .execute(Action::KeyDown {
+                key: key.clone(),
+                backend,
+            })
+            .await
+        {
+            let _ = release_pressed_modifiers(handle, &pressed, backend).await;
+            return Err(action_error_to_mcp(&error));
+        }
+        pressed.push(key.clone());
+    }
+
+    let drag_result = handle.execute(drag_action).await;
+    if drag_result.is_ok() && !pressed.is_empty() {
+        tokio::time::sleep(Duration::from_millis(MODIFIER_RELEASE_SETTLE_MS)).await;
+    }
+    let release_result = release_pressed_modifiers(handle, &pressed, backend).await;
+
+    if let Err(error) = drag_result {
+        return Err(action_error_to_mcp(&error));
+    }
+    if let Err(error) = release_result {
+        return Err(action_error_to_mcp(&error));
+    }
+    Ok(())
+}
+
+async fn release_pressed_modifiers(
+    handle: &ActionHandle,
+    pressed: &[Key],
+    backend: Backend,
+) -> Result<(), ActionError> {
+    let mut release_error = None;
+    for key in pressed.iter().rev() {
+        if let Err(error) = handle
+            .execute(Action::KeyUp {
+                key: key.clone(),
+                backend,
+            })
+            .await
+        {
+            if release_error.is_none() {
+                release_error = Some(error);
+            }
+        }
+    }
+    release_error.map_or(Ok(()), Err)
+}
+
+fn execute_recording(
+    recording: &RecordingBackend,
+    modifier_keys: &[Key],
+    drag_action: &Action,
+    backend: Backend,
+) -> Result<(), ErrorData> {
     let before_events = recording.events();
     let before_event_count = before_events.len();
     let mut emit_state = EmitState::new();
+    for key in modifier_keys {
+        recording
+            .execute(
+                &Action::KeyDown {
+                    key: key.clone(),
+                    backend,
+                },
+                &mut emit_state,
+            )
+            .map_err(|error| action_error_to_mcp(&error))?;
+    }
     recording
-        .execute(action, &mut emit_state)
+        .execute(drag_action, &mut emit_state)
         .map_err(|error| action_error_to_mcp(&error))?;
+    for key in modifier_keys.iter().rev() {
+        recording
+            .execute(
+                &Action::KeyUp {
+                    key: key.clone(),
+                    backend,
+                },
+                &mut emit_state,
+            )
+            .map_err(|error| action_error_to_mcp(&error))?;
+    }
     let after_events = recording.events();
     let new_events = &after_events[before_event_count..];
     let event_sequence = event_sequence(new_events);
@@ -266,6 +395,8 @@ fn event_sequence(events: &[RecordedInput]) -> String {
 
 fn event_label(event: &RecordedInput) -> String {
     match event {
+        RecordedInput::KeyDown { key } => format!("key_down:{}", key_label(key)),
+        RecordedInput::KeyUp { key } => format!("key_up:{}", key_label(key)),
         RecordedInput::MouseButtonDown { button } => format!("down:{}", button_label(*button)),
         RecordedInput::MouseMove {
             to,
@@ -278,6 +409,14 @@ fn event_label(event: &RecordedInput) -> String {
         ),
         RecordedInput::MouseButtonUp { button } => format!("up:{}", button_label(*button)),
         other => format!("{other:?}"),
+    }
+}
+
+fn key_label(key: &Key) -> String {
+    match &key.code {
+        KeyCode::Named { value } => value.clone(),
+        KeyCode::Symbol { value } => value.to_string(),
+        KeyCode::HidCode { value } => format!("hid:{value}"),
     }
 }
 
@@ -336,5 +475,97 @@ const fn backend_used_name(backend: Backend) -> &'static str {
         Backend::Auto | Backend::Software => "software",
         Backend::Hardware => "hardware",
         Backend::Vigem => "vigem",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use synapse_action::ActionEmitter;
+
+    use super::{
+        ActDragParams, ActDragPointTarget, ActDragTarget, DragBackend, DragButton, DragCurve,
+        DragModifier, act_drag_with_handle, event_sequence,
+    };
+
+    #[tokio::test]
+    async fn recording_backend_readback_exposes_all_drag_curve_variants() {
+        for (curve, expected_label) in [
+            (DragCurve::Natural, "natural_fast"),
+            (DragCurve::Instant, "instant"),
+            (DragCurve::Linear, "linear"),
+            (DragCurve::EaseInOut, "ease_in_out"),
+            (DragCurve::Bezier, "bezier"),
+        ] {
+            let (handle, _snapshot_handle, _emitter) = ActionEmitter::channel();
+            let recording = Arc::new(synapse_action::RecordingBackend::new());
+            let params = ActDragParams {
+                from: ActDragTarget::Point(ActDragPointTarget { x: 10, y: 20 }),
+                to: ActDragTarget::Point(ActDragPointTarget { x: 110, y: 140 }),
+                button: DragButton::Left,
+                curve,
+                duration_ms: 120,
+                backend: DragBackend::Software,
+                modifiers: Vec::new(),
+            };
+            let before = recording.events();
+            println!(
+                "readback=act_drag_recording edge=curve before=curve:{curve:?} events={before:?}"
+            );
+
+            let response = act_drag_with_handle(handle, Some(Arc::clone(&recording)), params)
+                .await
+                .unwrap_or_else(|error| panic!("act_drag recording should succeed: {error}"));
+            let after = recording.events();
+            let sequence = event_sequence(&after);
+            println!(
+                "readback=act_drag_recording edge=curve after=curve:{curve:?} sequence={sequence} distance={} result_value=ok",
+                response.distance_px
+            );
+
+            assert!(response.ok);
+            assert_eq!(response.curve_used, curve);
+            assert_eq!(
+                sequence,
+                format!("down:left>mouse_move:screen(110,140):{expected_label}:120>up:left")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_backend_readback_holds_drag_modifiers_around_drag() {
+        let (handle, _snapshot_handle, _emitter) = ActionEmitter::channel();
+        let recording = Arc::new(synapse_action::RecordingBackend::new());
+        let params = ActDragParams {
+            from: ActDragTarget::Point(ActDragPointTarget { x: 10, y: 20 }),
+            to: ActDragTarget::Point(ActDragPointTarget { x: 70, y: 80 }),
+            button: DragButton::Left,
+            curve: DragCurve::Linear,
+            duration_ms: 80,
+            backend: DragBackend::Software,
+            modifiers: vec![DragModifier::Shift],
+        };
+        let before = recording.events();
+        println!("readback=act_drag_recording edge=modifier before={before:?}");
+
+        let response = act_drag_with_handle(handle, Some(Arc::clone(&recording)), params)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("act_drag recording with modifier should succeed: {error}")
+            });
+        let after = recording.events();
+        let sequence = event_sequence(&after);
+        println!(
+            "readback=act_drag_recording edge=modifier after_sequence={sequence} modifiers={:?}",
+            response.modifiers_used
+        );
+
+        assert!(response.ok);
+        assert_eq!(response.modifiers_used, [DragModifier::Shift]);
+        assert_eq!(
+            sequence,
+            "key_down:shift>down:left>mouse_move:screen(70,80):linear:80>up:left>key_up:shift"
+        );
     }
 }

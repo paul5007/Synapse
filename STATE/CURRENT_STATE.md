@@ -1,5 +1,40 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T11:45:00-05:00
+- Active issue #602 `scenario(stress): act_drag boundary + Paint drawing + Explorer drag-drop` has implementation, manual MCP/SoT FSV, runtime cleanup, final supporting checks, release build, and diff review complete. Commit/push and GitHub closeout are next.
+- Patch in `crates/synapse-mcp/src/m2/drag.rs`:
+  - exposes `DragCurve::Bezier` in `act_drag` and maps it to `AimCurve::Bezier`;
+  - adds `modifiers: Vec<DragModifier>` with `ctrl/shift/alt/super`;
+  - wraps live drags with `KeyDown` modifiers before `MouseDrag`, a 200 ms post-drop settle before `KeyUp`, and release cleanup on failures;
+  - recording-backend tests prove all five curve labels and the modifier sequence `key_down:shift>down:left>mouse_move...>up:left>key_up:shift`.
+- Manual MCP/SoT FSV evidence is under `.runs\602\drag-fsv-20260602T1105-clean`.
+  - Initial daemon PID `52268`, resumed daemon PID `32428`, patched daemon PID `84276`, final patched-settle daemon PID `61420`, all on `127.0.0.1:7883` with repo release binary; final release binary length `46820864`, SHA256 `8432EEC297778C356BF0B006EABE9D0FA3AA94A6F0ADFF93BC4A3452A1D66826`, timestamp `2026-06-02T16:30:42.4786488Z`.
+  - Auth health readbacks passed and unauth health returned `401`; final strict Inspector `tools/list` `64_tools_list_patched2.json` loaded `80` tools and showed `act_drag` curve enum `natural,instant,linear,ease_in_out,bezier` and modifier enum `ctrl,shift,alt,super`.
+  - Paint happy path: `paint_curves.png` before length `7107`, SHA256 `F0D46746CD633A789F1F3D9D03B0AAF6B448D09A236991F66F0E2A9DFFC3C9E0`, white control pixels; real MCP `act_drag` calls for natural/instant/linear/ease_in_out/bezier produced five strokes; after length `7737`, SHA256 `1828E65628ED8B2D220C3385A0DA796D8F85DE72AB53A3CA334052FD0C466E23`, sampled stroke pixels black and control pixel white.
+  - Explorer happy path: `issue602_dragdrop.txt` before source existed/dest absent/SHA256 `D71F53A60259BF35EFF72D3BB4DEBA460651A30F55B42BEC4C76ED6324F05016`; `find` located row bbox `x=332,y=434,w=1013,h=37`; real MCP `act_drag` from `(838,452)` to destination Items View `(3675,932)` moved file; after source absent, dest exists length `38` with same SHA256; `CF_ACTION_LOG` moved `20 -> 22`.
+  - Boundary/cross-monitor: monitor SoT `26_monitor_sot_before_boundary.json` showed 3 monitors and virtual screen `10240x1742`; real MCP middle-button drag from `(5120,500)` to `(9216,500)` returned `distance_px=4096`, crossed DISPLAY1->DISPLAY3, storage `22 -> 24`, and separate input read showed no held buttons/keys.
+  - Over-limit: `(5120,500)` to `(9217,500)` failed closed with `action drag distance exceeds limit ... 4097.000 px exceeds max 4096 px`; no held input and file hash unchanged; rejected attempt was audited (`CF_ACTION_LOG 24 -> 26`).
+  - Zero-length: middle-button `(6000,600)` to `(6000,600)` returned `distance_px=0`, storage `26 -> 28`, no held input, file hash unchanged.
+  - Non-drop-target: `issue602_non_drop.txt` before source-only/SHA256 `30E924C3BFEB69F103959DB1F7CB2B7ADF7F985AA8D56EC0BBE0F0B0A62D639D`; drag from row center to source title/tab area `(1200,216)` left source present, dest absent, hash unchanged; storage `32 -> 34`, inputs neutral.
+  - Modifier-held: first Ctrl attempt showed a physical race (file moved), so the patch added the 200 ms settle. Repeated real MCP `act_drag modifiers=["ctrl"]` on `issue602_ctrl_settle.txt` physically copied: source and dest both exist, both length `32`, both SHA256 `F6209DEE7E9B5C536DA81B06D7FEFC76E71FB47E1D993DC956B0CD6C6F26E6C0`; storage `48 -> 50`, Ctrl/Shift/buttons released.
+  - Empty params and structurally invalid params failed closed through strict Inspector/MCP deserialization; `CF_ACTION_LOG` stayed `50`, inputs remained neutral, and known file bytes stayed unchanged.
+  - Cleanup: strict Inspector `release_all` returned `released_keys=0`, `released_buttons=0`, `neutralized_pads=0`; separate `GetAsyncKeyState` read showed Ctrl/Shift/left/middle/right all false; source/destination Explorer windows closed; final daemon PID `61420` stopped and port `7883` closed.
+- Final supporting checks passed:
+  - `cargo fmt --check`;
+  - `git diff --check` (CRLF warning only);
+  - `cargo test -p synapse-mcp --bin synapse-mcp recording_backend_readback_exposes_all_drag_curve_variants -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp recording_backend_readback_holds_drag_modifiers_around_drag -- --nocapture`;
+  - `cargo test -p synapse-action --test mouse_drag_validation -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`;
+  - `cargo check -p synapse-action -p synapse-mcp -j 2`;
+  - `cargo build --release -p synapse-mcp -j 2`.
+- Current next:
+  1. Scan tracked diff for token leakage, commit with `[skip ci]`, push.
+  2. Post #602 RESOLVED evidence, close #602, remove stale labels.
+  3. Refresh queue and continue to #603 unless GitHub changed.
+
 ## 2026-06-02T10:40:00-05:00
 - #601 is closed:
   - commit `aa81266 fix(reflex): persist combo timing audits (#601) [skip ci]`;

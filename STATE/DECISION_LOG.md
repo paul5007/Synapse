@@ -1158,3 +1158,19 @@ Evidence:
 Outcome:
 - Posted #602 START comment and labeled/assigned the issue.
 - Inspect drag implementation next.
+
+# 2026-06-02T11:45:00-05:00 - #602 act_drag patch and FSV accepted
+
+Decision: Patch `act_drag` rather than only run the existing surface, because #602 exposed two real capability gaps: MCP schema lacked `bezier` despite the core `AimCurve::Bezier`, and `act_drag` had no direct modifier-held path.
+
+Evidence:
+- Strict Inspector `tools/list` before patch showed `act_drag` loaded but only exposed `natural,instant,linear,ease_in_out`.
+- Recording tests now show all five curves, including `bezier`, and modifier order `key_down:shift>down:left>mouse_move...>up:left>key_up:shift`.
+- Live Ctrl-modified Explorer drag initially moved instead of copied, proving key release happened too soon for Explorer drop processing; after adding a 200 ms post-drop modifier settle, repeated Ctrl-drag physically copied with source+dest hashes both `F6209DEE7E9B5C536DA81B06D7FEFC76E71FB47E1D993DC956B0CD6C6F26E6C0`.
+- Manual FSV run `.runs\602\drag-fsv-20260602T1105-clean` also accepted Paint curve strokes, Explorer move, exact 4096px cross-monitor boundary, 4097px fail-closed, zero-length, non-drop, empty params, structurally invalid params, storage/input/file SoT readbacks, and cleanup.
+- Final strict tools-list on PID `61420` showed `act_drag` curve enum `natural,instant,linear,ease_in_out,bezier` and modifier enum `ctrl,shift,alt,super`.
+
+Outcome:
+- Final release binary SHA256 `8432EEC297778C356BF0B006EABE9D0FA3AA94A6F0ADFF93BC4A3452A1D66826`.
+- Final supporting checks passed; only `git diff --check` CRLF warning remains.
+- Next: token scan, commit/push with `[skip ci]`, post #602 RESOLVED evidence, close #602, refresh queue for #603.
