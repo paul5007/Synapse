@@ -108,6 +108,12 @@ pub(super) async fn require_http_security(
     }
 }
 
+/// Load the daemon bearer token value (file or env), for in-process consumers
+/// such as the `--mode connect` bridge that must authenticate to the daemon.
+pub(crate) fn load_token_value() -> anyhow::Result<String> {
+    load_token().map(|(token, _source)| token)
+}
+
 fn load_token() -> anyhow::Result<(String, TokenSource)> {
     match token_file_path() {
         Some(path) if path.is_file() => {

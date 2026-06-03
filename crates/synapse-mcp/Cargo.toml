@@ -22,7 +22,11 @@ hyper.workspace = true
 image.workspace = true
 metrics.workspace = true
 notify.workspace = true
-rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+rmcp = { workspace = true, features = [
+    "transport-streamable-http-server",
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 regex.workspace = true
 schemars.workspace = true
 serde.workspace = true

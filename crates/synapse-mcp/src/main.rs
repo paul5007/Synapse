@@ -15,6 +15,7 @@
         clippy::unwrap_used
     )
 )]
+mod connect;
 mod http;
 mod m1;
 mod m2;
@@ -51,6 +52,8 @@ const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
 enum Mode {
     Stdio,
     Http,
+    /// Thin stdio<->HTTP bridge to the shared daemon (for stdio-only clients).
+    Connect,
 }
 
 #[derive(Debug, Parser)]
@@ -164,6 +167,15 @@ async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     let telemetry_guard = configure_telemetry(&cli)?;
+
+    // The connect bridge is a thin stdio<->HTTP proxy; it does not initialize
+    // perception/action/storage, so return before the daemon-only setup below.
+    if matches!(cli.mode, Mode::Connect) {
+        let result = connect::run_connect(&cli.bind).await;
+        drop(telemetry_guard);
+        return result;
+    }
+
     let dpi_awareness = synapse_capture::init_process_dpi_awareness()
         .context("initialize per-monitor DPI awareness")?;
     tracing::info!(?cli, code = "MCP_CLI_PARSED", "synapse-mcp cli parsed");
@@ -224,6 +236,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             drop(telemetry_guard);
             Ok(code)
         }
+        Mode::Connect => unreachable!("connect mode is handled before daemon setup"),
     }
 }
 
