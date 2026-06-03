@@ -171,7 +171,7 @@ async fn run() -> anyhow::Result<ExitCode> {
     // The connect bridge is a thin stdio<->HTTP proxy; it does not initialize
     // perception/action/storage, so return before the daemon-only setup below.
     if matches!(cli.mode, Mode::Connect) {
-        let result = connect::run_connect(&cli.bind).await;
+        let result = connect::run_connect(&cli.bind, cli.db.as_deref()).await;
         drop(telemetry_guard);
         return result;
     }
