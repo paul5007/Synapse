@@ -315,6 +315,7 @@ fn write_profile(
     write_profile_with_runtime(path, id, label, exe, "hybrid", 16, true, default_backend)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_profile_with_runtime(
     path: &Path,
     id: &str,
