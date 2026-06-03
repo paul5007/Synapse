@@ -109,11 +109,11 @@ impl CaptureController {
     /// the old session cannot be stopped.
     pub fn switch_to(&mut self, config: CaptureConfig) -> Result<u64, CaptureError> {
         let handle = spawn_capture_loop(config)?;
-        if let Some(previous) = self.active.take() {
-            if let Err(error) = previous.stop() {
-                let _ = handle.stop();
-                return Err(error);
-            }
+        if let Some(previous) = self.active.take()
+            && let Err(error) = previous.stop()
+        {
+            let _ = handle.stop();
+            return Err(error);
         }
 
         self.generation = self.generation.saturating_add(1);
