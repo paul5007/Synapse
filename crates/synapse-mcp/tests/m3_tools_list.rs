@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 49] = [
+const EXPECTED_TOOLS: [&str; 50] = [
     "act_aim",
     "act_click",
     "act_clipboard",
@@ -13,6 +13,7 @@ const EXPECTED_TOOLS: [&str; 49] = [
     "act_pad",
     "act_press",
     "act_scroll",
+    "act_stroke",
     "act_type",
     "audio_tail",
     "audio_transcribe",
@@ -173,6 +174,20 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
         "act_click",
         "inputSchema.properties.hold_ms.default",
         &json!(120),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "act_stroke",
+        "inputSchema.properties.velocity_profile.default",
+        &json!("constant"),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "act_stroke",
+        "inputSchema.properties.backend.default",
+        &json!("auto"),
     )?;
     read_default(
         readbacks,
@@ -403,6 +418,8 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
 
 fn read_required_fields(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::Result<()> {
     read_required(readbacks, tools, "act_keymap", "alias")?;
+    read_required(readbacks, tools, "act_stroke", "path")?;
+    read_required(readbacks, tools, "act_stroke", "duration_or_speed")?;
     read_required(readbacks, tools, "subscribe_cancel", "subscription_id")?;
     read_required(readbacks, tools, "reflex_cancel", "reflex_id")?;
     read_required(readbacks, tools, "profile_activate", "profile_id")?;

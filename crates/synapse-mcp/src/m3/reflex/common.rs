@@ -335,6 +335,7 @@ fn apply_backend_default(action: &mut Action, fallback: Backend) {
         | Action::MouseMoveRelative { backend, .. }
         | Action::MouseButton { backend, .. }
         | Action::MouseDrag { backend, .. }
+        | Action::MouseStroke { backend, .. }
         | Action::MouseScroll { backend, .. }
         | Action::AimAt { backend, .. }
         | Action::Combo { backend, .. }
@@ -351,6 +352,7 @@ fn apply_backend_default(action: &mut Action, fallback: Backend) {
         | Action::MouseMoveRelative { .. }
         | Action::MouseButton { .. }
         | Action::MouseDrag { .. }
+        | Action::MouseStroke { .. }
         | Action::MouseScroll { .. }
         | Action::AimAt { .. }
         | Action::Combo { .. }

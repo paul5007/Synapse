@@ -2,10 +2,11 @@ use super::{
     ActAimParams, ActAimResponse, ActClickParams, ActClickResponse, ActClipboardParams,
     ActClipboardResponse, ActClipboardVerb, ActDragParams, ActDragResponse, ActKeymapParams,
     ActKeymapResponse, ActPadParams, ActPadResponse, ActPressParams, ActPressResponse,
-    ActScrollParams, ActScrollResponse, ActTypeParams, ActTypeResponse, ErrorData, Json,
-    Parameters, ReleaseAllParams, ReleaseAllResponse, SynapseService, act_aim_with_handle,
-    act_click_with_handle, act_clipboard, act_drag_with_handle, act_keymap_with_handle,
-    act_pad_with_handle, act_press_with_handle, act_scroll_with_handle, act_type_with_handle,
+    ActScrollParams, ActScrollResponse, ActStrokeParams, ActStrokeResponse, ActTypeParams,
+    ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams, ReleaseAllResponse,
+    SynapseService, act_aim_with_handle, act_click_with_handle, act_clipboard,
+    act_drag_with_handle, act_keymap_with_handle, act_pad_with_handle, act_press_with_handle,
+    act_scroll_with_handle, act_stroke_with_handle, act_type_with_handle,
     action_preflight::ActionPreflightReadback, release_all_with_handles, tool, tool_router,
 };
 use crate::m1::mcp_error;
@@ -212,6 +213,33 @@ impl SynapseService {
         let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
         let result = act_drag_with_handle(handle, recording, params.0).await;
         self.audit_action_result("act_drag", &result)?;
+        result.map(Json)
+    }
+
+    #[tool(description = "Move or draw along a path using a timed continuous mouse stroke")]
+    pub async fn act_stroke(
+        &self,
+        params: Parameters<ActStrokeParams>,
+    ) -> Result<Json<ActStrokeResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "act_stroke",
+            "tool.invocation kind=act_stroke"
+        );
+        let preflight = match self.ensure_supported_use_allows_action("act_stroke") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied("act_stroke", &error);
+                return Err(error);
+            }
+        };
+        self.audit_action_started_with_details(
+            "act_stroke",
+            &action_preflight_details(&preflight),
+        )?;
+        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
+        let result = act_stroke_with_handle(handle, recording, params.0).await;
+        self.audit_action_result("act_stroke", &result)?;
         result.map(Json)
     }
 

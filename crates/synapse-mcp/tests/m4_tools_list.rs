@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 80] = [
+const EXPECTED_TOOLS: [&str; 81] = [
     "act_aim",
     "act_click",
     "act_clipboard",
@@ -16,6 +16,7 @@ const EXPECTED_TOOLS: [&str; 80] = [
     "act_press",
     "act_run_shell",
     "act_scroll",
+    "act_stroke",
     "act_type",
     "audio_tail",
     "audio_transcribe",
@@ -103,7 +104,7 @@ async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<
         .map(str::to_owned)
         .collect::<Vec<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 80);
+    assert_eq!(names.len(), 81);
     assert_no_duplicate_names(&names)?;
 
     assert_schema_roots_closed(tools)?;
@@ -196,6 +197,20 @@ fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     read_default(
         &mut readbacks,
         tools,
+        "act_stroke",
+        "inputSchema.properties.velocity_profile.default",
+        &json!("constant"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_stroke",
+        "inputSchema.properties.backend.default",
+        &json!("auto"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
         "act_combo",
         "inputSchema.properties.backend.default",
         &json!("auto"),
@@ -244,6 +259,8 @@ fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     )?;
     read_required(&mut readbacks, tools, "act_combo", "steps")?;
     read_required(&mut readbacks, tools, "act_keymap", "alias")?;
+    read_required(&mut readbacks, tools, "act_stroke", "path")?;
+    read_required(&mut readbacks, tools, "act_stroke", "duration_or_speed")?;
     read_required(&mut readbacks, tools, "act_run_shell", "command")?;
     read_required(&mut readbacks, tools, "act_launch", "target")?;
     read_default(

@@ -280,6 +280,13 @@ fn action_resource(action: &Action) -> Vec<ConflictResource> {
             ConflictResource::MouseCursor,
             ConflictResource::MouseButton(*button),
         ],
+        Action::MouseStroke { button, .. } => {
+            let mut resources = vec![ConflictResource::MouseCursor];
+            if let Some(button) = button {
+                resources.push(ConflictResource::MouseButton(*button));
+            }
+            resources
+        }
         Action::PadButton { pad, button, .. } => {
             vec![ConflictResource::PadButton {
                 pad: *pad,

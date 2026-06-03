@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 80,
+  "count": 81,
   "m4_defaults": [
     {
       "actual": 33,
@@ -19,6 +19,16 @@ expression: snapshot
       "actual": 120,
       "path": "inputSchema.properties.hold_ms.default",
       "tool": "act_click"
+    },
+    {
+      "actual": "constant",
+      "path": "inputSchema.properties.velocity_profile.default",
+      "tool": "act_stroke"
+    },
+    {
+      "actual": "auto",
+      "path": "inputSchema.properties.backend.default",
+      "tool": "act_stroke"
     },
     {
       "actual": "auto",
@@ -64,6 +74,16 @@ expression: snapshot
       "actual_contains": "alias",
       "path": "inputSchema.required",
       "tool": "act_keymap"
+    },
+    {
+      "actual_contains": "path",
+      "path": "inputSchema.required",
+      "tool": "act_stroke"
+    },
+    {
+      "actual_contains": "duration_or_speed",
+      "path": "inputSchema.required",
+      "tool": "act_stroke"
     },
     {
       "actual_contains": "command",
@@ -128,6 +148,7 @@ expression: snapshot
     "act_press",
     "act_run_shell",
     "act_scroll",
+    "act_stroke",
     "act_type",
     "audio_tail",
     "audio_transcribe",

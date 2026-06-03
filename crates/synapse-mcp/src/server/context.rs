@@ -882,13 +882,14 @@ mod scope_gate_tests {
         m4::M4ServiceConfig,
     };
 
-    const ACTION_WRITE_TOOLS: [&str; 13] = [
+    const ACTION_WRITE_TOOLS: [&str; 14] = [
         "act_click",
         "act_type",
         "act_press",
         "act_keymap",
         "act_aim",
         "act_drag",
+        "act_stroke",
         "act_scroll",
         "act_pad",
         "act_clipboard",

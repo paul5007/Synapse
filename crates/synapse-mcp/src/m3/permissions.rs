@@ -169,6 +169,7 @@ pub fn add_action_permissions(action: &Action, required: &mut RequiredPermission
         | Action::MouseMoveRelative { backend, .. }
         | Action::MouseButton { backend, .. }
         | Action::MouseDrag { backend, .. }
+        | Action::MouseStroke { backend, .. }
         | Action::MouseScroll { backend, .. }
         | Action::AimAt { backend, .. } => {
             let _ = backend;
