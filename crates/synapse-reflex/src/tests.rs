@@ -251,9 +251,9 @@ fn duplicate_active_reflex_definition_is_rejected() -> Result<(), Box<dyn Error>
     );
 
     runtime.register(&first)?;
-    let error = runtime
-        .register(&duplicate)
-        .expect_err("duplicate active reflex definition must be rejected");
+    let Err(error) = runtime.register(&duplicate) else {
+        panic!("duplicate active reflex definition must be rejected");
+    };
 
     assert_eq!(error.code(), error_codes::REFLEX_PARAMS_INVALID);
     assert_eq!(runtime.list(false)?.len(), 1);
