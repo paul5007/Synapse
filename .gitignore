@@ -1,5 +1,6 @@
 .claude/
 docs2/
+profiles/
 
 /target/
 # Catch ad-hoc target dirs used for split-profile installs / release builds
