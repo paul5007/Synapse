@@ -32,7 +32,7 @@ fn bundled_profiles_parse_and_keep_natural_defaults() -> Result<(), Box<dyn std:
             path.display()
         );
         assert_eq!(
-            loaded.defaults.mouse_curve_default,
+            loaded.defaults.mouse_velocity_profile_default,
             "natural",
             "{}",
             path.display()
@@ -252,7 +252,7 @@ id = "missing_matches"
 label = "Missing Matches"
 schema_version = 2
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 "#,
             error_codes::PROFILE_PARSE_ERROR,
@@ -264,7 +264,7 @@ id = "bad_regex"
 label = "Bad Regex"
 schema_version = 2
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -279,7 +279,7 @@ id = "future_schema"
 label = "Future Schema"
 schema_version = 999
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -294,7 +294,7 @@ id = "invalid_keymap"
 label = "Invalid Keymap"
 schema_version = 2
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -312,7 +312,7 @@ id = "instant_default"
 label = "Instant Default"
 schema_version = 2
 use_scope = "productivity"
-mouse_curve_default = "instant"
+mouse_velocity_profile_default = "instant"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -340,6 +340,93 @@ exe = "instant.exe"
 }
 
 #[test]
+fn parser_accepts_mouse_velocity_profile_default_and_legacy_curve_alias() {
+    let new_key = r#"
+id = "new_velocity_key"
+label = "New Velocity Key"
+schema_version = 2
+use_scope = "productivity"
+mouse_velocity_profile_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "new_velocity_key.exe"
+"#;
+    let loaded = parse_profile_bytes(
+        "new_velocity_key.toml",
+        new_key.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    )
+    .expect("new mouse_velocity_profile_default key should parse");
+    println!(
+        "readback=profile_defaults edge=new_key after_mouse_velocity_profile_default={}",
+        loaded.defaults.mouse_velocity_profile_default
+    );
+    assert_eq!(loaded.defaults.mouse_velocity_profile_default, "natural");
+
+    let legacy_key = r#"
+id = "legacy_curve_key"
+label = "Legacy Curve Key"
+schema_version = 2
+use_scope = "productivity"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "legacy_curve_key.exe"
+"#;
+    let loaded = parse_profile_bytes(
+        "legacy_curve_key.toml",
+        legacy_key.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    )
+    .expect("deprecated mouse_curve_default key should remain a hidden compatibility alias");
+    println!(
+        "readback=profile_defaults edge=legacy_key after_mouse_velocity_profile_default={}",
+        loaded.defaults.mouse_velocity_profile_default
+    );
+    assert_eq!(loaded.defaults.mouse_velocity_profile_default, "natural");
+
+    let both = r#"
+id = "both_velocity_keys"
+label = "Both Velocity Keys"
+schema_version = 2
+use_scope = "productivity"
+mouse_velocity_profile_default = "natural"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "both_velocity_keys.exe"
+"#;
+    let error = parse_profile_bytes(
+        "both_velocity_keys.toml",
+        both.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    )
+    .expect_err("profile must fail closed when both velocity default names are present");
+    println!(
+        "readback=profile_defaults edge=both_keys after=code:{} error:{}",
+        error.code(),
+        error
+    );
+    assert_eq!(error.code(), error_codes::PROFILE_PARSE_ERROR);
+    assert!(error.to_string().contains("not both"));
+}
+
+#[test]
 fn parser_rejects_legacy_schema_and_missing_use_scope() {
     let cases = [
         (
@@ -349,7 +436,7 @@ id = "legacy_schema"
 label = "Legacy Schema"
 schema_version = 1
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -363,7 +450,7 @@ exe = "legacy.exe"
 id = "missing_use_scope"
 label = "Missing Use Scope"
 schema_version = 2
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -403,7 +490,7 @@ id = "hardware_alias"
 label = "Hardware Alias"
 schema_version = 2
 use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -441,7 +528,7 @@ id = "mouse_aliases"
 label = "Mouse Aliases"
 schema_version = 2
 use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -484,7 +571,7 @@ label = "Luanti Nested"
 schema_version = 2
 use_scope = "operator_owned_test"
 mode = "pixel_only"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -566,7 +653,7 @@ id = "center_hud"
 label = "Center HUD"
 schema_version = 2
 use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -620,7 +707,7 @@ id = "hud_threshold"
 label = "HUD Threshold"
 schema_version = 2
 use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -680,7 +767,7 @@ id = "bad_hud_threshold"
 label = "Bad HUD Threshold"
 schema_version = 2
 use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -728,7 +815,7 @@ id = "always_true_event"
 label = "Always True Event"
 schema_version = 2
 use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -772,7 +859,7 @@ id = "bad_hud"
 label = "Bad HUD"
 schema_version = 2
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]

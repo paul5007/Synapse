@@ -27,7 +27,10 @@ pub struct RawProfile {
     use_scope: String,
     #[serde(default = "default_mode")]
     mode: String,
-    mouse_curve_default: String,
+    #[serde(default)]
+    mouse_velocity_profile_default: Option<String>,
+    #[serde(default)]
+    mouse_curve_default: Option<String>,
     keyboard_dynamics_default: String,
     #[serde(default)]
     matches: Vec<RawProfileMatch>,
@@ -102,16 +105,33 @@ impl RawProfile {
             metadata: self.metadata,
             event_extensions: self.event_extensions,
         };
+        let mouse_velocity_profile_default = match (
+            self.mouse_velocity_profile_default,
+            self.mouse_curve_default,
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(ProfileError::Parse {
+                    path,
+                    message: "profile accepts mouse_velocity_profile_default or deprecated mouse_curve_default, not both".to_owned(),
+                });
+            }
+            (Some(value), None) => {
+                natural_default(&path, "mouse_velocity_profile_default", &value)?
+            }
+            (None, Some(value)) => natural_default(&path, "mouse_curve_default", &value)?,
+            (None, None) => {
+                return Err(ProfileError::Parse {
+                    path,
+                    message: "profile is missing mouse_velocity_profile_default".to_owned(),
+                });
+            }
+        };
 
         Ok(LoadedProfile {
             profile,
             schema_version: self.schema_version,
             defaults: ProfileDefaults {
-                mouse_curve_default: natural_default(
-                    &path,
-                    "mouse_curve_default",
-                    &self.mouse_curve_default,
-                )?,
+                mouse_velocity_profile_default,
                 keyboard_dynamics_default: natural_default(
                     &path,
                     "keyboard_dynamics_default",

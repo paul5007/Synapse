@@ -94,7 +94,7 @@ id = "quality.synthetic"
 label = "Quality Synthetic"
 schema_version = 2
 use_scope = "operator_owned_test"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]

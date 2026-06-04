@@ -23,7 +23,7 @@ const DEFAULT_SCREEN_HEIGHT: i32 = 2160;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileDefaults {
-    pub mouse_curve_default: String,
+    pub mouse_velocity_profile_default: String,
     pub keyboard_dynamics_default: String,
 }
 

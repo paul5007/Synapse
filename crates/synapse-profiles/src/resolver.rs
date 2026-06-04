@@ -324,7 +324,7 @@ mod tests {
             },
             schema_version: 1,
             defaults: ProfileDefaults {
-                mouse_curve_default: "natural".to_owned(),
+                mouse_velocity_profile_default: "natural".to_owned(),
                 keyboard_dynamics_default: "natural".to_owned(),
             },
             source_path: PathBuf::from(source_path),

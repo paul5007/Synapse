@@ -33,7 +33,7 @@ id = "scratch"
 label = "Scratch Broken"
 schema_version = 2
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
@@ -132,7 +132,7 @@ id = "{id}"
 label = "{label}"
 schema_version = 2
 use_scope = "productivity"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]

@@ -343,7 +343,7 @@ label = "{label}"
 schema_version = 2
 use_scope = "productivity"
 mode = "{mode}"
-mouse_curve_default = "natural"
+mouse_velocity_profile_default = "natural"
 keyboard_dynamics_default = "natural"
 
 [[matches]]
