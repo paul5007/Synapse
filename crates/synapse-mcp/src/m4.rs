@@ -886,7 +886,7 @@ fn chromium_renderer_accessibility_arg(params: &ActLaunchParams) -> Option<Strin
     let already_configured = params
         .args
         .iter()
-        .any(|arg| arg.eq_ignore_ascii_case("--force-renderer-accessibility"));
+        .any(|arg| is_force_renderer_accessibility_arg(arg));
     if already_configured {
         tracing::info!(
             code = "M4_ACT_LAUNCH_RENDERER_A11Y_SKIPPED",
@@ -896,6 +896,14 @@ fn chromium_renderer_accessibility_arg(params: &ActLaunchParams) -> Option<Strin
         return None;
     }
     Some("--force-renderer-accessibility".to_owned())
+}
+
+fn is_force_renderer_accessibility_arg(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("--force-renderer-accessibility") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('=')
 }
 
 fn force_renderer_accessibility_enabled(params: &ActLaunchParams) -> bool {
@@ -2448,6 +2456,12 @@ mod tests {
         assert!(
             chromium_renderer_accessibility_arg(&caller).is_none(),
             "caller-supplied flag must not be duplicated"
+        );
+
+        caller.args[0] = "--force-renderer-accessibility=complete".to_owned();
+        assert!(
+            chromium_renderer_accessibility_arg(&caller).is_none(),
+            "caller-supplied valued flag must not be duplicated"
         );
 
         for value in ["1", "true", "yes", "on", " TRUE "] {
