@@ -11,6 +11,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -115,6 +116,11 @@ fn kill_synapse_processes_for_db(db: &str) {
     }
 }
 
+fn lifecycle_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn ps_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "''"))
 }
@@ -123,6 +129,9 @@ fn ps_quote(raw: &str) -> String {
 /// closing the pipe) — the shutdown path that was only tested on unix before.
 #[test]
 fn stdio_server_exits_on_stdin_eof() -> anyhow::Result<()> {
+    let _guard = lifecycle_test_lock()
+        .lock()
+        .map_err(|err| anyhow::anyhow!("lifecycle test lock poisoned: {err}"))?;
     let tmp = tempfile::tempdir()?;
     let db = db_arg(tmp.path())?;
     let mut child = Command::new(bin())
@@ -155,6 +164,9 @@ fn stdio_server_exits_on_stdin_eof() -> anyhow::Result<()> {
 /// DB path after the bridge exit assertion.
 #[test]
 fn connect_bridge_exits_when_parent_process_dies() -> anyhow::Result<()> {
+    let _guard = lifecycle_test_lock()
+        .lock()
+        .map_err(|err| anyhow::anyhow!("lifecycle test lock poisoned: {err}"))?;
     let tmp = tempfile::tempdir()?;
     let db = db_arg(tmp.path())?;
     let bind = free_loopback_bind()?;
@@ -221,6 +233,9 @@ fn connect_bridge_exits_when_parent_process_dies() -> anyhow::Result<()> {
 /// (exit code 3) while the first keeps running.
 #[test]
 fn duplicate_daemon_is_refused() -> anyhow::Result<()> {
+    let _guard = lifecycle_test_lock()
+        .lock()
+        .map_err(|err| anyhow::anyhow!("lifecycle test lock poisoned: {err}"))?;
     let tmp = tempfile::tempdir()?;
     let db = db_arg(tmp.path())?;
     let pid_file = tmp.path().join("db").join("daemon.pid");
