@@ -685,7 +685,9 @@ async fn execute_with_modifiers(
             })
             .await
         {
-            let _ = release_pressed_modifiers(handle, &pressed, backend).await;
+            let _release_result =
+                release_pressed_modifiers(handle, &pressed, backend, "modifier_press_cleanup")
+                    .await;
             return Err(action_error_to_mcp(&error));
         }
         pressed.push(key.clone());
@@ -695,7 +697,12 @@ async fn execute_with_modifiers(
     if stroke_result.is_ok() && !pressed.is_empty() {
         tokio::time::sleep(Duration::from_millis(MODIFIER_RELEASE_SETTLE_MS)).await;
     }
-    let release_result = release_pressed_modifiers(handle, &pressed, backend).await;
+    let release_stage = if stroke_result.is_err() {
+        "stroke_error_cleanup"
+    } else {
+        "post_stroke_release"
+    };
+    let release_result = release_pressed_modifiers(handle, &pressed, backend, release_stage).await;
 
     if let Err(error) = stroke_result {
         return Err(action_error_to_mcp(&error));
@@ -761,21 +768,48 @@ async fn release_pressed_modifiers(
     handle: &ActionHandle,
     pressed: &[synapse_core::Key],
     backend: Backend,
+    stage: &'static str,
 ) -> Result<(), ActionError> {
     let mut release_error = None;
-    for key in pressed.iter().rev() {
+    for (release_index, key) in pressed.iter().rev().enumerate() {
         if let Err(error) = handle
             .execute(Action::KeyUp {
                 key: key.clone(),
                 backend,
             })
             .await
-            && release_error.is_none()
         {
-            release_error = Some(error);
+            log_modifier_release_error(stage, release_index, key, backend, &error);
+            if release_error.is_none() {
+                release_error = Some(error);
+            }
         }
     }
     release_error.map_or(Ok(()), Err)
+}
+
+fn log_modifier_release_error(
+    stage: &'static str,
+    release_index: usize,
+    key: &synapse_core::Key,
+    backend: Backend,
+    error: &ActionError,
+) {
+    let key = format!("{key:?}");
+    tracing::error!(
+        code = "M2_ACT_STROKE_MODIFIER_RELEASE_FAILED",
+        failure_stage = stage,
+        release_index,
+        modifier_key = %key,
+        backend = backend_used_name(backend),
+        error_code = error.code(),
+        detail = error.detail(),
+        retry_after_ms = error.retry_after_ms(),
+        queue_rate_state = %queue_rate_state(error),
+        fallback_path_executed = false,
+        action_kind = "act_stroke",
+        "act_stroke modifier release failed without fallback"
+    );
 }
 
 fn execute_recording(
@@ -1339,6 +1373,30 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(25)
         );
+    }
+
+    #[tokio::test]
+    async fn modifier_release_cleanup_returns_keyup_failure() {
+        let (handle, action_rx) = ActionHandle::channel();
+        drop(action_rx);
+        let pressed = vec![synapse_core::Key {
+            code: synapse_core::KeyCode::Named {
+                value: "shift".to_owned(),
+            },
+            use_scancode: false,
+        }];
+
+        let error = release_pressed_modifiers(
+            &handle,
+            &pressed,
+            Backend::Software,
+            "modifier_press_cleanup",
+        )
+        .await
+        .expect_err("closed emitter should fail modifier cleanup key-up");
+
+        assert_eq!(error.code(), error_codes::ACTION_BACKEND_UNAVAILABLE);
+        assert!(error.detail().contains("action emitter channel is closed"));
     }
 
     fn validation_error(params: &ActStrokeParams) -> ErrorData {
