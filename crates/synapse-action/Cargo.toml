@@ -10,6 +10,7 @@ repository.workspace = true
 bit-set = "0.10.0"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
 tokio.workspace = true
@@ -32,7 +33,6 @@ criterion.workspace = true
 insta.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

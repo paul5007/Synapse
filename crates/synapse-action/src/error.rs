@@ -78,6 +78,30 @@ impl ActionError {
     }
 
     #[must_use]
+    pub fn with_detail(self, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        match self {
+            Self::QueueFull { .. } => Self::QueueFull { detail },
+            Self::RateLimited { retry_after_ms, .. } => Self::RateLimited {
+                detail,
+                retry_after_ms,
+            },
+            Self::BackendUnavailable { .. } => Self::BackendUnavailable { detail },
+            Self::TargetInvalid { .. } => Self::TargetInvalid { detail },
+            Self::HoldExceededMax { .. } => Self::HoldExceededMax { detail },
+            Self::VigemNotInstalled { .. } => Self::VigemNotInstalled { detail },
+            Self::VigemPluginFailed { .. } => Self::VigemPluginFailed { detail },
+            Self::ElementNotResolved { .. } => Self::ElementNotResolved { detail },
+            Self::ForegroundLost { .. } => Self::ForegroundLost { detail },
+            Self::UnsupportedKey { .. } => Self::UnsupportedKey { detail },
+            Self::DragDistanceExceedsLimit { .. } => Self::DragDistanceExceedsLimit { detail },
+            Self::StuckKeyAutoReleased { .. } => Self::StuckKeyAutoReleased { detail },
+            Self::SafetyReleaseAllFired { .. } => Self::SafetyReleaseAllFired { detail },
+            Self::SafetyOperatorHotkeyFired { .. } => Self::SafetyOperatorHotkeyFired { detail },
+        }
+    }
+
+    #[must_use]
     pub const fn retry_after_ms(&self) -> Option<u64> {
         match self {
             Self::RateLimited { retry_after_ms, .. } => Some(*retry_after_ms),

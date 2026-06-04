@@ -7,7 +7,8 @@ use rmcp::ErrorData;
 use rmcp::model::ErrorCode;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use synapse_action::{
     ActionBackend, ActionError, ActionHandle, ArcLengthPath, EmitState, PathError, RecordedInput,
     RecordingBackend, StrokeError, StrokePlan, plan_timed_stroke, screen_point_from_path_point,
@@ -126,6 +127,50 @@ pub async fn act_stroke_with_handle(
 
 pub fn validate_act_stroke_params(params: &ActStrokeParams) -> Result<StrokePlan, ErrorData> {
     validate_and_plan(params)
+}
+
+pub fn act_stroke_request_details(params: &ActStrokeParams, plan: &StrokePlan) -> Value {
+    json!({
+        "path_id": act_stroke_path_id(params, plan),
+        "path_kind": path_kind(&params.path),
+        "control_point_count": control_point_count(&params.path),
+        "button": params.button,
+        "velocity_profile": params.velocity_profile,
+        "duration_or_speed": &params.duration_or_speed,
+        "humanized": params.humanize.is_some(),
+        "humanize": params.humanize,
+        "backend_requested": params.backend,
+        "backend_resolved": backend_used_name(params.backend.to_backend()),
+        "modifiers": &params.modifiers,
+        "plan": {
+            "point_stream_count": plan.samples.len(),
+            "path_length_px": plan.path_length_px,
+            "duration_ms": plan.duration_ms,
+            "first_sample": plan.samples.first().map(stroke_sample_details),
+            "last_sample": plan.samples.last().map(stroke_sample_details),
+        },
+        "fallback_path_executed": false,
+    })
+}
+
+pub fn act_stroke_error_details(error: &ErrorData) -> Value {
+    let data = error.data.as_ref();
+    json!({
+        "code": data
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+        "message": error.message.to_string(),
+        "data": error.data.clone(),
+        "point_index": data
+            .and_then(|data| data.get("point_index"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "queue_rate_state": data
+            .and_then(|data| data.get("queue_rate_state"))
+            .cloned()
+            .unwrap_or_else(|| json!({ "kind": "not_rate_or_queue" })),
+        "fallback_path_executed": false,
+    })
 }
 
 impl StrokeBackend {
@@ -609,7 +654,17 @@ fn stroke_error_to_mcp(error: &StrokeError) -> ErrorData {
 }
 
 fn action_error_to_mcp(error: &ActionError) -> ErrorData {
-    mcp_error(error.code(), error.to_string())
+    ErrorData::new(
+        ErrorCode(-32099),
+        error.to_string(),
+        Some(json!({
+            "code": error.code(),
+            "detail": error.detail(),
+            "retry_after_ms": error.retry_after_ms(),
+            "point_index": extract_sample_index(error.detail()),
+            "queue_rate_state": queue_rate_state(error),
+        })),
+    )
 }
 
 fn path_error_to_mcp(error: &PathError) -> ErrorData {
@@ -657,6 +712,82 @@ const fn backend_used_name(backend: Backend) -> &'static str {
         Backend::Hardware => "hardware",
         Backend::Vigem => "vigem",
     }
+}
+
+fn act_stroke_path_id(params: &ActStrokeParams, plan: &StrokePlan) -> String {
+    let payload = serde_json::to_vec(&json!({
+        "path": &params.path,
+        "velocity_profile": params.velocity_profile,
+        "duration_or_speed": &params.duration_or_speed,
+        "humanize": params.humanize,
+        "plan": {
+            "point_stream_count": plan.samples.len(),
+            "duration_ms": plan.duration_ms,
+            "path_length_px": plan.path_length_px,
+        },
+    }))
+    .unwrap_or_else(|_error| {
+        format!(
+            "{:?}:{:?}:{:?}:{:?}",
+            params.path, params.velocity_profile, params.duration_or_speed, params.humanize
+        )
+        .into_bytes()
+    });
+    format!("stroke:{}", sha256_hex(payload))
+}
+
+fn sha256_hex(payload: Vec<u8>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(payload);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn stroke_sample_details(sample: &synapse_action::TimedPathPoint) -> Value {
+    json!({
+        "elapsed_ms": sample.elapsed_ms,
+        "arclen": sample.arclen,
+        "point": {
+            "x": sample.point.x,
+            "y": sample.point.y,
+        },
+    })
+}
+
+fn queue_rate_state(error: &ActionError) -> Value {
+    match error {
+        ActionError::RateLimited {
+            retry_after_ms,
+            detail,
+        } => json!({
+            "kind": "rate_limited",
+            "retry_after_ms": retry_after_ms,
+            "detail": detail,
+        }),
+        ActionError::QueueFull { detail } => json!({
+            "kind": "queue_full",
+            "detail": detail,
+        }),
+        _ => json!({
+            "kind": "not_rate_or_queue",
+        }),
+    }
+}
+
+fn extract_sample_index(detail: &str) -> Option<usize> {
+    let marker = "sample_index=";
+    let start = detail.find(marker)? + marker.len();
+    let digits = detail[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty())
+        .then(|| digits.parse::<usize>().ok())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -764,6 +895,77 @@ mod tests {
 
         assert_tool_params_invalid_detail(&error, STROKE_DETAIL_SPEED_INVALID);
         assert!(error.message.contains("px_per_sec"));
+    }
+
+    #[test]
+    fn stroke_request_details_include_stable_path_context() {
+        let params = line_params(
+            PathPoint::new(1.0, 1.0),
+            PathPoint::new(5.0, 1.0),
+            StrokeTiming::DurationMs { duration_ms: 4 },
+        );
+        let plan = match validate_and_plan_with_screen_bounds(&params, test_bounds()) {
+            Ok(plan) => plan,
+            Err(error) => panic!("valid stroke should plan: {error:?}"),
+        };
+
+        let details = act_stroke_request_details(&params, &plan);
+
+        let path_id = details
+            .get("path_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(path_id.starts_with("stroke:"));
+        assert_eq!(path_id.len(), "stroke:".len() + 64);
+        assert_eq!(
+            details.get("path_kind").and_then(serde_json::Value::as_str),
+            Some("line")
+        );
+        assert_eq!(
+            details
+                .pointer("/plan/point_stream_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            details
+                .get("fallback_path_executed")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn stroke_action_error_data_preserves_rate_state_and_sample_index() {
+        let error = ActionError::RateLimited {
+            detail: "mouse_stroke send_input sample_index=7: backend=software retry_after_ms=25 requested_tokens=1 available_tokens=0 refill_rate_per_s=10".to_owned(),
+            retry_after_ms: 25,
+        };
+
+        let mcp_error = action_error_to_mcp(&error);
+        let data = mcp_error
+            .data
+            .as_ref()
+            .expect("action error data should be present");
+
+        assert_eq!(
+            data.get("code").and_then(serde_json::Value::as_str),
+            Some(error_codes::ACTION_RATE_LIMITED)
+        );
+        assert_eq!(
+            data.get("point_index").and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            data.pointer("/queue_rate_state/kind")
+                .and_then(serde_json::Value::as_str),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            data.pointer("/queue_rate_state/retry_after_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(25)
+        );
     }
 
     fn validation_error(params: &ActStrokeParams) -> ErrorData {

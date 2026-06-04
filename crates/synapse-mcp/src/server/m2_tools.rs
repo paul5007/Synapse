@@ -7,12 +7,17 @@ use super::{
     SynapseService, act_aim_with_handle, act_click_with_handle, act_clipboard,
     act_drag_with_handle, act_keymap_with_handle, act_pad_with_handle, act_press_with_handle,
     act_scroll_with_handle, act_stroke_with_handle, act_type_with_handle,
-    action_preflight::ActionPreflightReadback, release_all_with_handles, tool, tool_router,
-    validate_act_stroke_params,
+    action_preflight::{ActionPreflightReadback, ForegroundProof},
+    release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
 use crate::m1::mcp_error;
+use crate::m2::{act_stroke_error_details, act_stroke_request_details};
+use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
-use synapse_core::{Backend, error_codes};
+use synapse_core::{Backend, ForegroundContext, error_codes};
+use tokio_util::sync::CancellationToken;
+
+const ACT_STROKE_FOREGROUND_MONITOR_INTERVAL_MS: u64 = 10;
 
 #[tool_router(router = m2_tool_router, vis = "pub(super)")]
 impl SynapseService {
@@ -229,20 +234,53 @@ impl SynapseService {
             "tool.invocation kind=act_stroke"
         );
         let plan = validate_act_stroke_params(&params)?;
+        let stroke_details = act_stroke_request_details(&params, &plan);
         let preflight = match self.ensure_supported_use_allows_action("act_stroke") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied("act_stroke", &error);
+                self.audit_action_denied_with_details(
+                    "act_stroke",
+                    &error,
+                    &json!({
+                        "stroke": stroke_details,
+                        "failure": act_stroke_error_details(&error),
+                    }),
+                );
                 return Err(error);
             }
         };
         self.audit_action_started_with_details(
             "act_stroke",
-            &action_preflight_details(&preflight),
+            &act_stroke_audit_details(&stroke_details, &preflight),
         )?;
         let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
-        let result = act_stroke_with_handle(handle, recording, params, plan).await;
-        self.audit_action_result("act_stroke", &result)?;
+        let foreground_monitor = recording
+            .is_none()
+            .then(|| self.start_act_stroke_foreground_monitor(&preflight));
+        let result = act_stroke_with_handle(handle, recording, params.clone(), plan.clone()).await;
+        let foreground_error = await_act_stroke_foreground_monitor(foreground_monitor).await;
+        let result = match foreground_error {
+            Some(error) => Err(error),
+            None => result,
+        };
+        match &result {
+            Ok(response) => {
+                self.audit_action_ok_with_details(
+                    "act_stroke",
+                    &json!({
+                        "response": response,
+                        "stroke": stroke_details,
+                        "preflight": preflight,
+                    }),
+                )?;
+            }
+            Err(error) => {
+                let failure_details =
+                    act_stroke_failure_audit_details(&stroke_details, &preflight, error);
+                log_act_stroke_failure(&failure_details, error);
+                self.audit_action_error_with_details("act_stroke", error, &failure_details)?;
+            }
+        }
         result.map(Json)
     }
 
@@ -363,6 +401,225 @@ fn action_preflight_details(preflight: &ActionPreflightReadback) -> Value {
     })
 }
 
+fn act_stroke_audit_details(stroke_details: &Value, preflight: &ActionPreflightReadback) -> Value {
+    json!({
+        "stroke": stroke_details,
+        "preflight": preflight,
+    })
+}
+
+fn act_stroke_failure_audit_details(
+    stroke_details: &Value,
+    preflight: &ActionPreflightReadback,
+    error: &ErrorData,
+) -> Value {
+    json!({
+        "stroke": stroke_details,
+        "preflight": preflight,
+        "failure": act_stroke_error_details(error),
+    })
+}
+
+fn log_act_stroke_failure(details: &Value, error: &ErrorData) {
+    let stroke = details.get("stroke").unwrap_or(&Value::Null);
+    let failure = details.get("failure").unwrap_or(&Value::Null);
+    let preflight = details.get("preflight").unwrap_or(&Value::Null);
+    let error_code = failure
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("UNKNOWN");
+    let path_id = stroke
+        .get("path_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let path_kind = stroke
+        .get("path_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let backend_requested = stroke
+        .get("backend_requested")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let backend_resolved = stroke
+        .get("backend_resolved")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let point_index = failure.get("point_index").cloned().unwrap_or(Value::Null);
+    let queue_rate_state = failure
+        .get("queue_rate_state")
+        .cloned()
+        .unwrap_or_else(|| json!({ "kind": "not_rate_or_queue" }));
+    let foreground_proof = preflight
+        .get("after")
+        .or_else(|| preflight.get("before"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    tracing::error!(
+        code = error_code,
+        detail = %error.message,
+        path_id,
+        path_kind,
+        backend_requested,
+        backend_resolved,
+        point_index = ?point_index,
+        queue_rate_state = ?queue_rate_state,
+        foreground_proof = ?foreground_proof,
+        fallback_path_executed = false,
+        action_kind = "act_stroke",
+        "act_stroke failed without fallback"
+    );
+}
+
+impl SynapseService {
+    fn start_act_stroke_foreground_monitor(
+        &self,
+        preflight: &ActionPreflightReadback,
+    ) -> ActStrokeForegroundMonitor {
+        let cancel = CancellationToken::new();
+        let expected = preflight
+            .after
+            .clone()
+            .unwrap_or_else(|| preflight.before.clone());
+        let task = tokio::spawn(monitor_act_stroke_foreground(
+            self.clone(),
+            expected,
+            cancel.clone(),
+        ));
+        ActStrokeForegroundMonitor { cancel, task }
+    }
+}
+
+struct ActStrokeForegroundMonitor {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<Option<ErrorData>>,
+}
+
+async fn await_act_stroke_foreground_monitor(
+    monitor: Option<ActStrokeForegroundMonitor>,
+) -> Option<ErrorData> {
+    let Some(monitor) = monitor else {
+        return None;
+    };
+    monitor.cancel.cancel();
+    match monitor.task.await {
+        Ok(error) => error,
+        Err(error) => Some(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_stroke foreground monitor join failed: {error}"),
+        )),
+    }
+}
+
+async fn monitor_act_stroke_foreground(
+    service: SynapseService,
+    expected: ForegroundProof,
+    cancel: CancellationToken,
+) -> Option<ErrorData> {
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return None,
+            () = tokio::time::sleep(std::time::Duration::from_millis(ACT_STROKE_FOREGROUND_MONITOR_INTERVAL_MS)) => {}
+        }
+
+        match service.current_audit_foreground() {
+            Ok(actual) if actual.hwnd == expected.hwnd => {}
+            Ok(actual) => {
+                synapse_action::request_release_interrupt();
+                tracing::error!(
+                    code = error_codes::ACTION_FOREGROUND_LOST,
+                    expected_hwnd = expected.hwnd,
+                    actual_hwnd = actual.hwnd,
+                    expected_pid = expected.pid,
+                    actual_pid = actual.pid,
+                    expected_process_name = %expected.process_name,
+                    actual_process_name = %actual.process_name,
+                    expected_window_title = %expected.window_title,
+                    actual_window_title = %actual.window_title,
+                    action_kind = "act_stroke",
+                    "act_stroke foreground lost mid-stroke; release interrupt requested"
+                );
+                return Some(act_stroke_foreground_lost_error(
+                    &expected,
+                    Some(&actual),
+                    None,
+                ));
+            }
+            Err(error) => {
+                synapse_action::request_release_interrupt();
+                tracing::error!(
+                    code = error_codes::ACTION_FOREGROUND_LOST,
+                    expected_hwnd = expected.hwnd,
+                    expected_pid = expected.pid,
+                    expected_process_name = %expected.process_name,
+                    expected_window_title = %expected.window_title,
+                    read_error = %error.message,
+                    action_kind = "act_stroke",
+                    "act_stroke foreground read failed mid-stroke; release interrupt requested"
+                );
+                return Some(act_stroke_foreground_lost_error(
+                    &expected,
+                    None,
+                    Some(&error),
+                ));
+            }
+        }
+    }
+}
+
+fn act_stroke_foreground_lost_error(
+    expected: &ForegroundProof,
+    actual: Option<&ForegroundContext>,
+    read_error: Option<&ErrorData>,
+) -> ErrorData {
+    let detail = match actual {
+        Some(actual) => format!(
+            "act_stroke expected foreground hwnd 0x{:x} ({}) but current foreground is hwnd 0x{:x} ({})",
+            expected.hwnd, expected.window_title, actual.hwnd, actual.window_title
+        ),
+        None => format!(
+            "act_stroke could not read current foreground mid-stroke for expected hwnd 0x{:x} ({})",
+            expected.hwnd, expected.window_title
+        ),
+    };
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_LOST,
+            "reason": "act_stroke_foreground_lost_mid_stroke",
+            "detail": detail,
+            "point_index": Value::Null,
+            "queue_rate_state": {
+                "kind": "not_rate_or_queue",
+            },
+            "foreground_expected": expected,
+            "foreground_actual": actual.map(foreground_context_details),
+            "foreground_read_error": read_error.map(|error| json!({
+                "message": error.message.to_string(),
+                "data": error.data.clone(),
+            })),
+        })),
+    )
+}
+
+fn foreground_context_details(foreground: &ForegroundContext) -> Value {
+    json!({
+        "hwnd": foreground.hwnd,
+        "pid": foreground.pid,
+        "process_name": &foreground.process_name,
+        "process_path": &foreground.process_path,
+        "window_title": &foreground.window_title,
+        "monitor_index": foreground.monitor_index,
+        "dpi_scale": foreground.dpi_scale,
+        "profile_id": &foreground.profile_id,
+        "steam_appid": foreground.steam_appid,
+        "is_fullscreen": foreground.is_fullscreen,
+        "is_dwm_composed": foreground.is_dwm_composed,
+        "window_bounds": &foreground.window_bounds,
+    })
+}
+
 fn clipboard_response_audit_details(response: &ActClipboardResponse) -> Value {
     json!({
         "response": {
@@ -391,4 +648,88 @@ fn ensure_everquest_click_backend(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use synapse_core::Rect;
+
+    use super::*;
+
+    #[test]
+    fn stroke_foreground_lost_error_carries_specific_code_and_readbacks() {
+        let expected = foreground_proof(100, 10, "notepad.exe", "before");
+        let actual = foreground_context(200, 20, "calc.exe", "after");
+
+        let error = act_stroke_foreground_lost_error(&expected, Some(&actual), None);
+        let data = match error.data.as_ref() {
+            Some(data) => data,
+            None => panic!("foreground lost error should carry structured data"),
+        };
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(
+            data.pointer("/foreground_expected/hwnd")
+                .and_then(Value::as_i64),
+            Some(100)
+        );
+        assert_eq!(
+            data.pointer("/foreground_actual/hwnd")
+                .and_then(Value::as_i64),
+            Some(200)
+        );
+        assert_eq!(
+            data.pointer("/queue_rate_state/kind")
+                .and_then(Value::as_str),
+            Some("not_rate_or_queue")
+        );
+    }
+
+    fn foreground_proof(
+        hwnd: i64,
+        pid: u32,
+        process_name: &str,
+        window_title: &str,
+    ) -> ForegroundProof {
+        ForegroundProof {
+            hwnd,
+            pid,
+            process_name: process_name.to_owned(),
+            process_path: format!(r"C:\test\{process_name}"),
+            window_title: window_title.to_owned(),
+            is_minimized: Some(false),
+            minimized_readback_error: None,
+            observed_profile_id: None,
+        }
+    }
+
+    fn foreground_context(
+        hwnd: i64,
+        pid: u32,
+        process_name: &str,
+        window_title: &str,
+    ) -> ForegroundContext {
+        ForegroundContext {
+            hwnd,
+            pid,
+            process_name: process_name.to_owned(),
+            process_path: format!(r"C:\test\{process_name}"),
+            window_title: window_title.to_owned(),
+            window_bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+            },
+            monitor_index: 0,
+            dpi_scale: 1.0,
+            profile_id: None,
+            steam_appid: None,
+            is_fullscreen: false,
+            is_dwm_composed: true,
+        }
+    }
 }

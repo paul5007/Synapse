@@ -1,6 +1,8 @@
 use std::{fmt::Write as _, sync::Once};
 
 use enigo::Enigo;
+use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use synapse_core::{
     AimCurve, AimStyle, AimTarget, ButtonAction, HumanizeParams, MouseButton, MouseTarget,
     PathSpec, Point, StrokeTiming, VelocityProfile,
@@ -148,24 +150,43 @@ pub(super) fn mouse_stroke(
 ) -> Result<(), ActionError> {
     let plan =
         plan_timed_stroke(path, profile, timing, humanize).map_err(|error| stroke_error(&error))?;
-    let first = plan
-        .samples
-        .first()
-        .ok_or_else(|| ActionError::TargetInvalid {
-            detail: "mouse_stroke planner returned an empty point stream".to_owned(),
-        })?;
-    send_absolute_mouse_move(
-        screen_point_from_path_point(first.point, 0).map_err(|error| stroke_error(&error))?,
-        "mouse stroke origin absolute mouse move",
-    )?;
-
-    if let Some(button) = button {
-        mouse_button(button, ButtonAction::Down, 0, state)?;
+    let context = StrokeEmitLogContext::new(path, button, profile, timing, humanize, &plan);
+    let first = match plan.samples.first() {
+        Some(first) => first,
+        None => {
+            let error = ActionError::TargetInvalid {
+                detail: "mouse_stroke planner returned an empty point stream".to_owned(),
+            };
+            log_stroke_emit_error(&context, None, None, "plan_empty", &error);
+            return Err(error);
+        }
+    };
+    let first_point = match screen_point_from_path_point(first.point, 0) {
+        Ok(point) => point,
+        Err(error) => {
+            let error = annotate_stroke_emit_error(stroke_error(&error), "origin_point", Some(0));
+            log_stroke_emit_error(&context, Some(0), Some(first.point), "origin_point", &error);
+            return Err(error);
+        }
+    };
+    if let Err(error) =
+        send_absolute_mouse_move(first_point, "mouse stroke origin absolute mouse move")
+    {
+        let error = annotate_stroke_emit_error(error, "origin_move", Some(0));
+        log_stroke_emit_error(&context, Some(0), Some(first.point), "origin_move", &error);
+        return Err(error);
     }
 
-    let stream_result = emit_stroke_stream(&plan.samples);
+    if let Some(button) = button {
+        if let Err(error) = mouse_button(button, ButtonAction::Down, 0, state) {
+            let error = annotate_stroke_emit_error(error, "button_down", Some(0));
+            log_stroke_emit_error(&context, Some(0), Some(first.point), "button_down", &error);
+            return Err(error);
+        }
+    }
+
+    let stream_result = emit_stroke_stream(&plan.samples, &context);
     if let Err(error) = stream_result {
-        log_stroke_emit_error(None, &error);
         if let Some(button) = button
             && let Err(release_error) = mouse_button(button, ButtonAction::Up, 0, state)
         {
@@ -174,6 +195,13 @@ pub(super) fn mouse_stroke(
                 detail = release_error.detail(),
                 original_code = error.code(),
                 original_detail = error.detail(),
+                path_id = %context.path_id,
+                path_kind = context.path_kind,
+                backend = context.backend,
+                point_stream_count = context.point_stream_count,
+                duration_ms = context.duration_ms,
+                path_length_px = context.path_length_px,
+                button = ?context.button,
                 action_kind = "software_mouse_stroke",
                 "mouse_stroke failed and button cleanup also failed"
             );
@@ -265,27 +293,72 @@ fn mouse_move_curve(
     send_input_batch(&inputs, "drag curve absolute mouse move")
 }
 
-fn emit_stroke_stream(samples: &[TimedPathPoint]) -> Result<(), ActionError> {
-    let desktop = virtual_desktop()?;
+fn emit_stroke_stream(
+    samples: &[TimedPathPoint],
+    context: &StrokeEmitLogContext,
+) -> Result<(), ActionError> {
+    let desktop = match virtual_desktop() {
+        Ok(desktop) => desktop,
+        Err(error) => {
+            let error = annotate_stroke_emit_error(error, "virtual_desktop", None);
+            log_stroke_emit_error(context, None, None, "virtual_desktop", &error);
+            return Err(error);
+        }
+    };
     let mut previous_elapsed = samples.first().map_or(0.0, |sample| sample.elapsed_ms);
     for (index, sample) in samples.iter().enumerate().skip(1) {
-        let delay_ms = stroke_delay_ms(previous_elapsed, sample.elapsed_ms, index)?;
+        let delay_ms = match stroke_delay_ms(previous_elapsed, sample.elapsed_ms, index) {
+            Ok(delay_ms) => delay_ms,
+            Err(error) => {
+                let error = annotate_stroke_emit_error(error, "delay", Some(index));
+                log_stroke_emit_error(context, Some(index), Some(sample.point), "delay", &error);
+                return Err(error);
+            }
+        };
         if sleep_ms(delay_ms) {
-            return Err(ActionError::SafetyOperatorHotkeyFired {
+            let error = ActionError::SafetyOperatorHotkeyFired {
                 detail: format!(
                     "operator release requested during mouse_stroke at sample_index={index}"
                 ),
-            });
+            };
+            log_stroke_emit_error(
+                context,
+                Some(index),
+                Some(sample.point),
+                "operator_release",
+                &error,
+            );
+            return Err(error);
         }
         previous_elapsed = sample.elapsed_ms;
-        let point = screen_point_from_path_point(sample.point, index)
-            .map_err(|error| stroke_error(&error))?;
+        let point = match screen_point_from_path_point(sample.point, index) {
+            Ok(point) => point,
+            Err(error) => {
+                let error =
+                    annotate_stroke_emit_error(stroke_error(&error), "screen_point", Some(index));
+                log_stroke_emit_error(
+                    context,
+                    Some(index),
+                    Some(sample.point),
+                    "screen_point",
+                    &error,
+                );
+                return Err(error);
+            }
+        };
         let result = send_input_batch(
             &[absolute_mouse_input_for_desktop(point, desktop)],
             "mouse stroke absolute move",
         );
         if let Err(error) = result {
-            log_stroke_emit_error(Some(index), &error);
+            let error = annotate_stroke_emit_error(error, "send_input", Some(index));
+            log_stroke_emit_error(
+                context,
+                Some(index),
+                Some(sample.point),
+                "send_input",
+                &error,
+            );
             return Err(error);
         }
     }
@@ -295,16 +368,53 @@ fn emit_stroke_stream(samples: &[TimedPathPoint]) -> Result<(), ActionError> {
         .checked_sub(1)
         .map(|index| (index, samples[index]))
     {
-        let requested = screen_point_from_path_point(final_sample.point, index)
-            .map_err(|error| stroke_error(&error))?;
-        let actual = read_physical_cursor_position("mouse stroke final cursor readback")?;
+        let requested = match screen_point_from_path_point(final_sample.point, index) {
+            Ok(point) => point,
+            Err(error) => {
+                let error = annotate_stroke_emit_error(
+                    stroke_error(&error),
+                    "final_screen_point",
+                    Some(index),
+                );
+                log_stroke_emit_error(
+                    context,
+                    Some(index),
+                    Some(final_sample.point),
+                    "final_screen_point",
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        let actual = match read_physical_cursor_position("mouse stroke final cursor readback") {
+            Ok(actual) => actual,
+            Err(error) => {
+                let error = annotate_stroke_emit_error(error, "final_cursor_readback", Some(index));
+                log_stroke_emit_error(
+                    context,
+                    Some(index),
+                    Some(final_sample.point),
+                    "final_cursor_readback",
+                    &error,
+                );
+                return Err(error);
+            }
+        };
         if !cursor_readback_matches(requested, actual) {
-            return Err(ActionError::BackendUnavailable {
+            let error = ActionError::BackendUnavailable {
                 detail: format!(
-                    "mouse stroke final cursor readback mismatch: requested={requested:?} actual=({},{}) tolerance_px={CURSOR_READBACK_TOLERANCE_PX}",
+                    "mouse_stroke final_cursor_readback sample_index={index}: mouse stroke final cursor readback mismatch: requested={requested:?} actual=({},{}) tolerance_px={CURSOR_READBACK_TOLERANCE_PX}",
                     actual.x, actual.y
                 ),
-            });
+            };
+            log_stroke_emit_error(
+                context,
+                Some(index),
+                Some(final_sample.point),
+                "final_cursor_readback_mismatch",
+                &error,
+            );
+            return Err(error);
         }
     }
     Ok(())
@@ -463,11 +573,117 @@ fn stroke_error(error: &StrokeError) -> ActionError {
     }
 }
 
-fn log_stroke_emit_error(sample_index: Option<usize>, error: &ActionError) {
+#[derive(Clone, Debug)]
+struct StrokeEmitLogContext {
+    path_id: String,
+    path_kind: &'static str,
+    backend: &'static str,
+    button: Option<MouseButton>,
+    point_stream_count: usize,
+    duration_ms: f64,
+    path_length_px: f64,
+}
+
+impl StrokeEmitLogContext {
+    fn new(
+        path: &PathSpec,
+        button: Option<MouseButton>,
+        profile: VelocityProfile,
+        timing: &StrokeTiming,
+        humanize: Option<HumanizeParams>,
+        plan: &crate::StrokePlan,
+    ) -> Self {
+        Self {
+            path_id: stroke_path_id(path, profile, timing, humanize, plan),
+            path_kind: path_kind(path),
+            backend: "software",
+            button,
+            point_stream_count: plan.samples.len(),
+            duration_ms: plan.duration_ms,
+            path_length_px: plan.path_length_px,
+        }
+    }
+}
+
+fn stroke_path_id(
+    path: &PathSpec,
+    profile: VelocityProfile,
+    timing: &StrokeTiming,
+    humanize: Option<HumanizeParams>,
+    plan: &crate::StrokePlan,
+) -> String {
+    let payload = serde_json::to_vec(&json!({
+        "path": path,
+        "velocity_profile": profile,
+        "duration_or_speed": timing,
+        "humanize": humanize,
+        "plan": {
+            "point_stream_count": plan.samples.len(),
+            "duration_ms": plan.duration_ms,
+            "path_length_px": plan.path_length_px,
+        },
+    }))
+    .unwrap_or_else(|_error| format!("{path:?}:{profile:?}:{timing:?}:{humanize:?}").into_bytes());
+    format!("stroke:{}", sha256_hex(payload))
+}
+
+fn sha256_hex(payload: Vec<u8>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(payload);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn path_kind(path: &PathSpec) -> &'static str {
+    match path {
+        PathSpec::Line { .. } => "line",
+        PathSpec::Arc { .. } => "arc",
+        PathSpec::Circle { .. } => "circle",
+        PathSpec::CubicBezier { .. } => "cubic_bezier",
+        PathSpec::Polyline { .. } => "polyline",
+        PathSpec::CatmullRom { .. } => "catmull_rom",
+    }
+}
+
+fn annotate_stroke_emit_error(
+    error: ActionError,
+    stage: &'static str,
+    sample_index: Option<usize>,
+) -> ActionError {
+    let index = sample_index
+        .map(|index| format!(" sample_index={index}"))
+        .unwrap_or_default();
+    let detail = format!("mouse_stroke {stage}{index}: {}", error.detail());
+    error.with_detail(detail)
+}
+
+fn log_stroke_emit_error(
+    context: &StrokeEmitLogContext,
+    sample_index: Option<usize>,
+    requested_path_point: Option<synapse_core::PathPoint>,
+    failure_stage: &'static str,
+    error: &ActionError,
+) {
     tracing::error!(
         code = error.code(),
         detail = error.detail(),
         sample_index,
+        failure_stage,
+        path_id = %context.path_id,
+        path_kind = context.path_kind,
+        backend = context.backend,
+        point_stream_count = context.point_stream_count,
+        duration_ms = context.duration_ms,
+        path_length_px = context.path_length_px,
+        button = ?context.button,
+        requested_x = requested_path_point.map(|point| point.x),
+        requested_y = requested_path_point.map(|point| point.y),
+        queue_rate_state = "backend_dispatch",
+        fallback_path_executed = false,
         action_kind = "software_mouse_stroke",
         "mouse_stroke emit failed without fallback"
     );
@@ -787,5 +1003,22 @@ mod tests {
         );
         assert!(cursor_readback_matches(requested, within));
         assert!(!cursor_readback_matches(requested, outside));
+    }
+
+    #[test]
+    fn stroke_emit_annotation_preserves_code_and_sample_index() {
+        let error = ActionError::BackendUnavailable {
+            detail: "SendInput returned 0".to_owned(),
+        };
+
+        let annotated = annotate_stroke_emit_error(error, "send_input", Some(7));
+
+        assert_eq!(
+            annotated.code(),
+            synapse_core::error_codes::ACTION_BACKEND_UNAVAILABLE
+        );
+        assert!(annotated.detail().contains("mouse_stroke send_input"));
+        assert!(annotated.detail().contains("sample_index=7"));
+        assert!(annotated.detail().contains("SendInput returned 0"));
     }
 }
