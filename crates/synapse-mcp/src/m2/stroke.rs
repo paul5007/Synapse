@@ -1100,6 +1100,7 @@ fn act_stroke_path_id(params: &ActStrokeParams, plan: &ActStrokePlan) -> String 
         "to": &params.to,
         "velocity_profile": params.velocity_profile,
         "duration_or_speed": &params.duration_or_speed,
+        "motion_model": params.motion_model,
         "humanize": params.humanize,
         "plan": {
             "point_stream_count": plan.plan.as_ref().map_or(1, |plan| plan.samples.len()),
@@ -1109,14 +1110,15 @@ fn act_stroke_path_id(params: &ActStrokeParams, plan: &ActStrokePlan) -> String 
     }))
     .unwrap_or_else(|_error| {
         format!(
-            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
+            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
             plan.input_kind,
             plan.path,
             params.target,
             params.from,
             params.to,
             params.velocity_profile,
-            params.duration_or_speed
+            params.duration_or_speed,
+            params.motion_model
         )
         .into_bytes()
     });
@@ -1339,6 +1341,74 @@ mod tests {
                 .get("fallback_path_executed")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn stroke_path_id_includes_wind_mouse_motion_model() {
+        let mut first_params = line_params(
+            PathPoint::new(0.0, 0.0),
+            PathPoint::new(80.0, 0.0),
+            StrokeTiming::DurationMs { duration_ms: 80 },
+        );
+        first_params.motion_model = StrokeMotionModel::WindMouse {
+            gravity: 9.0,
+            wind: 3.0,
+            max_step: 10.0,
+            damped_distance: 12.0,
+            seed: Some(42),
+        };
+        let mut second_params = first_params.clone();
+        second_params.motion_model = StrokeMotionModel::WindMouse {
+            gravity: 9.0,
+            wind: 3.0,
+            max_step: 10.0,
+            damped_distance: 12.0,
+            seed: Some(43),
+        };
+
+        let first_plan = match validate_and_plan_with_screen_bounds(&first_params, None) {
+            Ok(plan) => plan,
+            Err(error) => panic!("first wind_mouse stroke should plan: {error:?}"),
+        };
+        let second_plan = match validate_and_plan_with_screen_bounds(&second_params, None) {
+            Ok(plan) => plan,
+            Err(error) => panic!("second wind_mouse stroke should plan: {error:?}"),
+        };
+        let first_details = act_stroke_request_details(&first_params, &first_plan);
+        let first_details_again = act_stroke_request_details(&first_params, &first_plan);
+        let second_details = act_stroke_request_details(&second_params, &second_plan);
+        let first_id = first_details
+            .get("path_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let first_id_again = first_details_again
+            .get("path_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let second_id = second_details
+            .get("path_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        println!(
+            "readback=act_stroke_path_id edge=wind_mouse_seed before_seed=42 after_first_id={first_id} after_first_repeat={first_id_again} after_second_seed=43 after_second_id={second_id} first_points={} second_points={}",
+            stroke_plan(&first_plan).samples.len(),
+            stroke_plan(&second_plan).samples.len()
+        );
+
+        assert_eq!(first_id, first_id_again);
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            first_details.get("motion_model"),
+            Some(&json!({
+                "kind": "wind_mouse",
+                "gravity": 9.0,
+                "wind": 3.0,
+                "max_step": 10.0,
+                "damped_distance": 12.0,
+                "seed": 42
+            }))
         );
     }
 
