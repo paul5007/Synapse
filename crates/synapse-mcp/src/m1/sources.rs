@@ -20,6 +20,8 @@ use synapse_perception::ObservationInput;
 
 const FS_WATCH_ROOT_ENV: &str = "SYNAPSE_FS_WATCH_ROOT";
 const MAX_FS_RECENT_EVENTS: usize = 5;
+#[cfg(windows)]
+const CHROMIUM_RENDERER_UIA_SUPPLEMENT_MAX_NODES: usize = 160;
 
 pub fn synthetic_notepad_input() -> ObservationInput {
     let at = Utc::now();
@@ -920,6 +922,7 @@ fn input_from_tree_and_foreground(
     foreground: ForegroundContext,
     mode: PerceptionMode,
 ) -> Result<ObservationInput, ErrorData> {
+    let snapshot_depth = tree.max_depth;
     rebase_nodes_to_foreground(&mut tree.nodes, &foreground);
     let focused = tree
         .nodes
@@ -932,6 +935,7 @@ fn input_from_tree_and_foreground(
     input.elements = tree.nodes;
     input.a11y_status = SensorStatus::Healthy;
     populate_cdp_diagnostics(&mut input);
+    supplement_chromium_renderer_accessibility(&mut input, snapshot_depth);
     if mode == PerceptionMode::A11yOnly {
         input.capture_status = SensorStatus::Disabled;
     } else {
@@ -941,6 +945,62 @@ fn input_from_tree_and_foreground(
         input.mode_override = Some(mode);
     }
     Ok(input)
+}
+
+#[cfg(windows)]
+fn supplement_chromium_renderer_accessibility(input: &mut ObservationInput, snapshot_depth: u32) {
+    use std::collections::HashSet;
+
+    use synapse_core::CdpStatus;
+
+    if !synapse_a11y::is_chromium_family(&input.foreground.process_name) {
+        return;
+    }
+    if !input
+        .cdp
+        .as_ref()
+        .is_some_and(|cdp| cdp.status == CdpStatus::Unreachable)
+    {
+        return;
+    }
+    let started = Instant::now();
+    let Ok(nodes) = synapse_a11y::chromium_renderer_accessibility_nodes_from_window(
+        input.foreground.hwnd,
+        snapshot_depth.max(1),
+        CHROMIUM_RENDERER_UIA_SUPPLEMENT_MAX_NODES,
+    ) else {
+        return;
+    };
+    if nodes.is_empty() {
+        return;
+    }
+
+    let mut seen: HashSet<_> = input
+        .elements
+        .iter()
+        .map(|node| node.element_id.clone())
+        .collect();
+    let before = input.elements.len();
+    input.elements.extend(
+        nodes
+            .into_iter()
+            .filter(|node| seen.insert(node.element_id.clone())),
+    );
+    if input.elements.len() == before {
+        return;
+    }
+    let foreground = input.foreground.clone();
+    rebase_nodes_to_foreground(&mut input.elements, &foreground);
+    input.sensor_latency_ms.insert(
+        "uia_renderer".to_owned(),
+        started.elapsed().as_secs_f32() * 1000.0,
+    );
+    tracing::info!(
+        code = "A11Y_CHROMIUM_RENDERER_UIA_ATTACHED",
+        hwnd = input.foreground.hwnd,
+        added = input.elements.len().saturating_sub(before),
+        "attached Chromium renderer UIA nodes omitted by raw child walking"
+    );
 }
 
 /// CDP reachability probe timeout. Loopback connection-refused returns

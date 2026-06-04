@@ -146,6 +146,16 @@ pub fn find_by_name_and_pattern_in_window(
     ))
 }
 
+pub fn chromium_renderer_accessibility_nodes_from_window(
+    _hwnd: i64,
+    _depth: u32,
+    _max_nodes: usize,
+) -> A11yResult<Vec<AccessibleNode>> {
+    Err(A11yError::not_available(
+        "Chromium renderer UIA supplement requires Windows",
+    ))
+}
+
 pub fn snapshot_element(_id: &ElementId, _depth: u32) -> A11yResult<AccessibleSubtree> {
     Err(A11yError::not_available(
         "UIA element snapshots require Windows",

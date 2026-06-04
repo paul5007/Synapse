@@ -571,12 +571,55 @@ fn should_attempt_browser_ocr(input: &ObservationInput) -> bool {
     if input.web_path != Some(WebPerceptionPath::UiaOnly) {
         return false;
     }
+    if has_chromium_renderer_uia_content(input) {
+        return false;
+    }
     input.cdp.as_ref().is_some_and(|diagnostics| {
         matches!(
             diagnostics.status,
             CdpStatus::Unreachable | CdpStatus::AttachFailed
         )
     })
+}
+
+fn has_chromium_renderer_uia_content(input: &ObservationInput) -> bool {
+    if !synapse_a11y::is_chromium_family(&input.foreground.process_name) {
+        return false;
+    }
+    let Some(content_region) = browser_content_region(input.foreground.window_bounds) else {
+        return false;
+    };
+    input.elements.iter().any(|node| {
+        if node
+            .automation_id
+            .as_deref()
+            .is_some_and(|automation_id| automation_id.starts_with("ocr:"))
+        {
+            return false;
+        }
+        if node.bbox.w <= 0 || node.bbox.h <= 0 || !rects_overlap(node.bbox, content_region) {
+            return false;
+        }
+        let role = node.role.to_ascii_lowercase();
+        matches!(
+            role.as_str(),
+            "button" | "document" | "edit" | "heading" | "hyperlink" | "link" | "text"
+        ) && (!node.name.trim().is_empty()
+            || node
+                .value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || !node.patterns.is_empty()
+            || role == "document")
+    })
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    let a_right = a.x.saturating_add(a.w);
+    let a_bottom = a.y.saturating_add(a.h);
+    let b_right = b.x.saturating_add(b.w);
+    let b_bottom = b.y.saturating_add(b.h);
+    a.x < b_right && a_right > b.x && a.y < b_bottom && a_bottom > b.y
 }
 
 fn apply_browser_ocr_words(
@@ -1437,6 +1480,38 @@ mod tests {
             error_codes::A11Y_CDP_UNREACHABLE,
         ));
         input.web_path = Some(WebPerceptionPath::Cdp);
+        assert!(!should_attempt_browser_ocr(&input));
+    }
+
+    #[test]
+    fn browser_ocr_skips_when_renderer_uia_content_is_present() {
+        let mut input = chromium_ocr_input();
+        input.elements.push(AccessibleNode {
+            element_id: synapse_core::element_id(0x2200, "0000002a00000042"),
+            parent: None,
+            name: "Force Renderer Complete Button".to_owned(),
+            role: "button".to_owned(),
+            automation_id: Some("probe-button".to_owned()),
+            value: None,
+            bbox: Rect {
+                x: 40,
+                y: 180,
+                w: 320,
+                h: 34,
+            },
+            enabled: true,
+            focused: false,
+            patterns: vec![synapse_core::UiaPattern::Invoke],
+            children_count: 0,
+            depth: 2,
+        });
+
+        println!(
+            "readback=browser_ocr edge=renderer_uia after_has_content:{} after_should_ocr:{}",
+            has_chromium_renderer_uia_content(&input),
+            should_attempt_browser_ocr(&input)
+        );
+        assert!(has_chromium_renderer_uia_content(&input));
         assert!(!should_attempt_browser_ocr(&input));
     }
 

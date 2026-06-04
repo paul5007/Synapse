@@ -14,8 +14,9 @@ pub use resolve::{
     focus_element, re_resolve, set_element_value,
 };
 pub use snapshot::{
-    element_node_from_point, find_by_name_and_pattern, find_by_name_and_pattern_in_window,
-    focused_element_node, snapshot, snapshot_element, snapshot_window_from_hwnd,
+    chromium_renderer_accessibility_nodes_from_window, element_node_from_point,
+    find_by_name_and_pattern, find_by_name_and_pattern_in_window, focused_element_node, snapshot,
+    snapshot_element, snapshot_window_from_hwnd,
 };
 pub use window::{
     close_window, current_foreground_context, element_from_point, focus_window, focused_element,

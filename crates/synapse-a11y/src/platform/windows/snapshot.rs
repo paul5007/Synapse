@@ -33,6 +33,7 @@ const SNAPSHOT_NODE_BUDGET: usize = 4000;
 /// inherently slower cross-process UWP/ApplicationFrameHost trees.
 const SNAPSHOT_DEADLINE: Duration = Duration::from_millis(400);
 const RAW_SUPPLEMENT_NODE_BUDGET: usize = 60;
+const CHROMIUM_RENDERER_CONTENT_TOP_INSET_PX: i32 = 96;
 // Packaged Notepad exposes these top-level menu items through raw
 // name+ExpandCollapse search even when RawView child walking omits them.
 const RAW_MENU_SUPPLEMENT_NAMES: [&str; 3] = ["File", "Edit", "View"];
@@ -177,6 +178,90 @@ pub fn find_by_name_and_pattern_in_window(
             .map_err(map_uia_error)?;
         find_by_name_and_pattern_from_root(automation, &root, &name, pattern, scope)
     })
+}
+
+pub fn chromium_renderer_accessibility_nodes_from_window(
+    hwnd: i64,
+    depth: u32,
+    max_nodes: usize,
+) -> A11yResult<Vec<AccessibleNode>> {
+    if hwnd == 0 || max_nodes == 0 {
+        return Ok(Vec::new());
+    }
+    let hwnd = isize::try_from(hwnd).map_err(|err| A11yError::InvalidElementId {
+        detail: err.to_string(),
+    })?;
+    with_automation(move |automation| {
+        let root = automation
+            .element_from_handle(Handle::from(hwnd))
+            .map_err(map_uia_error)?;
+        chromium_renderer_accessibility_nodes_from_root(automation, &root, depth, max_nodes)
+    })
+}
+
+fn chromium_renderer_accessibility_nodes_from_root(
+    automation: &UIAutomation,
+    root: &UIElement,
+    depth: u32,
+    max_nodes: usize,
+) -> A11yResult<Vec<AccessibleNode>> {
+    let class_name = root.get_classname().unwrap_or_default();
+    if !is_chromium_widget_window_class(&class_name) {
+        return Ok(Vec::new());
+    }
+
+    let root_cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Raw)?;
+    let cached_root = root
+        .build_updated_cache(&root_cache)
+        .map_err(map_uia_error)?;
+    let root_hwnd = cached_hwnd(&cached_root).unwrap_or(0);
+    let root_id = element_id_from_cached_element(&cached_root, root_hwnd)?;
+    let root_rect = cached_rect(&cached_root);
+
+    let cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Raw)?;
+    let content_condition = automation
+        .create_property_condition(UIProperty::IsContentElement, Variant::from(true), None)
+        .map_err(map_uia_error)?;
+    let elements = root
+        .find_all_build_cache(TreeScope::Subtree, &content_condition, &cache)
+        .map_err(map_uia_error)?;
+
+    let mut nodes = Vec::new();
+    let mut seen = HashSet::new();
+    let node_depth = depth.max(1);
+    for element in elements {
+        if nodes.len() >= max_nodes {
+            break;
+        }
+        let node = match node_from_cached_element(
+            &element,
+            Some(root_id.clone()),
+            node_depth,
+            root_hwnd,
+            0,
+        ) {
+            Ok(node) => node,
+            Err(error) => {
+                tracing::warn!(
+                    code = "A11Y_CHROMIUM_RENDERER_SUPPLEMENT_NODE_FAILED",
+                    error = %error,
+                    element_name = %element.get_cached_name().unwrap_or_default(),
+                    element_class = %element.get_cached_classname().unwrap_or_default(),
+                    control_type = ?element.get_cached_control_type().ok(),
+                    automation_id = %element.get_cached_automation_id().unwrap_or_default(),
+                    process_id = element.get_cached_process_id().unwrap_or(-1),
+                    "Chromium renderer UIA supplement node read failed; node omitted"
+                );
+                continue;
+            }
+        };
+        if is_chromium_renderer_content_node(&node, root_rect)
+            && seen.insert(node.element_id.clone())
+        {
+            nodes.push(node);
+        }
+    }
+    Ok(nodes)
 }
 
 fn find_by_name_and_pattern_from_root(
@@ -602,6 +687,66 @@ fn should_supplement_raw_pattern_nodes(root_name: Option<&str>) -> bool {
         return false;
     };
     root_name == "Notepad" || root_name.ends_with(" - Notepad")
+}
+
+fn is_chromium_widget_window_class(class_name: &str) -> bool {
+    class_name.starts_with("Chrome_WidgetWin_")
+}
+
+fn is_chromium_renderer_content_node(node: &AccessibleNode, root_rect: synapse_core::Rect) -> bool {
+    if node.bbox.w <= 0 || node.bbox.h <= 0 {
+        return false;
+    }
+    if node.bbox.y < chromium_renderer_content_top(root_rect) {
+        return false;
+    }
+    if node
+        .automation_id
+        .as_deref()
+        .is_some_and(|automation_id| automation_id.starts_with("view_"))
+    {
+        return false;
+    }
+
+    let role = node.role.to_ascii_lowercase();
+    let content_role = matches!(
+        role.as_str(),
+        "button"
+            | "check box"
+            | "combo box"
+            | "document"
+            | "edit"
+            | "group"
+            | "heading"
+            | "hyperlink"
+            | "image"
+            | "link"
+            | "list"
+            | "list item"
+            | "pane"
+            | "radio button"
+            | "table"
+            | "text"
+    );
+    if !content_role {
+        return false;
+    }
+    role == "document"
+        || !node.name.trim().is_empty()
+        || node
+            .value
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || !node.patterns.is_empty()
+}
+
+fn chromium_renderer_content_top(root_rect: synapse_core::Rect) -> i32 {
+    if root_rect.h <= 240 {
+        return root_rect.y;
+    }
+    root_rect
+        .y
+        .saturating_add(CHROMIUM_RENDERER_CONTENT_TOP_INSET_PX.min(root_rect.h / 3))
 }
 
 fn node_from_cached_element(

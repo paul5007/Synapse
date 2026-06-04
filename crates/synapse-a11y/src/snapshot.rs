@@ -116,3 +116,18 @@ pub fn find_by_name_and_pattern_in_window(
 ) -> A11yResult<Option<AccessibleNode>> {
     platform::find_by_name_and_pattern_in_window(hwnd, name.into(), pattern, scope)
 }
+
+/// Returns Chromium renderer UIA nodes that UIA raw child walking can omit even
+/// after `--force-renderer-accessibility` activates the renderer tree.
+///
+/// # Errors
+///
+/// Returns a structured UIA error for OS failures, or `A11Y_NOT_AVAILABLE` on
+/// non-Windows platforms.
+pub fn chromium_renderer_accessibility_nodes_from_window(
+    hwnd: i64,
+    depth: u32,
+    max_nodes: usize,
+) -> A11yResult<Vec<AccessibleNode>> {
+    platform::chromium_renderer_accessibility_nodes_from_window(hwnd, depth, max_nodes)
+}
