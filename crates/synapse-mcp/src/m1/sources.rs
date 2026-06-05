@@ -102,6 +102,7 @@ pub fn synthetic_notepad_input() -> ObservationInput {
         mode_override: None,
         capture_config: None,
         capture_runtime: None,
+        input_backends: None,
         cdp: None,
         web_path: None,
     }
@@ -933,6 +934,7 @@ fn input_from_tree_and_foreground(
     let mut input = ObservationInput::new(foreground);
     input.focused = focused;
     input.elements = tree.nodes;
+    supplement_focused_element(&mut input);
     input.a11y_status = SensorStatus::Healthy;
     populate_cdp_diagnostics(&mut input);
     supplement_chromium_renderer_accessibility(&mut input, snapshot_depth);
@@ -945,6 +947,28 @@ fn input_from_tree_and_foreground(
         input.mode_override = Some(mode);
     }
     Ok(input)
+}
+
+#[cfg(windows)]
+fn supplement_focused_element(input: &mut ObservationInput) {
+    let Ok(mut focused_node) = synapse_a11y::focused_element_node() else {
+        return;
+    };
+    let Ok(parts) = focused_node.element_id.parts() else {
+        return;
+    };
+    if parts.hwnd != input.foreground.hwnd {
+        return;
+    }
+    rebase_nodes_to_foreground(std::slice::from_mut(&mut focused_node), &input.foreground);
+    input.focused = Some(focused_from_node(&focused_node));
+    if !input
+        .elements
+        .iter()
+        .any(|node| node.element_id == focused_node.element_id)
+    {
+        input.elements.push(focused_node);
+    }
 }
 
 #[cfg(windows)]
@@ -1243,7 +1267,7 @@ fn focused_from_node(node: &AccessibleNode) -> FocusedElement {
         bbox: node.bbox,
         enabled: node.enabled,
         patterns: node.patterns.clone(),
-        value: None,
+        value: node.value.clone(),
         selected_text: None,
     }
 }

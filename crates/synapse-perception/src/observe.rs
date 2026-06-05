@@ -8,8 +8,8 @@ use chrono::Utc;
 use synapse_core::{
     AccessibleNode, AudioContext, CaptureRuntimeReadback, CdpDiagnostics, ClipboardSummary,
     DetectedEntity, EventSummary, FocusedElement, ForegroundContext, FsEvent, HudReadings,
-    Observation, ObservationCaptureConfig, ObservationDiagnostics, ObservationElementsPage,
-    PerceptionMode, SensorStatus, WebPerceptionPath,
+    InputBackendDiagnostics, Observation, ObservationCaptureConfig, ObservationDiagnostics,
+    ObservationElementsPage, PerceptionMode, SensorStatus, WebPerceptionPath,
 };
 
 use crate::{PerceptionError, PerceptionResult};
@@ -125,6 +125,7 @@ pub struct ObservationInput {
     pub mode_override: Option<PerceptionMode>,
     pub capture_config: Option<ObservationCaptureConfig>,
     pub capture_runtime: Option<CaptureRuntimeReadback>,
+    pub input_backends: Option<InputBackendDiagnostics>,
     /// CDP probe/attach outcome for the foreground (Chromium-family only).
     /// Threaded into [`ObservationDiagnostics::cdp`] by [`assemble`].
     pub cdp: Option<CdpDiagnostics>,
@@ -154,6 +155,7 @@ impl ObservationInput {
             mode_override: None,
             capture_config: None,
             capture_runtime: None,
+            input_backends: None,
             cdp: None,
             web_path: None,
         }
@@ -239,6 +241,7 @@ impl ObservationAssembler {
                 audio_status: input.audio_status,
                 capture_config: input.capture_config,
                 capture_runtime: input.capture_runtime,
+                input_backends: input.input_backends,
                 cdp,
                 web_path,
                 elements_truncated,

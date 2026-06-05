@@ -25,9 +25,9 @@ use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode
 pub use detection::populate_detection_from_state;
 use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_config};
 #[cfg(windows)]
-pub use ocr::read_text_request_from_bgra;
-#[cfg(windows)]
 pub use ocr::ocr_result_from_web_bitmap;
+#[cfg(windows)]
+pub use ocr::read_text_request_from_bgra;
 pub use ocr::{ResolvedReadTextRequest, read_text_request_uncached, resolve_read_text_request};
 use search::{element_match, entity_match};
 pub use sources::{FsRecentTracker, populate_clipboard_summary, populate_fs_recent};
@@ -1470,6 +1470,8 @@ mod tests {
             process_name: "chrome.exe".to_owned(),
             status: CdpStatus::Ok,
             endpoint: Some("http://127.0.0.1:9222".to_owned()),
+            checked_ports: vec![9222],
+            checked_endpoints: vec!["http://127.0.0.1:9222".to_owned()],
             reason_code: None,
             detail: None,
             capabilities: Vec::new(),

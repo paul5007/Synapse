@@ -105,6 +105,16 @@ pub struct CdpDiagnostics {
     /// Reachable/attached endpoint (`http://127.0.0.1:<port>`), when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Loopback ports Synapse checked while trying to attach to the foreground
+    /// browser. Present for Chromium-family foregrounds so an unreachable CDP
+    /// result is actionable instead of a generic "no port" claim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checked_ports: Vec<u16>,
+    /// Loopback HTTP endpoints derived from [`checked_ports`]. These are safe
+    /// to surface because they contain only localhost ports, not page URLs,
+    /// cookies, titles, or account data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checked_endpoints: Vec<String>,
     /// Machine-readable reason code for non-`ok` statuses
     /// (`A11Y_CDP_UNREACHABLE`, `A11Y_CDP_ATTACH_FAILED`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +138,8 @@ impl CdpDiagnostics {
             process_name: process_name.into(),
             status: CdpStatus::NotChromium,
             endpoint: None,
+            checked_ports: Vec::new(),
+            checked_endpoints: Vec::new(),
             reason_code: None,
             detail: None,
             capabilities: Vec::new(),
@@ -142,8 +154,36 @@ impl CdpDiagnostics {
             process_name: process_name.into(),
             status: CdpStatus::Unreachable,
             endpoint: None,
+            checked_ports: Vec::new(),
+            checked_endpoints: Vec::new(),
             reason_code: Some(reason_code.into()),
             detail: None,
+            capabilities: Vec::new(),
+            attached_node_count: None,
+        }
+    }
+
+    /// Chromium-family but no reachable debug port, with explicit probe
+    /// evidence.
+    #[must_use]
+    pub fn unreachable_with_probe(
+        process_name: impl Into<String>,
+        reason_code: impl Into<String>,
+        checked_ports: Vec<u16>,
+        detail: impl Into<String>,
+    ) -> Self {
+        let checked_endpoints = checked_ports
+            .iter()
+            .map(|port| format!("http://127.0.0.1:{port}"))
+            .collect();
+        Self {
+            process_name: process_name.into(),
+            status: CdpStatus::Unreachable,
+            endpoint: None,
+            checked_ports,
+            checked_endpoints,
+            reason_code: Some(reason_code.into()),
+            detail: Some(detail.into()),
             capabilities: Vec::new(),
             attached_node_count: None,
         }

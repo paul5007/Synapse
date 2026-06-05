@@ -32,7 +32,7 @@ fn stroke_planner_duration_and_speed_keep_tick_count_and_monotonic_time() {
     );
     assert_eq!(duration_plan.samples, speed_plan.samples);
     assert_eq!(duration_plan.samples.len(), 5);
-    assert_eq!(duration_plan.duration_ms, 4.0);
+    assert!((duration_plan.duration_ms - 4.0).abs() < f64::EPSILON);
     assert!(monotonic_elapsed(&duration_plan.samples));
     assert_eq!(duration_plan.samples[0].point, PathPoint::new(0.0, 0.0));
     assert_eq!(duration_plan.samples[4].point, PathPoint::new(4.0, 0.0));
@@ -345,7 +345,7 @@ fn recording_backend_invalid_stroke_does_not_mutate_events() {
     assert!(emit_state.snapshot().held_buttons.is_empty());
 }
 
-fn line_path(x0: f64, y0: f64, x1: f64, y1: f64) -> PathSpec {
+const fn line_path(x0: f64, y0: f64, x1: f64, y1: f64) -> PathSpec {
     PathSpec::Line {
         from: PathPoint::new(x0, y0),
         to: PathPoint::new(x1, y1),

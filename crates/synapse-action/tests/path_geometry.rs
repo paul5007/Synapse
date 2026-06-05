@@ -148,7 +148,7 @@ fn catmull_rom_passes_through_waypoints_and_closes() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn degenerate_and_invalid_inputs_return_errors() {
+fn degenerate_segments_return_errors() {
     let same_line = PathSpec::Line {
         from: point(1.0, 1.0),
         to: point(1.0, 1.0),
@@ -160,41 +160,6 @@ fn degenerate_and_invalid_inputs_return_errors() {
     assert!(matches!(
         same_line_after,
         Err(PathError::DegenerateSegment {
-            kind: "line",
-            index: 0
-        })
-    ));
-
-    let bad_arc = PathSpec::Arc {
-        center: point(0.0, 0.0),
-        radius: 0.0,
-        start_angle_rad: 0.0,
-        sweep_angle_rad: 1.0,
-    };
-    let bad_arc_after = SpatialPath::new(&bad_arc);
-    println!(
-        "readback=path_geometry edge=non_positive_radius before=radius:0 after={bad_arc_after:?} expected=non_positive_parameter"
-    );
-    assert!(matches!(
-        bad_arc_after,
-        Err(PathError::NonPositiveParameter {
-            kind: "arc",
-            field: "radius",
-            value: 0.0
-        })
-    ));
-
-    let non_finite = PathSpec::Line {
-        from: point(f64::NAN, 0.0),
-        to: point(1.0, 1.0),
-    };
-    let non_finite_after = SpatialPath::new(&non_finite);
-    println!(
-        "readback=path_geometry edge=non_finite_point before=from:(NaN,0),to:(1,1) after={non_finite_after:?} expected=non_finite_point"
-    );
-    assert!(matches!(
-        non_finite_after,
-        Err(PathError::NonFinitePoint {
             kind: "line",
             index: 0
         })
@@ -229,6 +194,44 @@ fn degenerate_and_invalid_inputs_return_errors() {
         duplicate_after,
         Err(PathError::DegenerateSegment {
             kind: "polyline",
+            index: 0
+        })
+    ));
+}
+
+#[test]
+fn invalid_parameters_return_errors() {
+    let bad_arc = PathSpec::Arc {
+        center: point(0.0, 0.0),
+        radius: 0.0,
+        start_angle_rad: 0.0,
+        sweep_angle_rad: 1.0,
+    };
+    let bad_arc_after = SpatialPath::new(&bad_arc);
+    println!(
+        "readback=path_geometry edge=non_positive_radius before=radius:0 after={bad_arc_after:?} expected=non_positive_parameter"
+    );
+    assert!(matches!(
+        bad_arc_after,
+        Err(PathError::NonPositiveParameter {
+            kind: "arc",
+            field: "radius",
+            value: 0.0
+        })
+    ));
+
+    let non_finite = PathSpec::Line {
+        from: point(f64::NAN, 0.0),
+        to: point(1.0, 1.0),
+    };
+    let non_finite_after = SpatialPath::new(&non_finite);
+    println!(
+        "readback=path_geometry edge=non_finite_point before=from:(NaN,0),to:(1,1) after={non_finite_after:?} expected=non_finite_point"
+    );
+    assert!(matches!(
+        non_finite_after,
+        Err(PathError::NonFinitePoint {
+            kind: "line",
             index: 0
         })
     ));
@@ -267,7 +270,7 @@ fn degenerate_and_invalid_inputs_return_errors() {
     ));
 }
 
-fn point(x: f64, y: f64) -> PathPoint {
+const fn point(x: f64, y: f64) -> PathPoint {
     PathPoint { x, y }
 }
 

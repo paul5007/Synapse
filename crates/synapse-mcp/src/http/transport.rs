@@ -754,7 +754,7 @@ mod tests {
     async fn synapse_mcp_session_store_round_trips_exact_keys_and_deletes() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let db = Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
-        let store = SynapseMcpSessionStore::new(Arc::clone(&db), Some(Duration::from_secs(300)));
+        let store = SynapseMcpSessionStore::new(Arc::clone(&db), Some(Duration::from_mins(5)));
 
         assert!(
             store
@@ -857,7 +857,7 @@ mod tests {
     async fn synapse_mcp_session_store_deletes_legacy_rows_without_ttl() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let db = Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
-        let store = SynapseMcpSessionStore::new(Arc::clone(&db), Some(Duration::from_secs(300)));
+        let store = SynapseMcpSessionStore::new(Arc::clone(&db), Some(Duration::from_mins(5)));
         let key = mcp_session_store_key("legacy-session");
         let legacy_state = test_session_state("legacy-test");
         let legacy_encoded = synapse_storage::encode_json(&legacy_state)?;

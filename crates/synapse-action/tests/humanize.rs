@@ -134,7 +134,7 @@ fn base_timed_path() -> Vec<TimedPathPoint> {
     ]
 }
 
-fn timed(elapsed_ms: f64, arclen: f64, x: f64, y: f64) -> TimedPathPoint {
+const fn timed(elapsed_ms: f64, arclen: f64, x: f64, y: f64) -> TimedPathPoint {
     TimedPathPoint {
         elapsed_ms,
         arclen,

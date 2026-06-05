@@ -31,11 +31,16 @@ Browser observations carry diagnostics so agents can tell the difference between
 
 - `diagnostics.cdp.status = "ok"`: a CDP endpoint is reachable. After the DOM
   attach succeeds, `diagnostics.web_path = "cdp"` and page nodes should appear in
-  `elements`.
+  `elements`. `diagnostics.cdp.checked_ports` and
+  `diagnostics.cdp.checked_endpoints` show the loopback probes that led to the
+  reachable endpoint.
 - `diagnostics.cdp.status = "A11Y_CDP_UNREACHABLE"` with matching
   `reason_code = "A11Y_CDP_UNREACHABLE"`: the foreground process is Chromium
-  family, but no probed debug port accepted a connection. Synapse then attempts
-  OCR over tiled browser content. If readable text is found,
+  family, but no probed debug port accepted a connection. The diagnostics
+  include the exact localhost ports/endpoints checked and a detail string that
+  says an existing-browser attach requires remote debugging to be enabled for
+  that running browser instance. Synapse then attempts OCR over tiled browser
+  content. If readable text is found,
   `diagnostics.web_path = "ocr"` and OCR text nodes appear in `elements`; if OCR
   has no usable text or capture is unavailable, `web_path` remains `uia_only`.
 - CDP attach errors use the same diagnostics object with
@@ -71,18 +76,31 @@ primary browser profile.
 
 ## Already-Running User Browsers
 
-Synapse cannot turn CDP on inside an already-running Chrome/Edge process that
-was launched without a remote-debugging port. For an existing authenticated
+Prefer the already-running authenticated browser when the workflow depends on
+that user's cookies, tabs, extensions, or site state. Synapse attaches to that
+session when the browser exposes a reachable CDP endpoint; it does not need a
+separate automation profile in that case.
+
+Synapse cannot turn a loopback CDP socket on from outside an already-running
+Chrome/Edge process that was launched without remote debugging or without the
+browser's own local remote-debugging consent. For an existing authenticated
 browser session, the supported attach path is:
 
 1. Read `observe.diagnostics.cdp`.
-2. If it is `A11Y_CDP_UNREACHABLE`, verify whether that browser was already
-   launched with a debug port.
-3. If it was, set `SYNAPSE_CDP_PORTS` to that port before starting the daemon
-   or launch the daemon with that environment so `observe`/`find` can probe it.
-4. If it was not, relaunch the browser with an explicit debug port and a
-   non-default `--user-data-dir`, or use Synapse `act_launch` so the automation
-   profile and debug port are created together.
+2. If it is `ok`, use `diagnostics.cdp.endpoint` and require
+   `diagnostics.web_path = "cdp"` after attach before assuming DOM access.
+3. If it is `A11Y_CDP_UNREACHABLE`, read
+   `diagnostics.cdp.checked_ports`, `checked_endpoints`, and `detail`; those are
+   the actual endpoints Synapse checked.
+4. If the existing browser has a known remote-debugging port not listed there,
+   set `SYNAPSE_CDP_PORTS` to include that port and restart only the Synapse
+   daemon, not the browser.
+5. If Chrome's own UI supports enabling remote debugging for the running
+   browser, enable it from that browser session, then re-run `observe`.
+6. If the current browser session still exposes no endpoint, fail closed with
+   `web_path = "uia_only"` or `ocr`; do not claim DOM/control readback. Relaunch
+   is a user/session decision because it changes the authenticated browser
+   process.
 
 Do not treat a fresh automation profile as equivalent to the user's primary
 profile when cookies/session state matter. Also do not silently fall back to
@@ -107,21 +125,25 @@ UIA fallback matters.
 
 ## Agent Workflow
 
-For browser work, prefer this loop:
+For browser work in an existing authenticated Chrome session, prefer this loop:
 
-1. Call `act_launch` with a Chromium-family target and the page URL as an arg.
-2. Read the process/window state and the returned `cdp_debug_port` /
-   `cdp_endpoint`.
-3. Call `observe` with `include = ["focused", "elements", "diagnostics"]`.
-4. Require `diagnostics.cdp.status = "ok"` and `diagnostics.web_path = "cdp"`
+1. Bring the existing Chrome tab/window to foreground using ordinary user-level
+   navigation; do not launch a second Chrome when session state matters.
+2. Call `observe` with `include = ["focused", "elements", "diagnostics"]`.
+3. Require `diagnostics.cdp.status = "ok"` and `diagnostics.web_path = "cdp"`
    before assuming page DOM nodes are present.
-5. Call `find` with a role/name query, such as `role = "button"` and
+4. Call `find` with a role/name query, such as `role = "button"` and
    `name_substring = "Apply"`.
-6. Use the returned CDP-backed `element_id` with `act_click`, `act_type`, or
-   `act_stroke`.
-7. Read the separate source of truth after the action: page text/DOM state,
+5. Use the returned CDP-backed `element_id` with `act_click`, `act_type`, or
+   `act_stroke`. For fragile browser controls, set `act_click.verify_delta =
+   true` so Synapse fails closed with `ACTION_NO_OBSERVED_DELTA` when no
+   focused/UI/pixel state change is observed.
+6. Read the separate source of truth after the action: page text/DOM state,
    visible UI state, downloaded file bytes, server-side record, or the Synapse
    audit row that should have changed.
+
+For a disposable automation browser where login/session state does not matter,
+`act_launch` remains the simplest way to create a dedicated CDP-enabled profile.
 
 If `observe` reports `A11Y_CDP_UNREACHABLE` and `web_path = "ocr"`, text can be
 searched but DOM-only controls still need a CDP-backed browser launch. If

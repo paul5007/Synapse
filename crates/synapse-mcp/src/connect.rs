@@ -64,7 +64,7 @@ fn install_parent_watchdog() -> anyhow::Result<()> {
                 parent.pid,
                 parent.name
             );
-        };
+        }
         verify_parent_watchdog_handle(parent.pid)?;
         let parent_pid = parent.pid;
         std::thread::spawn(move || {

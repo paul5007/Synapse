@@ -152,7 +152,7 @@ fn arclen_invalid_edges_return_explicit_errors() {
     ));
 }
 
-fn point(x: f64, y: f64) -> PathPoint {
+const fn point(x: f64, y: f64) -> PathPoint {
     PathPoint::new(x, y)
 }
 

@@ -354,6 +354,13 @@ impl SynapseService {
         let started = Instant::now();
         let panic_epoch = synapse_action::operator_release_epoch();
         let started_level = self.read_level();
+        let ctx = AutocombatLoopContext {
+            policy,
+            profile,
+            panic_epoch,
+            run_started: started,
+            action_session_id,
+        };
         let mut state = LoopState::default();
         let mut stop = StopReason::MaxIterations;
         for index in 0..policy.max_iterations {
@@ -363,17 +370,7 @@ impl SynapseService {
                     .await;
                 break;
             }
-            let iteration = self
-                .run_engagement(
-                    index,
-                    policy,
-                    profile,
-                    panic_epoch,
-                    started,
-                    &mut state,
-                    action_session_id,
-                )
-                .await?;
+            let iteration = self.run_engagement(index, &ctx, &mut state).await?;
             let outcome = iteration.outcome.clone();
             state.iterations.push(iteration);
             if outcome == EngagementOutcome::OperatorPanic.as_str() {
@@ -459,13 +456,14 @@ impl SynapseService {
     async fn run_engagement(
         &self,
         index: u32,
-        policy: &Policy,
-        profile: &Profile,
-        panic_epoch: u64,
-        run_started: Instant,
+        ctx: &AutocombatLoopContext<'_>,
         state: &mut LoopState,
-        action_session_id: Option<&str>,
     ) -> Result<ActAutocombatIteration, ErrorData> {
+        let policy = ctx.policy;
+        let profile = ctx.profile;
+        let panic_epoch = ctx.panic_epoch;
+        let run_started = ctx.run_started;
+        let action_session_id = ctx.action_session_id;
         let log_path = self.autocombat_log_path()?;
 
         // If we are already trading blows with a living mob, skip the fresh
@@ -808,6 +806,16 @@ impl SynapseService {
         drop(runtime);
         result
     }
+}
+
+/// Shared immutable state for one bounded autocombat loop.
+#[derive(Clone, Copy)]
+struct AutocombatLoopContext<'a> {
+    policy: &'a Policy,
+    profile: &'a Profile,
+    panic_epoch: u64,
+    run_started: Instant,
+    action_session_id: Option<&'a str>,
 }
 
 /// Per-engagement timing/log context for the sustained fight loop.

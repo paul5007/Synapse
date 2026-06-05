@@ -10,6 +10,7 @@ use uiautomation::{
     },
     variants::Variant,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::{A11yError, A11yResult, ElementSearchScope};
 
@@ -124,7 +125,10 @@ pub fn focused_element_node() -> A11yResult<AccessibleNode> {
         let element = automation
             .get_focused_element_build_cache(&cache)
             .map_err(map_uia_error)?;
-        let root_hwnd = cached_hwnd(&element).unwrap_or(0);
+        let foreground_hwnd = unsafe { GetForegroundWindow() };
+        let root_hwnd = cached_hwnd(&element)
+            .filter(|value| *value != 0)
+            .unwrap_or(foreground_hwnd.0 as isize as i64);
         node_from_cached_element(&element, None, 0, root_hwnd, 0)
     })
 }

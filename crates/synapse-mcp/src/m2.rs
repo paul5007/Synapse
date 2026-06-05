@@ -21,7 +21,7 @@ use synapse_action::{
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-pub use click::{ActClickParams, ActClickResponse, act_click_with_handle};
+pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, act_click_with_handle};
 #[cfg(test)]
 pub use clipboard::ActClipboardFormat;
 pub use clipboard::{ActClipboardParams, ActClipboardResponse, ActClipboardVerb, act_clipboard};

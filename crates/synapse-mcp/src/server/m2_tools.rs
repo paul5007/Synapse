@@ -10,16 +10,17 @@ use super::{
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
 use crate::m1::mcp_error;
-use crate::m2::{act_stroke_error_details, act_stroke_request_details};
+use crate::m2::{ActClickPostcondition, act_stroke_error_details, act_stroke_request_details};
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 use synapse_action::{ACTION_QUEUE_CAPACITY, ActionError, ResolvedBackend, TokenBucketSnapshot};
 use synapse_core::{
-    Action, Backend, ForegroundContext, PathPoint, PathSpec, Point, StrokeMotionModel,
-    StrokeTiming, VelocityProfile, error_codes,
+    AccessibleNode, Action, Backend, ForegroundContext, PathPoint, PathSpec, Point, Rect,
+    StrokeMotionModel, StrokeTiming, VelocityProfile, error_codes,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -126,9 +127,37 @@ impl SynapseService {
             self.audit_action_result("act_click", &result)?;
             return result.map(Json);
         }
+        let before_delta_signature = if params.verify_delta {
+            match self.capture_click_delta_signature(160).await {
+                Ok(signature) => Some(signature),
+                Err(error) => {
+                    let result: Result<ActClickResponse, ErrorData> = Err(error);
+                    self.audit_action_result("act_click", &result)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
+        let verify_timeout_ms = params.verify_timeout_ms;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
-        let result = act_click_with_handle(handle, recording, params).await;
+        let result = match act_click_with_handle(handle, recording, params).await {
+            Ok(mut response) => {
+                if let Some(before) = before_delta_signature {
+                    match self.verify_click_delta(before, verify_timeout_ms).await {
+                        Ok(postcondition) => {
+                            response.postcondition = postcondition;
+                            Ok(response)
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Ok(response)
+                }
+            }
+            Err(error) => Err(error),
+        };
         self.audit_action_result("act_click", &result)?;
         result.map(Json)
     }
@@ -611,6 +640,226 @@ impl SynapseService {
         self.audit_action_result_best_effort("release_all", &result);
         result.map(Json)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClickDeltaSignature {
+    foreground_hwnd: i64,
+    foreground_pid: u32,
+    foreground_process: String,
+    foreground_title_sha256: Option<String>,
+    focused_element_id: Option<String>,
+    focused_role: Option<String>,
+    focused_name_sha256: Option<String>,
+    focused_value_sha256: Option<String>,
+    focused_bbox: Option<Rect>,
+    element_count: usize,
+    elements_sha256: String,
+    cdp_status: Option<String>,
+    cdp_endpoint_present: bool,
+    web_path: Option<String>,
+    pixel: ClickPixelSignature,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClickPixelSignature {
+    status: String,
+    region: Rect,
+    bitmap_sha256: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClickElementFingerprint {
+    element_id: String,
+    role: String,
+    automation_id: Option<String>,
+    name_sha256: Option<String>,
+    value_sha256: Option<String>,
+    bbox: Rect,
+    enabled: bool,
+    focused: bool,
+}
+
+impl SynapseService {
+    async fn capture_click_delta_signature(
+        &self,
+        max_elements: usize,
+    ) -> Result<ClickDeltaSignature, ErrorData> {
+        let mut input = {
+            let state = self.m1_state()?;
+            crate::m1::current_input(&state, 6)?
+        };
+        crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
+        crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
+
+        let focused = input.focused.clone();
+        let elements_sha256 = elements_fingerprint_hash(&input.elements)?;
+        let pixel = capture_pixel_signature(input.foreground.window_bounds);
+        Ok(ClickDeltaSignature {
+            foreground_hwnd: input.foreground.hwnd,
+            foreground_pid: input.foreground.pid,
+            foreground_process: input.foreground.process_name,
+            foreground_title_sha256: non_empty_sha256(&input.foreground.window_title),
+            focused_element_id: focused.as_ref().map(|item| item.element_id.to_string()),
+            focused_role: focused.as_ref().map(|item| item.role.clone()),
+            focused_name_sha256: focused
+                .as_ref()
+                .and_then(|item| non_empty_sha256(&item.name)),
+            focused_value_sha256: focused
+                .as_ref()
+                .and_then(|item| item.value.as_deref())
+                .and_then(non_empty_sha256),
+            focused_bbox: focused.as_ref().map(|item| item.bbox),
+            element_count: input.elements.len(),
+            elements_sha256,
+            cdp_status: input.cdp.as_ref().map(|cdp| cdp.status.as_str().to_owned()),
+            cdp_endpoint_present: input.cdp.as_ref().is_some_and(|cdp| cdp.endpoint.is_some()),
+            web_path: input.web_path.map(|path| path.as_str().to_owned()),
+            pixel,
+        })
+    }
+
+    async fn verify_click_delta(
+        &self,
+        before: ClickDeltaSignature,
+        timeout_ms: u32,
+    ) -> Result<ActClickPostcondition, ErrorData> {
+        tokio::time::sleep(Duration::from_millis(u64::from(timeout_ms))).await;
+        let after = self.capture_click_delta_signature(160).await?;
+        let before_hash = signature_hash(&before)?;
+        let after_hash = signature_hash(&after)?;
+        if before == after {
+            return Err(no_observed_delta_error(
+                timeout_ms,
+                &before_hash,
+                &after_hash,
+                &before,
+                &after,
+            ));
+        }
+        Ok(ActClickPostcondition {
+            status: "observed_delta".to_owned(),
+            observed_delta: Some(true),
+            before_signature: Some(before_hash),
+            after_signature: Some(after_hash),
+            detail: Some(
+                "act_click verify_delta observed a changed focused/UI/pixel signature after delivery"
+                    .to_owned(),
+            ),
+        })
+    }
+}
+
+fn elements_fingerprint_hash(elements: &[AccessibleNode]) -> Result<String, ErrorData> {
+    let fingerprints: Vec<_> = elements
+        .iter()
+        .take(160)
+        .map(|node| ClickElementFingerprint {
+            element_id: node.element_id.to_string(),
+            role: node.role.clone(),
+            automation_id: node.automation_id.clone(),
+            name_sha256: non_empty_sha256(&node.name),
+            value_sha256: node.value.as_deref().and_then(non_empty_sha256),
+            bbox: node.bbox,
+            enabled: node.enabled,
+            focused: node.focused,
+        })
+        .collect();
+    hash_json(&fingerprints)
+}
+
+fn capture_pixel_signature(region: Rect) -> ClickPixelSignature {
+    if region.w <= 0 || region.h <= 0 {
+        return ClickPixelSignature {
+            status: "unavailable".to_owned(),
+            region,
+            bitmap_sha256: None,
+            detail: Some("foreground window bounds are empty".to_owned()),
+        };
+    }
+    match synapse_capture::screen_region_to_bgra_bitmap(region) {
+        Ok(bitmap) => {
+            let mut hasher = Sha256::new();
+            hasher.update(bitmap.width.to_le_bytes());
+            hasher.update(bitmap.height.to_le_bytes());
+            hasher.update(&bitmap.bytes);
+            ClickPixelSignature {
+                status: "ok".to_owned(),
+                region: bitmap.region,
+                bitmap_sha256: Some(hex_encode(&hasher.finalize())),
+                detail: Some(format!(
+                    "captured {}x{} BGRA bytes={}",
+                    bitmap.width,
+                    bitmap.height,
+                    bitmap.bytes.len()
+                )),
+            }
+        }
+        Err(error) => ClickPixelSignature {
+            status: "unavailable".to_owned(),
+            region,
+            bitmap_sha256: None,
+            detail: Some(error.to_string()),
+        },
+    }
+}
+
+fn signature_hash(signature: &ClickDeltaSignature) -> Result<String, ErrorData> {
+    hash_json(signature)
+}
+
+fn hash_json<T: Serialize>(value: &T) -> Result<String, ErrorData> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("failed to encode click delta signature: {error}"),
+        )
+    })?;
+    Ok(hex_encode(&Sha256::digest(bytes)))
+}
+
+fn non_empty_sha256(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| hex_encode(&Sha256::digest(trimmed.as_bytes())))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn no_observed_delta_error(
+    timeout_ms: u32,
+    before_hash: &str,
+    after_hash: &str,
+    before: &ClickDeltaSignature,
+    after: &ClickDeltaSignature,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act_click verify_delta observed no focused/UI/pixel state change within {timeout_ms} ms"
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_NO_OBSERVED_DELTA,
+            "verify_delta": {
+                "timeout_ms": timeout_ms,
+                "before_signature": before_hash,
+                "after_signature": after_hash,
+                "before": before,
+                "after": after,
+            }
+        })),
+    )
 }
 
 fn action_preflight_details(preflight: &ActionPreflightReadback) -> Value {

@@ -96,6 +96,7 @@ fn synthetic_notepad_input(mode_override: Option<PerceptionMode>) -> Observation
         mode_override,
         capture_config: None,
         capture_runtime: None,
+        input_backends: None,
         cdp: None,
         web_path: None,
     }

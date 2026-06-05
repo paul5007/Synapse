@@ -471,7 +471,9 @@ fn decode_png_to_bgra(png_bytes: &[u8]) -> A11yResult<CdpNodeBitmap> {
         png::ColorType::Rgb => rgb8_to_bgra(pixels),
         other => {
             return Err(A11yError::CdpAxtreeFailed {
-                detail: format!("unexpected screenshot PNG color type {other:?}; expected RGB/RGBA"),
+                detail: format!(
+                    "unexpected screenshot PNG color type {other:?}; expected RGB/RGBA"
+                ),
             });
         }
     };

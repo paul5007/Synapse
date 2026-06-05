@@ -107,7 +107,7 @@ fn element_query_score(node: &AccessibleNode, query: &str) -> Option<f32> {
 
     let coverage = matched as f32 / terms.len() as f32;
     let density = matched.min(3) as f32 / 3.0;
-    Some(0.35 * coverage + 0.15 * density)
+    Some(0.35f32.mul_add(coverage, 0.15 * density))
 }
 
 fn query_terms(query: &str) -> Vec<String> {

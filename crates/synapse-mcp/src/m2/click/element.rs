@@ -26,7 +26,9 @@ use windows::{
 
 use super::{
     action_error_to_mcp, backend_used_name, record,
-    schema::{ActClickElementTarget, ActClickParams, ActClickResponse},
+    schema::{
+        ActClickElementTarget, ActClickParams, ActClickResponse, postcondition_not_requested,
+    },
 };
 
 pub(super) async fn execute_element_click(
@@ -57,6 +59,7 @@ pub(super) async fn execute_element_click(
             ok: true,
             used_invoke_pattern: false,
             backend_used,
+            postcondition: postcondition_not_requested(),
             press_hold_ms: params.hold_ms,
             double_click_window_ms: timing.window_ms,
             inter_click_delay_ms: timing.inter_click_delay_ms,
@@ -110,6 +113,7 @@ pub(super) async fn execute_element_click(
         ok: true,
         used_invoke_pattern,
         backend_used: backend_used.to_owned(),
+        postcondition: postcondition_not_requested(),
         press_hold_ms: params.hold_ms,
         double_click_window_ms: timing.window_ms,
         inter_click_delay_ms: timing.inter_click_delay_ms,
@@ -514,7 +518,7 @@ mod tests {
     use super::*;
     use crate::m2::click::schema::{
         ActClickTarget, ClickVelocityProfile, default_click_button, default_click_duration_ms,
-        default_click_hold_ms,
+        default_click_hold_ms, default_verify_timeout_ms,
     };
 
     #[test]
@@ -532,6 +536,8 @@ mod tests {
             hold_ms: default_click_hold_ms(),
             backend: Backend::Software,
             use_invoke_pattern: false,
+            verify_delta: false,
+            verify_timeout_ms: default_verify_timeout_ms(),
             deprecated_curve_alias_used: false,
         };
         let screen_point = Point { x: 320, y: 240 };

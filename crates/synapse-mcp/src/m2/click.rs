@@ -13,7 +13,7 @@ mod schema;
 mod tests;
 
 use schema::ActClickTarget;
-pub use schema::{ActClickParams, ActClickResponse};
+pub use schema::{ActClickParams, ActClickPostcondition, ActClickResponse};
 
 const MAX_CLICK_HOLD_MS: u32 = 30_000;
 
@@ -79,6 +79,7 @@ pub async fn act_click_with_handle(
         ok: true,
         used_invoke_pattern: false,
         backend_used: backend_used_name(params.backend).to_owned(),
+        postcondition: schema::postcondition_not_requested(),
         press_hold_ms: params.hold_ms,
         double_click_window_ms: double_click_timing.window_ms,
         inter_click_delay_ms: double_click_timing.inter_click_delay_ms,
@@ -149,6 +150,7 @@ async fn execute_cdp_click(
         ok: true,
         used_invoke_pattern: false,
         backend_used: "cdp".to_owned(),
+        postcondition: schema::postcondition_not_requested(),
         press_hold_ms: params.hold_ms,
         double_click_window_ms: double_click_timing.window_ms,
         inter_click_delay_ms: double_click_timing.inter_click_delay_ms,
@@ -185,6 +187,15 @@ fn validate_click_params(params: &ActClickParams) -> Result<(), ErrorData> {
                 params.hold_ms
             ),
         }));
+    }
+    if !(50..=5000).contains(&params.verify_timeout_ms) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_click verify_timeout_ms must be in 50..=5000, got {}",
+                params.verify_timeout_ms
+            ),
+        ));
     }
     if !params.modifiers.is_empty() {
         return Err(action_error_to_mcp(&ActionError::BackendUnavailable {

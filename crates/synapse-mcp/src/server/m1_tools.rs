@@ -22,7 +22,11 @@ use image::{GrayImage, Luma};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use sha2::{Digest as _, Sha256};
-use synapse_core::{HudFieldError, HudReadings, OcrResult, Profile, error_codes};
+use synapse_action::{BackendResolutionPolicy, ResolvedBackend, VigemBackend};
+use synapse_core::{
+    HudFieldError, HudReadings, InputBackendCapability, InputBackendDiagnostics, OcrResult,
+    Profile, error_codes,
+};
 use synapse_perception::ObservationAssembler;
 #[cfg(windows)]
 use synapse_storage::{cf, decode_json, encode_json};
@@ -87,6 +91,9 @@ impl SynapseService {
 
         if include.audio && input.audio == synapse_core::AudioContext::default() {
             populate_audio_summary(&self.m3_state, &mut input);
+        }
+        if include.diagnostics {
+            self.populate_input_backend_diagnostics(&mut input);
         }
         if include.clipboard && input.clipboard_summary.is_none() {
             populate_clipboard_summary(&mut input);
@@ -263,6 +270,29 @@ impl SynapseService {
                     error = %error,
                     "profile resolver failed for observed foreground"
                 );
+            }
+        }
+    }
+
+    fn populate_input_backend_diagnostics(&self, input: &mut synapse_perception::ObservationInput) {
+        let Ok(state) = self.m2_state.lock() else {
+            input.input_backends = Some(input_backend_diagnostics_from_error(
+                "m2_state_lock_poisoned",
+                error_codes::TOOL_INTERNAL_ERROR,
+                "M2 service state lock poisoned",
+            ));
+            return;
+        };
+        match state.backend_resolution_readback() {
+            Ok((source, policy)) => {
+                input.input_backends = Some(input_backend_diagnostics(&source, policy));
+            }
+            Err(error) => {
+                input.input_backends = Some(input_backend_diagnostics_from_error(
+                    "backend_resolution_unavailable",
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    error,
+                ));
             }
         }
     }
@@ -609,6 +639,146 @@ const fn ocr_backend_name(backend: OcrBackend) -> &'static str {
         OcrBackend::Winrt => "winrt",
         OcrBackend::Crnn => "crnn",
         OcrBackend::Auto => "auto",
+    }
+}
+
+fn input_backend_diagnostics(
+    source: &str,
+    policy: BackendResolutionPolicy,
+) -> InputBackendDiagnostics {
+    let vigem = vigem_capability();
+    InputBackendDiagnostics {
+        source: source.to_owned(),
+        mouse_default: policy.mouse_auto_backend().as_str().to_owned(),
+        keyboard_default: policy.keyboard_auto_backend().as_str().to_owned(),
+        pad_default: policy.pad_auto_backend().as_str().to_owned(),
+        release_all_default: policy.release_all_auto_backend().as_str().to_owned(),
+        mouse: vec![
+            available_backend(
+                ResolvedBackend::Software,
+                "software mouse input is available",
+            ),
+            unavailable_backend(
+                ResolvedBackend::Vigem,
+                error_codes::ACTION_BACKEND_UNAVAILABLE,
+                "backend=vigem reason=ViGEm is a gamepad backend and cannot emit mouse input",
+                false,
+            ),
+            hardware_unavailable("mouse"),
+        ],
+        keyboard: vec![
+            available_backend(
+                ResolvedBackend::Software,
+                "software keyboard input is available",
+            ),
+            unavailable_backend(
+                ResolvedBackend::Vigem,
+                error_codes::ACTION_BACKEND_UNAVAILABLE,
+                "backend=vigem reason=ViGEm is a gamepad backend and cannot emit keyboard input",
+                false,
+            ),
+            hardware_unavailable("keyboard"),
+        ],
+        pad: vec![
+            unavailable_backend(
+                ResolvedBackend::Software,
+                error_codes::ACTION_BACKEND_UNAVAILABLE,
+                "backend=software reason=software backend does not emit virtual gamepad reports",
+                false,
+            ),
+            vigem.clone(),
+            hardware_unavailable("pad"),
+        ],
+        release_all: vec![
+            available_backend(
+                ResolvedBackend::Software,
+                "software release_all is available for software-held input state",
+            ),
+            vigem,
+            hardware_unavailable("release_all"),
+        ],
+    }
+}
+
+fn input_backend_diagnostics_from_error(
+    source: &str,
+    reason_code: impl Into<String>,
+    reason: impl Into<String>,
+) -> InputBackendDiagnostics {
+    let capability = InputBackendCapability {
+        backend: "unknown".to_owned(),
+        available: false,
+        reason_code: Some(reason_code.into()),
+        reason: Some(reason.into()),
+        host_boundary: false,
+        transient: true,
+    };
+    InputBackendDiagnostics {
+        source: source.to_owned(),
+        mouse_default: "unknown".to_owned(),
+        keyboard_default: "unknown".to_owned(),
+        pad_default: "unknown".to_owned(),
+        release_all_default: "unknown".to_owned(),
+        mouse: vec![capability.clone()],
+        keyboard: vec![capability.clone()],
+        pad: vec![capability.clone()],
+        release_all: vec![capability],
+    }
+}
+
+fn available_backend(
+    backend: ResolvedBackend,
+    reason: impl Into<String>,
+) -> InputBackendCapability {
+    InputBackendCapability {
+        backend: backend.as_str().to_owned(),
+        available: true,
+        reason_code: None,
+        reason: Some(reason.into()),
+        host_boundary: false,
+        transient: false,
+    }
+}
+
+fn unavailable_backend(
+    backend: ResolvedBackend,
+    reason_code: impl Into<String>,
+    reason: impl Into<String>,
+    transient: bool,
+) -> InputBackendCapability {
+    InputBackendCapability {
+        backend: backend.as_str().to_owned(),
+        available: false,
+        reason_code: Some(reason_code.into()),
+        reason: Some(reason.into()),
+        host_boundary: true,
+        transient,
+    }
+}
+
+fn hardware_unavailable(class_name: &str) -> InputBackendCapability {
+    unavailable_backend(
+        ResolvedBackend::Hardware,
+        error_codes::ACTION_BACKEND_UNAVAILABLE,
+        format!(
+            "backend=hardware reason=hardware backend removed; use backend=software for keyboard/mouse or backend=vigem for gamepad action_class={class_name}"
+        ),
+        false,
+    )
+}
+
+fn vigem_capability() -> InputBackendCapability {
+    match VigemBackend::new().ensure_ready() {
+        Ok(()) => available_backend(
+            ResolvedBackend::Vigem,
+            "ViGEm virtual gamepad backend is available",
+        ),
+        Err(error) => unavailable_backend(
+            ResolvedBackend::Vigem,
+            error.code(),
+            error.to_string(),
+            false,
+        ),
     }
 }
 

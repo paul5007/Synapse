@@ -207,21 +207,21 @@ pub(super) fn mouse_stroke(
         return Err(error);
     }
 
-    if let Some(button) = button {
-        if let Err(error) = mouse_button(button, ButtonAction::Up, 0, state) {
-            let sample_index = plan.samples.len().checked_sub(1);
-            let requested_path_point =
-                sample_index.and_then(|index| plan.samples.get(index).map(|sample| sample.point));
-            let error = annotate_stroke_emit_error(error, "button_up", sample_index);
-            log_stroke_emit_error(
-                &context,
-                sample_index,
-                requested_path_point,
-                "button_up",
-                &error,
-            );
-            return Err(error);
-        }
+    if let Some(button) = button
+        && let Err(error) = mouse_button(button, ButtonAction::Up, 0, state)
+    {
+        let sample_index = plan.samples.len().checked_sub(1);
+        let requested_path_point =
+            sample_index.and_then(|index| plan.samples.get(index).map(|sample| sample.point));
+        let error = annotate_stroke_emit_error(error, "button_up", sample_index);
+        log_stroke_emit_error(
+            &context,
+            sample_index,
+            requested_path_point,
+            "button_up",
+            &error,
+        );
+        return Err(error);
     }
     Ok(())
 }

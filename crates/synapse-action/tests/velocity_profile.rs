@@ -27,8 +27,8 @@ fn same_path_profiles_keep_points_but_change_timestamps() -> Result<(), Box<dyn 
         "readback=velocity_profile edge=same_path_different_profiles before=line:(0,0)->(10,0),samples:6,duration:1000 after_linear_points={linear_points:?} after_minjerk_points={min_jerk_points:?} after_linear_times={linear_times:?} after_minjerk_times={min_jerk_times:?}"
     );
     assert_eq!(linear_points, min_jerk_points);
-    assert_ne!(linear_times[1], min_jerk_times[1]);
-    assert_ne!(linear_times[4], min_jerk_times[4]);
+    assert!((linear_times[1] - min_jerk_times[1]).abs() > EPSILON);
+    assert!((linear_times[4] - min_jerk_times[4]).abs() > EPSILON);
     assert_point(linear_points[2], 4.0, 0.0);
 
     Ok(())

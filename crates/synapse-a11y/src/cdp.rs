@@ -146,11 +146,21 @@ fn configured_ports() -> Vec<u16> {
 
 // === Probing ================================================================
 
-fn ok_diagnostics(process_name: &str, port: u16) -> CdpDiagnostics {
+fn endpoint_for_port(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+fn endpoints_for_ports(ports: &[u16]) -> Vec<String> {
+    ports.iter().map(|port| endpoint_for_port(*port)).collect()
+}
+
+fn ok_diagnostics(process_name: &str, port: u16, checked_ports: Vec<u16>) -> CdpDiagnostics {
     CdpDiagnostics {
         process_name: process_name.to_owned(),
         status: CdpStatus::Ok,
-        endpoint: Some(format!("http://127.0.0.1:{port}")),
+        endpoint: Some(endpoint_for_port(port)),
+        checked_endpoints: endpoints_for_ports(&checked_ports),
+        checked_ports,
         reason_code: None,
         detail: None,
         capabilities: cdp_capabilities(),
@@ -173,13 +183,20 @@ pub fn probe_chromium_cdp_blocking(
     if !is_chromium_family(process_name) {
         return CdpDiagnostics::not_chromium(process_name);
     }
+    let mut checked_ports = Vec::new();
     for port in ports {
+        checked_ports.push(*port);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port);
         if TcpStream::connect_timeout(&addr, connect_timeout).is_ok() {
-            return ok_diagnostics(process_name, *port);
+            return ok_diagnostics(process_name, *port, checked_ports);
         }
     }
-    CdpDiagnostics::unreachable(process_name, error_codes::A11Y_CDP_UNREACHABLE)
+    CdpDiagnostics::unreachable_with_probe(
+        process_name,
+        error_codes::A11Y_CDP_UNREACHABLE,
+        checked_ports,
+        "no reachable loopback CDP endpoint on checked ports; existing Chrome attach requires remote debugging to be enabled for that running browser instance",
+    )
 }
 
 /// Async CDP reachability probe (used by tests and the async attach path).
@@ -192,17 +209,24 @@ pub async fn probe_chromium_cdp(
         return CdpDiagnostics::not_chromium(process_name);
     }
 
+    let mut checked_ports = Vec::new();
     for port in ports {
+        checked_ports.push(*port);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port);
         if timeout(connect_timeout, TokioTcpStream::connect(addr))
             .await
             .is_ok_and(|result| result.is_ok())
         {
-            return ok_diagnostics(process_name, *port);
+            return ok_diagnostics(process_name, *port, checked_ports);
         }
     }
 
-    CdpDiagnostics::unreachable(process_name, error_codes::A11Y_CDP_UNREACHABLE)
+    CdpDiagnostics::unreachable_with_probe(
+        process_name,
+        error_codes::A11Y_CDP_UNREACHABLE,
+        checked_ports,
+        "no reachable loopback CDP endpoint on checked ports; existing Chrome attach requires remote debugging to be enabled for that running browser instance",
+    )
 }
 
 /// Resolves a reachable CDP endpoint for the browser window `hwnd`.

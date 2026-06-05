@@ -149,6 +149,8 @@ fn attached_cdp_surfaces_ok_status_and_dom_elements() {
         process_name: "chrome.exe".to_owned(),
         status: CdpStatus::Ok,
         endpoint: Some("http://127.0.0.1:9222".to_owned()),
+        checked_ports: vec![9222],
+        checked_endpoints: vec!["http://127.0.0.1:9222".to_owned()],
         reason_code: None,
         detail: None,
         capabilities: vec![CdpCapability::AccessibilityFullAxTree],

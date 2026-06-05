@@ -38,6 +38,10 @@ impl BackendRateLimitControl {
     }
 
     #[cfg(test)]
+    #[must_use]
+    /// # Panics
+    ///
+    /// Panics if the backend rate-limit state lock is poisoned in a test.
     pub fn snapshot(&self) -> BackendRateLimitSnapshot {
         match self.try_snapshot() {
             Ok(snapshot) => snapshot,
@@ -45,6 +49,10 @@ impl BackendRateLimitControl {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ActionError::BackendUnavailable`] if the backend rate-limit
+    /// state lock is poisoned.
     pub fn try_snapshot(&self) -> ActionResult<BackendRateLimitSnapshot> {
         self.inner
             .read()
@@ -54,6 +62,10 @@ impl BackendRateLimitControl {
             })
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ActionError::BackendUnavailable`] if the backend rate-limit
+    /// state lock is poisoned.
     pub fn override_backend(
         &self,
         backend: ResolvedBackend,
@@ -69,6 +81,10 @@ impl BackendRateLimitControl {
         Ok(rate_limits.replace_backend(backend, TokenBucket::new(capacity, refill_rate_per_s)))
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ActionError::BackendUnavailable`] if the backend rate-limit
+    /// state lock is poisoned.
     pub fn reset_backend(
         &self,
         backend: ResolvedBackend,
@@ -83,18 +99,19 @@ impl BackendRateLimitControl {
     }
 
     pub(super) fn consume(&self, backend: ResolvedBackend) -> ActionResult<()> {
-        let rate_limits = self
+        let Some(snapshot) = (match self
             .inner
             .read()
             .map_err(|_err| ActionError::BackendUnavailable {
                 detail: "backend rate limit lock poisoned".to_owned(),
-            })?;
-        let bucket = rate_limits.bucket(backend);
-        if bucket.try_consume(1) {
+            })?
+            .bucket(backend)
+        {
+            bucket if bucket.try_consume(1) => None,
+            bucket => Some(bucket.snapshot()),
+        }) else {
             return Ok(());
-        }
-
-        let snapshot = bucket.snapshot();
+        };
         let retry_after_ms = retry_after_ms_for_snapshot(snapshot, 1);
         Err(ActionError::RateLimited {
             detail: format!(
@@ -139,7 +156,7 @@ impl BackendRateLimits {
         }
     }
 
-    fn bucket_mut(&mut self, backend: ResolvedBackend) -> &mut TokenBucket {
+    const fn bucket_mut(&mut self, backend: ResolvedBackend) -> &mut TokenBucket {
         match backend {
             ResolvedBackend::Software => &mut self.software,
             ResolvedBackend::Vigem => &mut self.vigem,

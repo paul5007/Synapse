@@ -293,6 +293,11 @@ pub struct ObservationDiagnostics {
     pub capture_config: Option<ObservationCaptureConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_runtime: Option<CaptureRuntimeReadback>,
+    /// Action/input backend capability preflight captured at observe time.
+    /// This lets agents distinguish an unavailable host boundary from a
+    /// transient action failure before attempting a click/key/pad action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_backends: Option<InputBackendDiagnostics>,
     /// CDP probe/attach outcome for the foreground window. `Some` for every
     /// Chromium-family foreground (wire status `ok` / `A11Y_CDP_UNREACHABLE` /
     /// `A11Y_CDP_ATTACH_FAILED` / `not_chromium`), `None` for non-browser
@@ -311,6 +316,31 @@ pub struct ObservationDiagnostics {
     pub entities_truncated: bool,
     pub size_bytes: u32,
     pub size_estimate_tokens: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputBackendDiagnostics {
+    pub source: String,
+    pub mouse_default: String,
+    pub keyboard_default: String,
+    pub pad_default: String,
+    pub release_all_default: String,
+    pub mouse: Vec<InputBackendCapability>,
+    pub keyboard: Vec<InputBackendCapability>,
+    pub pad: Vec<InputBackendCapability>,
+    pub release_all: Vec<InputBackendCapability>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputBackendCapability {
+    pub backend: String,
+    pub available: bool,
+    pub reason_code: Option<String>,
+    pub reason: Option<String>,
+    pub host_boundary: bool,
+    pub transient: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

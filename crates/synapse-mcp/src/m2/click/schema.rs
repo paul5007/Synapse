@@ -31,6 +31,12 @@ pub struct ActClickParams {
     #[serde(default = "default_use_invoke_pattern")]
     #[schemars(default = "default_use_invoke_pattern")]
     pub use_invoke_pattern: bool,
+    #[serde(default)]
+    #[schemars(default)]
+    pub verify_delta: bool,
+    #[serde(default = "default_verify_timeout_ms")]
+    #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
+    pub verify_timeout_ms: u32,
     #[serde(skip)]
     #[schemars(skip)]
     pub deprecated_curve_alias_used: bool,
@@ -81,10 +87,21 @@ pub struct ActClickResponse {
     pub ok: bool,
     pub used_invoke_pattern: bool,
     pub backend_used: String,
+    pub postcondition: ActClickPostcondition,
     pub press_hold_ms: u32,
     pub double_click_window_ms: u32,
     pub inter_click_delay_ms: u32,
     pub elapsed_ms: u32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActClickPostcondition {
+    pub status: String,
+    pub observed_delta: Option<bool>,
+    pub before_signature: Option<String>,
+    pub after_signature: Option<String>,
+    pub detail: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ActClickParams {
@@ -114,6 +131,10 @@ impl<'de> Deserialize<'de> for ActClickParams {
             backend: Backend,
             #[serde(default = "default_use_invoke_pattern")]
             use_invoke_pattern: bool,
+            #[serde(default)]
+            verify_delta: bool,
+            #[serde(default = "default_verify_timeout_ms")]
+            verify_timeout_ms: u32,
         }
 
         let raw = RawActClickParams::deserialize(deserializer)?;
@@ -139,6 +160,8 @@ impl<'de> Deserialize<'de> for ActClickParams {
             hold_ms: raw.hold_ms,
             backend: raw.backend,
             use_invoke_pattern: raw.use_invoke_pattern,
+            verify_delta: raw.verify_delta,
+            verify_timeout_ms: raw.verify_timeout_ms,
             deprecated_curve_alias_used,
         })
     }
@@ -183,4 +206,21 @@ pub(in crate::m2::click) const fn default_click_backend() -> Backend {
 
 pub(in crate::m2::click) const fn default_use_invoke_pattern() -> bool {
     true
+}
+
+pub(in crate::m2::click) const fn default_verify_timeout_ms() -> u32 {
+    250
+}
+
+pub(in crate::m2::click) fn postcondition_not_requested() -> ActClickPostcondition {
+    ActClickPostcondition {
+        status: "not_requested".to_owned(),
+        observed_delta: None,
+        before_signature: None,
+        after_signature: None,
+        detail: Some(
+            "act_click only verified low-level delivery; set verify_delta=true to require an observed app-state delta"
+                .to_owned(),
+        ),
+    }
 }

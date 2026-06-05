@@ -300,6 +300,7 @@ mod tests {
             mode_override: Some(PerceptionMode::Auto),
             capture_config: None,
             capture_runtime: None,
+            input_backends: None,
             cdp: None,
             web_path: None,
         }

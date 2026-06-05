@@ -40,6 +40,8 @@ async fn coordinate_click_leaves_actor_held_state_empty() {
             hold_ms: super::schema::default_click_hold_ms(),
             backend: default_click_backend(),
             use_invoke_pattern: default_use_invoke_pattern(),
+            verify_delta: false,
+            verify_timeout_ms: super::schema::default_verify_timeout_ms(),
             deprecated_curve_alias_used: false,
         },
     )
