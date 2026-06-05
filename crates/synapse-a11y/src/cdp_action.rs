@@ -20,6 +20,10 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchMouseEventParams, DispatchMouseEventType, InsertTextParams, MouseButton,
 };
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, GetLayoutMetricsParams, Viewport,
+};
+use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt as _;
 
 use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
@@ -201,6 +205,87 @@ pub async fn cdp_aim_node(
     .await
 }
 
+/// A decoded, top-down BGRA8 bitmap captured from a web node via CDP (#703).
+///
+/// `bgra` is 4 bytes per pixel with no row padding, sized `width * height * 4`,
+/// ready for the `WinRT` OCR `read_text_from_bgra_bitmap` path.
+#[derive(Clone, Debug)]
+pub struct CdpNodeBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// Captures just a web node's rendered pixels and returns them as a BGRA8 bitmap
+/// for OCR (#703).
+///
+/// Mirrors how clicks resolve a node — attach, find the owning page, scroll the
+/// node into view, resolve its live box model — then converts the viewport-CSS
+/// box to document coordinates (using `Page.getLayoutMetrics` scroll offset) and
+/// captures exactly that element via `Page.captureScreenshot { clip,
+/// captureBeyondViewport:true }`. This is DPI-/scroll-/occlusion-robust and
+/// needs no CSS→screen mapping (which the click path also deliberately avoids).
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/node cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if box-model resolution, layout metrics, capture, or
+/// PNG decode fails.
+pub async fn cdp_capture_node_bgra(
+    endpoint: &str,
+    page_title_hint: &str,
+    backend_node_id: i64,
+) -> A11yResult<CdpNodeBitmap> {
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let result = async {
+        let page = resolve_owning_page(&browser, page_title_hint, backend_node_id).await?;
+        let rect = node_content_rect(&page, backend_node_id).await?;
+        // getBoxModel is viewport-relative (the click path dispatches at its
+        // centre as viewport coords and lands correctly); captureScreenshot with
+        // captureBeyondViewport=true expects document coords, so add the scroll
+        // offset. Chrome's own "Capture node screenshot" uses the same shape.
+        let metrics = page
+            .execute(GetLayoutMetricsParams::default())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("getLayoutMetrics: {err}"),
+            })?;
+        let scroll_x = i32::try_from(metrics.result.css_layout_viewport.page_x).unwrap_or(0);
+        let scroll_y = i32::try_from(metrics.result.css_layout_viewport.page_y).unwrap_or(0);
+        let clip = Viewport {
+            x: f64::from(rect.x) + f64::from(scroll_x),
+            y: f64::from(rect.y) + f64::from(scroll_y),
+            width: f64::from(rect.w),
+            height: f64::from(rect.h),
+            scale: 1.0,
+        };
+        let params = ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Png)
+            .clip(clip)
+            .from_surface(true)
+            .capture_beyond_viewport(true)
+            .build();
+        let png_bytes =
+            page.screenshot(params)
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("captureScreenshot: {err}"),
+                })?;
+        decode_png_to_bgra(&png_bytes)
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
 fn mouse_event(
     kind: DispatchMouseEventType,
     point: CdpActionPoint,
@@ -271,64 +356,8 @@ where
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let result = async {
-        use chromiumoxide::cdp::browser_protocol::dom::GetDocumentParams;
-
-        // A fresh CDP connection discovers existing page targets asynchronously
-        // via its handler, so pages() can briefly return empty — poll until the
-        // browser's targets show up.
-        let pages = wait_for_pages(&browser).await?;
-        // Backend node ids are per-DOCUMENT, so the same numeric id can exist in
-        // several tabs. Order candidate pages so the one whose title matches the
-        // foreground window (the tab observe read) is tried first, then scroll
-        // the node into view to confirm it really belongs to that page. Each
-        // page is first primed with DOM.getDocument because a fresh CDP
-        // connection has not been pushed the page's DOM (observe() and act_* use
-        // separate connections, so priming is required, not optional).
-        let mut ordered = Vec::with_capacity(pages.len());
-        let mut tail = Vec::new();
-        for page in pages {
-            let matches_hint = matches!(
-                page.get_title().await,
-                Ok(Some(title)) if !title.is_empty() && page_title_hint.contains(title.as_str())
-            );
-            if matches_hint {
-                ordered.push(page);
-            } else {
-                tail.push(page);
-            }
-        }
-        ordered.extend(tail);
-
-        let mut owning_page = None;
-        for page in ordered {
-            let prime = GetDocumentParams::builder().depth(-1).pierce(true).build();
-            let _ = page.execute(prime).await;
-            let scroll = ScrollIntoViewIfNeededParams::builder()
-                .backend_node_id(BackendNodeId::new(backend_node_id))
-                .build();
-            if page.execute(scroll).await.is_ok() {
-                owning_page = Some(page);
-                break;
-            }
-        }
-        let page = owning_page.ok_or_else(|| A11yError::CdpAxtreeFailed {
-            detail: format!("no attached page owns backendNodeId {backend_node_id}"),
-        })?;
-
-        let box_params = GetBoxModelParams::builder()
-            .backend_node_id(BackendNodeId::new(backend_node_id))
-            .build();
-        let model = page
-            .execute(box_params)
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("getBoxModel: {err}"),
-            })?;
-        let rect = rect_from_quad(model.result.model.content.inner()).ok_or_else(|| {
-            A11yError::CdpAxtreeFailed {
-                detail: "node has no resolvable box model (not rendered)".to_owned(),
-            }
-        })?;
+        let page = resolve_owning_page(&browser, page_title_hint, backend_node_id).await?;
+        let rect = node_content_rect(&page, backend_node_id).await?;
         let center = CdpActionPoint {
             x: f64::from(rect.x) + f64::from(rect.w) / 2.0,
             y: f64::from(rect.y) + f64::from(rect.h) / 2.0,
@@ -339,6 +368,136 @@ where
 
     handler_task.abort();
     result
+}
+
+/// Finds the attached page that owns `backend_node_id`, priming each candidate's
+/// DOM and confirming ownership by scrolling the node into view.
+///
+/// Backend node ids are per-DOCUMENT, so the same numeric id can exist in
+/// several tabs. Candidate pages whose title matches the foreground window (the
+/// tab `observe` read) are tried first. A fresh CDP connection discovers targets
+/// asynchronously and has not been pushed each page's DOM, so we poll for pages
+/// and prime with `DOM.getDocument` before resolving (required, not optional).
+async fn resolve_owning_page(
+    browser: &chromiumoxide::Browser,
+    page_title_hint: &str,
+    backend_node_id: i64,
+) -> A11yResult<chromiumoxide::Page> {
+    use chromiumoxide::cdp::browser_protocol::dom::GetDocumentParams;
+
+    let pages = wait_for_pages(browser).await?;
+    let mut ordered = Vec::with_capacity(pages.len());
+    let mut tail = Vec::new();
+    for page in pages {
+        let matches_hint = matches!(
+            page.get_title().await,
+            Ok(Some(title)) if !title.is_empty() && page_title_hint.contains(title.as_str())
+        );
+        if matches_hint {
+            ordered.push(page);
+        } else {
+            tail.push(page);
+        }
+    }
+    ordered.extend(tail);
+
+    for page in ordered {
+        let prime = GetDocumentParams::builder().depth(-1).pierce(true).build();
+        let _ = page.execute(prime).await;
+        let scroll = ScrollIntoViewIfNeededParams::builder()
+            .backend_node_id(BackendNodeId::new(backend_node_id))
+            .build();
+        if page.execute(scroll).await.is_ok() {
+            return Ok(page);
+        }
+    }
+    Err(A11yError::CdpAxtreeFailed {
+        detail: format!("no attached page owns backendNodeId {backend_node_id}"),
+    })
+}
+
+/// Resolves a web node's live content-box rectangle in viewport-CSS pixels.
+async fn node_content_rect(
+    page: &chromiumoxide::Page,
+    backend_node_id: i64,
+) -> A11yResult<synapse_core::Rect> {
+    let box_params = GetBoxModelParams::builder()
+        .backend_node_id(BackendNodeId::new(backend_node_id))
+        .build();
+    let model = page
+        .execute(box_params)
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("getBoxModel: {err}"),
+        })?;
+    rect_from_quad(model.result.model.content.inner()).ok_or_else(|| A11yError::CdpAxtreeFailed {
+        detail: "node has no resolvable box model (not rendered)".to_owned(),
+    })
+}
+
+/// Decodes a Chrome PNG screenshot into a top-down BGRA8 bitmap for OCR (#703).
+fn decode_png_to_bgra(png_bytes: &[u8]) -> A11yResult<CdpNodeBitmap> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png_bytes))
+        .read_info()
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("screenshot PNG header decode failed: {err}"),
+        })?;
+    let buf_size = reader
+        .output_buffer_size()
+        .ok_or_else(|| A11yError::CdpAxtreeFailed {
+            detail: "screenshot PNG output buffer size overflowed usize".to_owned(),
+        })?;
+    let mut buf = vec![0u8; buf_size];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("screenshot PNG frame decode failed: {err}"),
+        })?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "unexpected screenshot PNG bit depth {:?}; expected 8-bit",
+                info.bit_depth
+            ),
+        });
+    }
+    let pixels = buf
+        .get(..info.buffer_size())
+        .ok_or_else(|| A11yError::CdpAxtreeFailed {
+            detail: "screenshot PNG buffer shorter than reported frame size".to_owned(),
+        })?;
+    let bgra = match info.color_type {
+        png::ColorType::Rgba => rgba8_to_bgra(pixels),
+        png::ColorType::Rgb => rgb8_to_bgra(pixels),
+        other => {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!("unexpected screenshot PNG color type {other:?}; expected RGB/RGBA"),
+            });
+        }
+    };
+    Ok(CdpNodeBitmap {
+        width: info.width,
+        height: info.height,
+        bgra,
+    })
+}
+
+/// Swaps RGBA8 → BGRA8 (Chrome screenshots are RGBA; `WinRT` OCR wants BGRA).
+fn rgba8_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len());
+    for px in rgba.chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    out
+}
+
+/// Expands RGB8 → BGRA8 with an opaque alpha channel.
+fn rgb8_to_bgra(rgb: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
+    for px in rgb.chunks_exact(3) {
+        out.extend_from_slice(&[px[2], px[1], px[0], 0xFF]);
+    }
+    out
 }
 
 #[cfg(test)]

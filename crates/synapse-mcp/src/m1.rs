@@ -26,6 +26,8 @@ pub use detection::populate_detection_from_state;
 use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_config};
 #[cfg(windows)]
 pub use ocr::read_text_request_from_bgra;
+#[cfg(windows)]
+pub use ocr::ocr_result_from_web_bitmap;
 pub use ocr::{ResolvedReadTextRequest, read_text_request_uncached, resolve_read_text_request};
 use search::{element_match, entity_match};
 pub use sources::{FsRecentTracker, populate_clipboard_summary, populate_fs_recent};

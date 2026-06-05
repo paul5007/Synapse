@@ -3619,6 +3619,7 @@ dependencies = [
  "chromiumoxide",
  "criterion",
  "futures-util",
+ "png",
  "proptest",
  "serde",
  "serde_json",

@@ -16,6 +16,7 @@ tracing.workspace = true
 [target.'cfg(windows)'.dependencies]
 chromiumoxide.workspace = true
 futures-util.workspace = true
+png = "0.18"
 serde_json.workspace = true
 uiautomation.workspace = true
 windows.workspace = true

@@ -92,6 +92,49 @@ pub fn read_text_request_from_bgra(
     }
 }
 
+/// Runs WinRT OCR over a web element's captured BGRA bitmap and returns an
+/// `OcrResult` whose word boxes are relative to the captured element (#703).
+///
+/// Used by the `read_text` handler when `element_id` is a CDP/web node, which
+/// the UIA element-bounds path cannot resolve. The bitmap comes from a CDP
+/// element-clipped screenshot, so the OCR region is the whole bitmap.
+///
+/// # Errors
+///
+/// `OCR_NO_TEXT` if the bitmap dimensions exceed `i32` or OCR finds no text;
+/// any `WinRT` OCR backend error from `read_text_from_bgra_bitmap`.
+#[cfg(windows)]
+pub fn ocr_result_from_web_bitmap(
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    lang_hint: Option<&str>,
+) -> Result<OcrResult, ErrorData> {
+    let w = i32::try_from(width).map_err(|_| {
+        mcp_error(
+            error_codes::OCR_NO_TEXT,
+            format!("web element OCR bitmap width {width} exceeds i32"),
+        )
+    })?;
+    let h = i32::try_from(height).map_err(|_| {
+        mcp_error(
+            error_codes::OCR_NO_TEXT,
+            format!("web element OCR bitmap height {height} exceeds i32"),
+        )
+    })?;
+    let region = Rect { x: 0, y: 0, w, h };
+    let words = synapse_perception::read_text_from_bgra_bitmap(region, width, height, bgra)
+        .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+    let request = ResolvedReadTextRequest {
+        region,
+        requested_backend: OcrBackend::Auto,
+        effective_backend: OcrBackend::Winrt,
+        lang_hint: lang_hint.map(str::to_owned),
+        synthetic: false,
+    };
+    Ok(ocr_result_from_text_regions(words, &request))
+}
+
 fn text_region(state: &M1State, params: &ReadTextParams) -> Result<Rect, ErrorData> {
     if let Some(region) = params.region {
         return Ok(region);

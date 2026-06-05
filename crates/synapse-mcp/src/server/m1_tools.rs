@@ -144,6 +144,19 @@ impl SynapseService {
             kind = "read_text",
             "tool.invocation kind=read_text"
         );
+        // #703: a web element id (cdcd sentinel) is not a UIA element, so the
+        // element-bounds path cannot resolve it. OCR it from a CDP
+        // element-clipped screenshot instead of failing with a stale-UIA error.
+        #[cfg(windows)]
+        if params.0.region.is_none()
+            && let Some(element_id) = params.0.element_id.as_ref()
+            && let Some(backend_node_id) = synapse_a11y::cdp_backend_from_element_id(element_id)
+        {
+            return self
+                .read_text_web_element(element_id, backend_node_id, &params.0)
+                .await
+                .map(Json);
+        }
         let request = {
             let state = self.m1_state()?;
             resolve_read_text_request(&state, &params.0)?
@@ -256,6 +269,53 @@ impl SynapseService {
 }
 
 impl SynapseService {
+    /// OCRs a CDP/web element by capturing its rendered pixels via CDP and
+    /// running WinRT OCR on them (#703). UIA element-bounds resolution cannot see
+    /// web nodes, so `read_text(element_id=<web node>)` routes here. Fail-loud if
+    /// the browser/debug endpoint is gone or the node has no rendered box.
+    #[cfg(windows)]
+    async fn read_text_web_element(
+        &self,
+        element_id: &synapse_core::ElementId,
+        backend_node_id: i64,
+        params: &ReadTextParams,
+    ) -> Result<OcrResult, ErrorData> {
+        let hwnd = element_id
+            .parts()
+            .map_err(|err| {
+                mcp_error(
+                    error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                    format!("web element id is malformed: {err}"),
+                )
+            })?
+            .hwnd;
+        let endpoint = synapse_a11y::endpoint_for_window(hwnd).ok_or_else(|| {
+            mcp_error(
+                error_codes::A11Y_CDP_UNREACHABLE,
+                format!(
+                    "no reachable CDP endpoint for web element {element_id} (browser closed or debug port gone)"
+                ),
+            )
+        })?;
+        let title_hint = synapse_a11y::foreground_context(hwnd)
+            .map(|context| context.window_title)
+            .unwrap_or_default();
+        let bitmap = synapse_a11y::cdp_capture_node_bgra(&endpoint, &title_hint, backend_node_id)
+            .await
+            .map_err(|err| {
+                mcp_error(
+                    err.code(),
+                    format!("web element OCR capture failed for {element_id}: {err}"),
+                )
+            })?;
+        crate::m1::ocr_result_from_web_bitmap(
+            bitmap.width,
+            bitmap.height,
+            &bitmap.bgra,
+            params.lang_hint.as_deref(),
+        )
+    }
+
     #[cfg(windows)]
     fn read_text_request_with_cache(
         &self,
