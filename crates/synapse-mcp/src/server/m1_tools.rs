@@ -63,6 +63,7 @@ impl SynapseService {
     pub async fn observe(
         &self,
         params: Parameters<ObserveParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<synapse_core::Observation>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
@@ -70,8 +71,26 @@ impl SynapseService {
             "tool.invocation kind=observe"
         );
         let include = observe_include(&params.0);
-        let target_hwnd =
-            self.session_target_hwnd(crate::http::current_mcp_session_id().as_deref());
+        let target_hwnd = self.request_session_target_hwnd(&request_context)?;
+        self.observe_with_target_hwnd(params, include, target_hwnd)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_without_request_context_for_test(
+        &self,
+        params: Parameters<ObserveParams>,
+    ) -> Result<Json<synapse_core::Observation>, ErrorData> {
+        let include = observe_include(&params.0);
+        self.observe_with_target_hwnd(params, include, None).await
+    }
+
+    async fn observe_with_target_hwnd(
+        &self,
+        params: Parameters<ObserveParams>,
+        include: synapse_perception::ObserveInclude,
+        target_hwnd: Option<i64>,
+    ) -> Result<Json<synapse_core::Observation>, ErrorData> {
         // Scope the (non-Send) state guard so it is released before any await.
         let mut input = {
             let state = self.m1_state()?;
@@ -127,14 +146,30 @@ impl SynapseService {
     pub async fn find(
         &self,
         params: Parameters<FindParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<FindResponse>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "find",
             "tool.invocation kind=find"
         );
-        let target_hwnd =
-            self.session_target_hwnd(crate::http::current_mcp_session_id().as_deref());
+        let target_hwnd = self.request_session_target_hwnd(&request_context)?;
+        self.find_with_target_hwnd(params, target_hwnd).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn find_without_request_context_for_test(
+        &self,
+        params: Parameters<FindParams>,
+    ) -> Result<Json<FindResponse>, ErrorData> {
+        self.find_with_target_hwnd(params, None).await
+    }
+
+    async fn find_with_target_hwnd(
+        &self,
+        params: Parameters<FindParams>,
+        target_hwnd: Option<i64>,
+    ) -> Result<Json<FindResponse>, ErrorData> {
         let mut input = {
             let mut state = self.m1_state()?;
             super::build_find_input(&mut state, &params.0, target_hwnd)?
@@ -153,6 +188,7 @@ impl SynapseService {
     pub async fn read_text(
         &self,
         params: Parameters<ReadTextParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
@@ -172,8 +208,23 @@ impl SynapseService {
                 .await
                 .map(Json);
         }
-        let target_hwnd =
-            self.session_target_hwnd(crate::http::current_mcp_session_id().as_deref());
+        let target_hwnd = self.request_session_target_hwnd(&request_context)?;
+        self.read_text_with_target_hwnd(params, target_hwnd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_text_without_request_context_for_test(
+        &self,
+        params: Parameters<ReadTextParams>,
+    ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
+        self.read_text_with_target_hwnd(params, None)
+    }
+
+    fn read_text_with_target_hwnd(
+        &self,
+        params: Parameters<ReadTextParams>,
+        target_hwnd: Option<i64>,
+    ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
         let request = {
             let state = self.m1_state()?;
             resolve_read_text_request(&state, &params.0, target_hwnd)?
@@ -404,6 +455,23 @@ impl SynapseService {
                 "session target registry lock poisoned",
             )
         })
+    }
+
+    fn request_session_target_hwnd(
+        &self,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Option<i64>, ErrorData> {
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
+        let target_hwnd = self.session_target_hwnd(session_id.as_deref())?;
+        if let (Some(session_id), Some(hwnd)) = (session_id.as_deref(), target_hwnd) {
+            tracing::debug!(
+                code = "SESSION_TARGET_RESOLVED",
+                session_id = %session_id,
+                hwnd,
+                "readback=session_target outcome=resolved_window"
+            );
+        }
+        Ok(target_hwnd)
     }
 }
 

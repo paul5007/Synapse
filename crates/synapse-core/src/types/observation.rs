@@ -291,6 +291,11 @@ pub struct ObservationDiagnostics {
     pub capture_status: SensorStatus,
     pub detection_status: SensorStatus,
     pub audio_status: SensorStatus,
+    /// True when the observed target HWND was minimized/iconic at snapshot time.
+    /// Target-scoped perception reports this explicitly so agents can distinguish
+    /// a minimized target from an empty or broken accessibility tree.
+    #[serde(default)]
+    pub is_minimized: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_config: Option<ObservationCaptureConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

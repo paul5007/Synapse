@@ -1316,7 +1316,7 @@ mod scope_gate_tests {
 
         install_synthetic_notepad_input(&service)?;
         let observation = service
-            .observe(Parameters(ObserveParams::default()))
+            .observe_without_request_context_for_test(Parameters(ObserveParams::default()))
             .await?;
         assert_eq!(
             observation.0.foreground.profile_id.as_deref(),
@@ -1440,12 +1440,12 @@ mod scope_gate_tests {
         assert!(service.health_payload().ok);
 
         let observation = service
-            .observe(Parameters(ObserveParams::default()))
+            .observe_without_request_context_for_test(Parameters(ObserveParams::default()))
             .await?;
         assert_eq!(observation.0.foreground.process_name, "notepad.exe");
 
         let matches = service
-            .find(Parameters(FindParams {
+            .find_without_request_context_for_test(Parameters(FindParams {
                 query: Some("Document".to_owned()),
                 role: None,
                 name_substring: None,
@@ -1464,8 +1464,8 @@ mod scope_gate_tests {
                 .any(|result| result.name.as_deref() == Some("Document"))
         );
 
-        let ocr = service
-            .read_text(Parameters(ReadTextParams {
+        let ocr =
+            service.read_text_without_request_context_for_test(Parameters(ReadTextParams {
                 region: Some(Rect {
                     x: 12,
                     y: 80,
@@ -1476,8 +1476,7 @@ mod scope_gate_tests {
                 window_hwnd: None,
                 backend: synapse_core::OcrBackend::Winrt,
                 lang_hint: None,
-            }))
-            .await?;
+            }))?;
         assert_eq!(ocr.0.full_text, "Synapse");
 
         let subscription = service
@@ -1545,7 +1544,7 @@ mod scope_gate_tests {
 
         install_synthetic_notepad_input(&service)?;
         let first = service
-            .observe(Parameters(ObserveParams::default()))
+            .observe_without_request_context_for_test(Parameters(ObserveParams::default()))
             .await?;
         assert_eq!(first.0.foreground.profile_id.as_deref(), Some("notepad"));
         let runtime = service.profile_runtime()?;
@@ -1555,7 +1554,7 @@ mod scope_gate_tests {
         install_synthetic_process_input(&service, "unprofiled.exe", "Unprofiled App", 0x6789)?;
         let started = std::time::Instant::now();
         let second = service
-            .observe(Parameters(ObserveParams::default()))
+            .observe_without_request_context_for_test(Parameters(ObserveParams::default()))
             .await?;
         let elapsed = started.elapsed();
         assert!(elapsed <= Duration::from_millis(200));

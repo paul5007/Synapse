@@ -109,6 +109,7 @@ impl A11yTreeSummary {
 #[derive(Clone, Debug)]
 pub struct ObservationInput {
     pub foreground: ForegroundContext,
+    pub is_minimized: bool,
     pub focused: Option<FocusedElement>,
     pub elements: Vec<AccessibleNode>,
     pub entities: Vec<DetectedEntity>,
@@ -139,6 +140,7 @@ impl ObservationInput {
     pub fn new(foreground: ForegroundContext) -> Self {
         Self {
             foreground,
+            is_minimized: false,
             focused: None,
             elements: Vec::new(),
             entities: Vec::new(),
@@ -239,6 +241,7 @@ impl ObservationAssembler {
                 capture_status: input.capture_status,
                 detection_status: input.detection_status,
                 audio_status: input.audio_status,
+                is_minimized: input.is_minimized,
                 capture_config: input.capture_config,
                 capture_runtime: input.capture_runtime,
                 input_backends: input.input_backends,
@@ -392,7 +395,9 @@ fn ensure_any_sensor_available(input: &ObservationInput) -> PerceptionResult<()>
     if statuses.iter().any(|status| {
         matches!(
             status,
-            SensorStatus::Healthy | SensorStatus::DegradedLatency { .. }
+            SensorStatus::Healthy
+                | SensorStatus::DegradedLatency { .. }
+                | SensorStatus::DegradedSensorFailed { .. }
         )
     }) {
         return Ok(());

@@ -22,6 +22,12 @@ const FS_WATCH_ROOT_ENV: &str = "SYNAPSE_FS_WATCH_ROOT";
 const MAX_FS_RECENT_EVENTS: usize = 5;
 #[cfg(windows)]
 const CHROMIUM_RENDERER_UIA_SUPPLEMENT_MAX_NODES: usize = 160;
+#[cfg(windows)]
+const A11Y_TARGET_WINDOW_MINIMIZED: &str = "A11Y_TARGET_WINDOW_MINIMIZED";
+#[cfg(windows)]
+const A11Y_TARGET_WINDOW_NO_UIA_CONTENT: &str = "A11Y_TARGET_WINDOW_NO_UIA_CONTENT";
+#[cfg(windows)]
+const A11Y_TARGET_WINDOW_SNAPSHOT_FAILED: &str = "A11Y_TARGET_WINDOW_SNAPSHOT_FAILED";
 
 pub fn synthetic_notepad_input() -> ObservationInput {
     let at = Utc::now();
@@ -57,6 +63,7 @@ pub fn synthetic_notepad_input() -> ObservationInput {
             is_fullscreen: false,
             is_dwm_composed: true,
         },
+        is_minimized: false,
         focused: Some(FocusedElement {
             element_id: focused_id,
             name: "Document".to_owned(),
@@ -885,7 +892,9 @@ pub fn platform_input(depth: u32, mode: PerceptionMode) -> Result<ObservationInp
         })?
         .hwnd;
     let foreground = windows_foreground_context(hwnd)?;
-    input_from_tree_and_foreground(tree, foreground, mode)
+    let mut input = input_from_tree_and_foreground(tree, foreground, mode)?;
+    input.is_minimized = synapse_a11y::is_window_minimized(hwnd).unwrap_or(false);
+    Ok(input)
 }
 
 #[cfg(windows)]
@@ -894,10 +903,38 @@ pub fn window_input_from_hwnd(
     depth: u32,
     mode: PerceptionMode,
 ) -> Result<ObservationInput, ErrorData> {
-    let tree =
-        synapse_a11y::snapshot_window_from_hwnd(hwnd, depth).map_err(|err| a11y_error(&err))?;
+    validate_live_target_hwnd(hwnd)?;
     let foreground = windows_foreground_context(hwnd)?;
-    input_from_tree_and_foreground(tree, foreground, mode)
+    if synapse_a11y::is_window_minimized(hwnd).map_err(|err| a11y_error(&err))? {
+        return Ok(degraded_window_input(
+            foreground,
+            mode,
+            true,
+            A11Y_TARGET_WINDOW_MINIMIZED,
+        ));
+    }
+    let tree = match synapse_a11y::snapshot_window_from_hwnd(hwnd, depth) {
+        Ok(tree) => tree,
+        Err(error) => {
+            tracing::warn!(
+                code = A11Y_TARGET_WINDOW_SNAPSHOT_FAILED,
+                hwnd,
+                error_code = error.code(),
+                error = %error,
+                "target window UIA snapshot failed; returning degraded target metadata"
+            );
+            return Ok(degraded_window_input(
+                foreground,
+                mode,
+                false,
+                A11Y_TARGET_WINDOW_SNAPSHOT_FAILED,
+            ));
+        }
+    };
+    let mut input = input_from_tree_and_foreground(tree, foreground, mode)?;
+    input.is_minimized = false;
+    mark_sparse_target_a11y(&mut input);
+    Ok(input)
 }
 
 #[cfg(windows)]
@@ -914,7 +951,83 @@ pub fn element_input_from_id(
         })?
         .hwnd;
     let foreground = windows_foreground_context(hwnd)?;
-    input_from_tree_and_foreground(tree, foreground, mode)
+    let mut input = input_from_tree_and_foreground(tree, foreground, mode)?;
+    input.is_minimized = synapse_a11y::is_window_minimized(hwnd).unwrap_or(false);
+    Ok(input)
+}
+
+#[cfg(windows)]
+fn degraded_window_input(
+    foreground: ForegroundContext,
+    mode: PerceptionMode,
+    is_minimized: bool,
+    reason_code: &'static str,
+) -> ObservationInput {
+    let root = window_metadata_node(&foreground);
+    let mut input = ObservationInput::new(foreground);
+    input.is_minimized = is_minimized;
+    input.focused = Some(focused_from_node(&root));
+    input.elements = vec![root];
+    input.a11y_status = SensorStatus::DegradedSensorFailed {
+        reason_code: reason_code.to_owned(),
+    };
+    input.capture_status = SensorStatus::Disabled;
+    input.detection_status = SensorStatus::Disabled;
+    input.audio_status = SensorStatus::Disabled;
+    if mode != PerceptionMode::Auto {
+        input.mode_override = Some(mode);
+    }
+    input
+}
+
+#[cfg(windows)]
+fn mark_sparse_target_a11y(input: &mut ObservationInput) {
+    let has_accessible_content = input.elements.iter().any(|node| node.depth > 0)
+        || input
+            .elements
+            .first()
+            .is_some_and(|node| node.children_count > 0);
+    if has_accessible_content {
+        return;
+    }
+    tracing::warn!(
+        code = A11Y_TARGET_WINDOW_NO_UIA_CONTENT,
+        hwnd = input.foreground.hwnd,
+        title = %input.foreground.window_title,
+        process_name = %input.foreground.process_name,
+        "target window snapshot exposed no accessible child content"
+    );
+    input.a11y_status = SensorStatus::DegradedSensorFailed {
+        reason_code: A11Y_TARGET_WINDOW_NO_UIA_CONTENT.to_owned(),
+    };
+}
+
+#[cfg(windows)]
+fn window_metadata_node(foreground: &ForegroundContext) -> AccessibleNode {
+    AccessibleNode {
+        element_id: element_id(foreground.hwnd, "0000000000000000"),
+        parent: None,
+        name: foreground.window_title.clone(),
+        role: "Window".to_owned(),
+        automation_id: None,
+        value: None,
+        bbox: foreground.window_bounds,
+        enabled: true,
+        focused: false,
+        patterns: vec![UiaPattern::Window],
+        children_count: 0,
+        depth: 0,
+    }
+}
+
+#[cfg(windows)]
+fn validate_live_target_hwnd(hwnd: i64) -> Result<(), ErrorData> {
+    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
+        crate::m1::mcp_error(
+            synapse_core::error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("target window_hwnd {hwnd:#x} is not a live window: {error}"),
+        )
+    })
 }
 
 #[cfg(windows)]

@@ -70,6 +70,7 @@ fn notepad_input() -> ObservationInput {
             is_fullscreen: false,
             is_dwm_composed: true,
         },
+        is_minimized: false,
         focused: Some(FocusedElement {
             element_id: focused_id,
             name: "Document".to_owned(),

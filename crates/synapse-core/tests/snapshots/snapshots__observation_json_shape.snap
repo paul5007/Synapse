@@ -122,6 +122,7 @@ expression: sample_observation()
     "capture_status": "healthy",
     "detection_status": "unavailable",
     "audio_status": "disabled",
+    "is_minimized": false,
     "elements_truncated": false,
     "entities_truncated": false,
     "size_bytes": 2048,

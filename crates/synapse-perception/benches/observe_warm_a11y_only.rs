@@ -44,6 +44,7 @@ fn synthetic_notepad_input(mode_override: Option<PerceptionMode>) -> Observation
             is_fullscreen: false,
             is_dwm_composed: true,
         },
+        is_minimized: false,
         focused: Some(FocusedElement {
             element_id: element_id(0x1234, "0000002a00000001"),
             name: "Document".to_owned(),

@@ -284,6 +284,7 @@ mod tests {
                 is_fullscreen: false,
                 is_dwm_composed: true,
             },
+            is_minimized: false,
             focused: None,
             elements: Vec::new(),
             entities: Vec::<DetectedEntity>::new(),

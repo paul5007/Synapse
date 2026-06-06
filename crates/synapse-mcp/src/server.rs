@@ -285,14 +285,32 @@ impl SynapseService {
 
     /// Resolves the session's active **window** target to an HWND, if any. The
     /// map guard is dropped before returning (a copied `i64`), so it is never
-    /// held across the non-`Send` perception path or an `.await`. A `Cdp` target
-    /// returns `None` here (CDP-scoped perception is a later phase).
-    pub(crate) fn session_target_hwnd(&self, session_id: Option<&str>) -> Option<i64> {
-        let session_id = session_id?;
-        let guard = self.session_targets.lock().ok()?;
-        match guard.get(session_id)? {
-            SessionTarget::Window { hwnd } => Some(*hwnd),
-            SessionTarget::Cdp { .. } => None,
+    /// held across the non-`Send` perception path or an `.await`.
+    pub(crate) fn session_target_hwnd(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<i64>, ErrorData> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let guard = self.session_targets.lock().map_err(|_err| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session target registry lock poisoned",
+            )
+        })?;
+        let target = match guard.get(session_id) {
+            Some(target) => target,
+            None => return Ok(None),
+        };
+        match target {
+            SessionTarget::Window { hwnd } => Ok(Some(*hwnd)),
+            SessionTarget::Cdp { cdp_target_id } => Err(mcp_error(
+                error_codes::TARGET_CDP_UNRESOLVED,
+                format!(
+                    "session {session_id} is bound to CDP target {cdp_target_id:?}, but CDP-scoped perception is not yet supported; bind a window target"
+                ),
+            )),
         }
     }
 
