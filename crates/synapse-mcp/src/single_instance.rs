@@ -164,3 +164,55 @@ impl Drop for SingleInstanceGuard {
         let _ = fs::remove_file(&self.pid_path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SingleInstanceError, SingleInstanceGuard};
+    use tempfile::TempDir;
+
+    /// The single-daemon invariant both `--mode http` and `--mode stdio` rely on:
+    /// a second acquire on the same DB path is refused and names the holder PID
+    /// (source of truth = the `daemon.pid` sidecar), and the lock frees once the
+    /// holder drops. Real filesystem, no mocks.
+    #[test]
+    fn second_acquire_same_db_is_refused_then_frees_on_drop() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db = dir.path();
+
+        let first = SingleInstanceGuard::acquire(db).map_err(|err| anyhow::anyhow!("{err}"))?;
+        // Source of truth: the recorded holder PID is this process.
+        assert_eq!(
+            SingleInstanceGuard::recorded_holder_pid(db),
+            Some(std::process::id())
+        );
+
+        match SingleInstanceGuard::acquire(db) {
+            Ok(_) => anyhow::bail!("second acquire on the same DB path must be refused"),
+            Err(SingleInstanceError::AlreadyRunning { holder_pid, .. }) => {
+                assert_eq!(holder_pid, Some(std::process::id()));
+            }
+            Err(other) => anyhow::bail!("expected AlreadyRunning, got {other}"),
+        }
+
+        drop(first);
+        // After the holder drops, the lock is free and the PID sidecar is gone.
+        assert_eq!(SingleInstanceGuard::recorded_holder_pid(db), None);
+        let _reacquired =
+            SingleInstanceGuard::acquire(db).map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
+
+    /// The guard is scoped per-DB-path: two daemons on DIFFERENT DB paths are
+    /// allowed (legitimate test/secondary instances), so the guard is not
+    /// over-broad.
+    #[test]
+    fn different_db_paths_acquire_independently() -> anyhow::Result<()> {
+        let dir_a = TempDir::new()?;
+        let dir_b = TempDir::new()?;
+        let _guard_a =
+            SingleInstanceGuard::acquire(dir_a.path()).map_err(|err| anyhow::anyhow!("{err}"))?;
+        let _guard_b =
+            SingleInstanceGuard::acquire(dir_b.path()).map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
+}

@@ -295,6 +295,58 @@ async fn run_stdio(
     m4_config: m4::M4ServiceConfig,
 ) -> anyhow::Result<ExitCode> {
     tracing::info!(code = "MCP_STDIO_STARTED", "starting stdio MCP transport");
+
+    // Single-instance guard (epic #717 / single-daemon invariant): an embedded
+    // stdio daemon is a FULL daemon: it opens RocksDB and owns its own
+    // process-global input lease + per-session registries. Without this guard a
+    // stray or misconfigured stdio launch would run a SECOND parallel daemon
+    // whose lease/state cannot coordinate with the canonical HTTP daemon, which
+    // silently breaks multi-agent isolation. The HTTP path already acquires this
+    // lock before binding the port; the stdio path must obey the same rule.
+    // Fail loud, naming the current holder, and point the operator at --mode
+    // connect (the supported way for a stdio-only client to reach the shared
+    // daemon) instead of crashing later on a cryptic RocksDB LOCK error.
+    let db_path = m3_config
+        .db_path
+        .clone()
+        .unwrap_or_else(crate::m3::default_db_path);
+    let _single_instance = match crate::single_instance::SingleInstanceGuard::acquire(&db_path) {
+        Ok(guard) => {
+            tracing::info!(
+                code = "MCP_DAEMON_SINGLE_INSTANCE_ACQUIRED",
+                lock_path = %guard.lock_path().display(),
+                db_path = %db_path.display(),
+                pid = std::process::id(),
+                mode = "stdio",
+                "daemon single-instance lock acquired"
+            );
+            guard
+        }
+        Err(crate::single_instance::SingleInstanceError::AlreadyRunning {
+            lock_path,
+            holder_pid,
+        }) => {
+            let holder = holder_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+            tracing::error!(
+                code = "MCP_DAEMON_ALREADY_RUNNING",
+                lock_path = %lock_path.display(),
+                holder_pid = %holder,
+                db_path = %db_path.display(),
+                mode = "stdio",
+                "refusing to start: another synapse-mcp daemon already owns this DB path"
+            );
+            eprintln!(
+                "synapse-mcp error: another synapse-mcp daemon already owns {} (holder pid {holder}); use --mode connect to reach the shared daemon instead of starting a second one",
+                db_path.display()
+            );
+            drop(telemetry_guard);
+            return Ok(ExitCode::from(3));
+        }
+        Err(err @ crate::single_instance::SingleInstanceError::Io { .. }) => {
+            return Err(anyhow::Error::new(err)).context("acquire daemon single-instance lock");
+        }
+    };
+
     let rmcp_token = CancellationToken::new();
     let emitter_shutdown_token = CancellationToken::new();
     let emitter_connection_closed_token = CancellationToken::new();
