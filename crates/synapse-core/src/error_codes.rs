@@ -15,6 +15,11 @@ pub const DETECTION_MODEL_INFER_FAILED: &str = "DETECTION_MODEL_INFER_FAILED";
 pub const DETECTION_NO_FRAME: &str = "DETECTION_NO_FRAME";
 pub const OCR_NO_TEXT: &str = "OCR_NO_TEXT";
 pub const OCR_BACKEND_UNAVAILABLE: &str = "OCR_BACKEND_UNAVAILABLE";
+// Per-agent active target (epic #720): each MCP session can bind its own window/CDP
+// target so observe/find/read_text perceive it without stealing the global foreground.
+pub const TARGET_WINDOW_NOT_FOUND: &str = "TARGET_WINDOW_NOT_FOUND";
+pub const TARGET_NOT_SET: &str = "TARGET_NOT_SET";
+pub const TARGET_CDP_UNRESOLVED: &str = "TARGET_CDP_UNRESOLVED";
 pub const HUD_NO_ACTIVE_PROFILE: &str = "HUD_NO_ACTIVE_PROFILE";
 pub const HUD_FIELD_NOT_DEFINED: &str = "HUD_FIELD_NOT_DEFINED";
 pub const HUD_EXTRACTION_FAILED: &str = "HUD_EXTRACTION_FAILED";
@@ -47,6 +52,10 @@ pub const ACTION_DRAG_DISTANCE_EXCEEDS_LIMIT: &str = "ACTION_DRAG_DISTANCE_EXCEE
 pub const STUCK_KEY_AUTO_RELEASED: &str = "STUCK_KEY_AUTO_RELEASED";
 pub const SAFETY_RELEASE_ALL_FIRED: &str = "SAFETY_RELEASE_ALL_FIRED";
 pub const SAFETY_OPERATOR_HOTKEY_FIRED: &str = "SAFETY_OPERATOR_HOTKEY_FIRED";
+// Multi-agent input lease (epic #719): the real foreground/cursor/keyboard/clipboard
+// is a single shared resource leased per MCP session. Background tiers never take it.
+pub const ACTION_FOREGROUND_LEASE_BUSY: &str = "ACTION_FOREGROUND_LEASE_BUSY";
+pub const ACTION_FOREGROUND_LEASE_NOT_HELD: &str = "ACTION_FOREGROUND_LEASE_NOT_HELD";
 
 // === Reflex (06 section 8.3) ===
 pub const REFLEX_CAP_REACHED: &str = "REFLEX_CAP_REACHED";

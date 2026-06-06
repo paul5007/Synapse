@@ -947,6 +947,7 @@ impl SynapseService {
             element_offset: None,
             subtree_root: None,
             since_event_seq: None,
+            window_hwnd: None,
         };
         let include = observe_include(&params);
         let state = self.m1_state()?;

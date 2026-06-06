@@ -19,7 +19,7 @@ pub use bitmap::*;
 pub use config::{CaptureConfig, CaptureTarget, ResolvedCaptureTarget};
 pub use controller::{
     CaptureController, CaptureHandle, register_capture_metrics, resolve_capture_target,
-    spawn_capture_loop,
+    spawn_capture_loop, validate_hwnd,
 };
 pub use coords::*;
 pub use dpi::*;

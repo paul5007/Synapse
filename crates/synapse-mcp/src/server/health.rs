@@ -276,15 +276,26 @@ impl SynapseService {
                     } else {
                         self.m4_config.allow_launch_count().to_string()
                     };
+                    let lease = synapse_action::lease::status();
+                    let lease_detail = lease.owner_session_id.as_deref().map_or_else(
+                        || "input_lease_held=false".to_owned(),
+                        |owner| {
+                            format!(
+                                "input_lease_held=true input_lease_owner={owner} input_lease_expires_in_ms={}",
+                                lease.expires_in_ms.unwrap_or(0)
+                            )
+                        },
+                    );
                     SubsystemHealth {
                         status: if emitter_available { "ok" } else { "error" }.to_owned(),
                         detail: Some(format!(
-                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={}",
+                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={} {}",
                             emitter_available,
                             state.recording_enabled(),
                             operator_hotkey,
                             allow_shell,
-                            allow_launch
+                            allow_launch,
+                            lease_detail
                         )),
                         backend_resolution: Some(backend_resolution_health(source, policy)),
                         ..SubsystemHealth::default()

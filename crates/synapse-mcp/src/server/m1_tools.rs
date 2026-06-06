@@ -1,13 +1,14 @@
 use super::{
     CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse, ErrorData,
     FindParams, FindResponse, Health, Json, ObserveParams, Parameters, ReadTextParams,
-    SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
-    SetPerceptionModeResponse, SynapseService, empty_input_schema, mcp_error, observe_include,
-    observe_input, populate_audio_summary, populate_clipboard_summary,
-    populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
-    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state, tool,
-    tool_router,
+    SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
+    SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
+    TargetWire, empty_input_schema, mcp_error, observe_include, observe_input,
+    populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
+    populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
+    set_capture_target_in_state, set_perception_mode_in_state, tool, tool_router,
 };
+use rmcp::{RoleServer, service::RequestContext};
 
 use std::{
     path::{Path, PathBuf},
@@ -56,7 +57,9 @@ impl SynapseService {
         Json(self.health_payload())
     }
 
-    #[tool(description = "Returns structured state of the focused window and surrounding context")]
+    #[tool(
+        description = "Returns structured state of the session's active target window (set via set_target) or the foreground window when no target is set, plus surrounding context"
+    )]
     pub async fn observe(
         &self,
         params: Parameters<ObserveParams>,
@@ -67,10 +70,12 @@ impl SynapseService {
             "tool.invocation kind=observe"
         );
         let include = observe_include(&params.0);
+        let target_hwnd =
+            self.session_target_hwnd(crate::http::current_mcp_session_id().as_deref());
         // Scope the (non-Send) state guard so it is released before any await.
         let mut input = {
             let state = self.m1_state()?;
-            let mut input = observe_input(&state, &params.0)?;
+            let mut input = observe_input(&state, &params.0, target_hwnd)?;
             if include.fs && input.fs_recent.is_empty() {
                 populate_fs_recent(&mut input, &state.fs_recent_tracker);
             }
@@ -128,9 +133,11 @@ impl SynapseService {
             kind = "find",
             "tool.invocation kind=find"
         );
+        let target_hwnd =
+            self.session_target_hwnd(crate::http::current_mcp_session_id().as_deref());
         let mut input = {
             let mut state = self.m1_state()?;
-            super::build_find_input(&mut state, &params.0)?
+            super::build_find_input(&mut state, &params.0, target_hwnd)?
         };
         super::enrich_input_with_cdp(
             &mut input,
@@ -234,6 +241,198 @@ impl SynapseService {
         let mut state = self.m1_state()?;
         set_perception_mode_in_state(&mut state, &params.0).map(Json)
     }
+
+    #[tool(
+        description = "Bind this MCP session's active perception target to a specific window (by HWND). While set, observe/find/read_text/capture_screenshot perceive THIS window without foregrounding it, so many agents observe different windows concurrently. Validates the window is live and snapshottable, echoing its title/process. Errors TARGET_WINDOW_NOT_FOUND for a dead/invalid HWND."
+    )]
+    pub async fn set_target(
+        &self,
+        params: Parameters<SetTargetParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TargetResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "set_target",
+            "tool.invocation kind=set_target"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let (target, wire, window_title, process_name) = match params.0.target {
+            SetTargetParam::Window { window_hwnd } => {
+                let (title, process) = validate_target_window(window_hwnd)?;
+                (
+                    SessionTarget::Window { hwnd: window_hwnd },
+                    TargetWire::Window { window_hwnd },
+                    Some(title),
+                    Some(process),
+                )
+            }
+            SetTargetParam::Cdp { cdp_target_id } => {
+                // CDP-scoped perception is a later phase. Fail loud rather than
+                // accept a binding that would silently not drive perception.
+                return Err(mcp_error(
+                    error_codes::TARGET_CDP_UNRESOLVED,
+                    format!(
+                        "CDP target binding (cdp_target_id={cdp_target_id:?}) is not yet supported; bind a window target (kind=window)"
+                    ),
+                ));
+            }
+        };
+        let previous = self.set_session_target(&session_id, target)?;
+        tracing::info!(
+            code = "SESSION_TARGET_SET",
+            session_id = %session_id,
+            window_title = window_title.as_deref().unwrap_or_default(),
+            process_name = process_name.as_deref().unwrap_or_default(),
+            "readback=session_target outcome=set"
+        );
+        Ok(Json(TargetResponse {
+            session_id,
+            previous,
+            current: Some(wire),
+            window_title,
+            process_name,
+        }))
+    }
+
+    #[tool(
+        description = "Return this MCP session's active perception target, or null when none is set.",
+        input_schema = empty_input_schema()
+    )]
+    pub async fn get_target(
+        &self,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TargetResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "get_target",
+            "tool.invocation kind=get_target"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let current = self.get_session_target_wire(&session_id)?;
+        Ok(Json(TargetResponse {
+            session_id,
+            previous: None,
+            current,
+            window_title: None,
+            process_name: None,
+        }))
+    }
+
+    #[tool(
+        description = "Clear this MCP session's active perception target, reverting observe/find/read_text to the global foreground.",
+        input_schema = empty_input_schema()
+    )]
+    pub async fn clear_target(
+        &self,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TargetResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "clear_target",
+            "tool.invocation kind=clear_target"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let previous = self.clear_session_target(&session_id)?;
+        tracing::info!(
+            code = "SESSION_TARGET_CLEARED",
+            session_id = %session_id,
+            had_target = previous.is_some(),
+            "readback=session_target outcome=cleared"
+        );
+        Ok(Json(TargetResponse {
+            session_id,
+            previous,
+            current: None,
+            window_title: None,
+            process_name: None,
+        }))
+    }
+}
+
+/// Resolves the calling session id for target tools, failing loud when absent
+/// (the target registry is per-session).
+fn require_target_session_id(
+    request_context: &RequestContext<RoleServer>,
+) -> Result<String, ErrorData> {
+    super::context::mcp_session_id_from_request_context(request_context)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target tools require an MCP session id (run the daemon in HTTP mode so each agent has its own Mcp-Session-Id)",
+        )
+    })
+}
+
+impl SynapseService {
+    fn set_session_target(
+        &self,
+        session_id: &str,
+        target: SessionTarget,
+    ) -> Result<Option<TargetWire>, ErrorData> {
+        let mut guard = self.lock_session_targets()?;
+        let previous = guard
+            .insert(session_id.to_owned(), target)
+            .map(|prior| target_wire(&prior));
+        drop(guard);
+        Ok(previous)
+    }
+
+    fn get_session_target_wire(&self, session_id: &str) -> Result<Option<TargetWire>, ErrorData> {
+        let guard = self.lock_session_targets()?;
+        let current = guard.get(session_id).map(target_wire);
+        drop(guard);
+        Ok(current)
+    }
+
+    fn clear_session_target(&self, session_id: &str) -> Result<Option<TargetWire>, ErrorData> {
+        let mut guard = self.lock_session_targets()?;
+        let previous = guard.remove(session_id).map(|prior| target_wire(&prior));
+        drop(guard);
+        Ok(previous)
+    }
+
+    fn lock_session_targets(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, std::collections::HashMap<String, SessionTarget>>,
+        ErrorData,
+    > {
+        self.session_targets_ref().lock().map_err(|_err| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session target registry lock poisoned",
+            )
+        })
+    }
+}
+
+fn target_wire(target: &SessionTarget) -> TargetWire {
+    match target {
+        SessionTarget::Window { hwnd } => TargetWire::Window { window_hwnd: *hwnd },
+        SessionTarget::Cdp { cdp_target_id } => TargetWire::Cdp {
+            cdp_target_id: cdp_target_id.clone(),
+        },
+    }
+}
+
+/// Validates a `set_target` window HWND is live and snapshottable, returning its
+/// (title, process_name) so the response confirms exactly which window was bound.
+/// Fail-loud: a dead/invalid/unresolvable HWND is `TARGET_WINDOW_NOT_FOUND`.
+fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
+    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("set_target window_hwnd {hwnd:#x} is not a live window: {error}"),
+        )
+    })?;
+    let context = synapse_a11y::foreground_context(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!(
+                "set_target window_hwnd {hwnd:#x} could not be resolved for perception: {error}"
+            ),
+        )
+    })?;
+    Ok((context.window_title, context.process_name))
 }
 
 fn capture_screenshot_to_file(
@@ -1397,7 +1596,41 @@ fn template_value(field_name: &str, path: &str, index: usize) -> PerceptionResul
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{ocr_cache_key, sha256_hex, template_value};
+    use super::{
+        SessionTarget, TargetWire, ocr_cache_key, sha256_hex, target_wire, template_value,
+        validate_target_window,
+    };
+    use synapse_core::error_codes;
+
+    #[test]
+    fn validate_target_window_rejects_dead_hwnd() {
+        // 0xDEAD is not a live window; set_target must fail loud, never bind it.
+        let error = match validate_target_window(0xDEAD) {
+            Ok(resolved) => panic!("dead hwnd unexpectedly validated: {resolved:?}"),
+            Err(error) => error,
+        };
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TARGET_WINDOW_NOT_FOUND));
+        println!("readback=set_target edge=dead_hwnd code={code:?}");
+    }
+
+    #[test]
+    fn target_wire_maps_session_target_variants() {
+        match target_wire(&SessionTarget::Window { hwnd: 0x1234 }) {
+            TargetWire::Window { window_hwnd } => assert_eq!(window_hwnd, 0x1234),
+            other => panic!("expected window wire, got {other:?}"),
+        }
+        match target_wire(&SessionTarget::Cdp {
+            cdp_target_id: "TID-1".to_owned(),
+        }) {
+            TargetWire::Cdp { cdp_target_id } => assert_eq!(cdp_target_id, "TID-1"),
+            other => panic!("expected cdp wire, got {other:?}"),
+        }
+    }
     use crate::m1::ResolvedReadTextRequest;
     use synapse_core::{OcrBackend, Rect};
 

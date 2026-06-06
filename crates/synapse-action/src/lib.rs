@@ -11,6 +11,7 @@ pub mod handle;
 pub mod hotkey;
 pub mod humanize;
 pub mod invoke;
+pub mod lease;
 pub mod path;
 pub mod rate_limit;
 pub mod recovery;
@@ -55,6 +56,11 @@ pub use hotkey::{
 pub use humanize::{HumanizeError, HumanizeResult, humanize_timed_path};
 pub use invoke::{
     CoordinateFallbackPlan, ElementClickOutcome, click_element_or_fallback, invoke_element,
+};
+pub use lease::{
+    DEFAULT_LEASE_TTL_MS, LeaseError, LeaseOutcome, LeaseStatus, MAX_LEASE_TTL_MS,
+    MIN_LEASE_TTL_MS, force_preempt as force_preempt_input_lease,
+    ttl_from_ms as input_lease_ttl_from_ms,
 };
 pub use path::{
     ArcLengthPath, DEFAULT_ARCLEN_LUT_SEGMENTS, PathError, PathResult, SpatialPath, path_length,

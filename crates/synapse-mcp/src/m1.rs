@@ -178,6 +178,11 @@ pub struct ObserveParams {
     pub subtree_root: Option<ElementId>,
     #[serde(default)]
     pub since_event_seq: Option<u64>,
+    /// Explicit per-call window override (HWND). Takes precedence over the
+    /// session's active target; when both are absent, observe falls back to the
+    /// global foreground (back-compat).
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema)]
@@ -355,6 +360,47 @@ pub struct SetPerceptionModeResponse {
     pub rationale: String,
 }
 
+/// `set_target` request: bind this MCP session's active perception target
+/// (epic #720, issue #736). Window targeting is live now; CDP targeting is
+/// accepted on the wire for forward compatibility.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SetTargetParam {
+    Window { window_hwnd: i64 },
+    Cdp { cdp_target_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetTargetParams {
+    pub target: SetTargetParam,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TargetWire {
+    Window { window_hwnd: i64 },
+    Cdp { cdp_target_id: String },
+}
+
+/// Response shared by `set_target`/`get_target`/`clear_target`. `current` is the
+/// target after the call (`None` when cleared/unset); `window_title`/
+/// `process_name` echo the validated window so the agent sees exactly which
+/// window it bound (fail-loud confirmation).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TargetResponse {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<TargetWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<TargetWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+}
+
 pub fn empty_input_schema() -> Arc<JsonObject> {
     common::schema_for_type::<EmptyParams>()
 }
@@ -434,10 +480,19 @@ pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, Er
 pub fn observe_input(
     state: &M1State,
     params: &ObserveParams,
+    target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
     let depth = params.depth.unwrap_or(2).min(6);
     if let Some(element_id) = &params.subtree_root {
         return element_input_from_id(element_id, depth, state.perception_mode);
+    }
+    // Precedence: explicit per-call window_hwnd > session active target >
+    // foreground. The target path snapshots the window without foregrounding it.
+    if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
+        let mut input = window_input_from_hwnd(hwnd, depth, state.perception_mode)?;
+        input.capture_config = Some(state.active_capture_config.clone());
+        input.capture_runtime = Some(state.capture_runtime_readback());
+        return Ok(input);
     }
     current_input(state, depth)
 }
@@ -1304,8 +1359,10 @@ const FIND_CDP_MAX_NODES: usize = 300;
 pub fn build_find_input(
     state: &mut M1State,
     params: &FindParams,
+    target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
-    let mut input = if let Some(hwnd) = params.window_hwnd {
+    // Precedence matches observe: explicit window_hwnd > session target > foreground.
+    let mut input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
         let mut input = window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, state.perception_mode)?;
         input.capture_config = Some(state.active_capture_config.clone());
         input.capture_runtime = Some(state.capture_runtime_readback());
@@ -1647,6 +1704,122 @@ mod tests {
         ProfileOcr, ProfileUseScope, SensorStatus, WebPerceptionPath,
     };
     use synapse_perception::TextRegion;
+
+    /// Real-window Full-State-Verification for per-agent target perception
+    /// (#736/#737): bind a BACKGROUND window as the target and prove `observe`
+    /// returns that window's content WITHOUT stealing the foreground. Source of
+    /// truth = `synapse_a11y::current_foreground_context()` (the real OS
+    /// foreground) read separately before/after. Spawns real Notepad + mspaint,
+    /// so it is `#[ignore]` by default; run on an interactive desktop with
+    /// `cargo test -p synapse-mcp --bins observe_target_window -- --ignored --nocapture`.
+    #[cfg(windows)]
+    #[ignore = "spawns real Notepad + mspaint; run on an interactive desktop with --ignored"]
+    #[test]
+    fn observe_target_window_in_background_without_foreground_steal() -> anyhow::Result<()> {
+        use std::{
+            process::Command,
+            thread::sleep,
+            time::{Duration, Instant},
+        };
+
+        fn wait_for_foreground_process(name: &str) -> Option<synapse_core::ForegroundContext> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if let Ok(foreground) = synapse_a11y::current_foreground_context()
+                    && foreground.process_name.eq_ignore_ascii_case(name)
+                {
+                    return Some(foreground);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                sleep(Duration::from_millis(150));
+            }
+        }
+
+        // 1) Launch Notepad and capture its HWND while it is the foreground.
+        let mut notepad = Command::new("notepad.exe").spawn()?;
+        let notepad_fg = wait_for_foreground_process("notepad.exe")
+            .ok_or_else(|| anyhow::anyhow!("notepad did not reach the foreground"))?;
+        let notepad_hwnd = notepad_fg.hwnd;
+        println!(
+            "readback=launch app=notepad hwnd=0x{:x} title={:?}",
+            notepad_hwnd, notepad_fg.window_title
+        );
+
+        // 2) Launch mspaint to STEAL the foreground away from Notepad (stands in
+        //    for the human / another agent changing focus).
+        let mut paint = Command::new("mspaint.exe").spawn()?;
+        let _paint_fg = wait_for_foreground_process("mspaint.exe")
+            .ok_or_else(|| anyhow::anyhow!("mspaint did not reach the foreground"))?;
+        let before_fg = synapse_a11y::current_foreground_context()?;
+        assert_ne!(
+            before_fg.hwnd, notepad_hwnd,
+            "precondition: Notepad must NOT be the foreground window"
+        );
+        println!(
+            "readback=foreground_before_observe hwnd=0x{:x} process={}",
+            before_fg.hwnd, before_fg.process_name
+        );
+
+        // 3) Observe the BACKGROUND Notepad via the per-session target path.
+        let state = M1State::default();
+        let params = ObserveParams {
+            window_hwnd: Some(notepad_hwnd),
+            ..ObserveParams::default()
+        };
+        let observation = observe_input(&state, &params, None)?;
+        println!(
+            "readback=observation foreground_hwnd=0x{:x} process={} title={:?}",
+            observation.foreground.hwnd,
+            observation.foreground.process_name,
+            observation.foreground.window_title
+        );
+
+        // Source of truth: the observation describes the TARGET (Notepad), not
+        // the OS foreground (mspaint).
+        assert_eq!(
+            observation.foreground.hwnd, notepad_hwnd,
+            "observation must describe the target window, not the foreground"
+        );
+        assert!(
+            observation
+                .foreground
+                .process_name
+                .eq_ignore_ascii_case("notepad.exe"),
+            "observed process should be notepad.exe, got {}",
+            observation.foreground.process_name
+        );
+
+        // 4) observe did NOT steal the foreground (no SetForegroundWindow on the
+        //    perception path).
+        let after_fg = synapse_a11y::current_foreground_context()?;
+        println!(
+            "readback=foreground_after_observe hwnd=0x{:x} process={}",
+            after_fg.hwnd, after_fg.process_name
+        );
+        assert_eq!(
+            after_fg.hwnd, before_fg.hwnd,
+            "observe must NOT change the foreground window"
+        );
+
+        // 5) Edge case: close the target, then observing it must fail loud
+        //    instead of silently reverting to the foreground.
+        notepad.kill().ok();
+        sleep(Duration::from_millis(750));
+        let after_close = observe_input(&state, &params, None);
+        println!(
+            "readback=observe_after_target_closed is_err={}",
+            after_close.is_err()
+        );
+        assert!(
+            after_close.is_err(),
+            "observing a closed target window must error, not silently fall back to foreground"
+        );
+
+        paint.kill().ok();
+        Ok(())
+    }
 
     #[test]
     fn capture_interval_floor_applies_to_manual_and_profile_metadata() {

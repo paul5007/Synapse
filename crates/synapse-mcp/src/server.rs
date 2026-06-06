@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -24,12 +24,13 @@ use crate::{
         CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse, FindParams,
         FindResponse, M1State, ObserveParams, ReadTextParams, SetCaptureTargetParams,
         SetCaptureTargetResponse, SetPerceptionModeParams, SetPerceptionModeResponse,
-        SharedM1State, apply_profile_runtime_config_in_state, build_find_input, current_input,
-        empty_input_schema, enrich_input_with_browser_ocr, enrich_input_with_cdp,
-        find_cdp_max_nodes, find_snapshot_depth, match_find_input, mcp_error, observe_include,
-        observe_input, populate_clipboard_summary, populate_detection_from_state,
-        populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
-        set_capture_target_in_state, set_perception_mode_in_state,
+        SetTargetParam, SetTargetParams, SharedM1State, TargetResponse, TargetWire,
+        apply_profile_runtime_config_in_state, build_find_input, current_input, empty_input_schema,
+        enrich_input_with_browser_ocr, enrich_input_with_cdp, find_cdp_max_nodes,
+        find_snapshot_depth, match_find_input, mcp_error, observe_include, observe_input,
+        populate_clipboard_summary, populate_detection_from_state, populate_fs_recent,
+        read_text_request_uncached, resolve_read_text_request, set_capture_target_in_state,
+        set_perception_mode_in_state,
     },
     m2::{
         ActClickParams, ActClickResponse, ActClipboardParams, ActClipboardResponse,
@@ -135,6 +136,7 @@ mod everquest_world_model;
 mod everquest_world_summary;
 mod handler;
 mod health;
+mod lease_tools;
 mod m1_tools;
 mod m2_tools;
 mod m3_tools;
@@ -145,6 +147,29 @@ mod target_policy;
 #[cfg(test)]
 mod tests;
 
+/// A single MCP session's active perception target (epic #720). When set,
+/// `observe`/`find`/`read_text`/`capture_screenshot` perceive this target
+/// instead of the global foreground, so many agents observe different windows
+/// concurrently. `Cdp` targeting is reserved for a later phase; the enum carries
+/// it now so the wire shape is stable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionTarget {
+    Window {
+        hwnd: i64,
+    },
+    // Reserved for phase 2 (CDP-scoped perception). set_target currently rejects
+    // CDP bindings with TARGET_CDP_UNRESOLVED, so this variant is not yet built.
+    #[allow(dead_code)]
+    Cdp {
+        cdp_target_id: String,
+    },
+}
+
+/// Per-session active-target registry keyed by `Mcp-Session-Id`. A small mutex
+/// held only to clone an entry out — never across a perception `.await` — so
+/// target reads never serialize behind another session's snapshot.
+pub(crate) type SharedSessionTargets = Arc<Mutex<HashMap<String, SessionTarget>>>;
+
 #[derive(Debug, Clone)]
 pub struct SynapseService {
     started_at: Instant,
@@ -153,6 +178,7 @@ pub struct SynapseService {
     m2_state: SharedM2State,
     m3_state: SharedM3State,
     m4_config: M4ServiceConfig,
+    session_targets: SharedSessionTargets,
 }
 
 impl SynapseService {
@@ -172,6 +198,7 @@ impl SynapseService {
             m2_state: shared_m2_state_from_env()?,
             m3_state: shared_m3_state_from_env()?,
             m4_config: M4ServiceConfig::from_env()?,
+            session_targets: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -202,6 +229,7 @@ impl SynapseService {
                 sse_state,
             )?,
             m4_config,
+            session_targets: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -232,6 +260,7 @@ impl SynapseService {
                 sse_state,
             )?,
             m4_config,
+            session_targets: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -246,6 +275,27 @@ impl SynapseService {
         Arc::clone(&self.m3_state)
     }
 
+    pub(crate) fn session_targets_handle(&self) -> SharedSessionTargets {
+        Arc::clone(&self.session_targets)
+    }
+
+    pub(crate) const fn session_targets_ref(&self) -> &SharedSessionTargets {
+        &self.session_targets
+    }
+
+    /// Resolves the session's active **window** target to an HWND, if any. The
+    /// map guard is dropped before returning (a copied `i64`), so it is never
+    /// held across the non-`Send` perception path or an `.await`. A `Cdp` target
+    /// returns `None` here (CDP-scoped perception is a later phase).
+    pub(crate) fn session_target_hwnd(&self, session_id: Option<&str>) -> Option<i64> {
+        let session_id = session_id?;
+        let guard = self.session_targets.lock().ok()?;
+        match guard.get(session_id)? {
+            SessionTarget::Window { hwnd } => Some(*hwnd),
+            SessionTarget::Cdp { .. } => None,
+        }
+    }
+
     pub(crate) fn unscoped_action_handle(&self) -> anyhow::Result<ActionHandle> {
         self.m2_state
             .lock()
@@ -256,6 +306,7 @@ impl SynapseService {
     fn tool_router() -> ToolRouter<Self> {
         let mut router = Self::m1_tool_router()
             + Self::m2_tool_router()
+            + Self::lease_tool_router()
             + Self::reality_tool_router()
             + Self::m3_tool_router()
             + Self::m4_tool_router();
