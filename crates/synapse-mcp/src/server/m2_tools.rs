@@ -1562,13 +1562,14 @@ fn capture_pixel_signature(region: Rect) -> ClickPixelSignature {
 }
 
 fn point_delta_rect(point: Point) -> Rect {
-    const HALF_SIZE: i32 = 32;
-    const SIZE: i32 = HALF_SIZE * 2;
+    // Wide list rows often leave blank padding under the pointer; include nearby content.
+    const HALF_WIDTH: i32 = 512;
+    const HALF_HEIGHT: i32 = 192;
     Rect {
-        x: point.x.saturating_sub(HALF_SIZE),
-        y: point.y.saturating_sub(HALF_SIZE),
-        w: SIZE,
-        h: SIZE,
+        x: point.x.saturating_sub(HALF_WIDTH),
+        y: point.y.saturating_sub(HALF_HEIGHT),
+        w: HALF_WIDTH * 2,
+        h: HALF_HEIGHT * 2,
     }
 }
 
