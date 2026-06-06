@@ -10,6 +10,10 @@ use super::{
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
 use crate::m1::mcp_error;
+use crate::m2::postcondition::{
+    ActPostcondition, hash_json as verify_hash_json,
+    no_observed_delta_error as source_no_observed_delta_error, postcondition_observed_delta,
+};
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA,
     act_click_postmessage_with_params, act_stroke_error_details, act_stroke_request_details,
@@ -22,8 +26,8 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::{sync::Arc, time::Duration};
 use synapse_action::{
-    ACTION_QUEUE_CAPACITY, ActionError, ActionHandle, RecordingBackend, ResolvedBackend,
-    TokenBucketSnapshot,
+    ACTION_QUEUE_CAPACITY, ActionEmitterSnapshotHandle, ActionError, ActionHandle,
+    ActionStateSnapshot, RecordingBackend, ResolvedBackend, TokenBucketSnapshot,
 };
 use synapse_core::{
     AccessibleNode, Action, Backend, ForegroundContext, PathPoint, PathSpec, Point, Rect,
@@ -194,7 +198,27 @@ impl SynapseService {
             self.audit_action_result("act_type", &result)?;
             return result.map(Json);
         }
+        let before_delta_signature = if params.verify_delta && params.into_element.is_none() {
+            match self.capture_action_delta_signature(160, None, false).await {
+                Ok(signature) => Some(signature),
+                Err(error) => {
+                    let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                    self.audit_action_result("act_type", &result)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
+        let verify_timeout_ms = params.verify_timeout_ms;
         let result = act_type_with_handle(handle, recording, params).await;
+        let result = match (result, before_delta_signature) {
+            (Ok(response), Some(before)) => {
+                self.verify_act_type_response(response, before, verify_timeout_ms)
+                    .await
+            }
+            (other, _) => other,
+        };
         self.audit_action_result("act_type", &result)?;
         result.map(Json)
     }
@@ -205,6 +229,7 @@ impl SynapseService {
         params: Parameters<ActPressParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActPressResponse>, ErrorData> {
+        let params = params.0;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_press",
@@ -219,10 +244,30 @@ impl SynapseService {
             }
         };
         self.audit_action_started_with_details("act_press", &action_preflight_details(&preflight))?;
+        let before_delta_signature = if params.verify_delta {
+            match self.capture_action_delta_signature(160, None, false).await {
+                Ok(signature) => Some(signature),
+                Err(error) => {
+                    let result: Result<ActPressResponse, ErrorData> = Err(error);
+                    self.audit_action_result("act_press", &result)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
+        let verify_timeout_ms = params.verify_timeout_ms;
         let (handle, recording, connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         let result =
-            act_press_with_handle(handle, recording, connection_closed_cancel, params.0).await;
+            act_press_with_handle(handle, recording, connection_closed_cancel, params).await;
+        let result = match (result, before_delta_signature) {
+            (Ok(response), Some(before)) => {
+                self.verify_act_press_response(response, before, verify_timeout_ms)
+                    .await
+            }
+            (other, _) => other,
+        };
         self.audit_action_result("act_press", &result)?;
         result.map(Json)
     }
@@ -336,6 +381,22 @@ impl SynapseService {
             "act_stroke",
             &act_stroke_audit_details(&stroke_details, &preflight),
         )?;
+        let before_delta_signature = if params.verify_delta {
+            match self.capture_action_delta_signature(160, None, true).await {
+                Ok(signature) => Some(signature),
+                Err(error) => {
+                    self.audit_action_error_with_details(
+                        "act_stroke",
+                        &error,
+                        &act_stroke_failure_audit_details(&stroke_details, &preflight, &error),
+                    )?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let verify_timeout_ms = params.verify_timeout_ms;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         let foreground_monitor = recording
@@ -346,6 +407,13 @@ impl SynapseService {
         let result = match foreground_error {
             Some(error) => Err(error),
             None => result,
+        };
+        let result = match (result, before_delta_signature) {
+            (Ok(response), Some(before)) => {
+                self.verify_act_stroke_response(response, before, verify_timeout_ms)
+                    .await
+            }
+            (other, _) => other,
         };
         match &result {
             Ok(response) => {
@@ -376,6 +444,7 @@ impl SynapseService {
         params: Parameters<ActScrollParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActScrollResponse>, ErrorData> {
+        let params = params.0;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_scroll",
@@ -392,9 +461,36 @@ impl SynapseService {
             "act_scroll",
             &action_preflight_details(&preflight),
         )?;
+        let point_region = params.at.map(|point| Point {
+            x: point.x,
+            y: point.y,
+        });
+        let before_delta_signature = if params.verify_delta {
+            match self
+                .capture_action_delta_signature(160, point_region, false)
+                .await
+            {
+                Ok(signature) => Some(signature),
+                Err(error) => {
+                    let result: Result<ActScrollResponse, ErrorData> = Err(error);
+                    self.audit_action_result("act_scroll", &result)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
+        let verify_timeout_ms = params.verify_timeout_ms;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
-        let result = act_scroll_with_handle(handle, recording, params.0).await;
+        let result = act_scroll_with_handle(handle, recording, params).await;
+        let result = match (result, before_delta_signature) {
+            (Ok(response), Some(before)) => {
+                self.verify_act_scroll_response(response, before, verify_timeout_ms, point_region)
+                    .await
+            }
+            (other, _) => other,
+        };
         self.audit_action_result("act_scroll", &result)?;
         result.map(Json)
     }
@@ -405,6 +501,7 @@ impl SynapseService {
         params: Parameters<ActPadParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActPadResponse>, ErrorData> {
+        let params = params.0;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_pad",
@@ -420,7 +517,33 @@ impl SynapseService {
         self.audit_action_started_with_details("act_pad", &action_preflight_details(&preflight))?;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
-        let result = act_pad_with_handle(handle, recording, params.0).await;
+        let snapshot_handle = if params.verify_delta {
+            Some(self.m2_snapshot_handle()?)
+        } else {
+            None
+        };
+        let before_snapshot = if let Some(snapshot_handle) = &snapshot_handle {
+            match snapshot_handle.snapshot().await {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    let error = mcp_error(error.code(), error.to_string());
+                    let result: Result<ActPadResponse, ErrorData> = Err(error);
+                    self.audit_action_result("act_pad", &result)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
+        let verify_timeout_ms = params.verify_timeout_ms;
+        let result = act_pad_with_handle(handle, recording, params).await;
+        let result = match (result, before_snapshot, snapshot_handle) {
+            (Ok(response), Some(before), Some(snapshot_handle)) => {
+                self.verify_act_pad_response(response, before, snapshot_handle, verify_timeout_ms)
+                    .await
+            }
+            (other, _, _) => other,
+        };
         self.audit_action_result("act_pad", &result)?;
         result.map(Json)
     }
@@ -662,7 +785,9 @@ struct ClickDeltaSignature {
     cdp_status: Option<String>,
     cdp_endpoint_present: bool,
     web_path: Option<String>,
+    cursor_position: Option<Point>,
     pixel: ClickPixelSignature,
+    point_pixel: Option<ClickPixelSignature>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -828,10 +953,13 @@ impl SynapseService {
             }
             Err(error) => {
                 let mut tier_attempts = response.tier_attempts.clone();
+                let error_code = click_error_data_code(&error)
+                    .unwrap_or(error_codes::ACTION_NO_OBSERVED_DELTA)
+                    .to_owned();
                 tier_attempts.push(click_tier_failed(
                     response.backend_tier_used.clone(),
                     CLICK_REASON_NO_OBSERVED_DELTA,
-                    error_codes::ACTION_NO_OBSERVED_DELTA,
+                    &error_code,
                     response.required_foreground,
                     error.message.to_string(),
                 ));
@@ -843,6 +971,16 @@ impl SynapseService {
     async fn capture_click_delta_signature(
         &self,
         max_elements: usize,
+    ) -> Result<ClickDeltaSignature, ErrorData> {
+        self.capture_action_delta_signature(max_elements, None, false)
+            .await
+    }
+
+    async fn capture_action_delta_signature(
+        &self,
+        max_elements: usize,
+        point_region: Option<Point>,
+        include_cursor: bool,
     ) -> Result<ClickDeltaSignature, ErrorData> {
         let mut input = {
             let state = self.m1_state()?;
@@ -874,7 +1012,11 @@ impl SynapseService {
             cdp_status: input.cdp.as_ref().map(|cdp| cdp.status.as_str().to_owned()),
             cdp_endpoint_present: input.cdp.as_ref().is_some_and(|cdp| cdp.endpoint.is_some()),
             web_path: input.web_path.map(|path| path.as_str().to_owned()),
+            cursor_position: include_cursor
+                .then(|| synapse_action::backend::software::cursor_position().ok())
+                .flatten(),
             pixel,
+            point_pixel: point_region.map(|point| capture_pixel_signature(point_delta_rect(point))),
         })
     }
 
@@ -884,11 +1026,15 @@ impl SynapseService {
         timeout_ms: u32,
     ) -> Result<ActClickPostcondition, ErrorData> {
         tokio::time::sleep(Duration::from_millis(u64::from(timeout_ms))).await;
-        let after = self.capture_click_delta_signature(160).await?;
+        let after = self
+            .capture_action_delta_signature(160, None, false)
+            .await?;
         let before_hash = signature_hash(&before)?;
         let after_hash = signature_hash(&after)?;
-        if before == after {
-            return Err(no_observed_delta_error(
+        if foreground_identity_changed(&before, &after) {
+            return Err(foreground_lost_delta_error(
+                "act_click",
+                "foreground_focused_ui_or_pixels",
                 timeout_ms,
                 &before_hash,
                 &after_hash,
@@ -896,16 +1042,215 @@ impl SynapseService {
                 &after,
             ));
         }
-        Ok(ActClickPostcondition {
-            status: "observed_delta".to_owned(),
-            observed_delta: Some(true),
-            before_signature: Some(before_hash),
-            after_signature: Some(after_hash),
-            detail: Some(
-                "act_click verify_delta observed a changed focused/UI/pixel signature after delivery"
-                    .to_owned(),
-            ),
-        })
+        if before == after {
+            return Err(source_no_observed_delta_error(
+                "act_click",
+                "foreground_focused_ui_or_pixels",
+                timeout_ms,
+                before_hash,
+                after_hash,
+                json!({
+                    "before": before,
+                    "after": after,
+                }),
+            ));
+        }
+        Ok(postcondition_observed_delta(
+            "act_click",
+            "foreground_focused_ui_or_pixels",
+            before_hash,
+            after_hash,
+            "observed a changed focused/UI/pixel signature after delivery",
+        ))
+    }
+
+    async fn verify_act_type_response(
+        &self,
+        mut response: ActTypeResponse,
+        before: ClickDeltaSignature,
+        verify_timeout_ms: u32,
+    ) -> Result<ActTypeResponse, ErrorData> {
+        response.postcondition = self
+            .verify_action_delta(
+                "act_type",
+                "foreground_focused_ui_or_pixels",
+                before,
+                verify_timeout_ms,
+                None,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn verify_act_press_response(
+        &self,
+        mut response: ActPressResponse,
+        before: ClickDeltaSignature,
+        verify_timeout_ms: u32,
+    ) -> Result<ActPressResponse, ErrorData> {
+        response.postcondition = self
+            .verify_action_delta(
+                "act_press",
+                "foreground_focused_ui_or_pixels",
+                before,
+                verify_timeout_ms,
+                None,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn verify_act_scroll_response(
+        &self,
+        mut response: ActScrollResponse,
+        before: ClickDeltaSignature,
+        verify_timeout_ms: u32,
+        point_region: Option<Point>,
+    ) -> Result<ActScrollResponse, ErrorData> {
+        response.postcondition = self
+            .verify_action_delta(
+                "act_scroll",
+                if point_region.is_some() {
+                    "target_point_pixels"
+                } else {
+                    "foreground_focused_ui_or_pixels"
+                },
+                before,
+                verify_timeout_ms,
+                point_region,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn verify_act_stroke_response(
+        &self,
+        mut response: ActStrokeResponse,
+        before: ClickDeltaSignature,
+        verify_timeout_ms: u32,
+    ) -> Result<ActStrokeResponse, ErrorData> {
+        response.postcondition = self
+            .verify_action_delta(
+                "act_stroke",
+                "cursor_foreground_ui_or_pixels",
+                before,
+                verify_timeout_ms,
+                None,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn verify_action_delta(
+        &self,
+        tool: &str,
+        source_of_truth: &str,
+        before: ClickDeltaSignature,
+        timeout_ms: u32,
+        point_region: Option<Point>,
+    ) -> Result<ActPostcondition, ErrorData> {
+        tokio::time::sleep(Duration::from_millis(u64::from(timeout_ms))).await;
+        let after = self
+            .capture_action_delta_signature(160, point_region, source_of_truth.contains("cursor"))
+            .await?;
+        if point_region.is_some() {
+            let before_point = before.point_pixel.clone();
+            let after_point = after.point_pixel.clone();
+            let before_hash = verify_hash_json(&before_point)?;
+            let after_hash = verify_hash_json(&after_point)?;
+            if before_point == after_point {
+                return Err(source_no_observed_delta_error(
+                    tool,
+                    source_of_truth,
+                    timeout_ms,
+                    before_hash,
+                    after_hash,
+                    json!({
+                        "point": point_region,
+                        "before_point_pixel": before_point,
+                        "after_point_pixel": after_point,
+                    }),
+                ));
+            }
+            return Ok(postcondition_observed_delta(
+                tool,
+                source_of_truth,
+                before_hash,
+                after_hash,
+                "observed a target point pixel signature change after delivery",
+            ));
+        }
+
+        let before_hash = signature_hash(&before)?;
+        let after_hash = signature_hash(&after)?;
+        if foreground_identity_changed(&before, &after) {
+            return Err(foreground_lost_delta_error(
+                tool,
+                source_of_truth,
+                timeout_ms,
+                &before_hash,
+                &after_hash,
+                &before,
+                &after,
+            ));
+        }
+        if before == after {
+            return Err(source_no_observed_delta_error(
+                tool,
+                source_of_truth,
+                timeout_ms,
+                before_hash,
+                after_hash,
+                json!({
+                    "before": before,
+                    "after": after,
+                }),
+            ));
+        }
+        Ok(postcondition_observed_delta(
+            tool,
+            source_of_truth,
+            before_hash,
+            after_hash,
+            "observed a Source-of-Truth signature change after delivery",
+        ))
+    }
+
+    async fn verify_act_pad_response(
+        &self,
+        mut response: ActPadResponse,
+        before: ActionStateSnapshot,
+        snapshot_handle: ActionEmitterSnapshotHandle,
+        verify_timeout_ms: u32,
+    ) -> Result<ActPadResponse, ErrorData> {
+        tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
+        let after = snapshot_handle
+            .snapshot()
+            .await
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let before_hash = verify_hash_json(&before.pad_state)?;
+        let after_hash = verify_hash_json(&after.pad_state)?;
+        if before.pad_state == after.pad_state {
+            return Err(source_no_observed_delta_error(
+                "act_pad",
+                "action_emitter.pad_state",
+                verify_timeout_ms,
+                before_hash,
+                after_hash,
+                json!({
+                    "before_pad_state": before.pad_state,
+                    "after_pad_state": after.pad_state,
+                }),
+            ));
+        }
+        response.postcondition = postcondition_observed_delta(
+            "act_pad",
+            "action_emitter.pad_state",
+            before_hash,
+            after_hash,
+            "observed action emitter pad_state change after delivery",
+        );
+        Ok(response)
     }
 }
 
@@ -1007,6 +1352,17 @@ fn capture_pixel_signature(region: Rect) -> ClickPixelSignature {
     }
 }
 
+fn point_delta_rect(point: Point) -> Rect {
+    const HALF_SIZE: i32 = 32;
+    const SIZE: i32 = HALF_SIZE * 2;
+    Rect {
+        x: point.x.saturating_sub(HALF_SIZE),
+        y: point.y.saturating_sub(HALF_SIZE),
+        w: SIZE,
+        h: SIZE,
+    }
+}
+
 fn signature_hash(signature: &ClickDeltaSignature) -> Result<String, ErrorData> {
     hash_json(signature)
 }
@@ -1036,20 +1392,45 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
-fn no_observed_delta_error(
+fn foreground_identity_changed(before: &ClickDeltaSignature, after: &ClickDeltaSignature) -> bool {
+    before.foreground_hwnd != after.foreground_hwnd
+        || before.foreground_pid != after.foreground_pid
+        || before.foreground_process != after.foreground_process
+}
+
+fn foreground_lost_delta_error(
+    tool: &str,
+    source_of_truth: &str,
     timeout_ms: u32,
     before_hash: &str,
     after_hash: &str,
     before: &ClickDeltaSignature,
     after: &ClickDeltaSignature,
 ) -> ErrorData {
+    tracing::warn!(
+        code = error_codes::ACTION_FOREGROUND_LOST,
+        tool,
+        source_of_truth,
+        timeout_ms,
+        before_hwnd = before.foreground_hwnd,
+        after_hwnd = after.foreground_hwnd,
+        before_pid = before.foreground_pid,
+        after_pid = after.foreground_pid,
+        before_process = %before.foreground_process,
+        after_process = %after.foreground_process,
+        before_signature = before_hash,
+        after_signature = after_hash,
+        "verify_delta foreground target identity changed before postcondition readback"
+    );
     ErrorData::new(
         ErrorCode(-32099),
         format!(
-            "act_click verify_delta observed no focused/UI/pixel state change within {timeout_ms} ms"
+            "{tool} verify_delta cannot accept observed delta because foreground target changed within {timeout_ms} ms"
         ),
         Some(json!({
-            "code": error_codes::ACTION_NO_OBSERVED_DELTA,
+            "code": error_codes::ACTION_FOREGROUND_LOST,
+            "tool": tool,
+            "source_of_truth": source_of_truth,
             "verify_delta": {
                 "timeout_ms": timeout_ms,
                 "before_signature": before_hash,

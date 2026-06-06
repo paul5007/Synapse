@@ -16,6 +16,7 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
+use schema::press_postcondition_not_requested;
 pub use schema::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
 };
@@ -56,6 +57,7 @@ pub async fn act_press_with_handle(
         keys_pressed: key_count,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         backend_used: backend_used_name(backend).to_owned(),
+        postcondition: press_postcondition_not_requested(),
     })
 }
 
@@ -81,6 +83,8 @@ pub async fn act_keymap_with_handle(
         keys: resolved_keys.clone(),
         hold_ms: params.hold_ms,
         backend: params.backend,
+        verify_delta: false,
+        verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
     };
     let response =
         act_press_with_handle(handle, recording, connection_closed_cancel, press).await?;

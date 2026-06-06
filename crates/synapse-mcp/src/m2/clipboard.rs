@@ -7,6 +7,11 @@ use synapse_action::{ActionError, ClipboardFormat};
 use synapse_core::error_codes;
 
 use crate::m1::mcp_error;
+use crate::m2::postcondition::{
+    ActPostcondition, default_verify_timeout_ms, no_observed_delta_error,
+    postcondition_failed_error, postcondition_not_requested, postcondition_observed_delta,
+    text_signature,
+};
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +21,12 @@ pub struct ActClipboardParams {
     #[serde(default = "default_clipboard_format")]
     #[schemars(default = "default_clipboard_format")]
     pub format: ActClipboardFormat,
+    #[serde(default)]
+    #[schemars(default)]
+    pub verify_delta: bool,
+    #[serde(default = "default_verify_timeout_ms")]
+    #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
+    pub verify_timeout_ms: u32,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -46,12 +57,21 @@ pub struct ActClipboardResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_len: Option<usize>,
     pub elapsed_ms: u32,
+    pub postcondition: ActPostcondition,
 }
 
 pub async fn act_clipboard(params: ActClipboardParams) -> Result<ActClipboardResponse, ErrorData> {
     validate_params(&params)?;
     let started = Instant::now();
     let format = params.format.to_clipboard_format();
+    let before_text = if params.verify_delta && !matches!(params.verb, ActClipboardVerb::Read) {
+        Some(
+            synapse_action::read_clipboard_text(format)
+                .map_err(|error| action_error_to_mcp(&error))?,
+        )
+    } else {
+        None
+    };
     let response = match params.verb {
         ActClipboardVerb::Read => {
             let text = synapse_action::read_clipboard_text(format)
@@ -65,6 +85,7 @@ pub async fn act_clipboard(params: ActClipboardParams) -> Result<ActClipboardRes
                 text_len: Some(text.chars().count()),
                 text: Some(text),
                 elapsed_ms: elapsed_ms(started),
+                postcondition: postcondition_not_requested("act_clipboard", "clipboard_text"),
             }
         }
         ActClipboardVerb::Write => {
@@ -83,6 +104,7 @@ pub async fn act_clipboard(params: ActClipboardParams) -> Result<ActClipboardRes
                 text: None,
                 text_len: Some(text.chars().count()),
                 elapsed_ms: elapsed_ms(started),
+                postcondition: postcondition_not_requested("act_clipboard", "clipboard_text"),
             }
         }
         ActClipboardVerb::Clear => {
@@ -96,8 +118,20 @@ pub async fn act_clipboard(params: ActClipboardParams) -> Result<ActClipboardRes
                 text: None,
                 text_len: None,
                 elapsed_ms: elapsed_ms(started),
+                postcondition: postcondition_not_requested("act_clipboard", "clipboard_text"),
             }
         }
+    };
+    let response = if let Some(before) = before_text {
+        tokio::time::sleep(std::time::Duration::from_millis(u64::from(
+            params.verify_timeout_ms,
+        )))
+        .await;
+        let after = synapse_action::read_clipboard_text(format)
+            .map_err(|error| action_error_to_mcp(&error))?;
+        verify_clipboard_delta(response, &params, before, after)?
+    } else {
+        response
     };
     tracing::info!(
         code = "M2_ACT_CLIPBOARD_READBACK",
@@ -168,6 +202,70 @@ fn action_error_to_mcp(error: &ActionError) -> ErrorData {
     mcp_error(error.code(), error.to_string())
 }
 
+fn verify_clipboard_delta(
+    mut response: ActClipboardResponse,
+    params: &ActClipboardParams,
+    before: String,
+    after: String,
+) -> Result<ActClipboardResponse, ErrorData> {
+    let before_signature = text_signature(&before);
+    let after_signature = text_signature(&after);
+    if before == after {
+        return Err(no_observed_delta_error(
+            "act_clipboard",
+            "clipboard_text",
+            params.verify_timeout_ms,
+            before_signature,
+            after_signature,
+            serde_json::json!({
+                "verb": params.verb,
+                "format": params.format,
+                "before_len": before.chars().count(),
+                "after_len": after.chars().count(),
+            }),
+        ));
+    }
+    if matches!(params.verb, ActClipboardVerb::Write)
+        && after != params.text.as_deref().unwrap_or_default()
+    {
+        return Err(postcondition_failed_error(
+            "act_clipboard",
+            "clipboard_text",
+            "clipboard text changed but did not equal requested write text",
+            before_signature,
+            after_signature,
+            serde_json::json!({
+                "verb": params.verb,
+                "format": params.format,
+                "expected_len": params.text.as_ref().map(|text| text.chars().count()),
+                "after_len": after.chars().count(),
+            }),
+        ));
+    }
+    if matches!(params.verb, ActClipboardVerb::Clear) && !after.is_empty() {
+        return Err(postcondition_failed_error(
+            "act_clipboard",
+            "clipboard_text",
+            "clipboard text changed but was not empty after clear",
+            before_signature,
+            after_signature,
+            serde_json::json!({
+                "verb": params.verb,
+                "format": params.format,
+                "after_len": after.chars().count(),
+            }),
+        ));
+    }
+    response.postcondition = postcondition_observed_delta(
+        "act_clipboard",
+        "clipboard_text",
+        before_signature,
+        after_signature,
+        "observed clipboard text Source-of-Truth change",
+    );
+    Ok(response)
+}
+
 const fn default_clipboard_format() -> ActClipboardFormat {
     ActClipboardFormat::Unicode
 }
@@ -186,6 +284,8 @@ mod tests {
             verb: ActClipboardVerb::Write,
             text: Some("unicode-clipboard-edge-雪".to_owned()),
             format: ActClipboardFormat::Text,
+            verify_delta: false,
+            verify_timeout_ms: default_verify_timeout_ms(),
         };
 
         assert!(validate_params(&params).is_ok());

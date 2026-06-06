@@ -15,7 +15,7 @@
 
 use chromiumoxide::Browser;
 use chromiumoxide::cdp::browser_protocol::dom::{
-    BackendNodeId, GetBoxModelParams, ScrollIntoViewIfNeededParams,
+    BackendNodeId, GetBoxModelParams, ResolveNodeParams, ScrollIntoViewIfNeededParams,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchMouseEventParams, DispatchMouseEventType, InsertTextParams, MouseButton,
@@ -23,6 +23,7 @@ use chromiumoxide::cdp::browser_protocol::input::{
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, GetLayoutMetricsParams, Viewport,
 };
+use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt as _;
 
@@ -154,6 +155,76 @@ pub async fn cdp_type_node(
     )
     .await
     .map(|_point| ())
+}
+
+/// Reads a web node's semantic value/text via CDP after resolving the exact
+/// backend node into a JavaScript object.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the node cannot be resolved or evaluated.
+pub async fn cdp_node_value(
+    endpoint: &str,
+    page_title_hint: &str,
+    backend_node_id: i64,
+) -> A11yResult<String> {
+    with_node_page(
+        endpoint,
+        page_title_hint,
+        backend_node_id,
+        |page| async move {
+            let resolve = ResolveNodeParams::builder()
+                .backend_node_id(BackendNodeId::new(backend_node_id))
+                .object_group("synapse_verify_delta")
+                .build();
+            let resolved =
+                page.execute(resolve)
+                    .await
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
+                    })?;
+            let object_id =
+                resolved
+                    .object
+                    .object_id
+                    .clone()
+                    .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                        detail: format!(
+                            "resolveNode for backendNodeId {backend_node_id} returned no objectId"
+                        ),
+                    })?;
+            let call = CallFunctionOnParams::builder()
+                .function_declaration(
+                    "function() {
+                    if (this === null || this === undefined) { return ''; }
+                    if ('value' in this) { return String(this.value ?? ''); }
+                    if ('checked' in this) { return String(Boolean(this.checked)); }
+                    if (this.textContent !== null && this.textContent !== undefined) {
+                        return String(this.textContent);
+                    }
+                    return '';
+                }",
+                )
+                .object_id(object_id)
+                .return_by_value(true)
+                .silent(true)
+                .build()
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("build Runtime.callFunctionOn params: {err}"),
+                })?;
+            page.evaluate_function(call)
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("Runtime.callFunctionOn value readback: {err}"),
+                })?
+                .into_value::<String>()
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("Runtime.callFunctionOn value decode: {err}"),
+                })
+        },
+    )
+    .await
 }
 
 /// Resolves the viewport-CSS centre of a web node (for `act_stroke` target
@@ -363,6 +434,34 @@ where
             y: f64::from(rect.y) + f64::from(rect.h) / 2.0,
         };
         action(page, center).await
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
+async fn with_node_page<A, Fut, T>(
+    endpoint: &str,
+    page_title_hint: &str,
+    backend_node_id: i64,
+    action: A,
+) -> A11yResult<T>
+where
+    A: FnOnce(chromiumoxide::Page) -> Fut,
+    Fut: std::future::Future<Output = A11yResult<T>>,
+{
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let result = async {
+        let page = resolve_owning_page(&browser, page_title_hint, backend_node_id).await?;
+        action(page).await
     }
     .await;
 

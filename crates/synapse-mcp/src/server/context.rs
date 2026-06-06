@@ -170,6 +170,20 @@ impl SynapseService {
             })
     }
 
+    pub(super) fn m2_snapshot_handle(
+        &self,
+    ) -> Result<synapse_action::ActionEmitterSnapshotHandle, ErrorData> {
+        self.m2_state
+            .lock()
+            .map(|state| state.snapshot_handle.clone())
+            .map_err(|_err| {
+                mcp_error(
+                    synapse_core::error_codes::OBSERVE_INTERNAL,
+                    "M2 service state lock poisoned",
+                )
+            })
+    }
+
     pub(super) fn ensure_supported_use_allows_action(
         &self,
         tool: &'static str,
@@ -1229,6 +1243,8 @@ mod scope_gate_tests {
                 verb: ActClipboardVerb::Read,
                 text: None,
                 format: ActClipboardFormat::Unicode,
+                verify_delta: false,
+                verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
             }))
             .await;
 

@@ -8,7 +8,10 @@ use uiautomation::{
     types::{ElementMode, ExpandCollapseState, Handle, Rect as UiaRect, TreeScope},
 };
 
-use crate::{A11yError, A11yResult, ElementClickAction, ElementValueSetReadback, ExpandState};
+use crate::{
+    A11yError, A11yResult, ElementClickAction, ElementValueReadback, ElementValueSetReadback,
+    ExpandState,
+};
 
 use super::common::{
     TreeView, cached_hwnd, cached_role, cached_runtime_id_hex_or_fallback, create_cache_request,
@@ -441,6 +444,23 @@ pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValue
             method: "uia_value_pattern".to_owned(),
             before_value,
             after_value,
+        })
+    })
+}
+
+pub fn element_value(id: &ElementId) -> A11yResult<ElementValueReadback> {
+    let id = id.clone();
+    with_automation(move |automation| {
+        let element = re_resolve_on_worker(automation, &id)?;
+        let pattern: UIValuePattern = element.get_pattern().map_err(|err| {
+            A11yError::internal(format!("ValuePattern not exposed for element {id}: {err}"))
+        })?;
+        let is_readonly = pattern.is_readonly().map_err(map_uia_error)?;
+        let value = pattern.get_value().map_err(map_uia_error)?;
+        Ok(ElementValueReadback {
+            method: "uia_value_pattern".to_owned(),
+            value,
+            is_readonly,
         })
     })
 }

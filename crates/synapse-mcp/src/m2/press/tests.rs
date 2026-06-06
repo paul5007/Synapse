@@ -25,6 +25,8 @@ async fn recording_backend_readback_orders_chord_and_default_hold() {
         keys: vec!["shift".to_owned(), "ctrl".to_owned(), "s".to_owned()],
         hold_ms: default_hold_ms(),
         backend: default_press_backend(),
+        verify_delta: false,
+        verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
     };
     let before = recording.events();
     println!("readback=act_press_recording edge=ordered_chord before={before:?}");

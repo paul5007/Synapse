@@ -49,6 +49,15 @@ pub struct ElementValueSetReadback {
     pub after_value: String,
 }
 
+/// Readback from an element's native text/value pattern without mutating it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ElementValueReadback {
+    pub method: String,
+    pub value: String,
+    pub is_readonly: bool,
+}
+
 /// Resolves an element and reads its current bounding rectangle as plain data.
 ///
 /// # Errors
@@ -97,6 +106,17 @@ pub fn focus_element(id: &ElementId) -> A11yResult<()> {
 /// or SetValue/readback fails, and `A11Y_NOT_AVAILABLE` on non-Windows.
 pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValueSetReadback> {
     platform::set_element_value(id, value)
+}
+
+/// Reads a re-resolved element's native `ValuePattern` text.
+///
+/// # Errors
+///
+/// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
+/// structured UIA error when the element does not expose `ValuePattern` or
+/// readback fails, and `A11Y_NOT_AVAILABLE` on non-Windows.
+pub fn element_value(id: &ElementId) -> A11yResult<ElementValueReadback> {
+    platform::element_value(id)
 }
 
 /// Read-only mirror of `uiautomation::types::ExpandCollapseState`. Kept

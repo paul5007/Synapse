@@ -19,6 +19,9 @@ use synapse_core::{
 };
 
 use crate::m1::mcp_error;
+use crate::m2::postcondition::{
+    ActPostcondition, default_verify_timeout_ms, postcondition_not_requested,
+};
 
 pub const MAX_STROKE_PATH_POINTS: usize = 4096;
 pub const MAX_STROKE_SAMPLES: usize = 60_001;
@@ -75,6 +78,12 @@ pub struct ActStrokeParams {
     #[serde(default)]
     #[schemars(default)]
     pub modifiers: Vec<StrokeModifier>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub verify_delta: bool,
+    #[serde(default = "default_verify_timeout_ms")]
+    #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
+    pub verify_timeout_ms: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -132,6 +141,7 @@ pub struct ActStrokeResponse {
     pub modifiers_used: Vec<StrokeModifier>,
     pub backend_used: String,
     pub elapsed_ms: u32,
+    pub postcondition: ActPostcondition,
 }
 
 #[derive(Clone, Debug)]
@@ -944,6 +954,7 @@ fn response(
         modifiers_used: params.modifiers.clone(),
         backend_used: backend_used_name(backend).to_owned(),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        postcondition: postcondition_not_requested("act_stroke", "cursor_foreground_ui_or_pixels"),
     }
 }
 
@@ -963,6 +974,7 @@ fn cdp_aim_response(params: &ActStrokeParams, started: Instant) -> ActStrokeResp
         modifiers_used: params.modifiers.clone(),
         backend_used: "cdp".to_owned(),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        postcondition: postcondition_not_requested("act_stroke", "cdp_pointer_or_foreground_ui"),
     }
 }
 
@@ -1557,6 +1569,8 @@ mod tests {
             humanize: None,
             backend: StrokeBackend::Software,
             modifiers: Vec::new(),
+            verify_delta: false,
+            verify_timeout_ms: default_verify_timeout_ms(),
         }
     }
 
@@ -1573,6 +1587,8 @@ mod tests {
             humanize: None,
             backend: StrokeBackend::Software,
             modifiers: Vec::new(),
+            verify_delta: false,
+            verify_timeout_ms: default_verify_timeout_ms(),
         }
     }
 

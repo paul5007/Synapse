@@ -2,6 +2,7 @@ mod click;
 mod clipboard;
 mod config;
 mod pad;
+pub(crate) mod postcondition;
 mod press;
 mod release_all;
 mod scroll;
@@ -31,6 +32,7 @@ pub use clipboard::ActClipboardFormat;
 pub use clipboard::{ActClipboardParams, ActClipboardResponse, ActClipboardVerb, act_clipboard};
 pub use config::M2ServiceConfig;
 pub use pad::{ActPadParams, ActPadResponse, act_pad_with_handle};
+pub use postcondition::default_verify_timeout_ms;
 pub use press::action_from_press_params;
 pub use press::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,

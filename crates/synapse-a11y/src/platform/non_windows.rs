@@ -5,7 +5,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     A11yError, A11yResult, AccessibleEvent, ElementClickAction, ElementSearchScope,
-    ElementValueSetReadback, ExpandState, UIElement, UiaWorkerReadback, WinEventHookReadback,
+    ElementValueReadback, ElementValueSetReadback, ExpandState, UIElement, UiaWorkerReadback,
+    WinEventHookReadback,
 };
 
 pub struct WinEventSubscription {
@@ -189,6 +190,12 @@ pub fn focus_element(_id: &ElementId) -> A11yResult<()> {
 pub fn set_element_value(_id: &ElementId, _value: &str) -> A11yResult<ElementValueSetReadback> {
     Err(A11yError::not_available(
         "UIA element ValuePattern text entry requires Windows",
+    ))
+}
+
+pub fn element_value(_id: &ElementId) -> A11yResult<ElementValueReadback> {
+    Err(A11yError::not_available(
+        "UIA element ValuePattern readback requires Windows",
     ))
 }
 

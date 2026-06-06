@@ -9,6 +9,9 @@ use synapse_action::{
 use synapse_core::{Action, GamepadController, GamepadReport, PadButton, PadId, error_codes};
 
 use crate::m1::mcp_error;
+use crate::m2::postcondition::{
+    ActPostcondition, default_verify_timeout_ms, postcondition_not_requested,
+};
 
 const MAX_HOLD_MS: u32 = 30_000;
 
@@ -26,6 +29,12 @@ pub struct ActPadParams {
     #[schemars(default = "default_pad_backend")]
     pub backend: PadBackend,
     pub hold_ms: Option<u32>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub verify_delta: bool,
+    #[serde(default = "default_verify_timeout_ms")]
+    #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
+    pub verify_timeout_ms: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -92,6 +101,7 @@ pub struct ActPadResponse {
     pub hold_ms: Option<u32>,
     pub returned_to_neutral: bool,
     pub elapsed_ms: u32,
+    pub postcondition: ActPostcondition,
 }
 
 pub async fn act_pad_with_handle(
@@ -137,6 +147,7 @@ pub async fn act_pad_with_handle(
         hold_ms: params.hold_ms,
         returned_to_neutral: params.hold_ms.is_some(),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        postcondition: postcondition_not_requested("act_pad", "action_emitter.pad_state"),
     })
 }
 
@@ -417,6 +428,8 @@ mod tests {
                 report: full_sweep_report(),
                 backend: PadBackend::Vigem,
                 hold_ms: Some(1),
+                verify_delta: false,
+                verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
             };
             let before = recording.events();
             println!(

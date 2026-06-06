@@ -12,6 +12,9 @@ use synapse_action::{
 use synapse_core::{Action, Backend, Point};
 
 use crate::m1::mcp_error;
+use crate::m2::postcondition::{
+    ActPostcondition, default_verify_timeout_ms, postcondition_not_requested,
+};
 
 #[cfg(windows)]
 use std::ffi::c_void;
@@ -46,6 +49,12 @@ pub struct ActScrollParams {
     #[serde(default)]
     #[schemars(default)]
     pub smooth: bool,
+    #[serde(default)]
+    #[schemars(default)]
+    pub verify_delta: bool,
+    #[serde(default = "default_verify_timeout_ms")]
+    #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
+    pub verify_timeout_ms: u32,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, JsonSchema)]
@@ -68,6 +77,7 @@ pub struct ActScrollResponse {
     pub scheduled_smooth_total_ms: u32,
     pub backend_used: String,
     pub elapsed_ms: u32,
+    pub postcondition: ActPostcondition,
 }
 
 pub async fn act_scroll_with_handle(
@@ -302,6 +312,10 @@ fn response(
         scheduled_smooth_total_ms: scheduled_smooth_total_ms(params.smooth, wheel_event_count),
         backend_used: backend_used.to_owned(),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        postcondition: postcondition_not_requested(
+            "act_scroll",
+            "target_point_pixels_or_foreground_ui",
+        ),
     }
 }
 

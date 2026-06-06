@@ -2,6 +2,10 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use synapse_core::Backend;
 
+use crate::m2::postcondition::{
+    ActPostcondition, default_verify_timeout_ms, postcondition_not_requested,
+};
+
 const DEFAULT_HOLD_MS: u32 = 33;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -14,6 +18,12 @@ pub struct ActPressParams {
     #[serde(default = "default_press_backend")]
     #[schemars(default = "default_press_backend")]
     pub backend: PressBackend,
+    #[serde(default)]
+    #[schemars(default)]
+    pub verify_delta: bool,
+    #[serde(default = "default_verify_timeout_ms")]
+    #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
+    pub verify_timeout_ms: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -43,6 +53,7 @@ pub struct ActPressResponse {
     pub keys_pressed: u32,
     pub elapsed_ms: u32,
     pub backend_used: String,
+    pub postcondition: ActPostcondition,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -74,4 +85,8 @@ pub(in crate::m2::press) const fn default_hold_ms() -> u32 {
 
 pub(in crate::m2::press) const fn default_press_backend() -> PressBackend {
     PressBackend::Auto
+}
+
+pub(in crate::m2::press) fn press_postcondition_not_requested() -> ActPostcondition {
+    postcondition_not_requested("act_press", "foreground_focused_ui_or_pixels")
 }

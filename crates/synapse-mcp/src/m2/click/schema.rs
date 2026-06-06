@@ -2,6 +2,11 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use synapse_core::{AimCurve, AimNaturalParams, Backend, ElementId, MouseButton};
 
+pub(in crate::m2::click) use crate::m2::postcondition::default_verify_timeout_ms;
+use crate::m2::postcondition::{
+    ActPostcondition, postcondition_not_requested as base_postcondition_not_requested,
+};
+
 const DEFAULT_CLICK_HOLD_MS: u32 = 120;
 
 #[derive(Clone, Debug, JsonSchema)]
@@ -108,15 +113,7 @@ pub struct ActClickTierAttempt {
     pub required_foreground: bool,
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ActClickPostcondition {
-    pub status: String,
-    pub observed_delta: Option<bool>,
-    pub before_signature: Option<String>,
-    pub after_signature: Option<String>,
-    pub detail: Option<String>,
-}
+pub type ActClickPostcondition = ActPostcondition;
 
 impl<'de> Deserialize<'de> for ActClickParams {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -222,19 +219,6 @@ pub(in crate::m2::click) const fn default_use_invoke_pattern() -> bool {
     true
 }
 
-pub(in crate::m2::click) const fn default_verify_timeout_ms() -> u32 {
-    250
-}
-
 pub(in crate::m2::click) fn postcondition_not_requested() -> ActClickPostcondition {
-    ActClickPostcondition {
-        status: "not_requested".to_owned(),
-        observed_delta: None,
-        before_signature: None,
-        after_signature: None,
-        detail: Some(
-            "act_click only verified low-level delivery; set verify_delta=true to require an observed app-state delta"
-                .to_owned(),
-        ),
-    }
+    base_postcondition_not_requested("act_click", "foreground_focused_ui_or_pixels")
 }
