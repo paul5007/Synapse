@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use rmcp::ErrorData;
+use rmcp::{ErrorData, model::ErrorCode};
+use serde_json::json;
 use synapse_action::{
     ActionError, ActionHandle, DoubleClickTiming, ElementClickOutcome, EmitState, RecordingBackend,
     click_element_or_fallback,
@@ -27,9 +28,9 @@ use windows::{
 };
 
 use super::{
-    CLICK_REASON_BACKEND_UNAVAILABLE, CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE,
-    CLICK_TIER_UIA, action_error_to_mcp, attach_click_tier_attempts, backend_used_name,
-    click_backend_tier_used, click_error_code, click_reason_for_error_code,
+    CLICK_REASON_BACKEND_UNAVAILABLE, CLICK_REASON_SELECTION_ONLY, CLICK_TIER_FOREGROUND,
+    CLICK_TIER_POSTMESSAGE, CLICK_TIER_UIA, action_error_to_mcp, attach_click_tier_attempts,
+    backend_used_name, click_backend_tier_used, click_error_code, click_reason_for_error_code,
     click_required_foreground, click_tier_delivered, click_tier_failed,
     error_has_click_tier_attempts, record,
     schema::{
@@ -58,6 +59,57 @@ pub(super) async fn execute_element_click(
             "coordinate_direct",
         )
         .await;
+    }
+
+    let metadata = element_coordinate_fallback_metadata(&element.element_id)?;
+    if coordinate_fallback_required_for_selection_only_list_item(&metadata) {
+        let detail = "UIA SelectionItemPattern on list item is selection-only and does not reliably emit the item click/activation event required by act_click";
+        let tier_attempts = vec![click_tier_failed(
+            CLICK_TIER_UIA,
+            CLICK_REASON_SELECTION_ONLY,
+            error_codes::ACTION_TARGET_INVALID,
+            false,
+            detail,
+        )];
+        if params.coordinate_fallback_on_unsupported {
+            tracing::info!(
+                code = "M2_ACT_CLICK_COORDINATE_FALLBACK_ON_SELECTION_ONLY_LIST_ITEM",
+                kind = "act_click",
+                element_id = %element.element_id,
+                role = %metadata.role,
+                automation_id = metadata.automation_id.as_deref(),
+                enabled = metadata.enabled,
+                patterns = ?metadata.patterns,
+                bbox = ?metadata.bbox,
+                "act_click list item target requires click activation semantics; routing around selection-only UIA path"
+            );
+            return execute_coordinate_element_click(
+                handle,
+                params,
+                element,
+                recording,
+                timing,
+                started,
+                tier_attempts,
+                "coordinate_fallback_on_selection_only_list_item",
+            )
+            .await;
+        }
+        tracing::warn!(
+            code = "M2_ACT_CLICK_SELECTION_ONLY_LIST_ITEM_DENIED",
+            kind = "act_click",
+            element_id = %element.element_id,
+            role = %metadata.role,
+            automation_id = metadata.automation_id.as_deref(),
+            enabled = metadata.enabled,
+            patterns = ?metadata.patterns,
+            bbox = ?metadata.bbox,
+            "act_click list item target requires click activation semantics but coordinate fallback is disabled"
+        );
+        return Err(attach_click_tier_attempts(
+            selection_only_list_item_error(&element.element_id, detail),
+            tier_attempts,
+        ));
     }
 
     let mut state = EmitState::new();
@@ -480,9 +532,19 @@ fn coordinate_fallback_allowed_after_selection_readback_failure(
     metadata.enabled && metadata.bbox.w > 0 && metadata.bbox.h > 0 && radio_role(&metadata.role)
 }
 
+fn coordinate_fallback_required_for_selection_only_list_item(
+    metadata: &synapse_a11y::ElementMetadataReadback,
+) -> bool {
+    metadata.enabled && metadata.bbox.w > 0 && metadata.bbox.h > 0 && list_item_role(&metadata.role)
+}
+
 fn editable_role(role: &str) -> bool {
     let role = role.to_ascii_lowercase();
     role.contains("edit") || role.contains("document") || role.contains("text")
+}
+
+fn list_item_role(role: &str) -> bool {
+    role.to_ascii_lowercase().contains("list item")
 }
 
 fn radio_role(role: &str) -> bool {
@@ -498,6 +560,19 @@ fn exposes_text_value_pattern(patterns: &[UiaPattern]) -> bool {
 fn selection_item_select_readback_failed(detail: &str) -> bool {
     detail.contains("SelectionItemPattern.select returned")
         && detail.contains("IsSelected stayed false")
+}
+
+fn selection_only_list_item_error(element_id: &synapse_core::ElementId, detail: &str) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("action target invalid: {detail} for element {element_id}"),
+        Some(json!({
+            "code": error_codes::ACTION_TARGET_INVALID,
+            "detail_code": "UIA_SELECTION_ITEM_IS_NOT_CLICK_ACTIVATION",
+            "element_id": element_id.as_str(),
+            "recommended_pattern": "retry with coordinate_fallback_on_unsupported=true or click the element bbox center so the target receives the real click/activation event",
+        })),
+    )
 }
 
 pub(super) async fn execute_element_postmessage_click(
@@ -1212,6 +1287,92 @@ mod tests {
         assert!(!selection_item_select_readback_failed(
             "TogglePattern.toggle returned but state stayed Off"
         ));
+    }
+
+    #[test]
+    fn coordinate_fallback_required_for_enabled_list_item_click_activation() {
+        let metadata = synapse_a11y::ElementMetadataReadback {
+            name: "Stream".to_owned(),
+            role: "list item".to_owned(),
+            automation_id: Some("synapse757_nav_list".to_owned()),
+            bbox: synapse_core::Rect {
+                x: 439,
+                y: 484,
+                w: 268,
+                h: 45,
+            },
+            enabled: true,
+            keyboard_focusable: false,
+            patterns: vec![
+                synapse_core::UiaPattern::Invoke,
+                synapse_core::UiaPattern::Value,
+                synapse_core::UiaPattern::SelectionItem,
+                synapse_core::UiaPattern::LegacyIAccessible,
+            ],
+            value: None,
+        };
+
+        let required = coordinate_fallback_required_for_selection_only_list_item(&metadata);
+
+        println!(
+            "readback=act_click_coordinate_fallback edge=list_item_selection_only metadata={metadata:?} required={required}"
+        );
+        assert!(required);
+    }
+
+    #[test]
+    fn coordinate_fallback_denies_disabled_list_item_click_activation() {
+        let metadata = synapse_a11y::ElementMetadataReadback {
+            name: "Stream".to_owned(),
+            role: "list item".to_owned(),
+            automation_id: Some("synapse757_nav_list".to_owned()),
+            bbox: synapse_core::Rect {
+                x: 439,
+                y: 484,
+                w: 268,
+                h: 45,
+            },
+            enabled: false,
+            keyboard_focusable: false,
+            patterns: vec![synapse_core::UiaPattern::SelectionItem],
+            value: None,
+        };
+
+        let required = coordinate_fallback_required_for_selection_only_list_item(&metadata);
+
+        println!(
+            "readback=act_click_coordinate_fallback edge=disabled_list_item_selection_only metadata={metadata:?} required={required}"
+        );
+        assert!(!required);
+    }
+
+    #[test]
+    fn selection_only_list_item_error_carries_detail_code() {
+        let element_id = synapse_core::ElementId::parse("0x1000:0000002a00000001")
+            .expect("synthetic element id must be valid");
+
+        let error = selection_only_list_item_error(
+            &element_id,
+            "UIA SelectionItemPattern on list item is selection-only",
+        );
+
+        let data = error
+            .data
+            .as_ref()
+            .expect("selection-only list item error should carry structured data");
+        println!("readback=act_click_selection_only_list_item_error data={data}");
+        assert_eq!(
+            data.get("code").and_then(serde_json::Value::as_str),
+            Some(synapse_core::error_codes::ACTION_TARGET_INVALID)
+        );
+        assert_eq!(
+            data.get("detail_code").and_then(serde_json::Value::as_str),
+            Some("UIA_SELECTION_ITEM_IS_NOT_CLICK_ACTIVATION")
+        );
+        assert_eq!(
+            data.get("element_id").and_then(serde_json::Value::as_str),
+            Some(element_id.as_str())
+        );
     }
 
     #[cfg(windows)]

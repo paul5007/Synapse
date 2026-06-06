@@ -34,6 +34,7 @@ pub(crate) const CLICK_REASON_BACKEND_UNAVAILABLE: &str = "backend_unavailable";
 pub(crate) const CLICK_REASON_TARGET_INVALID: &str = "target_invalid";
 pub(crate) const CLICK_REASON_PARAMS_INVALID: &str = "params_invalid";
 pub(crate) const CLICK_REASON_NO_OBSERVED_DELTA: &str = "no_observed_delta";
+pub(crate) const CLICK_REASON_SELECTION_ONLY: &str = "selection_only";
 pub(crate) const CLICK_REASON_ERROR: &str = "error";
 
 pub async fn act_click_with_handle(
