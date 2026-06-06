@@ -125,6 +125,47 @@ pub(super) async fn execute_element_click(
                         "act_click UIA pattern unsupported; coordinate fallback denied because element is not an enabled focusable edit/document-like target"
                     );
                 }
+                if error_code == error_codes::ACTION_TARGET_INVALID
+                    && params.coordinate_fallback_on_unsupported
+                    && selection_item_select_readback_failed(error.detail())
+                {
+                    let metadata = element_coordinate_fallback_metadata(&element.element_id)?;
+                    if coordinate_fallback_allowed_after_selection_readback_failure(&metadata) {
+                        tracing::info!(
+                            code = "M2_ACT_CLICK_COORDINATE_FALLBACK_ON_SELECTION_READBACK",
+                            kind = "act_click",
+                            element_id = %element.element_id,
+                            role = %metadata.role,
+                            automation_id = metadata.automation_id.as_deref(),
+                            enabled = metadata.enabled,
+                            patterns = ?metadata.patterns,
+                            bbox = ?metadata.bbox,
+                            "act_click UIA SelectionItemPattern.Select returned but IsSelected readback stayed false; explicit coordinate fallback allowed for enabled radio button"
+                        );
+                        return execute_coordinate_element_click(
+                            handle,
+                            params,
+                            element,
+                            recording,
+                            timing,
+                            started,
+                            tier_attempts,
+                            "coordinate_fallback_on_selection_readback_failure",
+                        )
+                        .await;
+                    }
+                    tracing::warn!(
+                        code = "M2_ACT_CLICK_COORDINATE_FALLBACK_DENIED",
+                        kind = "act_click",
+                        element_id = %element.element_id,
+                        role = %metadata.role,
+                        automation_id = metadata.automation_id.as_deref(),
+                        enabled = metadata.enabled,
+                        patterns = ?metadata.patterns,
+                        bbox = ?metadata.bbox,
+                        "act_click UIA SelectionItemPattern.Select readback failed; coordinate fallback denied because element is not an enabled radio button"
+                    );
+                }
                 let mcp_error = action_error_to_mcp(&error);
                 if error_has_click_tier_attempts(&mcp_error) {
                     return Err(mcp_error);
@@ -433,15 +474,30 @@ fn coordinate_fallback_allowed_for_metadata(
         && (editable_role(&metadata.role) || exposes_text_value_pattern(&metadata.patterns))
 }
 
+fn coordinate_fallback_allowed_after_selection_readback_failure(
+    metadata: &synapse_a11y::ElementMetadataReadback,
+) -> bool {
+    metadata.enabled && metadata.bbox.w > 0 && metadata.bbox.h > 0 && radio_role(&metadata.role)
+}
+
 fn editable_role(role: &str) -> bool {
     let role = role.to_ascii_lowercase();
     role.contains("edit") || role.contains("document") || role.contains("text")
+}
+
+fn radio_role(role: &str) -> bool {
+    role.to_ascii_lowercase().contains("radio")
 }
 
 fn exposes_text_value_pattern(patterns: &[UiaPattern]) -> bool {
     patterns
         .iter()
         .any(|pattern| matches!(pattern, UiaPattern::Value | UiaPattern::Text))
+}
+
+fn selection_item_select_readback_failed(detail: &str) -> bool {
+    detail.contains("SelectionItemPattern.select returned")
+        && detail.contains("IsSelected stayed false")
 }
 
 pub(super) async fn execute_element_postmessage_click(
@@ -1089,6 +1145,73 @@ mod tests {
             "readback=act_click_coordinate_fallback edge=non_focusable_value metadata={metadata:?} allowed={allowed}"
         );
         assert!(!allowed);
+    }
+
+    #[test]
+    fn coordinate_fallback_allows_enabled_radio_after_selection_readback_failure() {
+        let metadata = synapse_a11y::ElementMetadataReadback {
+            name: "No, it's not made for kids".to_owned(),
+            role: "radio button".to_owned(),
+            automation_id: Some("synapse758_no_radio".to_owned()),
+            bbox: synapse_core::Rect {
+                x: 10,
+                y: 20,
+                w: 220,
+                h: 28,
+            },
+            enabled: true,
+            keyboard_focusable: false,
+            patterns: vec![synapse_core::UiaPattern::SelectionItem],
+            value: None,
+        };
+
+        let allowed = coordinate_fallback_allowed_after_selection_readback_failure(&metadata);
+
+        println!(
+            "readback=act_click_coordinate_fallback edge=radio_selection_readback metadata={metadata:?} allowed={allowed}"
+        );
+        assert!(allowed);
+    }
+
+    #[test]
+    fn coordinate_fallback_denies_disabled_radio_after_selection_readback_failure() {
+        let metadata = synapse_a11y::ElementMetadataReadback {
+            name: "Disabled".to_owned(),
+            role: "radio button".to_owned(),
+            automation_id: Some("disabled_radio".to_owned()),
+            bbox: synapse_core::Rect {
+                x: 10,
+                y: 20,
+                w: 220,
+                h: 28,
+            },
+            enabled: false,
+            keyboard_focusable: true,
+            patterns: vec![synapse_core::UiaPattern::SelectionItem],
+            value: None,
+        };
+
+        let allowed = coordinate_fallback_allowed_after_selection_readback_failure(&metadata);
+
+        println!(
+            "readback=act_click_coordinate_fallback edge=disabled_radio_selection_readback metadata={metadata:?} allowed={allowed}"
+        );
+        assert!(!allowed);
+    }
+
+    #[test]
+    fn detects_selection_item_select_readback_failure_detail() {
+        let detail = "accessibility backend failed: SelectionItemPattern.select returned for element 0x1:0000002a00000001, but IsSelected stayed false";
+
+        let detected = selection_item_select_readback_failed(detail);
+
+        println!(
+            "readback=act_click_selection_readback_failure before_detail={detail:?} detected={detected}"
+        );
+        assert!(detected);
+        assert!(!selection_item_select_readback_failed(
+            "TogglePattern.toggle returned but state stayed Off"
+        ));
     }
 
     #[cfg(windows)]
