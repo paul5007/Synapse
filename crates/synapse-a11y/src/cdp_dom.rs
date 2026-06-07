@@ -294,6 +294,7 @@ pub async fn fetch_dom_snapshot(
     hwnd: i64,
     foreground_title: &str,
     foreground_url_hint: Option<&str>,
+    target_id_hint: Option<&str>,
     max_nodes: usize,
 ) -> crate::A11yResult<CdpDomSnapshot> {
     use std::collections::HashMap;
@@ -325,9 +326,14 @@ pub async fn fetch_dom_snapshot(
             .result
             .target_infos;
 
-        let selection =
-            select_existing_page(pages, &target_infos, foreground_title, foreground_url_hint)
-                .await?;
+        let selection = select_existing_page(
+            pages,
+            &target_infos,
+            foreground_title,
+            foreground_url_hint,
+            target_id_hint,
+        )
+        .await?;
         let page = selection.page;
         let page_url = page
             .url()
@@ -455,6 +461,7 @@ async fn select_existing_page(
     target_infos: &[chromiumoxide::cdp::browser_protocol::target::TargetInfo],
     foreground_title: &str,
     foreground_url_hint: Option<&str>,
+    target_id_hint: Option<&str>,
 ) -> crate::A11yResult<ExistingPageSelection> {
     use std::collections::HashMap;
 
@@ -500,6 +507,29 @@ async fn select_existing_page(
     }
 
     let target_candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+    if let Some(target_id_hint) = target_id_hint.filter(|hint| !hint.trim().is_empty()) {
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.target_id == target_id_hint)
+        {
+            return Ok(selection(
+                candidate,
+                target_candidate_count,
+                "target_id_hint",
+            ));
+        }
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "explicit CDP target_id hint {target_id_hint:?} was not discovered among page targets: {}",
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.target_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        });
+    }
+
     if let Some(url_hint) = foreground_url_hint.filter(|hint| !hint.trim().is_empty()) {
         let url_matches: Vec<_> = candidates
             .iter()

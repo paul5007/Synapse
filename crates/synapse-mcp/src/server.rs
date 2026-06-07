@@ -21,12 +21,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     http::sse::SseState,
     m1::{
-        CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse, FindParams,
+        CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
+        CdpCloseTabParams, CdpCloseTabResponse, CdpOpenTabParams, CdpOpenTabResponse, FindParams,
         FindResponse, M1State, ObserveParams, ReadTextParams, SetCaptureTargetParams,
         SetCaptureTargetResponse, SetPerceptionModeParams, SetPerceptionModeResponse,
         SetTargetParam, SetTargetParams, SharedM1State, TargetResponse, TargetWire,
         apply_profile_runtime_config_in_state, build_find_input, current_input, empty_input_schema,
-        enrich_input_with_browser_ocr, enrich_input_with_cdp, find_cdp_max_nodes,
+        enrich_input_with_browser_ocr, enrich_input_with_cdp_for_target, find_cdp_max_nodes,
         find_snapshot_depth, match_find_input, mcp_error, observe_include, observe_input,
         populate_clipboard_summary, populate_detection_from_state, populate_fs_recent,
         read_text_request_uncached, resolve_read_text_request, set_capture_target_in_state,
@@ -150,17 +151,14 @@ mod tests;
 /// A single MCP session's active perception target (epic #720). When set,
 /// `observe`/`find`/`read_text`/`capture_screenshot` perceive this target
 /// instead of the global foreground, so many agents observe different windows
-/// concurrently. `Cdp` targeting is reserved for a later phase; the enum carries
-/// it now so the wire shape is stable.
+/// or browser tabs concurrently.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SessionTarget {
     Window {
         hwnd: i64,
     },
-    // Reserved for phase 2 (CDP-scoped perception). set_target currently rejects
-    // CDP bindings with TARGET_CDP_UNRESOLVED, so this variant is not yet built.
-    #[allow(dead_code)]
     Cdp {
+        window_hwnd: i64,
         cdp_target_id: String,
     },
 }
@@ -169,6 +167,21 @@ pub(crate) enum SessionTarget {
 /// held only to clone an entry out — never across a perception `.await` — so
 /// target reads never serialize behind another session's snapshot.
 pub(crate) type SharedSessionTargets = Arc<Mutex<HashMap<String, SessionTarget>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CdpTargetOwner {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub endpoint: String,
+    pub requested_url: String,
+    pub target_url: String,
+    pub created_at_unix_ms: u64,
+}
+
+/// Per-CDP-target ownership registry keyed by browser `TargetID`. Only the
+/// creating MCP session may close a registered target; unowned targets may be
+/// observed by explicit `set_target` but are never closed by Synapse.
+pub(crate) type SharedCdpTargetOwners = Arc<Mutex<HashMap<String, CdpTargetOwner>>>;
 
 #[derive(Debug, Clone)]
 pub struct SynapseService {
@@ -179,6 +192,7 @@ pub struct SynapseService {
     m3_state: SharedM3State,
     m4_config: M4ServiceConfig,
     session_targets: SharedSessionTargets,
+    cdp_target_owners: SharedCdpTargetOwners,
 }
 
 impl SynapseService {
@@ -199,6 +213,7 @@ impl SynapseService {
             m3_state: shared_m3_state_from_env()?,
             m4_config: M4ServiceConfig::from_env()?,
             session_targets: Arc::new(Mutex::new(HashMap::new())),
+            cdp_target_owners: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -230,6 +245,7 @@ impl SynapseService {
             )?,
             m4_config,
             session_targets: Arc::new(Mutex::new(HashMap::new())),
+            cdp_target_owners: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -261,6 +277,7 @@ impl SynapseService {
             )?,
             m4_config,
             session_targets: Arc::new(Mutex::new(HashMap::new())),
+            cdp_target_owners: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -283,6 +300,32 @@ impl SynapseService {
         &self.session_targets
     }
 
+    pub(crate) fn cdp_target_owners_handle(&self) -> SharedCdpTargetOwners {
+        Arc::clone(&self.cdp_target_owners)
+    }
+
+    pub(crate) const fn cdp_target_owners_ref(&self) -> &SharedCdpTargetOwners {
+        &self.cdp_target_owners
+    }
+
+    /// Resolves the session's active target, if any. The cloned value is
+    /// returned after the map guard is dropped.
+    pub(crate) fn session_target(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<SessionTarget>, ErrorData> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let guard = self.session_targets.lock().map_err(|_err| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session target registry lock poisoned",
+            )
+        })?;
+        Ok(guard.get(session_id).cloned())
+    }
+
     /// Resolves the session's active **window** target to an HWND, if any. The
     /// map guard is dropped before returning (a copied `i64`), so it is never
     /// held across the non-`Send` perception path or an `.await`.
@@ -293,24 +336,10 @@ impl SynapseService {
         let Some(session_id) = session_id else {
             return Ok(None);
         };
-        let guard = self.session_targets.lock().map_err(|_err| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "session target registry lock poisoned",
-            )
-        })?;
-        let target = match guard.get(session_id) {
-            Some(target) => target,
-            None => return Ok(None),
-        };
-        match target {
-            SessionTarget::Window { hwnd } => Ok(Some(*hwnd)),
-            SessionTarget::Cdp { cdp_target_id } => Err(mcp_error(
-                error_codes::TARGET_CDP_UNRESOLVED,
-                format!(
-                    "session {session_id} is bound to CDP target {cdp_target_id:?}, but CDP-scoped perception is not yet supported; bind a window target"
-                ),
-            )),
+        match self.session_target(Some(session_id))? {
+            Some(SessionTarget::Window { hwnd }) => Ok(Some(hwnd)),
+            Some(SessionTarget::Cdp { window_hwnd, .. }) => Ok(Some(window_hwnd)),
+            None => Ok(None),
         }
     }
 

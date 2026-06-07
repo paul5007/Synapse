@@ -1,5 +1,6 @@
 use super::{
-    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse, ErrorData,
+    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse, CdpCloseTabParams,
+    CdpCloseTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpTargetOwner, ErrorData,
     FindParams, FindResponse, Health, Json, ObserveParams, Parameters, ReadTextParams,
     SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
     SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
@@ -25,6 +26,7 @@ use image::{DynamicImage, ImageFormat, RgbaImage};
 use image::{GrayImage, Luma};
 #[cfg(windows)]
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use synapse_action::{BackendResolutionPolicy, ResolvedBackend, VigemBackend};
 use synapse_core::{
@@ -71,9 +73,8 @@ impl SynapseService {
             "tool.invocation kind=observe"
         );
         let include = observe_include(&params.0);
-        let target_hwnd = self.request_session_target_hwnd(&request_context)?;
-        self.observe_with_target_hwnd(params, include, target_hwnd)
-            .await
+        let target = self.request_session_target(&request_context)?;
+        self.observe_with_target(params, include, target).await
     }
 
     #[cfg(test)]
@@ -82,15 +83,22 @@ impl SynapseService {
         params: Parameters<ObserveParams>,
     ) -> Result<Json<synapse_core::Observation>, ErrorData> {
         let include = observe_include(&params.0);
-        self.observe_with_target_hwnd(params, include, None).await
+        self.observe_with_target(params, include, None).await
     }
 
-    async fn observe_with_target_hwnd(
+    async fn observe_with_target(
         &self,
         params: Parameters<ObserveParams>,
         include: synapse_perception::ObserveInclude,
-        target_hwnd: Option<i64>,
+        target: Option<SessionTarget>,
     ) -> Result<Json<synapse_core::Observation>, ErrorData> {
+        let explicit_hwnd = params.0.window_hwnd;
+        let target_hwnd = explicit_hwnd.or_else(|| target_hwnd(&target));
+        let cdp_target_id_hint = if explicit_hwnd.is_some() {
+            None
+        } else {
+            target_cdp_id(&target)
+        };
         // Scope the (non-Send) state guard so it is released before any await.
         let mut input = {
             let state = self.m1_state()?;
@@ -105,10 +113,11 @@ impl SynapseService {
         }
 
         if include.elements {
-            super::enrich_input_with_cdp(
+            super::enrich_input_with_cdp_for_target(
                 &mut input,
                 include.max_subtree_depth,
                 include.max_subtree_nodes,
+                cdp_target_id_hint.as_deref(),
             )
             .await;
             super::enrich_input_with_browser_ocr(&mut input, include.max_subtree_nodes);
@@ -153,8 +162,8 @@ impl SynapseService {
             kind = "find",
             "tool.invocation kind=find"
         );
-        let target_hwnd = self.request_session_target_hwnd(&request_context)?;
-        self.find_with_target_hwnd(params, target_hwnd).await
+        let target = self.request_session_target(&request_context)?;
+        self.find_with_target(params, target).await
     }
 
     #[cfg(test)]
@@ -162,22 +171,30 @@ impl SynapseService {
         &self,
         params: Parameters<FindParams>,
     ) -> Result<Json<FindResponse>, ErrorData> {
-        self.find_with_target_hwnd(params, None).await
+        self.find_with_target(params, None).await
     }
 
-    async fn find_with_target_hwnd(
+    async fn find_with_target(
         &self,
         params: Parameters<FindParams>,
-        target_hwnd: Option<i64>,
+        target: Option<SessionTarget>,
     ) -> Result<Json<FindResponse>, ErrorData> {
+        let explicit_hwnd = params.0.window_hwnd;
+        let target_hwnd = explicit_hwnd.or_else(|| target_hwnd(&target));
+        let cdp_target_id_hint = if explicit_hwnd.is_some() {
+            None
+        } else {
+            target_cdp_id(&target)
+        };
         let mut input = {
             let mut state = self.m1_state()?;
             super::build_find_input(&mut state, &params.0, target_hwnd)?
         };
-        super::enrich_input_with_cdp(
+        super::enrich_input_with_cdp_for_target(
             &mut input,
             super::find_snapshot_depth(),
             super::find_cdp_max_nodes(),
+            cdp_target_id_hint.as_deref(),
         )
         .await;
         super::enrich_input_with_browser_ocr(&mut input, super::find_cdp_max_nodes());
@@ -319,15 +336,32 @@ impl SynapseService {
                     Some(process),
                 )
             }
-            SetTargetParam::Cdp { cdp_target_id } => {
-                // CDP-scoped perception is a later phase. Fail loud rather than
-                // accept a binding that would silently not drive perception.
-                return Err(mcp_error(
-                    error_codes::TARGET_CDP_UNRESOLVED,
-                    format!(
-                        "CDP target binding (cdp_target_id={cdp_target_id:?}) is not yet supported; bind a window target (kind=window)"
-                    ),
-                ));
+            SetTargetParam::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            } => {
+                validate_cdp_target_id(&cdp_target_id)?;
+                let (title, process) = validate_target_window(window_hwnd)?;
+                let endpoint = resolve_cdp_endpoint(window_hwnd, "set_target")?;
+                self.ensure_cdp_target_bindable(
+                    &session_id,
+                    window_hwnd,
+                    &endpoint,
+                    &cdp_target_id,
+                )
+                .await?;
+                (
+                    SessionTarget::Cdp {
+                        window_hwnd,
+                        cdp_target_id: cdp_target_id.clone(),
+                    },
+                    TargetWire::Cdp {
+                        window_hwnd,
+                        cdp_target_id,
+                    },
+                    Some(title),
+                    Some(process),
+                )
             }
         };
         let previous = self.set_session_target(&session_id, target)?;
@@ -400,6 +434,93 @@ impl SynapseService {
             process_name: None,
         }))
     }
+
+    #[tool(
+        description = "Open a visible Chromium tab in the background using CDP Target.createTarget(background=true), bind it to this MCP session, and return Target.getTargets readback. Requires an explicit browser window_hwnd or an existing session target; it never uses the human's current foreground as a fallback."
+    )]
+    pub async fn cdp_open_tab(
+        &self,
+        params: Parameters<CdpOpenTabParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<CdpOpenTabResponse>, ErrorData> {
+        const TOOL: &str = "cdp_open_tab";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=cdp_open_tab"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        validate_cdp_tab_url(&params.0.url)?;
+        let window_hwnd = self.resolve_cdp_context_window(&session_id, params.0.window_hwnd)?;
+        let (window_title, process_name) = validate_target_window(window_hwnd)?;
+        let endpoint = resolve_cdp_endpoint(window_hwnd, TOOL)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "endpoint": &endpoint,
+            "requested_url": &params.0.url,
+            "background": true,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details(TOOL, &request_details)?;
+        let result = self
+            .cdp_open_tab_impl(
+                &session_id,
+                window_hwnd,
+                &endpoint,
+                &params.0.url,
+                &window_title,
+                &process_name,
+            )
+            .await;
+        self.audit_action_result(TOOL, &result)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Close a CDP tab previously created by this MCP session with cdp_open_tab. Refuses targets owned by another session or not owned by this session; it never activates the browser."
+    )]
+    pub async fn cdp_close_tab(
+        &self,
+        params: Parameters<CdpCloseTabParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<CdpCloseTabResponse>, ErrorData> {
+        const TOOL: &str = "cdp_close_tab";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=cdp_close_tab"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        validate_cdp_target_id(&params.0.cdp_target_id)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "cdp_target_id": &params.0.cdp_target_id,
+            "required_foreground": false,
+        });
+        let owner = match self.cdp_target_owner_for_close(&session_id, &params.0.cdp_target_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                self.audit_action_denied_with_details(TOOL, &error, &request_details);
+                return Err(error);
+            }
+        };
+        self.audit_action_started_with_details(
+            TOOL,
+            &json!({
+                "session_id": &session_id,
+                "window_hwnd": owner.window_hwnd,
+                "endpoint": &owner.endpoint,
+                "cdp_target_id": &params.0.cdp_target_id,
+                "required_foreground": false,
+            }),
+        )?;
+        let result = self
+            .cdp_close_tab_impl(&session_id, &params.0.cdp_target_id, owner)
+            .await;
+        self.audit_action_result(TOOL, &result)?;
+        result.map(Json)
+    }
 }
 
 /// Resolves the calling session id for target tools, failing loud when absent
@@ -443,6 +564,28 @@ impl SynapseService {
         Ok(previous)
     }
 
+    fn clear_session_cdp_target_if_matches(
+        &self,
+        session_id: &str,
+        cdp_target_id: &str,
+    ) -> Result<Option<TargetWire>, ErrorData> {
+        let mut guard = self.lock_session_targets()?;
+        let should_clear = matches!(
+            guard.get(session_id),
+            Some(SessionTarget::Cdp {
+                cdp_target_id: current,
+                ..
+            }) if current == cdp_target_id
+        );
+        let previous = if should_clear {
+            guard.remove(session_id).map(|prior| target_wire(&prior))
+        } else {
+            None
+        };
+        drop(guard);
+        Ok(previous)
+    }
+
     fn lock_session_targets(
         &self,
     ) -> Result<
@@ -455,6 +598,49 @@ impl SynapseService {
                 "session target registry lock poisoned",
             )
         })
+    }
+
+    fn lock_cdp_target_owners(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, std::collections::HashMap<String, CdpTargetOwner>>,
+        ErrorData,
+    > {
+        self.cdp_target_owners_ref().lock().map_err(|_err| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "CDP target ownership registry lock poisoned",
+            )
+        })
+    }
+
+    fn request_session_target(
+        &self,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Option<SessionTarget>, ErrorData> {
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
+        let target = self.session_target(session_id.as_deref())?;
+        if let (Some(session_id), Some(target)) = (session_id.as_deref(), target.as_ref()) {
+            match target {
+                SessionTarget::Window { hwnd } => tracing::debug!(
+                    code = "SESSION_TARGET_RESOLVED",
+                    session_id = %session_id,
+                    hwnd,
+                    "readback=session_target outcome=resolved_window"
+                ),
+                SessionTarget::Cdp {
+                    window_hwnd,
+                    cdp_target_id,
+                } => tracing::debug!(
+                    code = "SESSION_TARGET_RESOLVED",
+                    session_id = %session_id,
+                    hwnd = *window_hwnd,
+                    cdp_target_id = %cdp_target_id,
+                    "readback=session_target outcome=resolved_cdp"
+                ),
+            }
+        }
+        Ok(target)
     }
 
     fn request_session_target_hwnd(
@@ -473,15 +659,394 @@ impl SynapseService {
         }
         Ok(target_hwnd)
     }
+
+    fn resolve_cdp_context_window(
+        &self,
+        session_id: &str,
+        explicit_window_hwnd: Option<i64>,
+    ) -> Result<i64, ErrorData> {
+        if let Some(window_hwnd) = explicit_window_hwnd {
+            return Ok(window_hwnd);
+        }
+        match self.session_target(Some(session_id))? {
+            Some(SessionTarget::Window { hwnd }) => Ok(hwnd),
+            Some(SessionTarget::Cdp { window_hwnd, .. }) => Ok(window_hwnd),
+            None => Err(mcp_error(
+                error_codes::TARGET_NOT_SET,
+                "cdp_open_tab requires window_hwnd or an existing session target; refusing to use the human foreground as an implicit browser",
+            )),
+        }
+    }
+
+    fn register_cdp_target_owner(
+        &self,
+        target_id: &str,
+        owner: CdpTargetOwner,
+    ) -> Result<(), ErrorData> {
+        let mut guard = self.lock_cdp_target_owners()?;
+        if let Some(existing) = guard.get(target_id) {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "CDP target {target_id:?} is already owned by MCP session {:?}",
+                    existing.session_id
+                ),
+            ));
+        }
+        guard.insert(target_id.to_owned(), owner);
+        drop(guard);
+        Ok(())
+    }
+
+    fn remove_cdp_target_owner(
+        &self,
+        target_id: &str,
+    ) -> Result<Option<CdpTargetOwner>, ErrorData> {
+        let mut guard = self.lock_cdp_target_owners()?;
+        let removed = guard.remove(target_id);
+        drop(guard);
+        Ok(removed)
+    }
+
+    fn cdp_target_owner_for_close(
+        &self,
+        session_id: &str,
+        target_id: &str,
+    ) -> Result<CdpTargetOwner, ErrorData> {
+        let guard = self.lock_cdp_target_owners()?;
+        let Some(owner) = guard.get(target_id).cloned() else {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "cdp_close_tab refused target {target_id:?}: target is not owned by this session or was already closed"
+                ),
+            ));
+        };
+        drop(guard);
+        if owner.session_id != session_id {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "cdp_close_tab refused target {target_id:?}: owner_session_id={:?}, requesting_session_id={:?}",
+                    owner.session_id, session_id
+                ),
+            ));
+        }
+        Ok(owner)
+    }
+
+    #[cfg(windows)]
+    async fn ensure_cdp_target_bindable(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        endpoint: &str,
+        cdp_target_id: &str,
+    ) -> Result<(), ErrorData> {
+        {
+            let guard = self.lock_cdp_target_owners()?;
+            if let Some(owner) = guard.get(cdp_target_id) {
+                if owner.session_id != session_id {
+                    return Err(mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        format!(
+                            "set_target refused CDP target {cdp_target_id:?}: owner_session_id={:?}, requesting_session_id={:?}",
+                            owner.session_id, session_id
+                        ),
+                    ));
+                }
+                if owner.window_hwnd != window_hwnd || owner.endpoint != endpoint {
+                    return Err(mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        format!(
+                            "set_target refused CDP target {cdp_target_id:?}: owner registry window/endpoint mismatch (owner_hwnd={:#x}, requested_hwnd={:#x})",
+                            owner.window_hwnd, window_hwnd
+                        ),
+                    ));
+                }
+            }
+        }
+        let targets = synapse_a11y::cdp_list_targets(endpoint)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("set_target CDP target readback failed: {error}"),
+                )
+            })?;
+        if !targets
+            .iter()
+            .any(|target| target.target_id == cdp_target_id)
+        {
+            return Err(mcp_error(
+                error_codes::TARGET_CDP_UNRESOLVED,
+                format!(
+                    "set_target refused CDP target {cdp_target_id:?}: Target.getTargets readback did not contain it; available target ids: {}",
+                    targets
+                        .iter()
+                        .map(|target| target.target_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    async fn ensure_cdp_target_bindable(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _endpoint: &str,
+        _cdp_target_id: &str,
+    ) -> Result<(), ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "CDP target binding is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
+    async fn cdp_open_tab_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        endpoint: &str,
+        requested_url: &str,
+        window_title: &str,
+        process_name: &str,
+    ) -> Result<CdpOpenTabResponse, ErrorData> {
+        let opened = synapse_a11y::cdp_open_background_tab(endpoint, requested_url)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("cdp_open_tab Target.createTarget/readback failed: {error}"),
+                )
+            })?;
+        let cdp_target_id = opened.target.target_id.clone();
+        self.register_cdp_target_owner(
+            &cdp_target_id,
+            CdpTargetOwner {
+                session_id: session_id.to_owned(),
+                window_hwnd,
+                endpoint: endpoint.to_owned(),
+                requested_url: requested_url.to_owned(),
+                target_url: opened.target.url.clone(),
+                created_at_unix_ms: unix_ms_now(),
+            },
+        )?;
+        let current = TargetWire::Cdp {
+            window_hwnd,
+            cdp_target_id: cdp_target_id.clone(),
+        };
+        let previous = self.set_session_target(
+            session_id,
+            SessionTarget::Cdp {
+                window_hwnd,
+                cdp_target_id: cdp_target_id.clone(),
+            },
+        )?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_TAB_OPENED",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %cdp_target_id,
+            requested_url = %requested_url,
+            target_url = %opened.target.url,
+            window_title = %window_title,
+            process_name = %process_name,
+            "readback=Target.getTargets outcome=target_present"
+        );
+        Ok(CdpOpenTabResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            endpoint: endpoint.to_owned(),
+            requested_url: requested_url.to_owned(),
+            cdp_target_id,
+            target_type: opened.target.target_type,
+            target_title: opened.target.title,
+            target_url: opened.target.url,
+            target_attached: opened.target.attached,
+            target_count_before: opened.target_count_before,
+            target_count_after: opened.target_count_after,
+            previous,
+            current,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn cdp_open_tab_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _endpoint: &str,
+        _requested_url: &str,
+        _window_title: &str,
+        _process_name: &str,
+    ) -> Result<CdpOpenTabResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "cdp_open_tab is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
+    async fn cdp_close_tab_impl(
+        &self,
+        session_id: &str,
+        cdp_target_id: &str,
+        owner: CdpTargetOwner,
+    ) -> Result<CdpCloseTabResponse, ErrorData> {
+        let closed = synapse_a11y::cdp_close_target(&owner.endpoint, cdp_target_id)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("cdp_close_tab Target.closeTarget/readback failed: {error}"),
+                )
+            })?;
+        let _removed = self.remove_cdp_target_owner(cdp_target_id)?;
+        let previous = self.clear_session_cdp_target_if_matches(session_id, cdp_target_id)?;
+        let current = self.get_session_target_wire(session_id)?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_TAB_CLOSED",
+            session_id = %session_id,
+            hwnd = owner.window_hwnd,
+            endpoint = %owner.endpoint,
+            cdp_target_id = %cdp_target_id,
+            requested_url = %owner.requested_url,
+            target_url = %owner.target_url,
+            owner_created_at_unix_ms = owner.created_at_unix_ms,
+            "readback=Target.getTargets outcome=target_absent"
+        );
+        Ok(CdpCloseTabResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd: owner.window_hwnd,
+            endpoint: owner.endpoint,
+            cdp_target_id: closed.target_id,
+            closed: true,
+            target_count_before: closed.target_count_before,
+            target_count_after: closed.target_count_after,
+            previous,
+            current,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn cdp_close_tab_impl(
+        &self,
+        _session_id: &str,
+        _cdp_target_id: &str,
+        _owner: CdpTargetOwner,
+    ) -> Result<CdpCloseTabResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "cdp_close_tab is only available on Windows in this build",
+        ))
+    }
+}
+
+fn target_hwnd(target: &Option<SessionTarget>) -> Option<i64> {
+    match target {
+        Some(SessionTarget::Window { hwnd }) => Some(*hwnd),
+        Some(SessionTarget::Cdp { window_hwnd, .. }) => Some(*window_hwnd),
+        None => None,
+    }
+}
+
+fn target_cdp_id(target: &Option<SessionTarget>) -> Option<String> {
+    match target {
+        Some(SessionTarget::Cdp { cdp_target_id, .. }) => Some(cdp_target_id.clone()),
+        Some(SessionTarget::Window { .. }) | None => None,
+    }
 }
 
 fn target_wire(target: &SessionTarget) -> TargetWire {
     match target {
         SessionTarget::Window { hwnd } => TargetWire::Window { window_hwnd: *hwnd },
-        SessionTarget::Cdp { cdp_target_id } => TargetWire::Cdp {
+        SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        } => TargetWire::Cdp {
+            window_hwnd: *window_hwnd,
             cdp_target_id: cdp_target_id.clone(),
         },
     }
+}
+
+fn validate_cdp_target_id(cdp_target_id: &str) -> Result<(), ErrorData> {
+    if cdp_target_id.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_target_id must not be empty",
+        ));
+    }
+    if cdp_target_id.chars().count() > 512 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_target_id must be at most 512 Unicode scalar values",
+        ));
+    }
+    if cdp_target_id.contains('\0') {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_target_id must not contain NUL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cdp_tab_url(url: &str) -> Result<(), ErrorData> {
+    if url.chars().count() > 8192 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_open_tab url must be at most 8192 Unicode scalar values",
+        ));
+    }
+    if url.contains('\0') {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_open_tab url must not contain NUL",
+        ));
+    }
+    if !url.is_empty() && url.trim() != url {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_open_tab url must not contain leading or trailing whitespace; use an empty string for about:blank",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_cdp_endpoint(window_hwnd: i64, tool_name: &str) -> Result<String, ErrorData> {
+    synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
+        mcp_error(
+            error_codes::A11Y_CDP_UNREACHABLE,
+            format!(
+                "{tool_name} requires a Chromium-family window launched with a reachable CDP endpoint; no endpoint found for window_hwnd {window_hwnd:#x}"
+            ),
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn resolve_cdp_endpoint(_window_hwnd: i64, tool_name: &str) -> Result<String, ErrorData> {
+    Err(mcp_error(
+        error_codes::A11Y_NOT_AVAILABLE,
+        format!("{tool_name} requires Windows CDP support"),
+    ))
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Validates a `set_target` window HWND is live and snapshottable, returning its
@@ -1695,9 +2260,16 @@ mod tests {
             other => panic!("expected window wire, got {other:?}"),
         }
         match target_wire(&SessionTarget::Cdp {
+            window_hwnd: 0x4321,
             cdp_target_id: "TID-1".to_owned(),
         }) {
-            TargetWire::Cdp { cdp_target_id } => assert_eq!(cdp_target_id, "TID-1"),
+            TargetWire::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            } => {
+                assert_eq!(window_hwnd, 0x4321);
+                assert_eq!(cdp_target_id, "TID-1");
+            }
             other => panic!("expected cdp wire, got {other:?}"),
         }
     }

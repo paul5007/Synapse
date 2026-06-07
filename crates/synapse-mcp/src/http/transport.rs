@@ -232,16 +232,19 @@ fn router(
         .unscoped_action_handle()
         .context("read action handle for HTTP session cleanup")?;
     let session_targets_cleanup = service.session_targets_handle();
+    let cdp_target_owners_cleanup = service.cdp_target_owners_handle();
     let (mcp_service, session_manager) = streamable_service(shutdown_cancel, service)
         .context("initialize HTTP MCP session state")?;
     let session_cleanup = session::SessionCleanupState::new(
         action_cleanup_handle.clone(),
         Arc::clone(&session_manager),
         session_targets_cleanup,
+        cdp_target_owners_cleanup.clone(),
     );
     let _stale_cleanup_task = spawn_stale_session_input_cleanup(
         action_cleanup_handle,
         Arc::clone(&session_manager),
+        cdp_target_owners_cleanup,
         shutdown_cancel.child_token(),
     );
     let state = HttpState {
@@ -294,6 +297,7 @@ fn streamable_service(
 fn spawn_stale_session_input_cleanup(
     action_handle: ActionHandle,
     session_manager: Arc<LocalSessionManager>,
+    cdp_target_owners: crate::server::SharedCdpTargetOwners,
     shutdown_cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -309,7 +313,11 @@ fn spawn_stale_session_input_cleanup(
                     break;
                 }
                 _ = interval.tick() => {
-                    cleanup_stale_session_inputs_once(&action_handle, &session_manager).await;
+                    cleanup_stale_session_inputs_once(
+                        &action_handle,
+                        &session_manager,
+                        &cdp_target_owners,
+                    ).await;
                 }
             }
         }
@@ -319,9 +327,11 @@ fn spawn_stale_session_input_cleanup(
 async fn cleanup_stale_session_inputs_once(
     action_handle: &ActionHandle,
     session_manager: &LocalSessionManager,
+    cdp_target_owners: &crate::server::SharedCdpTargetOwners,
 ) {
     let active_sessions = active_http_session_ids(session_manager).await;
     cleanup_expired_lease_inputs_once(action_handle).await;
+    cleanup_stale_session_cdp_targets_once(cdp_target_owners, &active_sessions).await;
 
     let snapshot = match action_handle.session_inputs_snapshot() {
         Ok(snapshot) => snapshot,
@@ -342,6 +352,43 @@ async fn cleanup_stale_session_inputs_once(
     }
 
     cleanup_stale_session_lease_once(action_handle, &active_sessions).await;
+}
+
+async fn cleanup_stale_session_cdp_targets_once(
+    cdp_target_owners: &crate::server::SharedCdpTargetOwners,
+    active_sessions: &BTreeSet<String>,
+) {
+    let stale_sessions = match cdp_target_owners.lock() {
+        Ok(owners) => owners
+            .values()
+            .filter_map(|owner| {
+                (!active_sessions.contains(&owner.session_id)).then(|| owner.session_id.clone())
+            })
+            .collect::<BTreeSet<_>>(),
+        Err(_error) => {
+            tracing::error!(
+                code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                "HTTP MCP stale-session cleanup could not lock CDP target ownership registry"
+            );
+            return;
+        }
+    };
+    for session_id in stale_sessions {
+        let readback =
+            session::cleanup_session_cdp_targets(cdp_target_owners, &session_id, "http_stale")
+                .await;
+        tracing::info!(
+            code = "MCP_HTTP_SESSION_CDP_TARGET_STALE_CLEANUP",
+            session_id = %session_id,
+            active_session_count = active_sessions.len(),
+            cdp_cleanup_reason = readback.reason,
+            cdp_owned_before = readback.owned_before,
+            cdp_closed = readback.closed,
+            cdp_failed = readback.failed,
+            cdp_target_ids = ?readback.target_ids,
+            "readback=cdp_target_ownership edge=http_session_gone after_cleanup"
+        );
+    }
 }
 
 async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTreeSet<String> {
@@ -851,6 +898,7 @@ async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         sync::{Arc, Mutex, MutexGuard, PoisonError},
         time::Duration,
     };
@@ -880,6 +928,10 @@ mod tests {
 
     fn test_store_error(error: SessionStoreError) -> anyhow::Error {
         anyhow::anyhow!("{error}")
+    }
+
+    fn empty_cdp_target_owners() -> crate::server::SharedCdpTargetOwners {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     #[tokio::test]
@@ -1063,7 +1115,8 @@ mod tests {
             Some(stale_session_id.as_str())
         );
 
-        cleanup_stale_session_inputs_once(&handle, &session_manager).await;
+        let cdp_target_owners = empty_cdp_target_owners();
+        cleanup_stale_session_inputs_once(&handle, &session_manager, &cdp_target_owners).await;
 
         let after_state = snapshot_handle.snapshot().await?;
         let after_ownership = handle.session_inputs_snapshot()?;
@@ -1120,7 +1173,8 @@ mod tests {
             "readback=http_session_cleanup edge=stale_lease before_state={before_state:?} before_lease={before_lease:?}"
         );
 
-        cleanup_stale_session_inputs_once(&handle, &session_manager).await;
+        let cdp_target_owners = empty_cdp_target_owners();
+        cleanup_stale_session_inputs_once(&handle, &session_manager, &cdp_target_owners).await;
 
         let after_state = snapshot_handle.snapshot().await?;
         let after_lease = synapse_action::lease::status();
@@ -1183,7 +1237,8 @@ mod tests {
             other => anyhow::bail!("contender should be refused pending cleanup, got {other:?}"),
         }
 
-        cleanup_stale_session_inputs_once(&handle, &session_manager).await;
+        let cdp_target_owners = empty_cdp_target_owners();
+        cleanup_stale_session_inputs_once(&handle, &session_manager, &cdp_target_owners).await;
 
         let after_state = snapshot_handle.snapshot().await?;
         let after_ownership = handle.session_inputs_snapshot()?;

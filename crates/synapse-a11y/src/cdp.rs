@@ -274,3 +274,239 @@ pub async fn attach_chromiumoxide(endpoint: &str) -> A11yResult<CdpAttachment> {
         endpoint: endpoint.to_owned(),
     })
 }
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct CdpTargetSummary {
+    pub target_id: String,
+    pub target_type: String,
+    pub title: String,
+    pub url: String,
+    pub attached: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct CdpOpenTabResult {
+    pub target: CdpTargetSummary,
+    pub target_count_before: u32,
+    pub target_count_after: u32,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct CdpCloseTabResult {
+    pub target_id: String,
+    pub target_count_before: u32,
+    pub target_count_after: u32,
+}
+
+/// Reads the current CDP `Target.getTargets` table for `endpoint`.
+///
+/// This is the physical Source of Truth for tab-target lifecycle checks; callers
+/// should inspect it separately from any create/close return value.
+///
+/// # Errors
+///
+/// Returns `A11Y_CDP_UNREACHABLE` when the endpoint cannot be connected and
+/// `A11Y_CDP_ATTACH_FAILED` when `Target.getTargets` itself fails.
+#[cfg(windows)]
+pub async fn cdp_list_targets(endpoint: &str) -> A11yResult<Vec<CdpTargetSummary>> {
+    use futures_util::StreamExt as _;
+
+    let CdpAttachment {
+        browser,
+        mut handler,
+        ..
+    } = attach_chromiumoxide(endpoint).await?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let result = cdp_list_targets_with_browser(&browser).await;
+    handler_task.abort();
+    result
+}
+
+/// Opens a visible background tab with `Target.createTarget(background=true)`,
+/// then reads `Target.getTargets` until the returned target id is present.
+///
+/// # Errors
+///
+/// Returns fail-loud CDP errors when the endpoint is unreachable, the protocol
+/// command fails, or the target does not appear in the target table.
+#[cfg(windows)]
+pub async fn cdp_open_background_tab(endpoint: &str, url: &str) -> A11yResult<CdpOpenTabResult> {
+    use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
+    use futures_util::StreamExt as _;
+
+    let CdpAttachment {
+        browser,
+        mut handler,
+        ..
+    } = attach_chromiumoxide(endpoint).await?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let result = async {
+        let before = cdp_list_targets_with_browser(&browser).await?;
+        let params = CreateTargetParams::builder()
+            .url(url)
+            .new_window(false)
+            .background(true)
+            .build()
+            .map_err(|error| A11yError::CdpAxtreeFailed {
+                detail: format!("Target.createTarget params: {error}"),
+            })?;
+        let created =
+            browser
+                .execute(params)
+                .await
+                .map_err(|error| A11yError::CdpAxtreeFailed {
+                    detail: format!("Target.createTarget(background=true): {error}"),
+                })?;
+        let target_id = created.result.target_id.inner().clone();
+        let after = wait_for_target_present(&browser, &target_id).await?;
+        let Some(target) = after
+            .iter()
+            .find(|target| target.target_id == target_id)
+            .cloned()
+        else {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "Target.createTarget returned {target_id:?}, but Target.getTargets readback did not contain it"
+                ),
+            });
+        };
+        Ok(CdpOpenTabResult {
+            target,
+            target_count_before: u32::try_from(before.len()).unwrap_or(u32::MAX),
+            target_count_after: u32::try_from(after.len()).unwrap_or(u32::MAX),
+        })
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
+/// Closes `target_id` with `Target.closeTarget`, then reads `Target.getTargets`
+/// until the target is absent.
+///
+/// # Errors
+///
+/// Returns fail-loud CDP errors when the endpoint is unreachable, the target was
+/// absent before close, the protocol command fails, or the target remains after
+/// the close command.
+#[cfg(windows)]
+pub async fn cdp_close_target(endpoint: &str, target_id: &str) -> A11yResult<CdpCloseTabResult> {
+    use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
+    use futures_util::StreamExt as _;
+
+    let CdpAttachment {
+        browser,
+        mut handler,
+        ..
+    } = attach_chromiumoxide(endpoint).await?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let result = async {
+        let before = cdp_list_targets_with_browser(&browser).await?;
+        if !before.iter().any(|target| target.target_id == target_id) {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "Target.closeTarget refused: Target.getTargets readback did not contain target_id {target_id:?} before close"
+                ),
+            });
+        }
+        browser
+            .execute(CloseTargetParams::new(target_id.to_owned()))
+            .await
+            .map_err(|error| A11yError::CdpAxtreeFailed {
+                detail: format!("Target.closeTarget({target_id:?}): {error}"),
+            })?;
+        let after = wait_for_target_absent(&browser, target_id).await?;
+        Ok(CdpCloseTabResult {
+            target_id: target_id.to_owned(),
+            target_count_before: u32::try_from(before.len()).unwrap_or(u32::MAX),
+            target_count_after: u32::try_from(after.len()).unwrap_or(u32::MAX),
+        })
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
+#[cfg(windows)]
+async fn cdp_list_targets_with_browser(
+    browser: &chromiumoxide::Browser,
+) -> A11yResult<Vec<CdpTargetSummary>> {
+    use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+
+    let targets = browser
+        .execute(GetTargetsParams::default())
+        .await
+        .map_err(|error| A11yError::CdpAttachFailed {
+            detail: format!("Target.getTargets: {error}"),
+        })?
+        .result
+        .target_infos
+        .into_iter()
+        .map(|target| CdpTargetSummary {
+            target_id: target.target_id.inner().clone(),
+            target_type: target.r#type,
+            title: target.title,
+            url: target.url,
+            attached: target.attached,
+        })
+        .collect();
+    Ok(targets)
+}
+
+#[cfg(windows)]
+async fn wait_for_target_present(
+    browser: &chromiumoxide::Browser,
+    target_id: &str,
+) -> A11yResult<Vec<CdpTargetSummary>> {
+    let mut last = Vec::new();
+    for _ in 0..30 {
+        last = cdp_list_targets_with_browser(browser).await?;
+        if last.iter().any(|target| target.target_id == target_id) {
+            return Ok(last);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(A11yError::CdpAxtreeFailed {
+        detail: format!(
+            "target_id {target_id:?} did not appear in Target.getTargets within 3s; last target ids: {}",
+            target_ids_for_error(&last)
+        ),
+    })
+}
+
+#[cfg(windows)]
+async fn wait_for_target_absent(
+    browser: &chromiumoxide::Browser,
+    target_id: &str,
+) -> A11yResult<Vec<CdpTargetSummary>> {
+    let mut last = Vec::new();
+    for _ in 0..30 {
+        last = cdp_list_targets_with_browser(browser).await?;
+        if !last.iter().any(|target| target.target_id == target_id) {
+            return Ok(last);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(A11yError::CdpAxtreeFailed {
+        detail: format!(
+            "target_id {target_id:?} remained in Target.getTargets after close for 3s; last target ids: {}",
+            target_ids_for_error(&last)
+        ),
+    })
+}
+
+#[cfg(windows)]
+fn target_ids_for_error(targets: &[CdpTargetSummary]) -> String {
+    targets
+        .iter()
+        .map(|target| target.target_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}

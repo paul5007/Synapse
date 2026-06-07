@@ -25,6 +25,7 @@ pub(super) struct SessionCleanupState {
     action_handle: ActionHandle,
     session_manager: Arc<LocalSessionManager>,
     session_targets: crate::server::SharedSessionTargets,
+    cdp_target_owners: crate::server::SharedCdpTargetOwners,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -38,11 +39,13 @@ impl SessionCleanupState {
         action_handle: ActionHandle,
         session_manager: Arc<LocalSessionManager>,
         session_targets: crate::server::SharedSessionTargets,
+        cdp_target_owners: crate::server::SharedCdpTargetOwners,
     ) -> Self {
         Self {
             action_handle,
             session_manager,
             session_targets,
+            cdp_target_owners,
         }
     }
 }
@@ -134,6 +137,8 @@ pub(super) async fn release_held_inputs_on_delete(
         .session_targets
         .lock()
         .is_ok_and(|mut targets| targets.remove(&session_id).is_some());
+    let cdp_cleanup =
+        cleanup_session_cdp_targets(&state.cdp_target_owners, &session_id, "http_delete").await;
     match result {
         Ok(summary) => {
             tracing::info!(
@@ -148,6 +153,11 @@ pub(super) async fn release_held_inputs_on_delete(
                 session_target_cleared = target_cleared,
                 before = ?before,
                 after = ?after,
+                cdp_cleanup_reason = cdp_cleanup.reason,
+                cdp_owned_before = cdp_cleanup.owned_before,
+                cdp_closed = cdp_cleanup.closed,
+                cdp_failed = cdp_cleanup.failed,
+                cdp_target_ids = ?cdp_cleanup.target_ids,
                 "readback=session_input_ownership edge=http_delete after_cleanup"
             );
             response
@@ -164,6 +174,127 @@ pub(super) async fn release_held_inputs_on_delete(
             cleanup_failed(error)
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct SessionCdpTargetCleanupReadback {
+    pub reason: &'static str,
+    pub owned_before: usize,
+    pub closed: usize,
+    pub failed: usize,
+    pub target_ids: Vec<String>,
+}
+
+pub(super) async fn cleanup_session_cdp_targets(
+    cdp_target_owners: &crate::server::SharedCdpTargetOwners,
+    session_id: &str,
+    reason: &'static str,
+) -> SessionCdpTargetCleanupReadback {
+    let owned = match remove_session_cdp_target_owners(cdp_target_owners, session_id) {
+        Ok(owned) => owned,
+        Err(detail) => {
+            tracing::error!(
+                code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                session_id,
+                reason,
+                detail = %detail,
+                "HTTP MCP session cleanup could not lock CDP target ownership registry"
+            );
+            return SessionCdpTargetCleanupReadback {
+                reason,
+                owned_before: 0,
+                closed: 0,
+                failed: 1,
+                target_ids: Vec::new(),
+            };
+        }
+    };
+    let target_ids = owned
+        .iter()
+        .map(|(target_id, _owner)| target_id.clone())
+        .collect::<Vec<_>>();
+    let owned_before = owned.len();
+    let mut closed = 0_usize;
+    let mut failed = 0_usize;
+    for (target_id, owner) in owned {
+        match close_cdp_target_for_cleanup(&target_id, &owner).await {
+            Ok(()) => {
+                closed = closed.saturating_add(1);
+                tracing::info!(
+                    code = "MCP_HTTP_SESSION_CDP_TARGET_CLEANUP",
+                    session_id,
+                    reason,
+                    hwnd = owner.window_hwnd,
+                    endpoint = %owner.endpoint,
+                    cdp_target_id = %target_id,
+                    "readback=Target.closeTarget edge=session_cleanup after=closed"
+                );
+            }
+            Err(detail) => {
+                failed = failed.saturating_add(1);
+                tracing::error!(
+                    code = synapse_core::error_codes::A11Y_CDP_AXTREE_FAILED,
+                    session_id,
+                    reason,
+                    hwnd = owner.window_hwnd,
+                    endpoint = %owner.endpoint,
+                    cdp_target_id = %target_id,
+                    detail = %detail,
+                    "HTTP MCP session cleanup removed CDP owner but failed to close target"
+                );
+            }
+        }
+    }
+    SessionCdpTargetCleanupReadback {
+        reason,
+        owned_before,
+        closed,
+        failed,
+        target_ids,
+    }
+}
+
+fn remove_session_cdp_target_owners(
+    cdp_target_owners: &crate::server::SharedCdpTargetOwners,
+    session_id: &str,
+) -> Result<Vec<(String, crate::server::CdpTargetOwner)>, String> {
+    let mut guard = cdp_target_owners
+        .lock()
+        .map_err(|_error| "CDP target ownership registry lock poisoned".to_owned())?;
+    let owned_ids = guard
+        .iter()
+        .filter_map(|(target_id, owner)| {
+            (owner.session_id == session_id).then(|| target_id.clone())
+        })
+        .collect::<Vec<_>>();
+    let owned = owned_ids
+        .into_iter()
+        .filter_map(|target_id| guard.remove(&target_id).map(|owner| (target_id, owner)))
+        .collect();
+    drop(guard);
+    Ok(owned)
+}
+
+#[cfg(windows)]
+async fn close_cdp_target_for_cleanup(
+    target_id: &str,
+    owner: &crate::server::CdpTargetOwner,
+) -> Result<(), String> {
+    synapse_a11y::cdp_close_target(&owner.endpoint, target_id)
+        .await
+        .map(|_closed| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+async fn close_cdp_target_for_cleanup(
+    target_id: &str,
+    owner: &crate::server::CdpTargetOwner,
+) -> Result<(), String> {
+    Err(format!(
+        "CDP target cleanup is only available on Windows; target_id={target_id:?} endpoint={:?}",
+        owner.endpoint
+    ))
 }
 
 async fn session_is_active(session_manager: &LocalSessionManager, session_id: &str) -> bool {

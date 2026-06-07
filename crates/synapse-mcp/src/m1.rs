@@ -365,13 +365,18 @@ pub struct SetPerceptionModeResponse {
 }
 
 /// `set_target` request: bind this MCP session's active perception target
-/// (epic #720, issue #736). Window targeting is live now; CDP targeting is
-/// accepted on the wire for forward compatibility.
+/// (epic #720, issue #736). Window targeting binds a native HWND; CDP
+/// targeting binds a specific browser tab target within a browser HWND.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SetTargetParam {
-    Window { window_hwnd: i64 },
-    Cdp { cdp_target_id: String },
+    Window {
+        window_hwnd: i64,
+    },
+    Cdp {
+        window_hwnd: i64,
+        cdp_target_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -383,8 +388,13 @@ pub struct SetTargetParams {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TargetWire {
-    Window { window_hwnd: i64 },
-    Cdp { cdp_target_id: String },
+    Window {
+        window_hwnd: i64,
+    },
+    Cdp {
+        window_hwnd: i64,
+        cdp_target_id: String,
+    },
 }
 
 /// Response shared by `set_target`/`get_target`/`clear_target`. `current` is the
@@ -403,6 +413,58 @@ pub struct TargetResponse {
     pub window_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpOpenTabParams {
+    /// Browser HWND with a reachable CDP endpoint. If omitted, the caller must
+    /// already have a session window/CDP target set.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Initial URL for the background tab. Empty string opens about:blank.
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpOpenTabResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub endpoint: String,
+    pub requested_url: String,
+    pub cdp_target_id: String,
+    pub target_type: String,
+    pub target_title: String,
+    pub target_url: String,
+    pub target_attached: bool,
+    pub target_count_before: u32,
+    pub target_count_after: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<TargetWire>,
+    pub current: TargetWire,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpCloseTabParams {
+    pub cdp_target_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpCloseTabResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub closed: bool,
+    pub target_count_before: u32,
+    pub target_count_after: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<TargetWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<TargetWire>,
 }
 
 pub fn empty_input_schema() -> Arc<JsonObject> {
@@ -512,6 +574,16 @@ pub fn observe_input(
 /// a silent empty tree. Non-browser / no-port foregrounds are a no-op.
 #[cfg(windows)]
 pub async fn enrich_input_with_cdp(input: &mut ObservationInput, max_depth: u32, max_nodes: usize) {
+    enrich_input_with_cdp_for_target(input, max_depth, max_nodes, None).await;
+}
+
+#[cfg(windows)]
+pub async fn enrich_input_with_cdp_for_target(
+    input: &mut ObservationInput,
+    max_depth: u32,
+    max_nodes: usize,
+    target_id_hint: Option<&str>,
+) {
     use synapse_core::{CdpStatus, WebPerceptionPath};
 
     let Some(cdp) = input.cdp.clone() else {
@@ -527,8 +599,15 @@ pub async fn enrich_input_with_cdp(input: &mut ObservationInput, max_depth: u32,
     let title = input.foreground.window_title.clone();
     let url_hint = foreground_web_url_hint(input);
 
-    match synapse_a11y::fetch_dom_snapshot(&endpoint, hwnd, &title, url_hint.as_deref(), max_nodes)
-        .await
+    match synapse_a11y::fetch_dom_snapshot(
+        &endpoint,
+        hwnd,
+        &title,
+        url_hint.as_deref(),
+        target_id_hint,
+        max_nodes,
+    )
+    .await
     {
         Ok(snapshot) => {
             let count = u32::try_from(snapshot.nodes.len()).unwrap_or(u32::MAX);
@@ -555,6 +634,7 @@ pub async fn enrich_input_with_cdp(input: &mut ObservationInput, max_depth: u32,
                 page_url = %snapshot.page_url,
                 target_id = %snapshot.target_id,
                 session_id = %snapshot.session_id,
+                requested_target_id = target_id_hint.unwrap_or_default(),
                 target_candidate_count = snapshot.target_candidate_count,
                 target_selection_reason = %snapshot.target_selection_reason,
                 node_count = count,
@@ -567,6 +647,7 @@ pub async fn enrich_input_with_cdp(input: &mut ObservationInput, max_depth: u32,
                 code = error.code(),
                 endpoint = %endpoint,
                 hwnd,
+                requested_target_id = target_id_hint.unwrap_or_default(),
                 error = %error,
                 "CDP DOM snapshot failed; web content not exposed (web_path stays uia_only)"
             );
@@ -1315,6 +1396,16 @@ pub async fn enrich_input_with_cdp(
     _input: &mut ObservationInput,
     _max_depth: u32,
     _max_nodes: usize,
+) {
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::unused_async)]
+pub async fn enrich_input_with_cdp_for_target(
+    _input: &mut ObservationInput,
+    _max_depth: u32,
+    _max_nodes: usize,
+    _target_id_hint: Option<&str>,
 ) {
 }
 

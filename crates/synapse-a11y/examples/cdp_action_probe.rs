@@ -72,9 +72,15 @@ mod windows_impl {
         // --- CLICK ---
         let button = button_backend.ok_or("button not found in AX tree")?;
         let before = eval_string(&page, "document.body.getAttribute('data-clicked')||''").await?;
-        let landed =
-            synapse_a11y::cdp_click_node(&endpoint, PAGE_TITLE, button, CdpMouseButton::Left, 1)
-                .await?;
+        let landed = synapse_a11y::cdp_click_node(
+            &endpoint,
+            PAGE_TITLE,
+            None,
+            button,
+            CdpMouseButton::Left,
+            1,
+        )
+        .await?;
         let after = eval_string(&page, "document.body.getAttribute('data-clicked')||''").await?;
         println!(
             "readback=cdp_click before=data-clicked:{before:?} landed:({:.1},{:.1}) after=data-clicked:{after:?}",
@@ -84,7 +90,7 @@ mod windows_impl {
 
         // --- TYPE: insert text into the input, read value back ---
         let input = input_backend.ok_or("input not found in AX tree")?;
-        synapse_a11y::cdp_type_node(&endpoint, PAGE_TITLE, input, "hello fsv").await?;
+        synapse_a11y::cdp_type_node(&endpoint, PAGE_TITLE, None, input, "hello fsv").await?;
         let value = eval_string(&page, "document.getElementById('t').value").await?;
         println!("readback=cdp_type after=input_value:{value:?}");
         assert_eq!(
