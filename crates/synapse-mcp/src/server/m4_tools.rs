@@ -91,12 +91,19 @@ impl SynapseService {
         let params = prepare_run_shell_params_for_context(raw_params, &shell_context)?;
         self.audit_action_started_with_details_for_session(
             "act_run_shell",
-            &run_shell_request_details(&params),
+            &run_shell_request_details(&params, self.m4_config.run_shell_inline_await_limit_ms()),
             &session_id,
         )?;
         let result = match authorize_run_shell(&self.m4_config, &params) {
             Ok(authorization) => {
-                run_shell_with_idempotency(self, params, authorization, Some(&shell_context)).await
+                run_shell_with_idempotency(
+                    self,
+                    params,
+                    authorization,
+                    self.m4_config.run_shell_inline_await_limit_ms(),
+                    Some(&shell_context),
+                )
+                .await
             }
             Err(error) => Err(error),
         };
@@ -1177,11 +1184,12 @@ async fn run_shell_with_idempotency(
     service: &SynapseService,
     params: ActRunShellParams,
     authorization: RunShellAuthorization,
+    inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
     let session_id = context.map(ShellExecutionContext::session_id);
     let Some(row_key) = run_shell_idempotency_row_key(&params, session_id)? else {
-        return run_authorized_shell(params, &authorization, context).await;
+        return run_authorized_shell(params, &authorization, inline_await_limit_ms, context).await;
     };
 
     let runtime = service.reflex_runtime()?;
@@ -1206,7 +1214,13 @@ async fn run_shell_with_idempotency(
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     }
 
-    let response = run_authorized_shell(params.clone(), &authorization, context).await?;
+    let response = run_authorized_shell(
+        params.clone(),
+        &authorization,
+        inline_await_limit_ms,
+        context,
+    )
+    .await?;
     let completed =
         run_shell_idempotency_completed_row(&params, &authorization, &response, session_id)?;
     {

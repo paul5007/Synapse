@@ -44,6 +44,9 @@ fn health_json_shape() {
         build: "dev".to_owned(),
         pid: 4321,
         uptime_s: 0,
+        tool_count: 2,
+        tool_surface_sha256: "0123456789abcdef".to_owned(),
+        tool_names: vec!["act_run_shell".to_owned(), "health".to_owned()],
         subsystems: BTreeMap::new(),
     });
 }

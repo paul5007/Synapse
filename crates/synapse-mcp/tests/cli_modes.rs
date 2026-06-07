@@ -184,6 +184,8 @@ async fn http_health_reads_m4_policy_counts_from_repeated_cli_flags() -> anyhow:
             "^notepad\\.exe$",
             "--allow-launch",
             "^calc\\.exe$",
+            "--run-shell-inline-await-limit-ms",
+            "1234",
         ])
         .env("SYNAPSE_LOG_DIR", dir.path())
         .env("APPDATA", dir.path())
@@ -204,6 +206,10 @@ async fn http_health_reads_m4_policy_counts_from_repeated_cli_flags() -> anyhow:
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(
         response.contains("allow_shell_patterns=2 allow_launch_patterns=2"),
+        "{response}"
+    );
+    assert!(
+        response.contains("\"run_shell_inline_await_limit_ms\":1234"),
         "{response}"
     );
     Ok(())

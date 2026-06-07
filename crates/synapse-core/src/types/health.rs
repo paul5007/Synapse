@@ -16,6 +16,14 @@ pub struct Health {
     /// daemon.
     pub pid: u32,
     pub uptime_s: u64,
+    /// Number of currently advertised MCP tools after schema sanitization.
+    pub tool_count: usize,
+    /// Stable SHA-256 fingerprint of the currently advertised sanitized tools/list
+    /// surface, sorted by tool name.
+    pub tool_surface_sha256: String,
+    /// Current sanitized tool names, sorted for deterministic stale-client
+    /// readback.
+    pub tool_names: Vec<String>,
     pub subsystems: BTreeMap<String, SubsystemHealth>,
 }
 
@@ -66,6 +74,8 @@ pub struct SubsystemHealth {
     pub sse_subscribers: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_resolution: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_shell_inline_await_limit_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perception_mode: Option<PerceptionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

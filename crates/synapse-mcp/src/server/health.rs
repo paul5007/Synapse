@@ -1,4 +1,5 @@
 use super::{BTreeMap, Health, SubsystemHealth, SynapseService};
+use sha2::{Digest as _, Sha256};
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::Backend;
 
@@ -38,6 +39,17 @@ impl SynapseService {
         subsystems.insert("action".to_owned(), self.action_health());
         subsystems.insert("audio".to_owned(), self.audio_health());
         subsystems.insert("http".to_owned(), self.http_health(active_sessions));
+        let tool_surface = self.tool_surface_fingerprint();
+        if let Some(error) = &tool_surface.error {
+            subsystems.insert(
+                "tool_surface".to_owned(),
+                SubsystemHealth {
+                    status: "error".to_owned(),
+                    detail: Some(error.clone()),
+                    ..SubsystemHealth::default()
+                },
+            );
+        }
         let ok = subsystems.values().all(|health| health.status != "error");
         Health {
             ok,
@@ -45,7 +57,47 @@ impl SynapseService {
             build: option_env!("VERGEN_GIT_SHA").unwrap_or("dev").to_owned(),
             pid: std::process::id(),
             uptime_s: self.started_at.elapsed().as_secs(),
+            tool_count: tool_surface.names.len(),
+            tool_surface_sha256: tool_surface.sha256,
+            tool_names: tool_surface.names,
             subsystems,
+        }
+    }
+
+    fn tool_surface_fingerprint(&self) -> ToolSurfaceFingerprint {
+        let mut tools = super::schema_sanitize::sanitize_tools(self.tool_router.list_all());
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        let canonical = serde_json::json!({
+            "mcp_surface": "tools/list",
+            "tools": tools,
+        });
+        let bytes = match serde_json::to_vec(&canonical) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::error!(
+                    code = "MCP_TOOL_SURFACE_FINGERPRINT_SERIALIZE_FAILED",
+                    %error,
+                    "sanitized MCP tool surface failed to serialize for health fingerprinting"
+                );
+                return ToolSurfaceFingerprint {
+                    names,
+                    sha256: "TOOL_SURFACE_FINGERPRINT_ERROR".to_owned(),
+                    error: Some(format!(
+                        "sanitized MCP tool surface failed to serialize for health fingerprinting: {error}"
+                    )),
+                };
+            }
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        ToolSurfaceFingerprint {
+            names,
+            sha256: hex_lower(&hasher.finalize()),
+            error: None,
         }
     }
 
@@ -298,6 +350,9 @@ impl SynapseService {
                             lease_detail
                         )),
                         backend_resolution: Some(backend_resolution_health(source, policy)),
+                        run_shell_inline_await_limit_ms: Some(
+                            self.m4_config.run_shell_inline_await_limit_ms(),
+                        ),
                         ..SubsystemHealth::default()
                     }
                 }
@@ -399,6 +454,21 @@ impl SynapseService {
             Err(_err) => state_lock_health(),
         }
     }
+}
+
+struct ToolSurfaceFingerprint {
+    names: Vec<String>,
+    sha256: String,
+    error: Option<String>,
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn backend_resolution_health(

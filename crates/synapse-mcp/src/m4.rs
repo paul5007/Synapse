@@ -33,6 +33,7 @@ use crate::{
 
 const MAX_COMBO_STEPS: usize = 256;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS: u64 = 90_000;
 const DEFAULT_LAUNCH_TIMEOUT_MS: u32 = 10_000;
 const MAX_LAUNCH_TIMEOUT_MS: u32 = 600_000;
 #[cfg(windows)]
@@ -54,6 +55,7 @@ const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
 /// `CF_ACTION_LOG` regardless, and the mode is logged loudly at startup.
 const ALLOW_SHELL_ANY_ENV: &str = "SYNAPSE_ALLOW_SHELL_ANY";
 const ALLOW_LAUNCH_ANY_ENV: &str = "SYNAPSE_ALLOW_LAUNCH_ANY";
+const RUN_SHELL_INLINE_AWAIT_LIMIT_ENV: &str = "SYNAPSE_RUN_SHELL_INLINE_AWAIT_LIMIT_MS";
 /// Sentinel recorded as the matched pattern when permissive mode authorizes a
 /// command/target without an allowlist entry.
 const ANY_PERMITTED_SENTINEL: &str = "__any_permitted__";
@@ -100,7 +102,6 @@ const LAUNCH_FOREGROUND_STABLE_MS: u64 = 750;
 const LAUNCH_FOREGROUND_POLL_MS: u64 = 75;
 const LAUNCH_FOREGROUND_MAX_MS: u64 = 3_000;
 const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
-const RUN_SHELL_INLINE_AWAIT_MAX_MS: u64 = 90_000;
 const SHELL_JOB_FINALIZING_GRACE_MS: u64 = 30_000;
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
@@ -108,12 +109,25 @@ pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
 // All fields are allowlist policy for the two gated tools; the shared `allow_`
 // prefix is intentional and reads clearly at call sites.
 #[allow(clippy::struct_field_names)]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct M4ServiceConfig {
     allow_shell: Vec<AllowPattern>,
     allow_launch: Vec<AllowPattern>,
     allow_shell_any: bool,
     allow_launch_any: bool,
+    run_shell_inline_await_limit_ms: u64,
+}
+
+impl Default for M4ServiceConfig {
+    fn default() -> Self {
+        Self {
+            allow_shell: Vec::new(),
+            allow_launch: Vec::new(),
+            allow_shell_any: false,
+            allow_launch_any: false,
+            run_shell_inline_await_limit_ms: DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +188,7 @@ impl M4ServiceConfig {
     pub fn from_cli_parts(
         allow_shell: Vec<String>,
         allow_launch: Vec<String>,
+        run_shell_inline_await_limit_ms: u64,
     ) -> anyhow::Result<Self> {
         let allow_shell_any = env_flag_default_true(ALLOW_SHELL_ANY_ENV);
         let allow_launch_any = env_flag_default_true(ALLOW_LAUNCH_ANY_ENV);
@@ -204,6 +219,7 @@ impl M4ServiceConfig {
             )?,
             allow_shell_any,
             allow_launch_any,
+            run_shell_inline_await_limit_ms,
         })
     }
 
@@ -211,6 +227,10 @@ impl M4ServiceConfig {
         Self::from_cli_parts(
             parse_env_list(ALLOW_SHELL_ENV),
             parse_env_list(ALLOW_LAUNCH_ENV),
+            parse_env_u64(
+                RUN_SHELL_INLINE_AWAIT_LIMIT_ENV,
+                DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
+            )?,
         )
     }
 
@@ -232,6 +252,11 @@ impl M4ServiceConfig {
     #[must_use]
     pub const fn allow_launch_any(&self) -> bool {
         self.allow_launch_any
+    }
+
+    #[must_use]
+    pub const fn run_shell_inline_await_limit_ms(&self) -> u64 {
+        self.run_shell_inline_await_limit_ms
     }
 
     fn shell_match<'a>(&'a self, command_line: &str) -> Option<&'a str> {
@@ -265,6 +290,17 @@ fn env_flag_default_true(name: &str) -> bool {
             "0" | "false" | "no" | "off"
         )
     })
+}
+
+fn parse_env_u64(name: &str, default: u64) -> anyhow::Result<u64> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be an unsigned integer number of milliseconds")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error).with_context(|| format!("read {name}")),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -951,7 +987,13 @@ pub async fn run_shell(
     params: ActRunShellParams,
 ) -> Result<ActRunShellResponse, ErrorData> {
     let authorization = authorize_run_shell(config, &params)?;
-    run_authorized_shell(params, &authorization, None).await
+    run_authorized_shell(
+        params,
+        &authorization,
+        config.run_shell_inline_await_limit_ms(),
+        None,
+    )
+    .await
 }
 
 pub fn authorize_run_shell(
@@ -992,17 +1034,19 @@ pub fn authorize_run_shell(
 pub async fn run_authorized_shell(
     params: ActRunShellParams,
     authorization: &RunShellAuthorization,
+    inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
     let started = Instant::now();
     let idempotency_present = params.idempotency_key.is_some();
-    let result = if should_background_direct_shell(&params) {
+    let result = if should_background_direct_shell(&params, inline_await_limit_ms) {
         let start_params = run_shell_params_to_start_params(params);
         let started_job = start_authorized_shell_job(start_params, authorization, context)?;
         act_run_shell_background_response(
             started_job.job,
             elapsed_ms_u32(started),
             "timeout_exceeds_inline_await_budget",
+            inline_await_limit_ms,
         )
     } else {
         run_allowlisted_shell(params, context).await?
@@ -1027,8 +1071,8 @@ pub async fn run_authorized_shell(
     Ok(result)
 }
 
-fn should_background_direct_shell(params: &ActRunShellParams) -> bool {
-    params.timeout_ms > RUN_SHELL_INLINE_AWAIT_MAX_MS
+fn should_background_direct_shell(params: &ActRunShellParams, inline_await_limit_ms: u64) -> bool {
+    params.timeout_ms > inline_await_limit_ms
 }
 
 fn run_shell_params_to_start_params(params: ActRunShellParams) -> ActRunShellStartParams {
@@ -1046,6 +1090,7 @@ fn act_run_shell_background_response(
     job: ActRunShellJobStatus,
     duration_ms: u32,
     reason: &'static str,
+    inline_await_limit_ms: u64,
 ) -> ActRunShellResponse {
     ActRunShellResponse {
         exit_code: None,
@@ -1059,21 +1104,24 @@ fn act_run_shell_background_response(
         effective_working_dir: job.effective_working_dir.clone(),
         backgrounded: true,
         background_reason: Some(reason.to_owned()),
-        inline_await_limit_ms: Some(RUN_SHELL_INLINE_AWAIT_MAX_MS),
+        inline_await_limit_ms: Some(inline_await_limit_ms),
         job_id: Some(job.job_id.clone()),
         job: Some(job),
     }
 }
 
-pub fn run_shell_request_details(params: &ActRunShellParams) -> serde_json::Value {
+pub fn run_shell_request_details(
+    params: &ActRunShellParams,
+    inline_await_limit_ms: u64,
+) -> serde_json::Value {
     json!({
         "command": params.command,
         "args": params.args,
         "working_dir": params.working_dir,
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
         "timeout_ms": params.timeout_ms,
-        "inline_await_limit_ms": RUN_SHELL_INLINE_AWAIT_MAX_MS,
-        "will_background": should_background_direct_shell(params),
+        "inline_await_limit_ms": inline_await_limit_ms,
+        "will_background": should_background_direct_shell(params, inline_await_limit_ms),
         "idempotency_key_present": params.idempotency_key.is_some(),
         "request_sha256": run_shell_request_sha256(params).ok(),
     })
@@ -5556,6 +5604,7 @@ mod tests {
         match M4ServiceConfig::from_cli_parts(
             vec![format!("^{}$", regex::escape(&shell_command_line(params)))],
             Vec::new(),
+            DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
         ) {
             Ok(config) => config,
             Err(error) => panic!("synthetic shell allowlist should compile: {error:#}"),
@@ -5664,6 +5713,7 @@ mod tests {
         match M4ServiceConfig::from_cli_parts(
             Vec::new(),
             vec![format!("^{}$", regex::escape(&command_line))],
+            DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
         ) {
             Ok(config) => config,
             Err(error) => panic!("synthetic launch allowlist should compile: {error:#}"),
@@ -6320,6 +6370,7 @@ mod tests {
                 r"^cargo (build|test)( --[\w-]+)*$".to_owned(),
             ],
             Vec::new(),
+            DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
         );
 
         assert!(
@@ -6340,8 +6391,11 @@ mod tests {
         ];
 
         for (pattern, reason) in cases {
-            let error = match M4ServiceConfig::from_cli_parts(vec![pattern.to_owned()], Vec::new())
-            {
+            let error = match M4ServiceConfig::from_cli_parts(
+                vec![pattern.to_owned()],
+                Vec::new(),
+                DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
+            ) {
                 Ok(config) => panic!("pattern {pattern:?} should reject, got {config:?}"),
                 Err(error) => error,
             };
@@ -6571,13 +6625,15 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_long_timeout_returns_durable_job_handle() {
-        let timeout_ms = RUN_SHELL_INLINE_AWAIT_MAX_MS + 1;
+        let inline_await_limit_ms = 1;
+        let timeout_ms = DEFAULT_SHELL_TIMEOUT_MS;
         let params = shell_params(
             "cmd.exe",
             vec!["/c", "echo background-handoff-ok"],
             timeout_ms,
         );
-        let config = shell_config_for(&params);
+        let mut config = shell_config_for(&params);
+        config.run_shell_inline_await_limit_ms = inline_await_limit_ms;
 
         let response = match run_shell(&config, params).await {
             Ok(response) => response,
@@ -6590,10 +6646,7 @@ mod tests {
             response.background_reason.as_deref(),
             Some("timeout_exceeds_inline_await_budget")
         );
-        assert_eq!(
-            response.inline_await_limit_ms,
-            Some(RUN_SHELL_INLINE_AWAIT_MAX_MS)
-        );
+        assert_eq!(response.inline_await_limit_ms, Some(inline_await_limit_ms));
         assert_eq!(response.exit_code, None);
         assert_eq!(response.stdout, "");
         assert_eq!(response.stderr, "");

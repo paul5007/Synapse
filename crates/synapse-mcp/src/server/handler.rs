@@ -50,11 +50,16 @@ impl ServerHandler for SynapseService {
     }
 
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "synapse-mcp",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(self.instructions())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "synapse-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(self.instructions())
     }
 }

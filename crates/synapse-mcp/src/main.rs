@@ -143,6 +143,14 @@ struct Cli {
         help = "Allow act_launch target regex; repeat for multiple entries. Env: SYNAPSE_ALLOW_LAUNCH comma-separated"
     )]
     allow_launch: Vec<String>,
+    #[arg(
+        long,
+        env = "SYNAPSE_RUN_SHELL_INLINE_AWAIT_LIMIT_MS",
+        default_value_t = m4::DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
+        value_name = "MILLISECONDS",
+        help = "Inline await budget for act_run_shell before it returns a durable job handle. Set 0 to background every direct shell request."
+    )]
+    run_shell_inline_await_limit_ms: u64,
 }
 
 impl Cli {
@@ -170,7 +178,11 @@ impl Cli {
         allow_shell.extend(self.allow_shell.clone());
         let mut allow_launch = parse_env_list(ALLOW_LAUNCH_ENV);
         allow_launch.extend(self.allow_launch.clone());
-        m4::M4ServiceConfig::from_cli_parts(allow_shell, allow_launch)
+        m4::M4ServiceConfig::from_cli_parts(
+            allow_shell,
+            allow_launch,
+            self.run_shell_inline_await_limit_ms,
+        )
     }
 }
 

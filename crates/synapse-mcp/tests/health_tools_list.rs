@@ -5,6 +5,14 @@ use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 #[tokio::test]
 async fn health_and_action_tools_appear_in_tools_list_with_schema() -> anyhow::Result<()> {
     let mut client = StdioMcpClient::launch_and_init().await?;
+    assert!(
+        client
+            .raw_received()
+            .iter()
+            .any(|line| line.contains("\"tools\"") && line.contains("\"listChanged\":true")),
+        "initialize response must advertise tools.listChanged: {:?}",
+        client.raw_received()
+    );
     let resp = client.tools_list().await?;
     let tools = resp
         .get("tools")
@@ -89,6 +97,20 @@ async fn health_and_action_tools_appear_in_tools_list_with_schema() -> anyhow::R
             .raw_received()
             .iter()
             .any(|line| line.contains("\"tools\"") && line.contains("\"act_focus_window\""))
+    );
+    let health_response = client.tools_call("health", serde_json::json!({})).await?;
+    let health = health_response
+        .get("structuredContent")
+        .context("health structuredContent missing")?;
+    assert!(health["tool_count"].as_u64().is_some_and(|count| count > 0));
+    assert!(
+        health["tool_names"]
+            .as_array()
+            .is_some_and(|tools| tools.contains(&Value::String("act_run_shell_status".to_owned())))
+    );
+    assert_eq!(
+        health["subsystems"]["action"]["run_shell_inline_await_limit_ms"],
+        Value::from(90_000)
     );
     let status = client.shutdown().await?;
     assert!(status.success());

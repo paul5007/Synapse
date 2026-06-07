@@ -382,10 +382,12 @@ fn health_json_shape_and_schema_are_stable() -> Result<(), Box<dyn std::error::E
         build: "dev".to_owned(),
         pid: 4321,
         uptime_s: 0,
+        tool_count: 2,
+        tool_surface_sha256: "0123456789abcdef".to_owned(),
+        tool_names: vec!["act_run_shell".to_owned(), "health".to_owned()],
         subsystems: BTreeMap::new(),
     };
-    let expected =
-        r#"{"ok":true,"version":"0.1.0","build":"dev","pid":4321,"uptime_s":0,"subsystems":{}}"#;
+    let expected = r#"{"ok":true,"version":"0.1.0","build":"dev","pid":4321,"uptime_s":0,"tool_count":2,"tool_surface_sha256":"0123456789abcdef","tool_names":["act_run_shell","health"],"subsystems":{}}"#;
     assert_eq!(serde_json::to_string(&health)?, expected);
 
     let value = serde_json::to_value(&health)?;
