@@ -68,7 +68,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required."
+        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required. Requests with timeout_ms above the inline await budget return immediately as a durable background job with job_id/status/stdout/stderr paths; poll act_run_shell_status and cancel with act_run_shell_cancel."
     )]
     pub async fn act_run_shell(
         &self,

@@ -100,6 +100,8 @@ const LAUNCH_FOREGROUND_STABLE_MS: u64 = 750;
 const LAUNCH_FOREGROUND_POLL_MS: u64 = 75;
 const LAUNCH_FOREGROUND_MAX_MS: u64 = 3_000;
 const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
+const RUN_SHELL_INLINE_AWAIT_MAX_MS: u64 = 90_000;
+const SHELL_JOB_FINALIZING_GRACE_MS: u64 = 30_000;
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
 
@@ -364,6 +366,16 @@ pub struct ActRunShellResponse {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub backgrounded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_await_limit_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<ActRunShellJobStatus>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -982,8 +994,19 @@ pub async fn run_authorized_shell(
     authorization: &RunShellAuthorization,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
+    let started = Instant::now();
     let idempotency_present = params.idempotency_key.is_some();
-    let result = run_allowlisted_shell(params, context).await?;
+    let result = if should_background_direct_shell(&params) {
+        let start_params = run_shell_params_to_start_params(params);
+        let started_job = start_authorized_shell_job(start_params, authorization, context)?;
+        act_run_shell_background_response(
+            started_job.job,
+            elapsed_ms_u32(started),
+            "timeout_exceeds_inline_await_budget",
+        )
+    } else {
+        run_allowlisted_shell(params, context).await?
+    };
     tracing::info!(
         code = "M4_ACT_RUN_SHELL_EXECUTED",
         command_line = %authorization.command_line,
@@ -991,6 +1014,9 @@ pub async fn run_authorized_shell(
         exit_code = ?result.exit_code,
         duration_ms = result.duration_ms,
         timed_out = result.timed_out,
+        backgrounded = result.backgrounded,
+        job_id = ?result.job_id,
+        inline_await_limit_ms = ?result.inline_await_limit_ms,
         stdout_truncated = result.stdout_truncated,
         stderr_truncated = result.stderr_truncated,
         session_id = ?result.session_id,
@@ -1001,6 +1027,44 @@ pub async fn run_authorized_shell(
     Ok(result)
 }
 
+fn should_background_direct_shell(params: &ActRunShellParams) -> bool {
+    params.timeout_ms > RUN_SHELL_INLINE_AWAIT_MAX_MS
+}
+
+fn run_shell_params_to_start_params(params: ActRunShellParams) -> ActRunShellStartParams {
+    ActRunShellStartParams {
+        command: params.command,
+        args: params.args,
+        working_dir: params.working_dir,
+        env: params.env,
+        timeout_ms: Some(params.timeout_ms),
+        job_id: None,
+    }
+}
+
+fn act_run_shell_background_response(
+    job: ActRunShellJobStatus,
+    duration_ms: u32,
+    reason: &'static str,
+) -> ActRunShellResponse {
+    ActRunShellResponse {
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        duration_ms,
+        timed_out: false,
+        stdout_truncated: false,
+        stderr_truncated: false,
+        session_id: job.session_id.clone(),
+        effective_working_dir: job.effective_working_dir.clone(),
+        backgrounded: true,
+        background_reason: Some(reason.to_owned()),
+        inline_await_limit_ms: Some(RUN_SHELL_INLINE_AWAIT_MAX_MS),
+        job_id: Some(job.job_id.clone()),
+        job: Some(job),
+    }
+}
+
 pub fn run_shell_request_details(params: &ActRunShellParams) -> serde_json::Value {
     json!({
         "command": params.command,
@@ -1008,9 +1072,15 @@ pub fn run_shell_request_details(params: &ActRunShellParams) -> serde_json::Valu
         "working_dir": params.working_dir,
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
         "timeout_ms": params.timeout_ms,
+        "inline_await_limit_ms": RUN_SHELL_INLINE_AWAIT_MAX_MS,
+        "will_background": should_background_direct_shell(params),
         "idempotency_key_present": params.idempotency_key.is_some(),
         "request_sha256": run_shell_request_sha256(params).ok(),
     })
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn authorize_run_shell_start(
@@ -1246,16 +1316,17 @@ pub fn shell_job_status(
     let mut job = read_shell_job_status(&paths.status_path, &params.job_id)?;
     ensure_shell_job_session_owner(&job, session_id)?;
     job = reconcile_shell_job_process_state(job, &paths)?;
+    let mut running = shell_job_process_still_running(&job);
+    if shell_job_live_status(&job.status) && !running {
+        job = reconcile_shell_job_process_state(job, &paths)?;
+        running = shell_job_process_still_running(&job);
+    }
     let tail_bytes =
         usize::try_from(params.tail_bytes).unwrap_or(SHELL_JOB_TAIL_MAX_BYTES as usize);
     let stdout_len_bytes = file_len(&paths.stdout_path, &params.job_id, "stdout")?;
     let stderr_len_bytes = file_len(&paths.stderr_path, &params.job_id, "stderr")?;
     let stdout_tail = tail_file_lossy(&paths.stdout_path, tail_bytes)?;
     let stderr_tail = tail_file_lossy(&paths.stderr_path, tail_bytes)?;
-    let running = shell_job_live_status(&job.status)
-        && job
-            .pid
-            .is_some_and(|pid| shell_job_live_process_ids(&[pid]).contains(&pid));
     tracing::info!(
         code = "M4_ACT_RUN_SHELL_JOB_STATUS_READ",
         job_id = %params.job_id,
@@ -1274,6 +1345,13 @@ pub fn shell_job_status(
         stdout_tail,
         stderr_tail,
     })
+}
+
+fn shell_job_process_still_running(job: &ActRunShellJobStatus) -> bool {
+    shell_job_live_status(&job.status)
+        && job
+            .pid
+            .is_some_and(|pid| shell_job_live_process_ids(&[pid]).contains(&pid))
 }
 
 pub fn cancel_shell_job(
@@ -4355,6 +4433,26 @@ fn reconcile_shell_job_process_state(
     mut job: ActRunShellJobStatus,
     paths: &ShellJobPaths,
 ) -> Result<ActRunShellJobStatus, ErrorData> {
+    if job.status == "finalizing" {
+        if let Some(terminal) =
+            wait_for_shell_job_terminal_status(paths, &job.job_id, Duration::from_millis(500))?
+        {
+            return Ok(terminal);
+        }
+        if job
+            .completed_at
+            .as_deref()
+            .and_then(elapsed_ms_since_rfc3339)
+            .is_some_and(|elapsed_ms| elapsed_ms >= SHELL_JOB_FINALIZING_GRACE_MS)
+        {
+            job.status = "exited_unobserved".to_owned();
+            job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+            job.error_message =
+                Some("job process exited before the monitor persisted final status".to_owned());
+            write_shell_job_status(&paths.status_path, &job)?;
+        }
+        return Ok(job);
+    }
     if !shell_job_live_status(&job.status) {
         return Ok(job);
     }
@@ -4372,14 +4470,21 @@ fn reconcile_shell_job_process_state(
     if shell_job_live_process_ids(&[pid]).contains(&pid) {
         return Ok(job);
     }
-    job.status = if job.cancel_requested {
-        "cancelled".to_owned()
-    } else {
-        job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-        job.error_message =
-            Some("job process exited before the monitor persisted final status".to_owned());
-        "exited_unobserved".to_owned()
-    };
+    if let Some(terminal) =
+        wait_for_shell_job_terminal_status(paths, &job.job_id, Duration::from_millis(500))?
+    {
+        return Ok(terminal);
+    }
+    if job.cancel_requested {
+        job.status = "cancelled".to_owned();
+        job.completed_at
+            .get_or_insert_with(|| chrono::Utc::now().to_rfc3339());
+        job.duration_ms
+            .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
+        write_shell_job_status(&paths.status_path, &job)?;
+        return Ok(job);
+    }
+    job.status = "finalizing".to_owned();
     job.completed_at
         .get_or_insert_with(|| chrono::Utc::now().to_rfc3339());
     job.duration_ms
@@ -4388,8 +4493,30 @@ fn reconcile_shell_job_process_state(
     Ok(job)
 }
 
+fn wait_for_shell_job_terminal_status(
+    paths: &ShellJobPaths,
+    job_id: &str,
+    max_wait: Duration,
+) -> Result<Option<ActRunShellJobStatus>, ErrorData> {
+    let started = Instant::now();
+    loop {
+        let latest = read_shell_job_status(&paths.status_path, job_id)?;
+        if shell_job_terminal_status(&latest.status) {
+            return Ok(Some(latest));
+        }
+        if started.elapsed() >= max_wait {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn shell_job_live_status(status: &str) -> bool {
     matches!(status, "running" | "cancel_requested")
+}
+
+fn shell_job_terminal_status(status: &str) -> bool {
+    !matches!(status, "running" | "cancel_requested" | "finalizing")
 }
 
 fn elapsed_ms_since_rfc3339(started_at: &str) -> Option<u64> {
@@ -4685,6 +4812,11 @@ async fn run_allowlisted_shell(
                 &resolve_shell_working_dir(None, context, "act_run_shell").ok()?,
             ))
         }),
+        backgrounded: false,
+        background_reason: None,
+        inline_await_limit_ms: None,
+        job_id: None,
+        job: None,
     })
 }
 
@@ -6436,6 +6568,72 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_long_timeout_returns_durable_job_handle() {
+        let timeout_ms = RUN_SHELL_INLINE_AWAIT_MAX_MS + 1;
+        let params = shell_params(
+            "cmd.exe",
+            vec!["/c", "echo background-handoff-ok"],
+            timeout_ms,
+        );
+        let config = shell_config_for(&params);
+
+        let response = match run_shell(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("long direct shell call should return job handle: {error}"),
+        };
+
+        println!("readback=act_run_shell edge=long_timeout_handoff after=response:{response:?}");
+        assert!(response.backgrounded);
+        assert_eq!(
+            response.background_reason.as_deref(),
+            Some("timeout_exceeds_inline_await_budget")
+        );
+        assert_eq!(
+            response.inline_await_limit_ms,
+            Some(RUN_SHELL_INLINE_AWAIT_MAX_MS)
+        );
+        assert_eq!(response.exit_code, None);
+        assert_eq!(response.stdout, "");
+        assert_eq!(response.stderr, "");
+        let job_id = response
+            .job_id
+            .clone()
+            .expect("background response should include job id");
+        let job = response
+            .job
+            .expect("background response should include job");
+        assert_eq!(job.job_id, job_id);
+        assert_eq!(job.status, "running");
+        assert_eq!(job.timeout_ms, Some(timeout_ms));
+
+        for _ in 0..100 {
+            let status = shell_job_status(
+                &ActRunShellStatusParams {
+                    job_id: job_id.clone(),
+                    tail_bytes: 4096,
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("status should read durable job state: {error}"));
+            println!("readback=act_run_shell edge=long_timeout_handoff after=status:{status:?}");
+            if status.job.status == "finalizing" {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            if !status.running {
+                assert_eq!(status.job.status, "ok");
+                assert_eq!(status.job.exit_code, Some(0));
+                assert!(status.stdout_tail.contains("background-handoff-ok"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("background job {job_id} did not complete within the regression readback window");
+    }
+
     #[test]
     fn launch_rejects_timeout_outside_schema_bounds() {
         for timeout_ms in [0, MAX_LAUNCH_TIMEOUT_MS + 1] {
@@ -6575,6 +6773,11 @@ mod tests {
             stderr_truncated: false,
             session_id: Some("session-a".to_owned()),
             effective_working_dir: Some("C:\\code\\Synapse".to_owned()),
+            backgrounded: false,
+            background_reason: None,
+            inline_await_limit_ms: None,
+            job_id: None,
+            job: None,
         };
         let row = run_shell_idempotency_completed_row(
             &params,
@@ -6607,6 +6810,11 @@ mod tests {
             stderr_truncated: false,
             session_id: Some("session-a".to_owned()),
             effective_working_dir: Some("C:\\code\\Synapse".to_owned()),
+            backgrounded: false,
+            background_reason: None,
+            inline_await_limit_ms: None,
+            job_id: None,
+            job: None,
         };
         let row = run_shell_idempotency_completed_row(
             &first,
