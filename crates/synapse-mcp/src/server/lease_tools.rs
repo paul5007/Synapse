@@ -92,7 +92,21 @@ impl SynapseService {
             "tool.invocation kind=control_lease_acquire"
         );
         let session_id = require_lease_session_id(&request_context)?;
-        acquire_lease_for_session(&session_id, params.0.ttl_ms).map(Json)
+        self.restore_session_lease_if_needed(&session_id)?;
+        let response = acquire_lease_for_session(&session_id, params.0.ttl_ms)?;
+        let status = lease::status();
+        if let Err(error) = self.persist_session_lease(&session_id, &status) {
+            let released = lease::release_if_owner(&session_id);
+            tracing::error!(
+                code = error_codes::TOOL_INTERNAL_ERROR,
+                session_id,
+                released_after_persist_failure = released,
+                error = ?error,
+                "input lease acquire failed durability write; released in-memory lease before returning error"
+            );
+            return Err(error);
+        }
+        Ok(Json(response))
     }
 
     #[tool(
@@ -109,7 +123,10 @@ impl SynapseService {
             "tool.invocation kind=control_lease_release"
         );
         let session_id = require_lease_session_id(&request_context)?;
-        release_lease_for_session(&session_id).map(Json)
+        self.restore_session_lease_if_needed(&session_id)?;
+        let response = release_lease_for_session(&session_id)?;
+        self.delete_persisted_session_lease(&session_id)?;
+        Ok(Json(response))
     }
 
     #[tool(
@@ -126,6 +143,7 @@ impl SynapseService {
             "tool.invocation kind=control_lease_status"
         );
         let session_id = require_lease_session_id(&request_context)?;
+        self.restore_session_lease_if_needed(&session_id)?;
         Ok(Json(lease_status_for_session(&session_id)))
     }
 }

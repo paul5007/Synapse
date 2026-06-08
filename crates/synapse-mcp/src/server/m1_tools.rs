@@ -556,25 +556,29 @@ impl SynapseService {
         session_id: &str,
         target: SessionTarget,
     ) -> Result<Option<TargetWire>, ErrorData> {
+        let previous = self
+            .memory_session_target(session_id)?
+            .as_ref()
+            .map(target_wire);
+        self.persist_session_target(session_id, &target)?;
         let mut guard = self.lock_session_targets()?;
-        let previous = guard
-            .insert(session_id.to_owned(), target)
-            .map(|prior| target_wire(&prior));
-        drop(guard);
+        guard.insert(session_id.to_owned(), target);
         Ok(previous)
     }
 
     fn get_session_target_wire(&self, session_id: &str) -> Result<Option<TargetWire>, ErrorData> {
-        let guard = self.lock_session_targets()?;
-        let current = guard.get(session_id).map(target_wire);
-        drop(guard);
-        Ok(current)
+        self.session_target(Some(session_id))
+            .map(|target| target.as_ref().map(target_wire))
     }
 
     fn clear_session_target(&self, session_id: &str) -> Result<Option<TargetWire>, ErrorData> {
+        let previous = self
+            .memory_session_target(session_id)?
+            .as_ref()
+            .map(target_wire);
+        self.delete_persisted_session_target(session_id)?;
         let mut guard = self.lock_session_targets()?;
-        let previous = guard.remove(session_id).map(|prior| target_wire(&prior));
-        drop(guard);
+        guard.remove(session_id);
         Ok(previous)
     }
 
@@ -583,6 +587,22 @@ impl SynapseService {
         session_id: &str,
         cdp_target_id: &str,
     ) -> Result<Option<TargetWire>, ErrorData> {
+        let expected = {
+            let guard = self.lock_session_targets()?;
+            match guard.get(session_id) {
+                Some(
+                    target @ SessionTarget::Cdp {
+                        cdp_target_id: current,
+                        ..
+                    },
+                ) if current == cdp_target_id => Some(target.clone()),
+                _ => None,
+            }
+        };
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        self.delete_persisted_session_target_if_matches(session_id, &expected)?;
         let mut guard = self.lock_session_targets()?;
         let should_clear = matches!(
             guard.get(session_id),

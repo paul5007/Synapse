@@ -97,6 +97,7 @@ pub struct SessionTeardownReport {
     pub termination_marker_error_message: Option<String>,
     pub input: SessionInputCleanupReport,
     pub target: SessionTargetCleanupReport,
+    pub continuity: SessionContinuityCleanupReport,
     pub audit_session: SessionAuditSessionCleanupReport,
     pub cdp: SessionCdpCleanupReport,
     pub shell: SessionShellCleanupReport,
@@ -135,6 +136,19 @@ pub struct SessionTargetCleanupReport {
     pub target_cleared: bool,
     pub target_sessions_before: usize,
     pub target_sessions_after: usize,
+    pub failed: bool,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionContinuityCleanupReport {
+    pub target_row_existed_before: bool,
+    pub target_row_deleted: bool,
+    pub target_row_exists_after: bool,
+    pub lease_row_existed_before: bool,
+    pub lease_row_deleted: bool,
+    pub lease_row_exists_after: bool,
     pub failed: bool,
     pub error_message: Option<String>,
 }
@@ -244,6 +258,7 @@ impl SessionTeardownReport {
             termination_marker_error_message: None,
             input: SessionInputCleanupReport::default(),
             target: SessionTargetCleanupReport::default(),
+            continuity: SessionContinuityCleanupReport::default(),
             audit_session: SessionAuditSessionCleanupReport::default(),
             cdp: SessionCdpCleanupReport::default(),
             shell: SessionShellCleanupReport::default(),
@@ -265,6 +280,9 @@ impl SessionTeardownReport {
             self.failure_count = self.failure_count.saturating_add(1);
         }
         if self.target.failed {
+            self.failure_count = self.failure_count.saturating_add(1);
+        }
+        if self.continuity.failed {
             self.failure_count = self.failure_count.saturating_add(1);
         }
         if self.audit_session.failed {
@@ -367,6 +385,7 @@ impl SessionLifecycleState {
         self.mark_terminated_session(&mut report);
         report.input = self.cleanup_inputs_and_lease(session_id).await;
         report.target = self.cleanup_target(session_id);
+        report.continuity = self.cleanup_continuity(session_id);
         report.audit_session = self.cleanup_audit_session(session_id);
         report.cdp = cleanup_session_cdp_targets(&self.cdp_target_owners, session_id).await;
         report.shell = cleanup_shell_jobs(session_id, reason);
@@ -585,6 +604,37 @@ impl SessionLifecycleState {
                 error_message: Some("session target registry lock poisoned".to_owned()),
                 ..SessionTargetCleanupReport::default()
             },
+        }
+    }
+
+    fn cleanup_continuity(&self, session_id: &str) -> SessionContinuityCleanupReport {
+        match super::session_continuity::delete_persisted_session_continuity_rows(
+            &self.m3_state,
+            session_id,
+        ) {
+            Ok(readback) => SessionContinuityCleanupReport {
+                target_row_existed_before: readback.target_row_existed_before,
+                target_row_deleted: readback.target_row_deleted,
+                target_row_exists_after: readback.target_row_exists_after,
+                lease_row_existed_before: readback.lease_row_existed_before,
+                lease_row_deleted: readback.lease_row_deleted,
+                lease_row_exists_after: readback.lease_row_exists_after,
+                failed: false,
+                error_message: None,
+            },
+            Err(error) => {
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    session_id,
+                    detail = %error,
+                    "session lifecycle failed to delete persisted continuity rows"
+                );
+                SessionContinuityCleanupReport {
+                    failed: true,
+                    error_message: Some(error),
+                    ..SessionContinuityCleanupReport::default()
+                }
+            }
         }
     }
 

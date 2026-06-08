@@ -702,6 +702,7 @@ impl SessionStore for SynapseMcpSessionStore {
                     self.db
                         .delete_batch(cf::CF_KV, [key])
                         .map_err(session_store_error)?;
+                    delete_session_continuity_rows(&self.db, session_id)?;
                     tracing::warn!(
                         code = "MCP_HTTP_SESSION_STORE_LEGACY_STALE_DELETE",
                         session_id,
@@ -723,6 +724,7 @@ impl SessionStore for SynapseMcpSessionStore {
             self.db
                 .delete_batch(cf::CF_KV, [key])
                 .map_err(session_store_error)?;
+            delete_session_continuity_rows(&self.db, session_id)?;
             tracing::warn!(
                 code = "MCP_HTTP_SESSION_STORE_EXPIRED",
                 session_id,
@@ -777,6 +779,7 @@ impl SessionStore for SynapseMcpSessionStore {
         self.db
             .delete_batch(cf::CF_KV, [key])
             .map_err(session_store_error)?;
+        delete_session_continuity_rows(&self.db, session_id)?;
         tracing::info!(
             code = "MCP_HTTP_SESSION_STORE_DELETE",
             session_id,
@@ -824,6 +827,21 @@ fn record_registry_closed(
 
 fn mcp_session_store_key(session_id: &str) -> Vec<u8> {
     crate::server::session_lifecycle::mcp_session_store_key(session_id)
+}
+
+fn delete_session_continuity_rows(db: &Db, session_id: &str) -> Result<(), SessionStoreError> {
+    let readback =
+        crate::server::session_continuity::delete_persisted_session_continuity_rows_from_db(
+            db, session_id,
+        )
+        .map_err(|error| -> SessionStoreError { Box::new(io::Error::other(error)) })?;
+    tracing::info!(
+        code = "MCP_HTTP_SESSION_CONTINUITY_DELETE",
+        session_id,
+        readback = ?readback,
+        "readback=CF_SESSIONS after=http_session_store_deleted_continuity"
+    );
+    Ok(())
 }
 
 fn session_store_error(error: synapse_storage::StorageError) -> SessionStoreError {

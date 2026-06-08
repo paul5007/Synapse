@@ -13,6 +13,7 @@ use rmcp::{
     model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
+use serde::{Deserialize, Serialize};
 use synapse_action::{ActionHandle, ActionStateSnapshot, RecordingBackend};
 use synapse_core::{Health, SubsystemHealth, error_codes};
 use tokio::sync::watch;
@@ -151,6 +152,7 @@ mod m3_tools;
 mod m4_tools;
 mod reality;
 mod schema_sanitize;
+pub(crate) mod session_continuity;
 pub(crate) mod session_lifecycle;
 pub(crate) mod session_registry;
 mod session_tools;
@@ -164,7 +166,8 @@ use session_registry::{SessionRegistry, SharedSessionRegistry};
 /// `observe`/`find`/`read_text`/`capture_screenshot` perceive this target
 /// instead of the global foreground, so many agents observe different windows
 /// or browser tabs concurrently.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SessionTarget {
     Window {
         hwnd: i64,
@@ -341,13 +344,7 @@ impl SynapseService {
         let Some(session_id) = session_id else {
             return Ok(None);
         };
-        let guard = self.session_targets.lock().map_err(|_err| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "session target registry lock poisoned",
-            )
-        })?;
-        Ok(guard.get(session_id).cloned())
+        self.restore_session_target_if_needed(session_id)
     }
 
     /// Resolves the session's active **window** target to an HWND, if any. The
