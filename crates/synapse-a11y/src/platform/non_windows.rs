@@ -5,8 +5,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     A11yError, A11yResult, AccessibleEvent, ElementClickAction, ElementMetadataReadback,
-    ElementSearchScope, ElementValueReadback, ElementValueSetReadback, ExpandState, UIElement,
-    UiaWorkerReadback, WinEventHookReadback,
+    ElementSearchScope, ElementValueReadback, ElementValueSetReadback, ExpandState,
+    ForegroundActivationIntent, UIElement, UiaWorkerReadback, WinEventHookReadback,
 };
 
 pub struct WinEventSubscription {
@@ -37,7 +37,7 @@ pub fn window_from_hwnd(_hwnd: i64) -> A11yResult<UIElement> {
     ))
 }
 
-pub fn focus_window(_hwnd: i64) -> A11yResult<()> {
+pub fn focus_window_with_intent(_hwnd: i64, _intent: ForegroundActivationIntent) -> A11yResult<()> {
     Err(A11yError::not_available(
         "foreground window focus requires Windows",
     ))

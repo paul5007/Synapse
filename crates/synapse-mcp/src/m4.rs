@@ -38,8 +38,6 @@ const DEFAULT_LAUNCH_TIMEOUT_MS: u32 = 10_000;
 const MAX_LAUNCH_TIMEOUT_MS: u32 = 600_000;
 #[cfg(windows)]
 const SW_HIDE: u16 = 0;
-#[cfg(windows)]
-const SW_SHOWNORMAL: u16 = 1;
 const DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS: u32 = 120_000;
 const MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS: u32 = 600_000;
 const DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS: u32 = 60_000;
@@ -98,9 +96,6 @@ const PROCESS_BASE_ENV_KEYS: [&str; 20] = [
 const WINDOWS_DEFAULT_PATHEXT: &str =
     ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW";
 const LAUNCH_WINDOW_POLL_INTERVAL_MS: u64 = 20;
-const LAUNCH_FOREGROUND_STABLE_MS: u64 = 750;
-const LAUNCH_FOREGROUND_POLL_MS: u64 = 75;
-const LAUNCH_FOREGROUND_MAX_MS: u64 = 3_000;
 const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
 const SHELL_JOB_FINALIZING_GRACE_MS: u64 = 30_000;
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
@@ -625,8 +620,9 @@ pub struct ActLaunchParams {
     #[schemars(default)]
     pub force_renderer_accessibility: Option<bool>,
     /// Windows console window state for console targets launched through
-    /// `CreateProcessW`. `hidden` uses CREATE_NO_WINDOW so background helper
-    /// shells do not flash a visible blank console.
+    /// `CreateProcessW`. `None` and `hidden` use `CREATE_NO_WINDOW` so background
+    /// helper shells do not flash or activate a visible blank console. `normal`
+    /// is refused until a non-activating visible-console path can be proven.
     #[serde(default)]
     #[schemars(default)]
     pub windows_console_window_state: Option<LaunchWindowState>,
@@ -2673,6 +2669,42 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
             )
         })?;
     }
+    validate_console_launch_visibility(params)?;
+    Ok(())
+}
+
+fn validate_console_launch_visibility(params: &ActLaunchParams) -> Result<(), ErrorData> {
+    if !launch_target_needs_new_console(&params.target) {
+        return Ok(());
+    }
+    if matches!(
+        params.windows_console_window_state,
+        Some(LaunchWindowState::Normal)
+    ) {
+        return Err(launch_tool_error(
+            error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            "act_launch refused a visible console window because Windows may activate the console host/terminal; use hidden console state for background helpers",
+            json!({
+                "code": error_codes::FOREGROUND_ACTIVATION_REFUSED,
+                "reason": "visible_console_activation_not_proven",
+                "target": params.target,
+                "windows_console_window_state": params.windows_console_window_state,
+            }),
+        ));
+    }
+    if params.wait_for_window_title_regex.is_some() {
+        return Err(launch_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_launch cannot wait for a console window title when console launch is hidden/no-window",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "hidden_console_has_no_window_to_wait_for",
+                "target": params.target,
+                "wait_for_window_title_regex": params.wait_for_window_title_regex,
+                "windows_console_window_state": params.windows_console_window_state,
+            }),
+        ));
+    }
     Ok(())
 }
 
@@ -2774,8 +2806,7 @@ fn spawn_windows_console_child(params: &ActLaunchParams) -> Result<u32, ErrorDat
         cb: startup_info_cb,
         dwFlags: STARTF_USESHOWWINDOW,
         wShowWindow: match params.windows_console_window_state {
-            Some(LaunchWindowState::Hidden) => SW_HIDE,
-            Some(LaunchWindowState::Normal) | None => SW_SHOWNORMAL,
+            Some(LaunchWindowState::Hidden | LaunchWindowState::Normal) | None => SW_HIDE,
         },
         ..Default::default()
     };
@@ -2826,12 +2857,11 @@ fn console_creation_flags(
     params: &ActLaunchParams,
 ) -> windows::Win32::System::Threading::PROCESS_CREATION_FLAGS {
     use windows::Win32::System::Threading::{
-        CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
     };
 
     let console_flag = match params.windows_console_window_state {
-        Some(LaunchWindowState::Hidden) => CREATE_NO_WINDOW,
-        Some(LaunchWindowState::Normal) | None => CREATE_NEW_CONSOLE,
+        Some(LaunchWindowState::Hidden | LaunchWindowState::Normal) | None => CREATE_NO_WINDOW,
     };
     console_flag | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT
 }
@@ -3422,8 +3452,14 @@ async fn wait_for_launch_window(
                     launch_target_name,
                     launch_args,
                 ) {
-                    let foreground = focus_launch_window(context.hwnd).await?;
-                    return Ok(WindowWaitResult::matched(foreground));
+                    tracing::info!(
+                        code = "M4_ACT_LAUNCH_WINDOW_MATCHED",
+                        hwnd = context.hwnd,
+                        pid = context.pid,
+                        title = %context.window_title,
+                        "act_launch matched the requested launched window without activating it"
+                    );
+                    return Ok(WindowWaitResult::matched(context.clone()));
                 }
                 last_error = None;
             }
@@ -3467,88 +3503,6 @@ async fn wait_for_launch_window(
         }
         tokio::time::sleep(Duration::from_millis(LAUNCH_WINDOW_POLL_INTERVAL_MS)).await;
     }
-}
-
-async fn focus_launch_window(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
-    let mut last_error = None;
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(LAUNCH_FOREGROUND_MAX_MS);
-    let stable_for = Duration::from_millis(LAUNCH_FOREGROUND_STABLE_MS);
-    let mut stable_since: Option<Instant> = None;
-    let mut focus_attempts = 0usize;
-    let mut last_matching_context: Option<ForegroundContext> = None;
-
-    loop {
-        match synapse_a11y::current_foreground_context() {
-            Ok(context) if context.hwnd == hwnd => {
-                let now = Instant::now();
-                let stable_since = *stable_since.get_or_insert(now);
-                last_matching_context = Some(context.clone());
-                if now.duration_since(stable_since) >= stable_for {
-                    tracing::info!(
-                        code = "M4_ACT_LAUNCH_FOCUSED",
-                        hwnd,
-                        attempts = focus_attempts,
-                        stable_ms = LAUNCH_FOREGROUND_STABLE_MS,
-                        pid = context.pid,
-                        title = %context.window_title,
-                        "act_launch foregrounded the matched window and verified it stayed foreground"
-                    );
-                    return Ok(context);
-                }
-            }
-            Ok(context) => {
-                stable_since = None;
-                last_error = Some(format!(
-                    "foreground readback hwnd 0x{:x} pid {} title {:?}, expected hwnd 0x{hwnd:x}",
-                    context.hwnd, context.pid, context.window_title
-                ));
-            }
-            Err(error) => {
-                stable_since = None;
-                last_error = Some(format!("foreground readback failed: {error}"));
-            }
-        }
-
-        if Instant::now() >= deadline {
-            break;
-        }
-
-        focus_attempts += 1;
-        if let Err(error) = synapse_a11y::focus_window(hwnd) {
-            stable_since = None;
-            last_error = Some(error.to_string());
-        }
-        tokio::time::sleep(Duration::from_millis(LAUNCH_FOREGROUND_POLL_MS)).await;
-    }
-    tracing::error!(
-        code = "M4_ACT_LAUNCH_FOCUS_FAILED",
-        hwnd,
-        error = ?last_error,
-        attempts = focus_attempts,
-        stable_ms = LAUNCH_FOREGROUND_STABLE_MS,
-        last_matching_title = ?last_matching_context.as_ref().map(|context| context.window_title.as_str()),
-        "act_launch matched the launched window but could not keep it foreground after retries"
-    );
-    Err(launch_tool_error(
-        error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
-        "act_launch matched the launched window but could not keep it foreground after retries",
-        json!({
-            "code": error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
-            "reason": "foreground_not_stable",
-            "hwnd": hwnd,
-            "attempts": focus_attempts,
-            "required_stable_ms": LAUNCH_FOREGROUND_STABLE_MS,
-            "max_wait_ms": LAUNCH_FOREGROUND_MAX_MS,
-            "last_error": last_error,
-            "last_matching_context": last_matching_context.map(|context| json!({
-                "hwnd": context.hwnd,
-                "pid": context.pid,
-                "process_name": context.process_name,
-                "title": context.window_title,
-            })),
-        }),
-    ))
 }
 
 fn window_context_summaries(contexts: &[ForegroundContext]) -> Vec<serde_json::Value> {

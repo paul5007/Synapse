@@ -373,7 +373,13 @@ mod platform {
                 "find newly launched/restored Notepad window for Ctrl+N retry after first timeout: {first_err:#}; excluded_notepad_hwnds={excluded_notepad_hwnds:?}; candidates={candidates:?}"
             )
         })?;
-        synapse_a11y::focus_window(candidate.hwnd).with_context(|| {
+        synapse_a11y::focus_window_with_intent(
+            candidate.hwnd,
+            synapse_a11y::ForegroundActivationIntent::OperatorRequested {
+                caller: "synapse_test_utils_force_untitled_notepad_tab",
+            },
+        )
+        .with_context(|| {
             format!(
                 "focus restored Notepad window hwnd 0x{:x} pid {} before Ctrl+N retry",
                 candidate.hwnd, candidate.pid

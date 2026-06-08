@@ -25,6 +25,8 @@ pub enum A11yError {
     CdpAttachFailed { detail: String },
     #[error("Chromium accessibility tree retrieval failed: {detail}")]
     CdpAxtreeFailed { detail: String },
+    #[error("foreground activation refused: {detail}")]
+    ForegroundActivationRefused { detail: String },
     #[error("invalid element id: {detail}")]
     InvalidElementId { detail: String },
     #[error("accessibility backend failed: {detail}")]
@@ -48,6 +50,7 @@ impl A11yError {
             Self::CdpUnreachable { .. } => error_codes::A11Y_CDP_UNREACHABLE,
             Self::CdpAttachFailed { .. } => error_codes::A11Y_CDP_ATTACH_FAILED,
             Self::CdpAxtreeFailed { .. } => error_codes::A11Y_CDP_AXTREE_FAILED,
+            Self::ForegroundActivationRefused { .. } => error_codes::FOREGROUND_ACTIVATION_REFUSED,
             Self::InvalidElementId { .. } | Self::Internal { .. } => error_codes::OBSERVE_INTERNAL,
         }
     }
@@ -62,6 +65,13 @@ impl A11yError {
     #[must_use]
     pub fn internal(detail: impl Into<String>) -> Self {
         Self::Internal {
+            detail: detail.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn foreground_activation_refused(detail: impl Into<String>) -> Self {
+        Self::ForegroundActivationRefused {
             detail: detail.into(),
         }
     }

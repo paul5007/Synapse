@@ -397,7 +397,12 @@ async fn verify_focus_window(
             break;
         }
 
-        if !current_matches_target && let Err(error) = synapse_a11y::focus_window(matched.hwnd) {
+        if !current_matches_target
+            && let Err(error) = synapse_a11y::focus_window_with_intent(
+                matched.hwnd,
+                synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
+            )
+        {
             stable_since = None;
             last_error = Some(error.to_string());
             focus_attempts = focus_attempts.saturating_add(1);

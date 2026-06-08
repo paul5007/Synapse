@@ -212,6 +212,9 @@ fn a11y_error_to_action(
         synapse_a11y::A11yError::NotAvailable { detail } => {
             crate::ActionError::BackendUnavailable { detail }
         }
+        synapse_a11y::A11yError::ForegroundActivationRefused { .. } => {
+            crate::ActionError::ForegroundActivationRefused { detail }
+        }
         synapse_a11y::A11yError::CdpUnreachable { .. }
         | synapse_a11y::A11yError::CdpAttachFailed { .. }
         | synapse_a11y::A11yError::CdpAxtreeFailed { .. }

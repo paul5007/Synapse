@@ -82,12 +82,21 @@ async fn notepad_type_save_writes_byte_correct_file_live() -> anyhow::Result<()>
 
     let editor_node = editor_node_from_uia_snapshot(hwnd)?;
     let editor_id = editor_node.element_id.clone();
-    match synapse_a11y::focus_window(hwnd) {
+    match synapse_a11y::focus_window_with_intent(
+        hwnd,
+        synapse_a11y::ForegroundActivationIntent::OperatorRequested {
+            caller: "m2_notepad_type_save_test",
+        },
+    ) {
         Ok(()) => {
-            println!("readback=synapse_a11y::focus_window edge=window after=ok hwnd=0x{hwnd:x}");
+            println!(
+                "readback=synapse_a11y::focus_window_with_intent edge=window after=ok hwnd=0x{hwnd:x}"
+            );
         }
         Err(error) => {
-            println!("readback=synapse_a11y::focus_window edge=window after_error={error}");
+            println!(
+                "readback=synapse_a11y::focus_window_with_intent edge=window after_error={error}"
+            );
         }
     }
     synapse_a11y::focus_element(&editor_id)
@@ -865,12 +874,21 @@ async fn observe(client: &mut StdioMcpClient) -> anyhow::Result<Observation> {
 
 #[cfg(windows)]
 fn focus_editor(hwnd: i64, editor_id: &ElementId) -> anyhow::Result<()> {
-    match synapse_a11y::focus_window(hwnd) {
+    match synapse_a11y::focus_window_with_intent(
+        hwnd,
+        synapse_a11y::ForegroundActivationIntent::OperatorRequested {
+            caller: "m2_notepad_type_save_focus_editor",
+        },
+    ) {
         Ok(()) => {
-            println!("readback=synapse_a11y::focus_window edge=window after=ok hwnd=0x{hwnd:x}");
+            println!(
+                "readback=synapse_a11y::focus_window_with_intent edge=window after=ok hwnd=0x{hwnd:x}"
+            );
         }
         Err(error) => {
-            println!("readback=synapse_a11y::focus_window edge=window after_error={error}");
+            println!(
+                "readback=synapse_a11y::focus_window_with_intent edge=window after_error={error}"
+            );
         }
     }
     synapse_a11y::focus_element(editor_id)

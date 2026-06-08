@@ -139,6 +139,33 @@ fn non_windows_uia_reports_not_available() {
     }
 }
 
+#[test]
+fn implicit_focus_window_refuses_before_touching_os_focus() {
+    let hwnd = 0x1234_i64;
+    println!("readback=foreground_activation_guard edge=implicit before_hwnd=0x{hwnd:x}");
+    let after = focus_window(hwnd);
+    println!("readback=foreground_activation_guard edge=implicit after={after:?}");
+    assert_eq!(
+        after.err().map(|err| err.code()),
+        Some(error_codes::FOREGROUND_ACTIVATION_REFUSED)
+    );
+}
+
+#[test]
+fn foreground_activation_intent_records_caller_and_reason() {
+    let intent = ForegroundActivationIntent::OperatorRequested {
+        caller: "supporting_regression_test",
+    };
+    println!("readback=foreground_activation_intent before={intent:?}");
+    println!(
+        "readback=foreground_activation_intent after_caller={} after_reason={}",
+        intent.caller(),
+        intent.reason()
+    );
+    assert_eq!(intent.caller(), "supporting_regression_test");
+    assert_eq!(intent.reason(), "operator_requested");
+}
+
 #[tokio::test]
 async fn cdp_probe_non_chromium_is_explicitly_not_chromium() {
     let before = ("notepad.exe", Vec::<u16>::new());

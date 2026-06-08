@@ -353,7 +353,10 @@ impl ForegroundInputContextSnapshot {
             return "skipped";
         }
 
-        match synapse_a11y::focus_window(hwnd) {
+        match synapse_a11y::focus_window_with_intent(
+            hwnd,
+            synapse_a11y::ForegroundActivationIntent::LeaseContextRestore { caller: tool },
+        ) {
             Ok(()) => match synapse_a11y::current_foreground_context() {
                 Ok(after) if after.hwnd == hwnd && after.pid == expected_pid => {
                     for sample in 1..=FOREGROUND_RESTORE_STABILITY_SAMPLES {

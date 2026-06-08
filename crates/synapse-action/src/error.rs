@@ -17,6 +17,8 @@ pub enum ActionError {
     },
     #[error("action backend unavailable: {detail}")]
     BackendUnavailable { detail: String },
+    #[error("foreground activation refused: {detail}")]
+    ForegroundActivationRefused { detail: String },
     #[error("action target invalid: {detail}")]
     TargetInvalid { detail: String },
     #[error("action hold exceeds max: {detail}")]
@@ -59,6 +61,7 @@ impl ActionError {
             Self::RateLimited { .. } => error_codes::ACTION_RATE_LIMITED,
             Self::ForegroundLeaseBusy { .. } => error_codes::ACTION_FOREGROUND_LEASE_BUSY,
             Self::BackendUnavailable { .. } => error_codes::ACTION_BACKEND_UNAVAILABLE,
+            Self::ForegroundActivationRefused { .. } => error_codes::FOREGROUND_ACTIVATION_REFUSED,
             Self::TargetInvalid { .. } => error_codes::ACTION_TARGET_INVALID,
             Self::HoldExceededMax { .. } => error_codes::ACTION_HOLD_EXCEEDED_MAX,
             Self::VigemNotInstalled { .. } => error_codes::ACTION_VIGEM_NOT_INSTALLED,
@@ -86,6 +89,7 @@ impl ActionError {
             | Self::RateLimited { detail, .. }
             | Self::ForegroundLeaseBusy { detail, .. }
             | Self::BackendUnavailable { detail }
+            | Self::ForegroundActivationRefused { detail }
             | Self::TargetInvalid { detail }
             | Self::HoldExceededMax { detail }
             | Self::VigemNotInstalled { detail }
@@ -123,6 +127,9 @@ impl ActionError {
                 retry_after_ms,
             },
             Self::BackendUnavailable { .. } => Self::BackendUnavailable { detail },
+            Self::ForegroundActivationRefused { .. } => {
+                Self::ForegroundActivationRefused { detail }
+            }
             Self::TargetInvalid { .. } => Self::TargetInvalid { detail },
             Self::HoldExceededMax { .. } => Self::HoldExceededMax { detail },
             Self::VigemNotInstalled { .. } => Self::VigemNotInstalled { detail },
@@ -150,6 +157,7 @@ impl ActionError {
             | Self::ForegroundLeaseBusy { retry_after_ms, .. } => Some(*retry_after_ms),
             Self::QueueFull { .. }
             | Self::BackendUnavailable { .. }
+            | Self::ForegroundActivationRefused { .. }
             | Self::TargetInvalid { .. }
             | Self::HoldExceededMax { .. }
             | Self::VigemNotInstalled { .. }

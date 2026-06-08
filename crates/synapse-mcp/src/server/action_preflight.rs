@@ -1,8 +1,6 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 
 use rmcp::{ErrorData, model::ErrorCode};
@@ -171,10 +169,16 @@ impl SynapseService {
         };
 
         let focus_hwnd = candidate.hwnd;
-        let focus_error = synapse_a11y::focus_window(focus_hwnd)
-            .err()
-            .map(|error| error.to_string());
-        thread::sleep(Duration::from_millis(50));
+        let focus_error = Some(format!(
+            "{}: implicit EverQuest preflight foreground activation refused for hwnd 0x{focus_hwnd:x}; use an explicit lease-held foreground action instead",
+            error_codes::FOREGROUND_ACTIVATION_REFUSED
+        ));
+        tracing::warn!(
+            code = error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            tool,
+            focus_hwnd,
+            "EverQuest action preflight refused implicit foreground activation"
+        );
 
         let after_result = self.read_current_action_foreground();
         let after = after_result

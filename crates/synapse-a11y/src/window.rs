@@ -2,6 +2,29 @@ use synapse_core::{ForegroundContext, Point};
 
 use crate::{A11yResult, UIElement, platform};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForegroundActivationIntent {
+    OperatorRequested { caller: &'static str },
+    LeaseContextRestore { caller: &'static str },
+}
+
+impl ForegroundActivationIntent {
+    #[must_use]
+    pub const fn caller(self) -> &'static str {
+        match self {
+            Self::OperatorRequested { caller } | Self::LeaseContextRestore { caller } => caller,
+        }
+    }
+
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::OperatorRequested { .. } => "operator_requested",
+            Self::LeaseContextRestore { .. } => "lease_context_restore",
+        }
+    }
+}
+
 /// # Errors
 ///
 /// Returns `A11Y_NO_FOREGROUND` when Windows has no foreground HWND, or
@@ -34,10 +57,29 @@ pub fn window_from_hwnd(hwnd: i64) -> A11yResult<UIElement> {
 ///
 /// # Errors
 ///
-/// Returns a structured UIA error when Windows rejects the foreground request,
-/// or `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+/// Always returns `FOREGROUND_ACTIVATION_REFUSED`; callers that truly intend to
+/// activate the foreground must use [`focus_window_with_intent`] and pass the
+/// already-validated intent explicitly.
 pub fn focus_window(hwnd: i64) -> A11yResult<()> {
-    platform::focus_window(hwnd)
+    tracing::warn!(
+        code = synapse_core::error_codes::FOREGROUND_ACTIVATION_REFUSED,
+        hwnd,
+        "implicit foreground activation refused"
+    );
+    Err(crate::A11yError::foreground_activation_refused(format!(
+        "implicit focus_window(hwnd=0x{hwnd:x}) is disabled; use focus_window_with_intent after validating foreground intent"
+    )))
+}
+
+/// Requests foreground focus for a top-level native HWND with explicit intent.
+///
+/// # Errors
+///
+/// Returns `FOREGROUND_ACTIVATION_REFUSED` if the caller has not already proven
+/// the intent at its boundary, a structured UIA error when Windows rejects the
+/// foreground request, or `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -> A11yResult<()> {
+    platform::focus_window_with_intent(hwnd, intent)
 }
 
 /// Returns whether a top-level native HWND is minimized/iconic.

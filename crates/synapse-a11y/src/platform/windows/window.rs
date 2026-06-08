@@ -26,7 +26,7 @@ use windows::{
     core::{BOOL, PWSTR},
 };
 
-use crate::{A11yError, A11yResult};
+use crate::{A11yError, A11yResult, ForegroundActivationIntent};
 
 use super::common::{TreeView, cached_hwnd, create_cache_request, map_uia_error, with_automation};
 pub fn focused_window() -> A11yResult<UIElement> {
@@ -67,13 +67,20 @@ pub fn window_from_hwnd(hwnd: i64) -> A11yResult<UIElement> {
     ))
 }
 
-pub fn focus_window(hwnd: i64) -> A11yResult<()> {
+pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -> A11yResult<()> {
     let hwnd = HWND(hwnd as *mut c_void);
     if hwnd.0.is_null() {
         return Err(A11yError::NoForeground {
             detail: "HWND was null".to_owned(),
         });
     }
+    tracing::info!(
+        code = "FOREGROUND_ACTIVATION_INTENT_ACCEPTED",
+        caller = intent.caller(),
+        intent = intent.reason(),
+        hwnd = hwnd.0 as isize,
+        "foreground activation entered explicit-intent guard"
+    );
     restore_window_for_focus(hwnd);
     let _ = unsafe { SetForegroundWindow(hwnd) };
     if unsafe { GetForegroundWindow() }.0 == hwnd.0 {

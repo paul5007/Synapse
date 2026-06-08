@@ -53,6 +53,11 @@ fn action_error_cases() -> Vec<(&'static str, ActionError, &'static str)> {
             BackendUnavailable,
             ACTION_BACKEND_UNAVAILABLE
         ),
+        case!(
+            "foreground_activation_refused",
+            ForegroundActivationRefused,
+            FOREGROUND_ACTIVATION_REFUSED
+        ),
         case!("target_invalid", TargetInvalid, ACTION_TARGET_INVALID),
         case!(
             "hold_exceeded_max",
