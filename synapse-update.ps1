@@ -175,7 +175,7 @@ if (-not $NoPersistEnv) {
 #    auto-start daemon, re-wire MCP clients, verify health).
 # ---------------------------------------------------------------------------
 Step "Rebuilding and reconnecting (scripts\synapse-setup.ps1)"
-$setupParams = @{ SourceDir = $RepoRoot; ForceRestart = $true }
+$setupParams = @{ SourceDir = $RepoRoot }
 & $SetupScript @setupParams @SetupArgs
 if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne $null) {
     Die "synapse-setup.ps1 exited with code $LASTEXITCODE."

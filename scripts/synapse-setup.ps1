@@ -1274,6 +1274,188 @@ function Read-SynapseDaemonToolSurface {
     }
 }
 
+function Get-SynapseFileSha256 {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Die "SYNAPSE_FILE_HASH_MISSING path=$Path remediation=build or install the daemon binary before hashing it"
+    }
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+}
+
+function New-SynapseSetupRunDirectory {
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [Parameter(Mandatory=$true)][string]$Purpose
+    )
+
+    $safePurpose = $Purpose -replace '[^A-Za-z0-9_.-]', '_'
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
+    $path = Join-Path $Root "$safePurpose-$stamp-$PID"
+    New-Item -ItemType Directory -Force -Path $path | Out-Null
+    return $path
+}
+
+function New-SynapseStagedDaemonBinary {
+    param(
+        [Parameter(Mandatory=$true)][string]$BuiltPath,
+        [Parameter(Mandatory=$true)][string]$LogDir
+    )
+
+    $stagingRoot = Join-Path $LogDir 'setup-staging'
+    $stagingDir = New-SynapseSetupRunDirectory -Root $stagingRoot -Purpose 'daemon-binary'
+    $builtHash = Get-SynapseFileSha256 -Path $BuiltPath
+    $stagedPath = Join-Path $stagingDir "synapse-mcp-$builtHash.exe"
+    Copy-Item -LiteralPath $BuiltPath -Destination $stagedPath -Force
+    $stagedHash = Get-SynapseFileSha256 -Path $stagedPath
+    if ($stagedHash -ne $builtHash) {
+        Die "SYNAPSE_STAGED_BINARY_HASH_MISMATCH built=$BuiltPath staged=$stagedPath built_hash=$builtHash staged_hash=$stagedHash remediation=inspect disk/storage; refusing to install an unverified binary"
+    }
+    Info "Staged daemon binary path=$stagedPath sha256=$stagedHash"
+    return [pscustomobject]@{
+        Path = $stagedPath
+        Sha256 = $stagedHash
+        SourcePath = $BuiltPath
+    }
+}
+
+function New-SynapseCandidateBind {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse('127.0.0.1'), 0)
+    try {
+        $listener.Start()
+        $port = [int]$listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
+    return "127.0.0.1:$port"
+}
+
+function Stop-SynapseExactCandidateProcess {
+    param(
+        [Parameter(Mandatory=$true)][int]$ProcessId,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [string]$Reason = 'candidate_health'
+    )
+
+    $current = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if (-not $current) {
+        Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds 5
+        return
+    }
+
+    $shutdown = Request-SynapseGracefulShutdown -Bind $Bind -Token $Token -ExpectedPids @($ProcessId) -Reason $Reason
+    if ($shutdown.Ok) {
+        $deadline = (Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Milliseconds 250
+            $current = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+            if (-not $current) {
+                Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds 5
+                Info "Candidate daemon graceful shutdown verified pid=$ProcessId bind=$Bind"
+                return
+            }
+        } while ((Get-Date) -lt $deadline)
+    } else {
+        Info "WARN: candidate graceful shutdown failed pid=$ProcessId bind=$Bind code=$($shutdown.Code) error=$($shutdown.Error); falling back to exact spawned PID stop"
+    }
+
+    $current = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if ($current) {
+        $exeLeaf = if ($current.ExecutablePath) { Split-Path -Leaf $current.ExecutablePath } else { '' }
+        if ($current.Name -ine 'synapse-mcp.exe' -and $exeLeaf -ine 'synapse-mcp.exe') {
+            Die "SYNAPSE_CANDIDATE_STOP_TARGET_MISMATCH pid=$ProcessId actual_name=$($current.Name) actual_path=$($current.ExecutablePath) remediation=PID was reused before candidate cleanup; refusing to stop it"
+        }
+        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        Info "Candidate daemon exact spawned PID stop issued pid=$ProcessId bind=$Bind"
+    }
+    Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds 5
+}
+
+function Test-SynapseCandidateDaemon {
+    param(
+        [Parameter(Mandatory=$true)][string]$CandidateExePath,
+        [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [Parameter(Mandatory=$true)][string]$TokenPath,
+        [Parameter(Mandatory=$true)][string]$LogDir
+    )
+
+    if (-not (Test-Path -LiteralPath $CandidateExePath)) {
+        Die "SYNAPSE_CANDIDATE_BINARY_MISSING path=$CandidateExePath remediation=build or provide a real synapse-mcp.exe before setup can touch the live daemon"
+    }
+    if (-not (Test-Path -LiteralPath $ProfilesDir)) {
+        Die "SYNAPSE_CANDIDATE_PROFILES_MISSING path=$ProfilesDir remediation=build/deploy profiles before validating the daemon candidate"
+    }
+    $tokenRead = Read-SynapseSetupTokenForRestartGuard -TokenPath $TokenPath
+    if (-not $tokenRead.Ok) {
+        Die "$($tokenRead.Code) stage=candidate_health $($tokenRead.Detail) remediation=setup must have a valid bearer token before candidate health can be proven"
+    }
+
+    $candidateRoot = New-SynapseSetupRunDirectory -Root (Join-Path $LogDir 'setup-candidates') -Purpose 'candidate'
+    $candidateDb = Join-Path $candidateRoot 'db'
+    New-Item -ItemType Directory -Force -Path $candidateDb | Out-Null
+    $candidateBind = New-SynapseCandidateBind
+    $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
+    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb profiles=$ProfilesDir"
+
+    $candidate = $null
+    $health = $null
+    $surface = $null
+    try {
+        $candidate = Start-Process `
+            -FilePath $CandidateExePath `
+            -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--log-level','info') `
+            -WindowStyle Hidden `
+            -PassThru
+        $deadline = (Get-Date).AddSeconds(25)
+        do {
+            Start-Sleep -Milliseconds 500
+            $read = Read-SynapseHealthForRestartGuard -Bind $candidateBind -Token $tokenRead.Token
+            if ($read.Ok -and $read.Health.ok) {
+                $health = $read.Health
+                break
+            }
+        } while ((Get-Date) -lt $deadline)
+
+        if ($null -eq $health) {
+            $alive = [bool](Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)
+            $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $candidateBind)
+            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} remediation=the newly built daemon was not healthy on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
+                $CandidateExePath,
+                $candidateHash,
+                $candidate.Id,
+                $alive,
+                $candidateBind,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners))
+        }
+
+        $healthPid = [int]$health.pid
+        if ($healthPid -ne [int]$candidate.Id) {
+            Die "SYNAPSE_CANDIDATE_PID_MISMATCH expected_pid=$($candidate.Id) health_pid=$healthPid bind=$candidateBind remediation=health came from an unexpected process; refusing handoff"
+        }
+        $surface = Read-SynapseDaemonToolSurface -Bind $candidateBind -Token $tokenRead.Token -Health $health
+        if ($surface.tool_count -lt 1) {
+            Die "SYNAPSE_CANDIDATE_TOOL_SURFACE_EMPTY pid=$healthPid bind=$candidateBind remediation=tools/list returned no tools; refusing handoff"
+        }
+        Info "Candidate daemon health preflight passed pid=$healthPid bind=$candidateBind tool_count=$($surface.tool_count) tool_surface_sha256=$($surface.tool_surface_sha256)"
+        return [pscustomobject]@{
+            Ok = $true
+            Pid = $healthPid
+            Bind = $candidateBind
+            DbPath = $candidateDb
+            ExePath = $CandidateExePath
+            Sha256 = $candidateHash
+            ToolCount = $surface.tool_count
+            ToolSurfaceSha256 = $surface.tool_surface_sha256
+        }
+    } finally {
+        if ($candidate -and (Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)) {
+            Stop-SynapseExactCandidateProcess -ProcessId ([int]$candidate.Id) -Bind $candidateBind -Token $tokenRead.Token -Reason 'candidate_health'
+        } elseif ($candidateBind) {
+            Wait-SynapseBindReleased -Reason 'candidate_health' -Bind $candidateBind -TimeoutSeconds 5
+        }
+    }
+}
+
 function Write-SynapseCodexToolSurfaceSnapshot {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
@@ -1392,7 +1574,8 @@ function Assert-SynapseRestartAllowed {
         [Parameter(Mandatory=$true)][string]$Reason,
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$TokenPath,
-        [switch]$ForceRestart
+        [switch]$ForceRestart,
+        [switch]$AllowActiveClientDrain
     )
 
     $processes = @(Get-SynapseMcpProcessSnapshot)
@@ -1449,10 +1632,15 @@ function Assert-SynapseRestartAllowed {
     })
     $staleTcpConnections = @($tcpConnections | Where-Object { -not $_.HasLivePeer })
     $blockers = @()
+    $clientDrainBlockers = @()
     if ($nonHttpProcesses.Count -gt 0) { $blockers += "non_http_synapse_processes=$($nonHttpProcesses.Count)" }
-    if ($tcpClients.Count -gt 0) { $blockers += "live_tcp_clients=$($tcpClients.Count)" }
+    if ($tcpClients.Count -gt 0) {
+        $blockers += "live_tcp_clients=$($tcpClients.Count)"
+        $clientDrainBlockers += "live_tcp_clients=$($tcpClients.Count)"
+    }
     if ($null -ne $activeSessions -and $activeSessions -gt 0 -and $tcpClients.Count -gt 0) {
         $blockers += "active_sessions=$activeSessions"
+        $clientDrainBlockers += "active_sessions=$activeSessions"
     }
     if ($null -ne $activeSessions -and $activeSessions -gt 0 -and $tcpClients.Count -eq 0) {
         Info "Synapse restart guard reason=$Reason idle_session_map_entries=$activeSessions live_tcp_clients=0 verdict=not_blocking_idle_sessions"
@@ -1482,7 +1670,17 @@ function Assert-SynapseRestartAllowed {
             (Format-SynapseMcpProcessSnapshot -Snapshot $processes),
             (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients),
             (Format-SynapseTcpClientSnapshot -Snapshot $staleTcpConnections))
-        if ($ForceRestart) {
+        if ($nonHttpProcesses.Count -gt 0 -and -not $ForceRestart) {
+            Die $message
+        } elseif ($AllowActiveClientDrain -and $clientDrainBlockers.Count -gt 0 -and $nonHttpProcesses.Count -eq 0) {
+            Info ("Synapse restart guard reason={0} verdict=drain_permitted blockers={1} active_sessions={2} live_tcp_clients={3} stale_tcp_connections={4} process_count={5} drain=authenticated_http_shutdown" -f `
+                $Reason,
+                ($clientDrainBlockers -join ','),
+                ($(if ($null -eq $activeSessions) { 'unknown' } else { $activeSessions })),
+                $tcpClients.Count,
+                $staleTcpConnections.Count,
+                $processes.Count)
+        } elseif ($ForceRestart) {
             Info "FORCE_RESTART: $message"
         } else {
             Die $message
@@ -1757,41 +1955,7 @@ if (-not $SkipBuild) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Stop the running daemon/bridges so the .exe is not locked, then install
-# ---------------------------------------------------------------------------
-Step "Installing daemon binary -> $ExePath"
-Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -TokenPath $TokenPath -ForceRestart:$ForceRestart
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-}
-Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -TokenPath $TokenPath -ForceRestart:$ForceRestart
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
-if (-not $SkipBuild) {
-    if (Test-Path $ExePath) { Copy-Item $ExePath "$ExePath.bak" -Force; Info "Backed up old binary -> $ExePath.bak" }
-    Copy-Item (Join-Path $CargoTarget 'release\synapse-mcp.exe') $ExePath -Force
-}
-if (-not (Test-Path $ExePath)) { Die "No daemon binary at $ExePath (build skipped and none installed)." }
-$ver = (& $ExePath --version) 2>&1
-Info "Installed binary reports: $ver"
-
-# ---------------------------------------------------------------------------
-# 4. Deploy bundled profiles next to the exe (executable-relative lookup) +
-#    keep an explicit --profile-dir for belt-and-suspenders.
-# ---------------------------------------------------------------------------
-Step "Deploying bundled profiles -> $ProfilesDir"
-$srcProfiles = if ($SourceDir) { Join-Path $SourceDir 'crates\synapse-profiles\profiles' } else { $null }
-if ($srcProfiles -and (Test-Path $srcProfiles)) {
-    New-Item -ItemType Directory -Force -Path $ProfilesDir | Out-Null
-    Copy-Item "$srcProfiles\*" $ProfilesDir -Recurse -Force
-    $n = (Get-ChildItem $ProfilesDir -Filter *.toml -File).Count
-    if ($n -lt 1) { Die "Copied profiles but found 0 .toml files in $ProfilesDir." }
-    Info "Deployed $n profiles."
-} elseif (-not (Test-Path $ProfilesDir)) {
-    Die "No bundled profiles found (source '$srcProfiles' missing and $ProfilesDir absent). Profile-dependent tools (reflexes, action policy) need these."
-} else { Info "Reusing existing profiles at $ProfilesDir." }
-
-# ---------------------------------------------------------------------------
-# 5. Token, DB and log dirs
+# 3. Token, data dirs, and profile source resolution
 # ---------------------------------------------------------------------------
 Step "Bearer token + data dirs"
 $tokDir = Split-Path -Parent $TokenPath
@@ -1820,8 +1984,101 @@ try {
     Info "WARN: environment broadcast failed: $($_.Exception.Message). Future GUI clients may need restart before seeing SYNAPSE_BEARER_TOKEN."
 }
 
+$srcProfiles = if ($SourceDir) { Join-Path $SourceDir 'crates\synapse-profiles\profiles' } else { $null }
+$candidateProfilesDir = $null
+if ($srcProfiles -and (Test-Path $srcProfiles)) {
+    $candidateProfilesDir = $srcProfiles
+    Info "Candidate profile source: $candidateProfilesDir"
+} elseif (Test-Path $ProfilesDir) {
+    $candidateProfilesDir = $ProfilesDir
+    Info "Candidate profile source: existing deployed profiles at $candidateProfilesDir"
+} else {
+    Die "SYNAPSE_CANDIDATE_PROFILES_MISSING source=$srcProfiles deployed=$ProfilesDir remediation=provide bundled profiles from SourceDir or an existing deployed ProfilesDir before setup can touch the live daemon"
+}
+$candidateProfileCount = (Get-ChildItem $candidateProfilesDir -Filter *.toml -File).Count
+if ($candidateProfileCount -lt 1) {
+    Die "SYNAPSE_CANDIDATE_PROFILES_EMPTY path=$candidateProfilesDir remediation=profile-dependent tools need at least one .toml profile before setup can touch the live daemon"
+}
+Info "Candidate profiles verified path=$candidateProfilesDir count=$candidateProfileCount"
+
 # ---------------------------------------------------------------------------
-# 6. Register + start the auto-start HTTP daemon (interactive desktop session)
+# 4. Stage and health-check the replacement before touching the live daemon
+# ---------------------------------------------------------------------------
+Step "Validating candidate daemon before handoff"
+$installSourcePath = $ExePath
+$installSourceHash = $null
+if ($SkipBuild) {
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        Die "SYNAPSE_SKIP_BUILD_BINARY_MISSING path=$ExePath remediation=-SkipBuild requires a real local synapse-mcp.exe at -ExePath before setup can touch the live daemon"
+    }
+    $installSourceHash = Get-SynapseFileSha256 -Path $ExePath
+    Info "SkipBuild candidate binary path=$ExePath sha256=$installSourceHash"
+} else {
+    $stagedBinary = New-SynapseStagedDaemonBinary -BuiltPath $built -LogDir $LogDir
+    $installSourcePath = $stagedBinary.Path
+    $installSourceHash = $stagedBinary.Sha256
+}
+$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir
+if ($candidatePreflight.Sha256 -ne $installSourceHash) {
+    Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
+}
+Info "Candidate daemon accepted for handoff sha256=$installSourceHash tool_count=$($candidatePreflight.ToolCount) tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256)"
+
+# ---------------------------------------------------------------------------
+# 5. Drain the running daemon, then install the proven binary
+# ---------------------------------------------------------------------------
+Step "Draining live daemon and installing verified binary -> $ExePath"
+Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
+Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -TokenPath $TokenPath -ForceRestart:$ForceRestart
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
+$backupPath = $null
+$oldInstalledHash = $null
+if (Test-Path -LiteralPath $ExePath) {
+    $oldInstalledHash = Get-SynapseFileSha256 -Path $ExePath
+    $backupPath = "$ExePath.bak"
+    Copy-Item -LiteralPath $ExePath -Destination $backupPath -Force
+    $backupHash = Get-SynapseFileSha256 -Path $backupPath
+    if ($backupHash -ne $oldInstalledHash) {
+        Die "SYNAPSE_BINARY_BACKUP_HASH_MISMATCH installed=$ExePath backup=$backupPath installed_hash=$oldInstalledHash backup_hash=$backupHash remediation=backup bytes changed during copy; refusing to install candidate"
+    }
+    Info "Backed up old binary -> $backupPath sha256=$backupHash"
+}
+if (-not $SkipBuild) {
+    Copy-Item -LiteralPath $installSourcePath -Destination $ExePath -Force
+} else {
+    Info "SkipBuild candidate already resides at install path=$ExePath"
+}
+if (-not (Test-Path -LiteralPath $ExePath)) {
+    Die "SYNAPSE_INSTALL_BINARY_MISSING path=$ExePath remediation=setup could not find the installed daemon binary after the copy step"
+}
+$installedHash = Get-SynapseFileSha256 -Path $ExePath
+if ($installedHash -ne $installSourceHash) {
+    Die "SYNAPSE_INSTALLED_BINARY_HASH_MISMATCH path=$ExePath expected_sha256=$installSourceHash actual_sha256=$installedHash remediation=installed daemon bytes do not match the candidate that passed health preflight"
+}
+$ver = (& $ExePath --version) 2>&1
+Info "Installed binary reports: $ver"
+Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
+
+# ---------------------------------------------------------------------------
+# 6. Deploy bundled profiles next to the exe (executable-relative lookup) +
+#    keep an explicit --profile-dir for belt-and-suspenders.
+# ---------------------------------------------------------------------------
+Step "Deploying bundled profiles -> $ProfilesDir"
+if ($srcProfiles -and (Test-Path $srcProfiles)) {
+    New-Item -ItemType Directory -Force -Path $ProfilesDir | Out-Null
+    Copy-Item "$srcProfiles\*" $ProfilesDir -Recurse -Force
+    $n = (Get-ChildItem $ProfilesDir -Filter *.toml -File).Count
+    if ($n -lt 1) { Die "SYNAPSE_PROFILES_DEPLOYED_EMPTY path=$ProfilesDir source=$srcProfiles remediation=copied profiles but found 0 .toml files in the deployed profile directory" }
+    Info "Deployed $n profiles."
+} elseif (-not (Test-Path $ProfilesDir)) {
+    Die "SYNAPSE_PROFILES_MISSING source=$srcProfiles deployed=$ProfilesDir remediation=profile-dependent tools need bundled or deployed profiles before daemon start"
+} else { Info "Reusing existing profiles at $ProfilesDir." }
+
+# ---------------------------------------------------------------------------
+# 7. Register + start the auto-start HTTP daemon (interactive desktop session)
 # ---------------------------------------------------------------------------
 Step "Registering auto-start daemon task '$TaskName'"
 Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 1
@@ -1853,7 +2110,7 @@ Start-ScheduledTask -TaskName $TaskName
 Info "Task registered and started."
 
 # ---------------------------------------------------------------------------
-# 7. Health verify (source of truth: the live daemon)
+# 8. Health verify (source of truth: the live daemon)
 # ---------------------------------------------------------------------------
 Step "Verifying daemon health (http://$Bind/health)"
 $ok = $false
@@ -1869,7 +2126,67 @@ for ($i=0; $i -lt 15; $i++) {
         }
     } catch { }
 }
-if (-not $ok) { Die "Daemon did not become healthy on http://$Bind/health. Check $launcherLog and synapse.log.* under $LogDir for launch / STORAGE_* / bind errors." }
+if (-not $ok) {
+    $failureListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+    $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3}`nlisteners:`n{4}`nprocesses:`n{5}`nremediation=inspect {6} and synapse.log.* under {7} for launch / STORAGE_* / bind errors" -f `
+        $Bind,
+        $installSourceHash,
+        $installedHash,
+        ($(if ($backupPath) { $backupPath } else { '<none>' })),
+        (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
+        (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
+        $launcherLog,
+        $LogDir)
+
+    if ($backupPath -and (Test-Path -LiteralPath $backupPath) -and $oldInstalledHash) {
+        Info "WARN: $failureDetail"
+        Info "Attempting rollback to previous daemon binary backup=$backupPath sha256=$oldInstalledHash"
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        }
+        Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -TokenPath $TokenPath -ForceRestart -TimeoutSeconds 10
+        Copy-Item -LiteralPath $backupPath -Destination $ExePath -Force
+        $rollbackHash = Get-SynapseFileSha256 -Path $ExePath
+        if ($rollbackHash -ne $oldInstalledHash) {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_HASH_MISMATCH expected_sha256=$oldInstalledHash actual_sha256=$rollbackHash backup=$backupPath install_path=$ExePath original_failure=[$failureDetail]"
+        }
+        Start-ScheduledTask -TaskName $TaskName
+        $rollbackOk = $false
+        $rollbackHealth = $null
+        for ($j=0; $j -lt 15; $j++) {
+            Start-Sleep -Seconds 2
+            try {
+                $rh = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 4
+                if ($rh.ok) {
+                    $rollbackHealth = $rh
+                    $rollbackOk = $true
+                    break
+                }
+            } catch { }
+        }
+        if ($rollbackOk) {
+            Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK candidate_sha256={0} rollback_sha256={1} rollback_pid={2} original_failure=[{3}] remediation=old daemon is serving again; inspect candidate startup logs before retrying" -f `
+                $installSourceHash,
+                $rollbackHash,
+                $rollbackHealth.pid,
+                $failureDetail)
+        }
+
+        $rollbackListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        $rollbackProcesses = @(Get-SynapseMcpProcessSnapshot)
+        Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_FAILED candidate_sha256={0} rollback_sha256={1} original_failure=[{2}]`nrollback_listeners:`n{3}`nrollback_processes:`n{4}`nremediation=rollback binary was restored but daemon did not become healthy; inspect {5} and synapse.log.* under {6}" -f `
+            $installSourceHash,
+            $rollbackHash,
+            $failureDetail,
+            (Format-SynapseTcpBindListenerSnapshot -Snapshot $rollbackListeners),
+            (Format-SynapseMcpProcessSnapshot -Snapshot $rollbackProcesses),
+            $launcherLog,
+            $LogDir)
+    }
+
+    Die $failureDetail
+}
 $daemonLineage = Get-ProcessLineage -StartPid $healthPid
 $cmdAncestor = $daemonLineage | Where-Object { $_.Name -ieq 'cmd.exe' } | Select-Object -First 1
 if ($cmdAncestor) {
@@ -1881,7 +2198,7 @@ $toolSurface = Read-SynapseDaemonToolSurface -Bind $Bind -Token $token -Health $
 Write-SynapseCodexToolSurfaceSnapshot -Path $CodexToolSurfaceSnapshotPath -Surface $toolSurface
 
 # ---------------------------------------------------------------------------
-# 8. Wire the Windows-side MCP clients
+# 9. Wire the Windows-side MCP clients
 # ---------------------------------------------------------------------------
 if (-not $SkipClientWiring) {
     Step "Wiring Windows-side MCP clients"
@@ -1928,18 +2245,22 @@ if (-not $SkipClientWiring) {
     } else { Info "No Claude Desktop config at $desktopCfg; skipping." }
 }
 
-$lineage = Get-ProcessLineage
-$codexAncestor = $lineage | Where-Object {
-    $_.Name -ieq 'codex.exe' -or $_.CommandLine -match '@openai[\\/]+codex|codex\.js|codex-win32'
-} | Select-Object -First 1
-if ($codexAncestor -and $processTokenAtStart -ne $token) {
-    Die ("SYNAPSE_CODEX_CURRENT_PROCESS_ENV_STALE codex_pid={0} token_at_process_start={1} token_file={2} remediation=restart Codex through the patched codex launcher; Windows cannot update an already-running Codex process environment, so this current session cannot authenticate mcp__synapse yet." -f $codexAncestor.ProcessId, ($(if ([string]::IsNullOrWhiteSpace($processTokenAtStart)) { 'missing' } else { 'mismatch' })), $TokenPath)
+if (-not $SkipClientWiring) {
+    $lineage = Get-ProcessLineage
+    $codexAncestor = $lineage | Where-Object {
+        $_.Name -ieq 'codex.exe' -or $_.CommandLine -match '@openai[\\/]+codex|codex\.js|codex-win32'
+    } | Select-Object -First 1
+    if ($codexAncestor -and $processTokenAtStart -ne $token) {
+        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_ENV_STALE codex_pid={0} token_at_process_start={1} token_file={2} remediation=restart Codex through the patched codex launcher; Windows cannot update an already-running Codex process environment, so this current session cannot authenticate mcp__synapse yet." -f $codexAncestor.ProcessId, ($(if ([string]::IsNullOrWhiteSpace($processTokenAtStart)) { 'missing' } else { 'mismatch' })), $TokenPath)
+    }
+    Assert-CodexCurrentProcessToolSurfaceFresh `
+        -CodexAncestor $codexAncestor `
+        -CurrentSurface $toolSurface `
+        -ProcessHashAtStart $processToolSurfaceHashAtStart `
+        -SnapshotPath $CodexToolSurfaceSnapshotPath
+} else {
+    Info "Skipped Codex current-process freshness check because -SkipClientWiring was set; daemon health and tools/list were still verified."
 }
-Assert-CodexCurrentProcessToolSurfaceFresh `
-    -CodexAncestor $codexAncestor `
-    -CurrentSurface $toolSurface `
-    -ProcessHashAtStart $processToolSurfaceHashAtStart `
-    -SnapshotPath $CodexToolSurfaceSnapshotPath
 
 Step "Done"
 Info "Synapse daemon is live on http://$Bind (MCP: http://$Bind/mcp)."
