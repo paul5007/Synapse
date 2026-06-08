@@ -6,9 +6,9 @@ use super::{
     ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams, ReleaseAllResponse,
     SessionTarget, SynapseService, act_click_with_handle_and_lease, act_clipboard_session_buffer,
     act_focus_window, act_focus_window_request_details, act_focus_window_target_hwnd,
-    act_keymap_with_handle, act_pad_with_handle, act_press_with_handle, act_scroll_with_handle,
-    act_set_value, act_set_value_request_details, act_stroke_validation_failure_details,
-    act_stroke_with_handle, act_type_with_handle,
+    act_pad_with_handle, act_press_with_handle, act_scroll_with_handle, act_set_value,
+    act_set_value_request_details, act_stroke_validation_failure_details, act_stroke_with_handle,
+    act_type_with_handle,
     action_preflight::{ActionPreflightReadback, ForegroundProof},
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
@@ -20,10 +20,13 @@ use crate::m2::postcondition::{
 };
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA,
-    CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params,
+    CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, HwndKeyboardTargetState, PressBackend,
+    ResolvedKeymapPress, act_click_postmessage_with_params, act_keymap_response_from_press,
+    act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
     act_stroke_error_details, act_stroke_request_details, action_from_press_params,
     attach_click_tier_attempts, click_params_can_route_background_first, click_target_root_hwnd,
-    click_tier_delivered, click_tier_failed, emitted_text,
+    click_tier_delivered, click_tier_failed, emitted_text, hwnd_keyboard_target_state,
+    resolve_keymap_press,
 };
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -435,7 +438,9 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(description = "Press a keyboard key or ordered chord")]
+    #[tool(
+        description = "Press a keyboard key or ordered chord. With an active session target and backend=auto/software, Synapse first uses background delivery: CDP Input.dispatchKeyEvent for CDP targets or HWND PostMessage keyboard messages for window targets. PostMessage delivery is accepted only after a separate target text/selection readback changes; ignored posted keys fail with ACTION_NO_OBSERVED_DELTA. backend=hardware, recording, no active target, or declared foreground-transition verification uses the leased foreground keyboard path."
+    )]
     pub async fn act_press(
         &self,
         params: Parameters<ActPressParams>,
@@ -478,6 +483,24 @@ impl SynapseService {
             self.audit_action_result_for_request("act_press", &result, &request_context)?;
             return result.map(Json);
         }
+        let (handle, recording, connection_closed_cancel) =
+            self.m2_action_context_for_request(&request_context)?;
+        match self
+            .try_act_press_background_target(params.clone(), recording.is_some(), &request_context)
+            .await
+        {
+            Ok(Some(response)) => {
+                let result = Ok(response);
+                self.audit_action_result_for_request("act_press", &result, &request_context)?;
+                return result.map(Json);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let result: Result<ActPressResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_press", &result, &request_context)?;
+                return result.map(Json);
+            }
+        }
         let before_delta_signature = if params.verify_delta {
             match self
                 .capture_action_delta_signature(160, None, false, None)
@@ -494,8 +517,6 @@ impl SynapseService {
             None
         };
         let verify_timeout_ms = params.verify_timeout_ms;
-        let (handle, recording, connection_closed_cancel) =
-            self.m2_action_context_for_request(&request_context)?;
         let _lease_guard = match acquire_tool_foreground_input_lease_with_ttl(
             "act_press",
             &request_context,
@@ -526,7 +547,9 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(description = "Press a keyboard alias from the active profile keymap")]
+    #[tool(
+        description = "Press a keyboard alias from the active profile keymap. With an active session target and backend=auto/software, resolves the alias before any lease and routes through the same background CDP/PostMessage keyboard tiers as act_press; hardware, recording, or no active target uses the leased foreground keyboard path."
+    )]
     pub async fn act_keymap(
         &self,
         params: Parameters<ActKeymapParams>,
@@ -590,8 +613,32 @@ impl SynapseService {
                     )
                 })?
         };
+        let resolved = match resolve_keymap_press(&profile, &params) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let result: Result<ActKeymapResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_keymap", &result, &request_context)?;
+                return result.map(Json);
+            }
+        };
         let (handle, recording, connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
+        match self
+            .try_act_keymap_background_target(&resolved, recording.is_some(), &request_context)
+            .await
+        {
+            Ok(Some(response)) => {
+                let result = Ok(response);
+                self.audit_action_result_for_request("act_keymap", &result, &request_context)?;
+                return result.map(Json);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let result: Result<ActKeymapResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_keymap", &result, &request_context)?;
+                return result.map(Json);
+            }
+        }
         let _lease_guard = match acquire_tool_foreground_input_lease_with_ttl(
             "act_keymap",
             &request_context,
@@ -608,14 +655,14 @@ impl SynapseService {
                 return Err(error);
             }
         };
-        let result = act_keymap_with_handle(
+        let result = act_press_with_handle(
             handle,
             recording,
             connection_closed_cancel,
-            &profile,
-            params,
+            resolved.press.clone(),
         )
-        .await;
+        .await
+        .map(|response| act_keymap_response_from_press(&resolved, response));
         self.audit_action_result_for_request("act_keymap", &result, &request_context)?;
         result.map(Json)
     }
@@ -1297,6 +1344,33 @@ struct ClickDeltaSignature {
     cursor_position: Option<Point>,
     pixel: ClickPixelSignature,
     point_pixel: Option<ClickPixelSignature>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CdpKeyboardDeltaSignature {
+    target_id: String,
+    has_active_element: bool,
+    tag_name: String,
+    id_sha256: Option<String>,
+    name_sha256: Option<String>,
+    value_len: usize,
+    value_sha256: String,
+    selection_start: Option<u32>,
+    selection_end: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HwndKeyboardDeltaSignature {
+    target: HwndKeyboardTargetState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HwndKeyboardExpectedEffect {
+    AnyDelta,
+    PrintableText { text: String },
+    SelectAll,
 }
 
 #[derive(Clone, Debug)]
@@ -2128,6 +2202,144 @@ impl SynapseService {
         Ok(response)
     }
 
+    async fn try_act_press_background_target(
+        &self,
+        params: ActPressParams,
+        recording_active: bool,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Option<ActPressResponse>, ErrorData> {
+        if !press_background_target_candidate(&params, recording_active) {
+            return Ok(None);
+        }
+        let Some(session_id) =
+            super::context::mcp_session_id_from_request_context(request_context)?
+        else {
+            return Ok(None);
+        };
+        let Some(target) = self.session_target(Some(&session_id))? else {
+            return Ok(None);
+        };
+        match target {
+            SessionTarget::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            } => self
+                .act_press_cdp_background_target(window_hwnd, cdp_target_id, params)
+                .await
+                .map(Some),
+            SessionTarget::Window { hwnd } => self
+                .act_press_postmessage_background_target(hwnd, params)
+                .await
+                .map(Some),
+        }
+    }
+
+    async fn try_act_keymap_background_target(
+        &self,
+        resolved: &ResolvedKeymapPress,
+        recording_active: bool,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Option<ActKeymapResponse>, ErrorData> {
+        self.try_act_press_background_target(
+            resolved.press.clone(),
+            recording_active,
+            request_context,
+        )
+        .await
+        .map(|response| response.map(|response| act_keymap_response_from_press(resolved, response)))
+    }
+
+    async fn act_press_cdp_background_target(
+        &self,
+        window_hwnd: i64,
+        cdp_target_id: String,
+        params: ActPressParams,
+    ) -> Result<ActPressResponse, ErrorData> {
+        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
+            mcp_error(
+                error_codes::A11Y_CDP_UNREACHABLE,
+                format!(
+                    "act_press background CDP target requires a reachable CDP endpoint for window_hwnd {window_hwnd:#x}"
+                ),
+            )
+        })?;
+        let before = if params.verify_delta {
+            Some(
+                self.capture_cdp_keyboard_delta_signature(&endpoint, &cdp_target_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let verify_timeout_ms = params.verify_timeout_ms;
+        let mut response = act_press_cdp_target(&endpoint, &cdp_target_id, params).await?;
+        if let Some(before) = before {
+            tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
+            let after = self
+                .capture_cdp_keyboard_delta_signature(&endpoint, &cdp_target_id)
+                .await?;
+            response.postcondition = verify_keyboard_delta_signature(
+                "act_press",
+                "cdp_active_element_value_or_selection",
+                verify_timeout_ms,
+                before,
+                after,
+                "observed CDP target active-element value/selection change after Input.dispatchKeyEvent delivery",
+            )?;
+        }
+        Ok(response)
+    }
+
+    async fn act_press_postmessage_background_target(
+        &self,
+        root_hwnd: i64,
+        params: ActPressParams,
+    ) -> Result<ActPressResponse, ErrorData> {
+        let expected_effect = hwnd_keyboard_expected_effect(&params)?;
+        let before = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
+        let verify_timeout_ms = params.verify_timeout_ms;
+        let mut response = act_press_postmessage_target(root_hwnd, params).await?;
+        tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
+        let after = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
+        response.postcondition = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            verify_timeout_ms,
+            before,
+            after,
+            expected_effect,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )?;
+        Ok(response)
+    }
+
+    async fn capture_cdp_keyboard_delta_signature(
+        &self,
+        endpoint: &str,
+        cdp_target_id: &str,
+    ) -> Result<CdpKeyboardDeltaSignature, ErrorData> {
+        let state = synapse_a11y::cdp_active_element_state(endpoint, cdp_target_id)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "act_press CDP active-element Source-of-Truth readback failed for target {cdp_target_id:?}: {error}"
+                    ),
+                )
+            })?;
+        Ok(cdp_keyboard_delta_signature(state))
+    }
+
+    fn capture_hwnd_keyboard_delta_signature(
+        &self,
+        root_hwnd: i64,
+    ) -> Result<HwndKeyboardDeltaSignature, ErrorData> {
+        Ok(HwndKeyboardDeltaSignature {
+            target: hwnd_keyboard_target_state(root_hwnd)?,
+        })
+    }
+
     async fn verify_act_scroll_response(
         &self,
         mut response: ActScrollResponse,
@@ -2323,6 +2535,224 @@ fn verify_captured_action_delta(
         after_hash,
         "observed a Source-of-Truth signature change after delivery",
     ))
+}
+
+fn verify_keyboard_delta_signature<T>(
+    tool: &str,
+    source_of_truth: &str,
+    timeout_ms: u32,
+    before: T,
+    after: T,
+    success_detail: &str,
+) -> Result<ActPostcondition, ErrorData>
+where
+    T: Serialize + PartialEq,
+{
+    let before_hash = hash_json(&before)?;
+    let after_hash = hash_json(&after)?;
+    if before == after {
+        return Err(source_no_observed_delta_error(
+            tool,
+            source_of_truth,
+            timeout_ms,
+            before_hash,
+            after_hash,
+            json!({
+                "before": before,
+                "after": after,
+            }),
+        ));
+    }
+    Ok(postcondition_observed_delta(
+        tool,
+        source_of_truth,
+        before_hash,
+        after_hash,
+        success_detail,
+    ))
+}
+
+fn verify_hwnd_keyboard_delta_signature(
+    tool: &str,
+    source_of_truth: &str,
+    timeout_ms: u32,
+    before: HwndKeyboardDeltaSignature,
+    after: HwndKeyboardDeltaSignature,
+    expected_effect: HwndKeyboardExpectedEffect,
+    success_detail: &str,
+) -> Result<ActPostcondition, ErrorData> {
+    let before_hash = hash_json(&before)?;
+    let after_hash = hash_json(&after)?;
+    if before == after {
+        return Err(source_no_observed_delta_error(
+            tool,
+            source_of_truth,
+            timeout_ms,
+            before_hash,
+            after_hash,
+            json!({
+                "before": before,
+                "after": after,
+                "expected_effect": hwnd_keyboard_expected_effect_name(&expected_effect),
+            }),
+        ));
+    }
+    if let Some(reason) = hwnd_keyboard_effect_mismatch(&before, &after, &expected_effect) {
+        return Err(postcondition_failed_error(
+            tool,
+            source_of_truth,
+            reason,
+            before_hash,
+            after_hash,
+            json!({
+                "before": before,
+                "after": after,
+                "expected_effect": hwnd_keyboard_expected_effect_name(&expected_effect),
+            }),
+        ));
+    }
+    Ok(postcondition_observed_delta(
+        tool,
+        source_of_truth,
+        before_hash,
+        after_hash,
+        success_detail,
+    ))
+}
+
+fn hwnd_keyboard_expected_effect(
+    params: &ActPressParams,
+) -> Result<HwndKeyboardExpectedEffect, ErrorData> {
+    let labels = act_press_normalized_labels(params)?;
+    if labels == ["ctrl", "a"] {
+        return Ok(HwndKeyboardExpectedEffect::SelectAll);
+    }
+    let has_command_modifier = labels
+        .iter()
+        .any(|label| matches!(label.as_str(), "ctrl" | "alt" | "super"));
+    if !has_command_modifier && labels.len() == 1 {
+        if let Some(text) = hwnd_printable_text_for_label(&labels[0]) {
+            return Ok(HwndKeyboardExpectedEffect::PrintableText { text });
+        }
+    }
+    Ok(HwndKeyboardExpectedEffect::AnyDelta)
+}
+
+fn hwnd_printable_text_for_label(label: &str) -> Option<String> {
+    if label.len() == 1 && label.as_bytes()[0].is_ascii_alphanumeric() {
+        return Some(label.to_owned());
+    }
+    match label {
+        "`" => Some("`".to_owned()),
+        "space" => Some(" ".to_owned()),
+        _ => None,
+    }
+}
+
+fn hwnd_keyboard_effect_mismatch(
+    before: &HwndKeyboardDeltaSignature,
+    after: &HwndKeyboardDeltaSignature,
+    expected_effect: &HwndKeyboardExpectedEffect,
+) -> Option<&'static str> {
+    match expected_effect {
+        HwndKeyboardExpectedEffect::AnyDelta => None,
+        HwndKeyboardExpectedEffect::SelectAll => {
+            if !same_hwnd_keyboard_target(before, after) {
+                return Some("target HWND changed while verifying Ctrl+A select-all delivery");
+            }
+            if before.target.text_len != after.target.text_len
+                || before.target.text_sha256 != after.target.text_sha256
+            {
+                return Some("Ctrl+A select-all changed target text instead of preserving it");
+            }
+            if !selection_covers_text(&after.target) {
+                return Some("Ctrl+A select-all did not select the full target text");
+            }
+            None
+        }
+        HwndKeyboardExpectedEffect::PrintableText { text } => {
+            if !same_hwnd_keyboard_target(before, after) {
+                return Some("target HWND changed while verifying printable key delivery");
+            }
+            if before.target.text_sha256 == after.target.text_sha256 {
+                return Some("printable key did not change target text");
+            }
+            if selection_covers_text(&before.target) {
+                let expected_len = text.chars().count();
+                let Ok(expected_len_u32) = u32::try_from(expected_len) else {
+                    return Some("printable key expected text length exceeded u32::MAX");
+                };
+                let expected_sha256 = text_sha256(text);
+                if after.target.text_len != Some(expected_len)
+                    || after.target.text_sha256.as_deref() != Some(expected_sha256.as_str())
+                    || after.target.selection_start != Some(expected_len_u32)
+                    || after.target.selection_end != Some(expected_len_u32)
+                {
+                    return Some(
+                        "printable key after full selection did not replace target text with the emitted character",
+                    );
+                }
+            }
+            None
+        }
+    }
+}
+
+fn same_hwnd_keyboard_target(
+    before: &HwndKeyboardDeltaSignature,
+    after: &HwndKeyboardDeltaSignature,
+) -> bool {
+    before.target.root_hwnd == after.target.root_hwnd
+        && before.target.hwnd == after.target.hwnd
+        && before.target.class_name == after.target.class_name
+}
+
+fn selection_covers_text(target: &HwndKeyboardTargetState) -> bool {
+    let Some(text_len) = target.text_len else {
+        return false;
+    };
+    let Ok(text_len) = u32::try_from(text_len) else {
+        return false;
+    };
+    target.selection_start == Some(0) && target.selection_end == Some(text_len)
+}
+
+fn hwnd_keyboard_expected_effect_name(
+    expected_effect: &HwndKeyboardExpectedEffect,
+) -> &'static str {
+    match expected_effect {
+        HwndKeyboardExpectedEffect::AnyDelta => "any_delta",
+        HwndKeyboardExpectedEffect::PrintableText { .. } => "printable_text",
+        HwndKeyboardExpectedEffect::SelectAll => "select_all",
+    }
+}
+
+fn cdp_keyboard_delta_signature(
+    state: synapse_a11y::CdpActiveElementState,
+) -> CdpKeyboardDeltaSignature {
+    CdpKeyboardDeltaSignature {
+        target_id: state.target_id,
+        has_active_element: state.has_active_element,
+        tag_name: state.tag_name,
+        id_sha256: non_empty_sha256(&state.id),
+        name_sha256: non_empty_sha256(&state.name),
+        value_len: state.value.chars().count(),
+        value_sha256: text_sha256(&state.value),
+        selection_start: state.selection_start,
+        selection_end: state.selection_end,
+    }
+}
+
+fn press_background_target_candidate(params: &ActPressParams, recording_active: bool) -> bool {
+    if recording_active {
+        return false;
+    }
+    if !matches!(params.backend, PressBackend::Auto | PressBackend::Software) {
+        return false;
+    }
+    !params.allow_foreground_change
+        && params.expected_foreground_process_regex.is_none()
+        && params.expected_foreground_title_regex.is_none()
 }
 
 fn act_press_foreground_change_policy(
@@ -3785,6 +4215,110 @@ mod tests {
     }
 
     #[test]
+    fn act_press_background_target_candidate_is_strict() {
+        let mut params = act_press_params(false, false, None, None);
+        params.backend = PressBackend::Auto;
+        assert!(press_background_target_candidate(&params, false));
+
+        params.backend = PressBackend::Software;
+        assert!(press_background_target_candidate(&params, false));
+
+        params.backend = PressBackend::Hardware;
+        assert!(!press_background_target_candidate(&params, false));
+
+        params.backend = PressBackend::Auto;
+        assert!(!press_background_target_candidate(&params, true));
+
+        params.verify_delta = true;
+        params.allow_foreground_change = true;
+        assert!(!press_background_target_candidate(&params, false));
+
+        params.allow_foreground_change = false;
+        params.expected_foreground_title_regex = Some("Chrome".to_owned());
+        assert!(!press_background_target_candidate(&params, false));
+    }
+
+    #[test]
+    fn hwnd_keyboard_ctrl_a_requires_full_selection_without_text_mutation() {
+        let before = hwnd_keyboard_signature("alpha beta gamma", 16, 16);
+        let after_inserted_a = hwnd_keyboard_signature("alpha beta gammaa", 17, 17);
+
+        let error = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before.clone(),
+            after_inserted_a,
+            HwndKeyboardExpectedEffect::SelectAll,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect_err("Ctrl+A must not pass when it inserts a literal a");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_POSTCONDITION_FAILED)
+        );
+        assert_eq!(
+            data.get("detail").and_then(Value::as_str),
+            Some("Ctrl+A select-all changed target text instead of preserving it")
+        );
+
+        let selected = hwnd_keyboard_signature("alpha beta gamma", 0, 16);
+        let postcondition = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before,
+            selected,
+            HwndKeyboardExpectedEffect::SelectAll,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect("Ctrl+A should pass only when readback shows full selection");
+        assert_eq!(postcondition.status, "observed_delta");
+    }
+
+    #[test]
+    fn hwnd_keyboard_printable_after_full_selection_requires_exact_replacement() {
+        let before = hwnd_keyboard_signature("alpha beta gamma", 0, 16);
+        let wrong_after = hwnd_keyboard_signature("alpha beta gammaz", 17, 17);
+
+        let error = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before.clone(),
+            wrong_after,
+            HwndKeyboardExpectedEffect::PrintableText {
+                text: "z".to_owned(),
+            },
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect_err("full-selection replacement must match the emitted character");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_POSTCONDITION_FAILED)
+        );
+
+        let replaced = hwnd_keyboard_signature("z", 1, 1);
+        let postcondition = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before,
+            replaced,
+            HwndKeyboardExpectedEffect::PrintableText {
+                text: "z".to_owned(),
+            },
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect("single printable key should pass when it replaces full selection exactly");
+        assert_eq!(postcondition.status, "observed_delta");
+    }
+
+    #[test]
     fn act_type_browser_url_policy_requires_verify_delta_before_input() {
         let params = act_type_params(false, Some("^file:///synapse-810\\.html$"));
 
@@ -4183,6 +4717,24 @@ mod tests {
             error_code: error_code.map(str::to_owned),
             detail: Some("synthetic regression attempt".to_owned()),
             required_foreground: tier == CLICK_TIER_FOREGROUND,
+        }
+    }
+
+    fn hwnd_keyboard_signature(
+        text: &str,
+        selection_start: u32,
+        selection_end: u32,
+    ) -> HwndKeyboardDeltaSignature {
+        HwndKeyboardDeltaSignature {
+            target: HwndKeyboardTargetState {
+                root_hwnd: 0x1000,
+                hwnd: 0x2000,
+                class_name: "WindowsForms10.EDIT.synthetic".to_owned(),
+                text_len: Some(text.chars().count()),
+                text_sha256: Some(text_sha256(text)),
+                selection_start: Some(selection_start),
+                selection_end: Some(selection_end),
+            },
         }
     }
 

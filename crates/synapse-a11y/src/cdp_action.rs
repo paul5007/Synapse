@@ -18,7 +18,8 @@ use chromiumoxide::cdp::browser_protocol::dom::{
     BackendNodeId, GetBoxModelParams, ResolveNodeParams, ScrollIntoViewIfNeededParams,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
-    DispatchMouseEventParams, DispatchMouseEventType, InsertTextParams, MouseButton,
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, GetLayoutMetricsParams, Viewport,
@@ -44,6 +45,20 @@ pub struct CdpWheelDelta {
     pub delta_y: f64,
 }
 
+/// One key descriptor for `Input.dispatchKeyEvent`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CdpKeyStroke {
+    pub key: String,
+    pub code: String,
+    pub windows_virtual_key_code: i64,
+    pub native_virtual_key_code: i64,
+    pub key_identifier: Option<String>,
+    pub text: Option<String>,
+    pub unmodified_text: Option<String>,
+    pub modifier_bit: i64,
+    pub location: Option<i64>,
+}
+
 /// Scroll source-of-truth read from the target node's DOM context.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CdpScrollState {
@@ -62,6 +77,19 @@ pub struct CdpScrollState {
     pub node_rect_top: f64,
     pub node_rect_width: f64,
     pub node_rect_height: f64,
+}
+
+/// Active-element Source-of-Truth read from a CDP page target.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CdpActiveElementState {
+    pub target_id: String,
+    pub has_active_element: bool,
+    pub tag_name: String,
+    pub id: String,
+    pub name: String,
+    pub value: String,
+    pub selection_start: Option<u32>,
+    pub selection_end: Option<u32>,
 }
 
 /// Which pointer button a CDP click uses.
@@ -187,6 +215,119 @@ pub async fn cdp_type_node(
     )
     .await
     .map(|_point| ())
+}
+
+/// Dispatches a key sequence to a specific CDP page target without activating
+/// the browser window.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if `Input.dispatchKeyEvent` fails.
+pub async fn cdp_press_key_sequence(
+    endpoint: &str,
+    target_id: &str,
+    keys: Vec<CdpKeyStroke>,
+    hold_ms: u32,
+) -> A11yResult<()> {
+    if keys.is_empty() {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "cdp_press_key_sequence requires at least one key".to_owned(),
+        });
+    }
+    with_target_page(endpoint, target_id, |page| async move {
+        let mut modifiers = 0_i64;
+        for key in &keys {
+            let key_down_type = if key.text.is_some() {
+                DispatchKeyEventType::KeyDown
+            } else {
+                DispatchKeyEventType::RawKeyDown
+            };
+            let event_modifiers = modifiers | key.modifier_bit;
+            page.execute(cdp_key_event(key_down_type, key, event_modifiers)?)
+                .await
+                .map_err(|err| dispatch_err(&err))?;
+            modifiers = event_modifiers;
+        }
+        if hold_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
+        }
+        for key in keys.iter().rev() {
+            if key.modifier_bit != 0 {
+                modifiers &= !key.modifier_bit;
+            }
+            page.execute(cdp_key_event(DispatchKeyEventType::KeyUp, key, modifiers)?)
+                .await
+                .map_err(|err| dispatch_err(&err))?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Reads the target page's active DOM element, value, and selection without
+/// activating the browser window.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the DOM readback fails.
+pub async fn cdp_active_element_state(
+    endpoint: &str,
+    target_id: &str,
+) -> A11yResult<CdpActiveElementState> {
+    let target_id = target_id.to_owned();
+    let target_id_for_lookup = target_id.clone();
+    with_target_page(endpoint, &target_id_for_lookup, |page| async move {
+        let expression = format!(
+            r#"(() => {{
+                const el = document.activeElement;
+                if (!el) {{
+                    return {{
+                        target_id: {target_id_json},
+                        has_active_element: false,
+                        tag_name: "",
+                        id: "",
+                        name: "",
+                        value: "",
+                        selection_start: null,
+                        selection_end: null
+                    }};
+                }}
+                const value = ("value" in el)
+                    ? String(el.value ?? "")
+                    : String(el.textContent ?? "");
+                const selectionStart = (typeof el.selectionStart === "number")
+                    ? el.selectionStart
+                    : null;
+                const selectionEnd = (typeof el.selectionEnd === "number")
+                    ? el.selectionEnd
+                    : null;
+                return {{
+                    target_id: {target_id_json},
+                    has_active_element: true,
+                    tag_name: String(el.tagName || ""),
+                    id: String(el.id || ""),
+                    name: String(el.getAttribute("name") || ""),
+                    value,
+                    selection_start: selectionStart,
+                    selection_end: selectionEnd
+                }};
+            }})()"#,
+            target_id_json =
+                serde_json::to_string(&target_id).unwrap_or_else(|_| "\"\"".to_owned())
+        );
+        page.evaluate_expression(expression)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Runtime.evaluate active-element readback: {err}"),
+            })?
+            .into_value::<CdpActiveElementState>()
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Runtime.evaluate active-element decode: {err}"),
+            })
+    })
+    .await
 }
 
 /// Dispatches wheel events over a web node after scrolling it into view.
@@ -504,6 +645,35 @@ fn dispatch_err(err: &chromiumoxide::error::CdpError) -> A11yError {
     }
 }
 
+fn cdp_key_event(
+    event_type: DispatchKeyEventType,
+    key: &CdpKeyStroke,
+    modifiers: i64,
+) -> A11yResult<DispatchKeyEventParams> {
+    let mut builder = DispatchKeyEventParams::builder()
+        .r#type(event_type)
+        .modifiers(modifiers)
+        .key(key.key.clone())
+        .code(key.code.clone())
+        .windows_virtual_key_code(key.windows_virtual_key_code)
+        .native_virtual_key_code(key.native_virtual_key_code);
+    if let Some(value) = &key.key_identifier {
+        builder = builder.key_identifier(value.clone());
+    }
+    if let Some(value) = &key.text {
+        builder = builder.text(value.clone());
+    }
+    if let Some(value) = &key.unmodified_text {
+        builder = builder.unmodified_text(value.clone());
+    }
+    if let Some(value) = key.location {
+        builder = builder.location(value);
+    }
+    builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
+        detail: format!("build Input.dispatchKeyEvent params: {err}"),
+    })
+}
+
 /// Polls `browser.pages()` until target discovery surfaces at least one page
 /// (fresh connections discover targets asynchronously), up to ~3s.
 async fn wait_for_pages(browser: &chromiumoxide::Browser) -> A11yResult<Vec<chromiumoxide::Page>> {
@@ -582,6 +752,41 @@ where
     let result = async {
         let page =
             resolve_owning_page(&browser, page_title_hint, target_id_hint, backend_node_id).await?;
+        action(page).await
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
+async fn with_target_page<A, Fut, T>(endpoint: &str, target_id: &str, action: A) -> A11yResult<T>
+where
+    A: FnOnce(chromiumoxide::Page) -> Fut,
+    Fut: std::future::Future<Output = A11yResult<T>>,
+{
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP target id must not be empty".to_owned(),
+        });
+    }
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let result = async {
+        let pages = wait_for_pages(&browser).await?;
+        let page = pages
+            .into_iter()
+            .find(|page| page.target_id().inner().eq_ignore_ascii_case(target_id))
+            .ok_or_else(|| A11yError::CdpAttachFailed {
+                detail: format!("CDP target {target_id:?} is no longer present"),
+            })?;
         action(page).await
     }
     .await;

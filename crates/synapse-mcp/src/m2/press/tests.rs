@@ -8,7 +8,7 @@ use synapse_core::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    act_keymap_with_handle, act_press_with_handle,
+    act_keymap_with_handle, act_press_with_handle, cdp_key_strokes,
     keys::{key, normalized_keys},
     live::execute_live_press_sequence,
     record::event_sequence,
@@ -295,6 +295,23 @@ fn normalized_keys_accept_minecraft_lshift_alias() {
         .collect::<Vec<_>>();
     println!("readback=act_press_keys edge=lshift_alias after={labels:?}");
     assert_eq!(labels, ["shift"]);
+}
+
+#[test]
+fn cdp_key_strokes_encode_ctrl_a_as_shortcut_without_text_payload() {
+    let keys = normalized_keys(&["ctrl".to_owned(), "a".to_owned()])
+        .unwrap_or_else(|error| panic!("ctrl+a should normalize: {error}"));
+    let strokes = cdp_key_strokes(&keys)
+        .unwrap_or_else(|error| panic!("ctrl+a should map to CDP key strokes: {error}"));
+
+    println!("readback=act_press_cdp_mapping edge=ctrl_a strokes={strokes:?}");
+    assert_eq!(strokes.len(), 2);
+    assert_eq!(strokes[0].key, "Control");
+    assert_eq!(strokes[0].modifier_bit, 2);
+    assert_eq!(strokes[1].key, "a");
+    assert_eq!(strokes[1].code, "KeyA");
+    assert_eq!(strokes[1].windows_virtual_key_code, 65);
+    assert_eq!(strokes[1].text, None);
 }
 
 #[test]

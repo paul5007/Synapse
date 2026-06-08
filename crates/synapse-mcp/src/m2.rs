@@ -59,6 +59,11 @@ pub use press::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
     act_keymap_with_handle, act_press_with_handle,
 };
+pub(crate) use press::{
+    HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,
+    act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
+    hwnd_keyboard_target_state, resolve_keymap_press,
+};
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
 pub use scroll::{ActScrollParams, ActScrollResponse, act_scroll_with_handle};
 pub use set_value::{
