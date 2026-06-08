@@ -283,7 +283,7 @@ impl SynapseService {
         };
         let verify_timeout_ms = params.verify_timeout_ms;
         let emitted = emitted_text(&params);
-        let before_text_signature = if params.into_element.is_none() {
+        let before_text_signature = if act_type_should_capture_text_signature(&params) {
             match self
                 .capture_act_type_text_signature(160, true, browser_url_policy.is_some())
                 .await
@@ -2407,6 +2407,10 @@ fn act_type_browser_url_policy(
     }))
 }
 
+fn act_type_should_capture_text_signature(params: &ActTypeParams) -> bool {
+    params.verify_delta && params.into_element.is_none()
+}
+
 fn act_type_url_policy_params_invalid(
     field: &'static str,
     detail: impl Into<String>,
@@ -3572,7 +3576,7 @@ fn ensure_everquest_click_backend(
 
 #[cfg(test)]
 mod tests {
-    use synapse_core::Rect;
+    use synapse_core::{ElementId, Rect};
 
     use super::*;
 
@@ -3812,6 +3816,40 @@ mod tests {
         assert_eq!(
             data.get("field").and_then(Value::as_str),
             Some("expected_browser_url_regex")
+        );
+    }
+
+    #[test]
+    fn act_type_text_signature_capture_respects_verify_delta_opt_out() {
+        let params = act_type_params(false, None);
+
+        assert!(
+            !act_type_should_capture_text_signature(&params),
+            "verify_delta=false must not collect foreground text signatures or run postconditions"
+        );
+    }
+
+    #[test]
+    fn act_type_text_signature_capture_only_for_foreground_verify_delta() {
+        let params = act_type_params(true, None);
+
+        assert!(
+            act_type_should_capture_text_signature(&params),
+            "foreground act_type with verify_delta=true must keep fail-closed SoT verification"
+        );
+    }
+
+    #[test]
+    fn act_type_text_signature_capture_skips_into_element_route() {
+        let mut params = act_type_params(true, None);
+        params.into_element = Some(
+            ElementId::parse("0x1000:0000002a00000001")
+                .expect("synthetic element id must be valid"),
+        );
+
+        assert!(
+            !act_type_should_capture_text_signature(&params),
+            "into_element routes own background readback and must not use foreground text signatures"
         );
     }
 
