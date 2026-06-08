@@ -22,15 +22,18 @@ use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA,
     CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params,
     act_stroke_error_details, act_stroke_request_details, attach_click_tier_attempts,
-    click_params_can_route_background_first, click_target_root_hwnd, click_tier_failed,
-    emitted_text,
+    click_params_can_route_background_first, click_target_root_hwnd, click_tier_delivered,
+    click_tier_failed, emitted_text,
 };
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use synapse_action::{
     ACTION_QUEUE_CAPACITY, ActionEmitterSnapshotHandle, ActionError, ActionHandle,
     ActionStateSnapshot, RecordingBackend, ResolvedBackend, TokenBucketSnapshot,
@@ -40,6 +43,7 @@ use synapse_core::{
     PathSpec, Point, Rect, StrokeMotionModel, StrokeTiming, UiaPattern, VelocityProfile,
     error_codes,
 };
+use synapse_perception::ObservationInput;
 use tokio_util::sync::CancellationToken;
 
 const ACT_STROKE_FOREGROUND_MONITOR_INTERVAL_MS: u64 = 10;
@@ -50,6 +54,8 @@ const ACTION_DIAGNOSTIC_MIN_TTL_MS: u64 = 100;
 const ACTION_DIAGNOSTIC_MAX_QUEUE_BLOCKER_MS: u32 = 10_000;
 const ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS: u32 = 250;
 const ACTION_DIAGNOSTIC_QUEUE_SETTLE_MS: u64 = 50;
+const ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH: &str = "cdp_target.url";
+const ACT_TYPE_BROWSER_URL_TEXT_INTEGRITY: &str = "cdp_target_url_readback";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +193,7 @@ impl SynapseService {
         let foreground_lease_session_id = foreground_lease_session_id(&request_context)?;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
+        let started = Instant::now();
         let result = if let Some(before) = before_delta_signature {
             self.act_click_with_verified_router(
                 handle,
@@ -196,6 +203,7 @@ impl SynapseService {
                 verify_timeout_ms,
                 target_window_hwnd,
                 foreground_lease_session_id,
+                started,
             )
             .await
         } else {
@@ -244,6 +252,14 @@ impl SynapseService {
         ) {
             return audit_target_claim_denial(self, "act_type", error, &request_context);
         }
+        let browser_url_policy = match act_type_browser_url_policy(&params) {
+            Ok(policy) => policy,
+            Err(error) => {
+                let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_type", &result, &request_context)?;
+                return result.map(Json);
+            }
+        };
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         if params.into_element.is_none()
@@ -268,7 +284,10 @@ impl SynapseService {
         let verify_timeout_ms = params.verify_timeout_ms;
         let emitted = emitted_text(&params);
         let before_text_signature = if params.into_element.is_none() {
-            match self.capture_act_type_text_signature(160).await {
+            match self
+                .capture_act_type_text_signature(160, true, browser_url_policy.is_some())
+                .await
+            {
                 Ok(signature) => Some(signature),
                 Err(error) => {
                     let result: Result<ActTypeResponse, ErrorData> = Err(error);
@@ -282,8 +301,14 @@ impl SynapseService {
         let result = act_type_with_handle(handle, recording, params).await;
         let result = match (result, before_text_signature) {
             (Ok(response), Some(before)) => {
-                self.verify_act_type_response(response, before, verify_timeout_ms, &emitted)
-                    .await
+                self.verify_act_type_response(
+                    response,
+                    before,
+                    verify_timeout_ms,
+                    &emitted,
+                    browser_url_policy.as_ref(),
+                )
+                .await
             }
             (other, _) => other,
         };
@@ -1298,6 +1323,20 @@ impl ForegroundChangePolicy {
 struct ActTypeTextReadback {
     signature: ActTypeTextSignature,
     value: Option<String>,
+    browser_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ActTypeBrowserUrlPolicy {
+    expected_url_regex: regex::Regex,
+    expected_url_pattern: String,
+}
+
+#[derive(Clone, Debug)]
+struct CdpTargetUrlReadback {
+    url: Option<String>,
+    target_id: Option<String>,
+    source: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1316,6 +1355,10 @@ struct ActTypeTextSignature {
     focused_bbox: Option<Rect>,
     readback_source: Option<String>,
     has_text_readback: bool,
+    browser_url_len: Option<usize>,
+    browser_url_sha256: Option<String>,
+    browser_cdp_target_id: Option<String>,
+    browser_url_readback_source: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1387,6 +1430,7 @@ impl SynapseService {
         verify_timeout_ms: u32,
         target_window_hwnd: Option<i64>,
         foreground_lease_session_id: Option<String>,
+        started: Instant,
     ) -> Result<ActClickResponse, ErrorData> {
         match act_click_with_handle_and_lease(
             handle.clone(),
@@ -1449,6 +1493,32 @@ impl SynapseService {
                 if can_route_click_element_background_first(&params, recording.as_ref())
                     && should_try_next_click_tier(&error) =>
             {
+                if click_postdispatch_readback_failed(&error) {
+                    match self
+                        .reconcile_click_postdispatch_error(
+                            &params,
+                            &error,
+                            before.clone(),
+                            verify_timeout_ms,
+                            target_window_hwnd,
+                            started,
+                        )
+                        .await
+                    {
+                        Ok(response) => return Ok(response),
+                        Err(verify_error) => {
+                            tracing::warn!(
+                                code = click_error_data_code(&verify_error)
+                                    .unwrap_or(error_codes::ACTION_POSTCONDITION_FAILED),
+                                kind = "act_click",
+                                original_error_code = click_error_data_code(&error)
+                                    .unwrap_or(error_codes::ACTION_TARGET_INVALID),
+                                detail = %verify_error.message,
+                                "act_click post-dispatch UIA readback error was not reconciled by target-window SoT; trying next eligible delivery tier"
+                            );
+                        }
+                    }
+                }
                 let tier_attempts = click_tier_attempts_from_error(&error);
                 if should_try_click_postmessage_tier(&tier_attempts) {
                     self.act_click_try_postmessage_then_foreground(
@@ -1615,6 +1685,59 @@ impl SynapseService {
         }
     }
 
+    async fn reconcile_click_postdispatch_error(
+        &self,
+        params: &ActClickParams,
+        error: &ErrorData,
+        before: ClickDeltaSignature,
+        verify_timeout_ms: u32,
+        target_window_hwnd: Option<i64>,
+        started: Instant,
+    ) -> Result<ActClickResponse, ErrorData> {
+        let postcondition = self
+            .verify_click_delta(before, verify_timeout_ms, target_window_hwnd)
+            .await?;
+        let mut tier_attempts = click_tier_attempts_from_error(error);
+        let tier = tier_attempts
+            .first()
+            .map(|attempt| attempt.tier.clone())
+            .unwrap_or_else(|| "uia".to_owned());
+        tier_attempts.push(click_tier_delivered(
+            tier.clone(),
+            tier_attempts
+                .iter()
+                .any(|attempt| attempt.required_foreground),
+            format!(
+                "delivery reported a post-dispatch UIA readback failure, but verify_delta separately observed target-window SoT mutation; original_error={}",
+                error.message
+            ),
+        ));
+        let timing = synapse_action::cached_double_click_timing();
+        tracing::info!(
+            code = "M2_ACT_CLICK_POSTDISPATCH_READBACK_RECONCILED",
+            kind = "act_click",
+            backend_tier_used = %tier,
+            error_message = %error.message,
+            postcondition_status = %postcondition.status,
+            "readback=target_window_delta tool=act_click outcome=reconciled_postdispatch_error"
+        );
+        Ok(ActClickResponse {
+            ok: true,
+            used_invoke_pattern: tier == "uia",
+            backend_used: tier.clone(),
+            backend_tier_used: tier,
+            required_foreground: tier_attempts
+                .iter()
+                .any(|attempt| attempt.required_foreground),
+            tier_attempts,
+            postcondition,
+            press_hold_ms: params.hold_ms,
+            double_click_window_ms: timing.window_ms,
+            inter_click_delay_ms: timing.inter_click_delay_ms,
+            elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        })
+    }
+
     async fn capture_click_delta_signature(
         &self,
         max_elements: usize,
@@ -1627,6 +1750,8 @@ impl SynapseService {
     async fn capture_act_type_text_signature(
         &self,
         max_elements: usize,
+        require_focused_text_value: bool,
+        require_browser_url: bool,
     ) -> Result<ActTypeTextReadback, ErrorData> {
         let mut input = {
             let state = self.m1_state()?;
@@ -1634,6 +1759,7 @@ impl SynapseService {
         };
         crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
         crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
+        let browser_url = Self::cdp_selected_target_url(&input, require_browser_url).await?;
 
         let focused = focused_text_candidate(input.focused.as_ref(), &input.elements);
         let (value, readback_source) = focused_text_readback(focused.as_ref());
@@ -1656,8 +1782,12 @@ impl SynapseService {
             focused_bbox: focused.as_ref().map(|item| item.bbox),
             readback_source: readback_source.map(str::to_owned),
             has_text_readback: value.is_some(),
+            browser_url_len: browser_url.url.as_ref().map(|url| url.chars().count()),
+            browser_url_sha256: browser_url.url.as_deref().and_then(non_empty_sha256),
+            browser_cdp_target_id: browser_url.target_id.clone(),
+            browser_url_readback_source: browser_url.source,
         };
-        if value.is_none() {
+        if require_focused_text_value && value.is_none() {
             let signature_hash = verify_hash_json(&signature)?;
             return Err(postcondition_failed_error(
                 "act_type",
@@ -1671,7 +1801,11 @@ impl SynapseService {
             ));
         }
 
-        Ok(ActTypeTextReadback { signature, value })
+        Ok(ActTypeTextReadback {
+            signature,
+            value,
+            browser_url: browser_url.url,
+        })
     }
 
     async fn capture_action_delta_signature(
@@ -1734,6 +1868,103 @@ impl SynapseService {
         })
     }
 
+    async fn cdp_selected_target_url(
+        input: &ObservationInput,
+        require_browser_url: bool,
+    ) -> Result<CdpTargetUrlReadback, ErrorData> {
+        let Some(cdp) = input.cdp.as_ref() else {
+            if require_browser_url {
+                return Err(act_type_browser_url_readback_error(
+                    error_codes::A11Y_CDP_UNREACHABLE,
+                    "act_type expected_browser_url_regex requires a Chromium CDP readback, but the foreground is not a CDP-observable browser",
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            return Ok(CdpTargetUrlReadback {
+                url: None,
+                target_id: None,
+                source: None,
+            });
+        };
+        let Some(endpoint) = cdp.endpoint.as_deref() else {
+            if require_browser_url {
+                return Err(act_type_browser_url_readback_error(
+                    cdp.reason_code
+                        .as_deref()
+                        .unwrap_or(error_codes::A11Y_CDP_UNREACHABLE),
+                    "act_type expected_browser_url_regex requires a reachable Chromium CDP endpoint",
+                    Some(cdp.status.as_str()),
+                    None,
+                    cdp.detail.as_deref(),
+                ));
+            }
+            return Ok(CdpTargetUrlReadback {
+                url: None,
+                target_id: cdp.selected_target_id.clone(),
+                source: Some(cdp.status.as_str().to_owned()),
+            });
+        };
+        let Some(target_id) = cdp.selected_target_id.as_deref() else {
+            if require_browser_url {
+                return Err(act_type_browser_url_readback_error(
+                    error_codes::A11Y_CDP_ATTACH_FAILED,
+                    "act_type expected_browser_url_regex requires a selected CDP target id from the observation readback",
+                    Some(cdp.status.as_str()),
+                    Some(endpoint),
+                    cdp.detail.as_deref(),
+                ));
+            }
+            return Ok(CdpTargetUrlReadback {
+                url: None,
+                target_id: None,
+                source: Some("cdp_without_selected_target".to_owned()),
+            });
+        };
+        let targets = synapse_a11y::cdp_list_targets(endpoint)
+            .await
+            .map_err(|error| {
+                act_type_browser_url_readback_error(
+                    error.code(),
+                    format!("Target.getTargets readback failed for act_type browser URL verification: {error}"),
+                    Some(cdp.status.as_str()),
+                    Some(endpoint),
+                    cdp.detail.as_deref(),
+                )
+            })?;
+        let Some(target) = targets
+            .iter()
+            .find(|target| target.target_id.eq_ignore_ascii_case(target_id))
+        else {
+            return Err(act_type_browser_url_readback_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "Target.getTargets readback did not contain selected target id {target_id:?} for act_type browser URL verification"
+                ),
+                Some(cdp.status.as_str()),
+                Some(endpoint),
+                cdp.detail.as_deref(),
+            ));
+        };
+        if target.url.trim().is_empty() && require_browser_url {
+            return Err(act_type_browser_url_readback_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "Target.getTargets readback for selected target id {target_id:?} contained an empty URL"
+                ),
+                Some(cdp.status.as_str()),
+                Some(endpoint),
+                cdp.detail.as_deref(),
+            ));
+        }
+        Ok(CdpTargetUrlReadback {
+            url: (!target.url.trim().is_empty()).then(|| target.url.clone()),
+            target_id: Some(target.target_id.clone()),
+            source: Some("Target.getTargets".to_owned()),
+        })
+    }
+
     async fn verify_click_delta(
         &self,
         before: ClickDeltaSignature,
@@ -1786,11 +2017,29 @@ impl SynapseService {
         before: ActTypeTextReadback,
         verify_timeout_ms: u32,
         emitted: &str,
+        browser_url_policy: Option<&ActTypeBrowserUrlPolicy>,
     ) -> Result<ActTypeResponse, ErrorData> {
         tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
-        let after = self.capture_act_type_text_signature(160).await?;
+        let after = self
+            .capture_act_type_text_signature(
+                160,
+                browser_url_policy.is_none(),
+                browser_url_policy.is_some(),
+            )
+            .await?;
         let before_hash = verify_hash_json(&before.signature)?;
         let after_hash = verify_hash_json(&after.signature)?;
+        if let Some(policy) = browser_url_policy {
+            return verify_act_type_browser_url_response(
+                response,
+                before,
+                after,
+                before_hash,
+                after_hash,
+                verify_timeout_ms,
+                policy,
+            );
+        }
         if act_type_foreground_identity_changed(&before.signature, &after.signature) {
             return Err(act_type_text_foreground_lost_error(
                 verify_timeout_ms,
@@ -2118,6 +2367,73 @@ fn act_press_foreground_change_policy(
     })
 }
 
+fn act_type_browser_url_policy(
+    params: &ActTypeParams,
+) -> Result<Option<ActTypeBrowserUrlPolicy>, ErrorData> {
+    let Some(pattern) = params.expected_browser_url_regex.as_deref() else {
+        return Ok(None);
+    };
+    if !params.verify_delta {
+        return Err(act_type_url_policy_params_invalid(
+            "verify_delta",
+            "act_type expected_browser_url_regex requires verify_delta=true",
+            "verify_delta_required",
+        ));
+    }
+    if params.into_element.is_some() {
+        return Err(act_type_url_policy_params_invalid(
+            "into_element",
+            "act_type expected_browser_url_regex applies only to foreground typing, not into_element routing",
+            "foreground_typing_required",
+        ));
+    }
+    if pattern.trim().is_empty() {
+        return Err(act_type_url_policy_params_invalid(
+            "expected_browser_url_regex",
+            "expected_browser_url_regex must not be empty",
+            "empty_expected_browser_url_regex",
+        ));
+    }
+    let expected_url_regex = regex::Regex::new(pattern).map_err(|error| {
+        act_type_url_policy_params_invalid(
+            "expected_browser_url_regex",
+            format!("expected_browser_url_regex is not a valid regex: {error}"),
+            "invalid_expected_browser_url_regex",
+        )
+    })?;
+    Ok(Some(ActTypeBrowserUrlPolicy {
+        expected_url_regex,
+        expected_url_pattern: pattern.to_owned(),
+    }))
+}
+
+fn act_type_url_policy_params_invalid(
+    field: &'static str,
+    detail: impl Into<String>,
+    reason: &'static str,
+) -> ErrorData {
+    let detail = detail.into();
+    tracing::error!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        tool = "act_type",
+        field,
+        reason,
+        detail = %detail,
+        "act_type browser URL policy parameters invalid"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": "act_type",
+            "field": field,
+            "reason": reason,
+            "detail": detail,
+        })),
+    )
+}
+
 fn compile_act_press_policy_regex(
     field: &'static str,
     pattern: Option<&str>,
@@ -2291,14 +2607,42 @@ fn can_route_click_element_background_first(
 }
 
 fn should_try_next_click_tier(error: &ErrorData) -> bool {
-    matches!(
-        click_error_data_code(error),
+    match click_error_data_code(error) {
         Some(
             error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
-                | error_codes::ACTION_NO_OBSERVED_DELTA
-                | error_codes::ACTION_BACKEND_UNAVAILABLE
-        )
-    )
+            | error_codes::ACTION_NO_OBSERVED_DELTA
+            | error_codes::ACTION_BACKEND_UNAVAILABLE,
+        ) => true,
+        Some(error_codes::ACTION_TARGET_INVALID) => click_postdispatch_readback_failed(error),
+        _ => false,
+    }
+}
+
+fn click_postdispatch_readback_failed(error: &ErrorData) -> bool {
+    let detail = click_error_detail(error).to_ascii_lowercase();
+    (detail.contains("togglepattern.toggle returned") && detail.contains("togglestate stayed"))
+        || (detail.contains("selectionitempattern.select returned")
+            && detail.contains("isselected stayed false"))
+}
+
+fn click_error_detail(error: &ErrorData) -> String {
+    let mut detail = error.message.to_string();
+    if let Some(data_detail) = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("detail"))
+        .and_then(Value::as_str)
+    {
+        detail.push(' ');
+        detail.push_str(data_detail);
+    }
+    for attempt in click_tier_attempts_from_error(error) {
+        if let Some(attempt_detail) = attempt.detail {
+            detail.push(' ');
+            detail.push_str(&attempt_detail);
+        }
+    }
+    detail
 }
 
 fn should_try_click_postmessage_tier(tier_attempts: &[ActClickTierAttempt]) -> bool {
@@ -2514,6 +2858,106 @@ fn act_type_foreground_identity_changed(
     before.foreground_hwnd != after.foreground_hwnd
         || before.foreground_pid != after.foreground_pid
         || before.foreground_process != after.foreground_process
+}
+
+fn verify_act_type_browser_url_response(
+    mut response: ActTypeResponse,
+    before: ActTypeTextReadback,
+    after: ActTypeTextReadback,
+    before_hash: String,
+    after_hash: String,
+    verify_timeout_ms: u32,
+    policy: &ActTypeBrowserUrlPolicy,
+) -> Result<ActTypeResponse, ErrorData> {
+    let before_signature_readback = before.signature.clone();
+    let after_signature_readback = after.signature.clone();
+    let after_url = after.browser_url.as_deref().ok_or_else(|| {
+        postcondition_failed_error(
+            "act_type",
+            ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
+            "expected_browser_url_regex was set but after-read CDP target URL was absent",
+            before_hash.clone(),
+            after_hash.clone(),
+            json!({
+                "expected_browser_url_regex": &policy.expected_url_pattern,
+                "before": before_signature_readback,
+                "after": after_signature_readback,
+            }),
+        )
+    })?;
+    if !policy.expected_url_regex.is_match(after_url) {
+        return Err(postcondition_failed_error(
+            "act_type",
+            ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
+            "after-read CDP target URL did not match expected_browser_url_regex",
+            before_hash,
+            after_hash,
+            json!({
+                "expected_browser_url_regex": &policy.expected_url_pattern,
+                "after_url_len": after_url.chars().count(),
+                "after_url_sha256": non_empty_sha256(after_url),
+                "before": before.signature,
+                "after": after.signature,
+            }),
+        ));
+    }
+    let before_url = before.browser_url.as_deref();
+    response.postcondition = if before_url == Some(after_url) {
+        ActPostcondition {
+            status: "verified_state".to_owned(),
+            observed_delta: Some(false),
+            source_of_truth: Some(ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH.to_owned()),
+            before_signature: Some(before_hash),
+            after_signature: Some(after_hash),
+            detail: Some(format!(
+                "act_type verify_delta verified after-read CDP target URL matched expected_browser_url_regex; no URL delta was observed within {verify_timeout_ms} ms"
+            )),
+        }
+    } else {
+        postcondition_observed_delta(
+            "act_type",
+            ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
+            before_hash,
+            after_hash,
+            "observed after-read CDP target URL matching expected_browser_url_regex after delivery",
+        )
+    };
+    response.target_readback_required = false;
+    response.target_text_integrity = ACT_TYPE_BROWSER_URL_TEXT_INTEGRITY.to_owned();
+    Ok(response)
+}
+
+fn act_type_browser_url_readback_error(
+    code: &str,
+    detail: impl Into<String>,
+    cdp_status: Option<&str>,
+    endpoint: Option<&str>,
+    cdp_detail: Option<&str>,
+) -> ErrorData {
+    let detail = detail.into();
+    tracing::error!(
+        code,
+        tool = "act_type",
+        source_of_truth = ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
+        cdp_status,
+        endpoint,
+        detail = %detail,
+        cdp_detail,
+        "act_type browser URL Source-of-Truth readback failed"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": code,
+            "tool": "act_type",
+            "source_of_truth": ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
+            "cdp_status": cdp_status,
+            "endpoint": endpoint,
+            "cdp_detail": cdp_detail,
+            "detail": detail,
+        })),
+    )
 }
 
 fn act_type_text_foreground_lost_error(
@@ -3332,6 +3776,103 @@ mod tests {
     }
 
     #[test]
+    fn act_type_browser_url_policy_requires_verify_delta_before_input() {
+        let params = act_type_params(false, Some("^file:///synapse-810\\.html$"));
+
+        let error = act_type_browser_url_policy(&params)
+            .expect_err("browser URL policy without verify_delta must fail before input");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("verify_delta_required")
+        );
+    }
+
+    #[test]
+    fn act_type_browser_url_policy_rejects_invalid_regex_before_input() {
+        let params = act_type_params(true, Some("["));
+
+        let error = act_type_browser_url_policy(&params)
+            .expect_err("invalid browser URL regex must fail before input");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("invalid_expected_browser_url_regex")
+        );
+        assert_eq!(
+            data.get("field").and_then(Value::as_str),
+            Some("expected_browser_url_regex")
+        );
+    }
+
+    #[test]
+    fn act_type_browser_url_policy_accepts_navigation_focus_change_when_url_matches() {
+        let policy = act_type_browser_url_policy(&act_type_params(
+            true,
+            Some("^file:///C:/synapse-810-after\\.html$"),
+        ))
+        .expect("valid browser URL policy")
+        .expect("policy should be present");
+        let before = act_type_readback(
+            Some("file:///C:/synapse-810-before.html"),
+            Some("address-bar"),
+            Some("file:///C:/synapse-810-before.html"),
+        );
+        let after = act_type_readback(
+            Some("file:///C:/synapse-810-after.html"),
+            Some("document-body"),
+            None,
+        );
+        let response = ActTypeResponse {
+            ok: true,
+            chars_typed: 36,
+            elapsed_ms: 10,
+            backend_tier_used: "foreground".to_owned(),
+            required_foreground: true,
+            target_text_integrity: "dispatch_only_requires_target_readback".to_owned(),
+            target_readback_required: true,
+            minimum_linear_ms_per_char: 20,
+            postcondition: crate::m2::postcondition::postcondition_not_requested(
+                "act_type",
+                "foreground_focused_ui_or_pixels",
+            ),
+        };
+
+        let verified = verify_act_type_browser_url_response(
+            response,
+            before,
+            after,
+            "before-hash".to_owned(),
+            "after-hash".to_owned(),
+            250,
+            &policy,
+        )
+        .expect("matching browser URL should verify despite focus moving to the document");
+
+        assert_eq!(verified.postcondition.status, "observed_delta");
+        assert_eq!(verified.postcondition.observed_delta, Some(true));
+        assert_eq!(
+            verified.postcondition.source_of_truth.as_deref(),
+            Some(ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH)
+        );
+        assert_eq!(
+            verified.target_text_integrity,
+            ACT_TYPE_BROWSER_URL_TEXT_INTEGRITY
+        );
+        assert!(!verified.target_readback_required);
+    }
+
+    #[test]
     fn click_router_respects_coordinate_fallback_disabled() {
         let mut params = act_click_element_params();
         params.use_invoke_pattern = true;
@@ -3398,6 +3939,34 @@ mod tests {
         assert!(!should_try_click_foreground_tier(&exhausted));
     }
 
+    #[test]
+    fn click_router_treats_toggle_readback_failure_as_postdispatch_retry_eligible() {
+        let error = postdispatch_click_error(
+            "accessibility backend failed: TogglePattern.toggle returned for element 0x1:0000002a00000001, but ToggleState stayed Off",
+        );
+
+        println!(
+            "readback=act_click_postdispatch edge=toggle detail={:?} retry={}",
+            error.message,
+            should_try_next_click_tier(&error)
+        );
+        assert!(click_postdispatch_readback_failed(&error));
+        assert!(should_try_next_click_tier(&error));
+    }
+
+    #[test]
+    fn click_router_keeps_generic_target_invalid_fail_closed() {
+        let error = postdispatch_click_error("element bbox is empty or inverted");
+
+        println!(
+            "readback=act_click_postdispatch edge=generic_target_invalid detail={:?} retry={}",
+            error.message,
+            should_try_next_click_tier(&error)
+        );
+        assert!(!click_postdispatch_readback_failed(&error));
+        assert!(!should_try_next_click_tier(&error));
+    }
+
     fn foreground_proof(
         hwnd: i64,
         pid: u32,
@@ -3461,6 +4030,61 @@ mod tests {
         }
     }
 
+    fn act_type_params(
+        verify_delta: bool,
+        expected_browser_url_regex: Option<&str>,
+    ) -> ActTypeParams {
+        serde_json::from_value(json!({
+            "text": "file:///C:/synapse-810-after.html",
+            "dynamics": "burst",
+            "press_enter_after": true,
+            "backend": "auto",
+            "verify_delta": verify_delta,
+            "expected_browser_url_regex": expected_browser_url_regex,
+            "verify_timeout_ms": crate::m2::default_verify_timeout_ms(),
+        }))
+        .expect("synthetic act_type params must deserialize through the public tool schema")
+    }
+
+    fn act_type_readback(
+        browser_url: Option<&str>,
+        focused_element_id: Option<&str>,
+        focused_value: Option<&str>,
+    ) -> ActTypeTextReadback {
+        let focused_value = focused_value.map(str::to_owned);
+        let browser_url_owned = browser_url.map(str::to_owned);
+        ActTypeTextReadback {
+            signature: ActTypeTextSignature {
+                foreground_hwnd: 100,
+                foreground_pid: 20,
+                foreground_process: "chrome.exe".to_owned(),
+                foreground_title_sha256: non_empty_sha256("Synthetic - Google Chrome"),
+                focused_element_id: focused_element_id.map(str::to_owned),
+                focused_role: focused_element_id.map(|_| "Edit".to_owned()),
+                focused_name_sha256: focused_element_id.and_then(non_empty_sha256),
+                focused_value_len: focused_value.as_ref().map(|value| value.chars().count()),
+                focused_value_sha256: focused_value.as_deref().and_then(non_empty_sha256),
+                focused_selected_text_sha256: None,
+                focused_bbox: Some(Rect {
+                    x: 10,
+                    y: 10,
+                    w: 400,
+                    h: 32,
+                }),
+                readback_source: focused_value.as_ref().map(|_| "focused.value".to_owned()),
+                has_text_readback: focused_value.is_some(),
+                browser_url_len: browser_url_owned
+                    .as_ref()
+                    .map(|value| value.chars().count()),
+                browser_url_sha256: browser_url_owned.as_deref().and_then(non_empty_sha256),
+                browser_cdp_target_id: Some("TARGET810".to_owned()),
+                browser_url_readback_source: Some("Target.getTargets".to_owned()),
+            },
+            value: focused_value,
+            browser_url: browser_url_owned,
+        }
+    }
+
     fn act_click_element_params() -> ActClickParams {
         serde_json::from_value(json!({
             "target": {
@@ -3469,6 +4093,25 @@ mod tests {
             "verify_delta": true
         }))
         .expect("synthetic act_click params must deserialize through the public tool schema")
+    }
+
+    fn postdispatch_click_error(detail: &str) -> ErrorData {
+        let tier_attempts = vec![ActClickTierAttempt {
+            tier: "uia".to_owned(),
+            status: "failed".to_owned(),
+            reason_code: Some("target_invalid".to_owned()),
+            error_code: Some(error_codes::ACTION_TARGET_INVALID.to_owned()),
+            detail: Some(detail.to_owned()),
+            required_foreground: false,
+        }];
+        ErrorData::new(
+            ErrorCode(-32099),
+            format!("action target invalid: {detail}"),
+            Some(json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "tier_attempts": tier_attempts,
+            })),
+        )
     }
 
     fn click_attempt(tier: &str, status: &str, error_code: Option<&str>) -> ActClickTierAttempt {

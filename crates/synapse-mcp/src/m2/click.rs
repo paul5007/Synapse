@@ -346,12 +346,12 @@ fn a11y_to_action_error(err: &synapse_a11y::A11yError) -> ActionError {
 }
 
 pub(crate) fn click_tier_delivered(
-    tier: &'static str,
+    tier: impl Into<String>,
     required_foreground: bool,
     detail: impl Into<String>,
 ) -> ActClickTierAttempt {
     let attempt = ActClickTierAttempt {
-        tier: tier.to_owned(),
+        tier: tier.into(),
         status: "delivered".to_owned(),
         reason_code: None,
         error_code: None,

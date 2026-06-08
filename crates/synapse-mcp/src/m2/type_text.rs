@@ -65,6 +65,12 @@ pub struct ActTypeParams {
     #[serde(default = "default_verify_delta")]
     #[schemars(default = "default_verify_delta")]
     pub verify_delta: bool,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "When set on foreground typing with verify_delta=true, verify the after-read Chromium CDP target URL against this regex. Intended for address-bar navigation where focus may move from the address field to the document; CDP URL readback is required and missing/unreachable CDP fails closed before input."
+    )]
+    pub expected_browser_url_regex: Option<String>,
     #[serde(default = "default_verify_timeout_ms")]
     #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
     pub verify_timeout_ms: u32,
@@ -876,6 +882,7 @@ mod tests {
             press_enter_after: false,
             backend: default_type_backend(),
             verify_delta: false,
+            expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
         };
         let before = recording.events();
@@ -950,6 +957,7 @@ mod tests {
             press_enter_after: false,
             backend: TypeBackend::Software,
             verify_delta: false,
+            expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
         };
 
@@ -989,6 +997,7 @@ mod tests {
             press_enter_after: false,
             backend: TypeBackend::Software,
             verify_delta: false,
+            expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
         };
 
@@ -1022,6 +1031,7 @@ mod tests {
             press_enter_after: false,
             backend: TypeBackend::Software,
             verify_delta: false,
+            expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
         };
 
