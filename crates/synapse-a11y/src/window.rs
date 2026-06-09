@@ -112,6 +112,16 @@ pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
     platform::is_top_level_window(hwnd)
 }
 
+/// Returns the top-level root HWND for a native HWND.
+///
+/// # Errors
+///
+/// Returns a structured UIA error when the HWND is invalid, or
+/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn top_level_root_hwnd(hwnd: i64) -> A11yResult<i64> {
+    platform::top_level_root_hwnd(hwnd)
+}
+
 /// Requests that a top-level native HWND close by posting `WM_CLOSE`.
 ///
 /// # Errors

@@ -59,6 +59,7 @@ const ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS: u32 = 250;
 const ACTION_DIAGNOSTIC_QUEUE_SETTLE_MS: u64 = 50;
 const ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH: &str = "cdp_target.url";
 const ACT_TYPE_BROWSER_URL_TEXT_INTEGRITY: &str = "cdp_target_url_readback";
+const BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH: &str = "os_foreground_window";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -320,7 +321,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Set a UI Automation element's ValuePattern value directly and verify with a separate UIA value readback. Requires a real enabled non-read-only ValuePattern target; does not fall back to keyboard typing."
+        description = "Set a UI Automation element's text/value without foreground. For known native edit HWNDs, routes through Win32 WM_SETTEXT; otherwise routes through UIA ValuePattern.SetValue. Both tiers require a separate target readback from the same Source of Truth and fail closed with probed tier details; there is no keyboard/foreground fallback."
     )]
     pub async fn act_set_value(
         &self,
@@ -361,7 +362,47 @@ impl SynapseService {
         ) {
             return audit_target_claim_denial(self, "act_set_value", error, &request_context);
         }
+        let foreground_guard = match act_set_value_target_foreground_guard(&params.element_id) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let result: Result<ActSetValueResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
+                return result.map(Json);
+            }
+        };
+        let foreground_before = match self.current_audit_foreground() {
+            Ok(foreground) => foreground,
+            Err(error) => {
+                let result: Result<ActSetValueResponse, ErrorData> = Err(
+                    act_set_value_foreground_read_error("before", "unknown", &error),
+                );
+                self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
+                return result.map(Json);
+            }
+        };
         let result = act_set_value(params).await;
+        let result = match result {
+            Ok(response) if !response.required_foreground => {
+                match self.current_audit_foreground() {
+                    Ok(foreground_after) => match verify_background_target_not_activated(
+                        "act_set_value",
+                        &response.source_of_truth,
+                        foreground_guard,
+                        &foreground_before,
+                        &foreground_after,
+                    ) {
+                        Ok(()) => Ok(response),
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(act_set_value_foreground_read_error(
+                        "after",
+                        &response.source_of_truth,
+                        &error,
+                    )),
+                }
+            }
+            other => other,
+        };
         self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
         result.map(Json)
     }
@@ -3906,6 +3947,167 @@ async fn monitor_act_stroke_foreground(
     }
 }
 
+#[derive(Copy, Clone, Debug, Serialize)]
+struct BackgroundTargetForegroundGuard {
+    element_hwnd: i64,
+    root_hwnd: i64,
+}
+
+impl BackgroundTargetForegroundGuard {
+    fn contains(self, hwnd: i64) -> bool {
+        hwnd == self.element_hwnd || hwnd == self.root_hwnd
+    }
+}
+
+fn act_set_value_target_foreground_guard(
+    element_id: &ElementId,
+) -> Result<BackgroundTargetForegroundGuard, ErrorData> {
+    let hwnd = element_id.parts().map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "act_set_value element id {element_id} could not be parsed for foreground guard: {error}"
+            ),
+        )
+    })?.hwnd;
+    let root_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "act_set_value element id {element_id} HWND 0x{hwnd:x} could not be normalized to a live top-level target root for foreground guard: {error}"
+            ),
+        )
+    })?;
+    Ok(BackgroundTargetForegroundGuard {
+        element_hwnd: hwnd,
+        root_hwnd,
+    })
+}
+
+fn verify_background_target_not_activated(
+    tool: &'static str,
+    action_source_of_truth: &str,
+    target: BackgroundTargetForegroundGuard,
+    before: &ForegroundContext,
+    after: &ForegroundContext,
+) -> Result<(), ErrorData> {
+    if before.hwnd == after.hwnd && before.pid == after.pid {
+        return Ok(());
+    }
+    if !target.contains(before.hwnd) && target.contains(after.hwnd) {
+        return Err(background_foreground_lost_error(
+            tool,
+            action_source_of_truth,
+            target,
+            before,
+            after,
+        ));
+    }
+    tracing::warn!(
+        code = "BACKGROUND_FOREGROUND_CHANGED_NON_TARGET",
+        tool,
+        source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+        action_source_of_truth,
+        target_element_hwnd = target.element_hwnd,
+        target_root_hwnd = target.root_hwnd,
+        before_hwnd = before.hwnd,
+        after_hwnd = after.hwnd,
+        before_pid = before.pid,
+        after_pid = after.pid,
+        before_process_name = %before.process_name,
+        after_process_name = %after.process_name,
+        "background action completed while foreground changed to a non-target window"
+    );
+    Ok(())
+}
+
+fn background_foreground_lost_error(
+    tool: &'static str,
+    action_source_of_truth: &str,
+    target: BackgroundTargetForegroundGuard,
+    before: &ForegroundContext,
+    after: &ForegroundContext,
+) -> ErrorData {
+    let detail = format!(
+        "{tool} returned a background result but foreground changed from hwnd 0x{:x} ({}) to hwnd 0x{:x} ({})",
+        before.hwnd, before.process_name, after.hwnd, after.process_name
+    );
+    tracing::error!(
+        code = error_codes::ACTION_FOREGROUND_LOST,
+        reason = "background_action_changed_foreground",
+        tool,
+        source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+        action_source_of_truth,
+        target_element_hwnd = target.element_hwnd,
+        target_root_hwnd = target.root_hwnd,
+        before_hwnd = before.hwnd,
+        after_hwnd = after.hwnd,
+        before_pid = before.pid,
+        after_pid = after.pid,
+        before_process_name = %before.process_name,
+        after_process_name = %after.process_name,
+        before_window_title = %before.window_title,
+        after_window_title = %after.window_title,
+        "background action changed foreground after reporting required_foreground=false"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_LOST,
+            "reason": "background_action_changed_foreground",
+            "tool": tool,
+            "source_of_truth": BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+            "action_source_of_truth": action_source_of_truth,
+            "required_foreground": false,
+            "target_element_hwnd": target.element_hwnd,
+            "target_root_hwnd": target.root_hwnd,
+            "detail": detail,
+            "foreground_before": foreground_context_details(before),
+            "foreground_after": foreground_context_details(after),
+        })),
+    )
+}
+
+fn act_set_value_foreground_read_error(
+    stage: &'static str,
+    action_source_of_truth: &str,
+    error: &ErrorData,
+) -> ErrorData {
+    let detail = format!(
+        "act_set_value could not read foreground {stage} background dispatch: {}",
+        error.message
+    );
+    tracing::error!(
+        code = error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+        reason = "background_foreground_read_failed",
+        tool = "act_set_value",
+        source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+        action_source_of_truth,
+        stage,
+        read_error = %error.message,
+        "act_set_value background foreground guard could not read OS foreground Source of Truth"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            "reason": "background_foreground_read_failed",
+            "tool": "act_set_value",
+            "source_of_truth": BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+            "action_source_of_truth": action_source_of_truth,
+            "required_foreground": false,
+            "stage": stage,
+            "detail": detail,
+            "read_error": {
+                "message": error.message.to_string(),
+                "data": error.data.clone(),
+            },
+        })),
+    )
+}
+
 fn act_stroke_foreground_lost_error(
     expected: &ForegroundProof,
     actual: Option<&ForegroundContext>,
@@ -4058,6 +4260,129 @@ mod tests {
                 .and_then(Value::as_str),
             Some("not_rate_or_queue")
         );
+    }
+
+    #[test]
+    fn act_set_value_background_guard_rejects_target_activation() {
+        let before = foreground_context(100, 10, "chrome.exe", "before");
+        let after = foreground_context(200, 20, "wpf-test.exe", "after");
+        let target = BackgroundTargetForegroundGuard {
+            element_hwnd: 150,
+            root_hwnd: 200,
+        };
+
+        let error = verify_background_target_not_activated(
+            "act_set_value",
+            "uia_value_pattern.value",
+            target,
+            &before,
+            &after,
+        )
+        .expect_err("background set_value must fail if it activates the target root");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("background_action_changed_foreground")
+        );
+        assert_eq!(
+            data.get("target_root_hwnd").and_then(Value::as_i64),
+            Some(200)
+        );
+        assert_eq!(
+            data.get("target_element_hwnd").and_then(Value::as_i64),
+            Some(150)
+        );
+        assert_eq!(
+            data.pointer("/foreground_before/hwnd")
+                .and_then(Value::as_i64),
+            Some(100)
+        );
+        assert_eq!(
+            data.pointer("/foreground_after/hwnd")
+                .and_then(Value::as_i64),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn act_set_value_background_guard_rejects_target_child_activation() {
+        let before = foreground_context(100, 10, "chrome.exe", "before");
+        let after = foreground_context(150, 20, "winforms-test.exe", "after child");
+        let target = BackgroundTargetForegroundGuard {
+            element_hwnd: 150,
+            root_hwnd: 200,
+        };
+
+        let error = verify_background_target_not_activated(
+            "act_set_value",
+            "uia_value_pattern.value",
+            target,
+            &before,
+            &after,
+        )
+        .expect_err("background set_value must fail if it activates the target child hwnd");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(
+            data.get("target_element_hwnd").and_then(Value::as_i64),
+            Some(150)
+        );
+        assert_eq!(
+            data.get("target_root_hwnd").and_then(Value::as_i64),
+            Some(200)
+        );
+        assert_eq!(
+            data.pointer("/foreground_after/hwnd")
+                .and_then(Value::as_i64),
+            Some(150)
+        );
+    }
+
+    #[test]
+    fn act_set_value_background_guard_allows_non_target_foreground_change() {
+        let before = foreground_context(100, 10, "chrome.exe", "before");
+        let after = foreground_context(300, 30, "code.exe", "human moved");
+        let target = BackgroundTargetForegroundGuard {
+            element_hwnd: 150,
+            root_hwnd: 200,
+        };
+
+        verify_background_target_not_activated(
+            "act_set_value",
+            "win32_window_text",
+            target,
+            &before,
+            &after,
+        )
+        .expect("non-target foreground changes should not be treated as target activation");
+    }
+
+    #[test]
+    fn act_set_value_background_guard_allows_already_target_foreground() {
+        let before = foreground_context(150, 20, "winforms-test.exe", "already target");
+        let after = foreground_context(200, 20, "winforms-test.exe", "root after");
+        let target = BackgroundTargetForegroundGuard {
+            element_hwnd: 150,
+            root_hwnd: 200,
+        };
+
+        verify_background_target_not_activated(
+            "act_set_value",
+            "uia_value_pattern.value",
+            target,
+            &before,
+            &after,
+        )
+        .expect("background guard should not fail when the target was already foreground");
     }
 
     #[test]

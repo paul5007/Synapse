@@ -196,6 +196,14 @@ pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
     Ok(root.0 == hwnd.0)
 }
 
+pub fn top_level_root_hwnd(hwnd: i64) -> A11yResult<i64> {
+    let seed = valid_hwnd(hwnd)?;
+    let root = unsafe { GetAncestor(seed, GA_ROOT) };
+    let root = if root.0.is_null() { seed } else { root };
+    let root = valid_hwnd(root.0 as isize as i64)?;
+    Ok(root.0 as isize as i64)
+}
+
 pub fn close_window(hwnd: i64) -> A11yResult<()> {
     let hwnd = HWND(hwnd as *mut c_void);
     if hwnd.0.is_null() {

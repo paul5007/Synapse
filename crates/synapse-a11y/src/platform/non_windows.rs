@@ -61,6 +61,12 @@ pub fn is_top_level_window(_hwnd: i64) -> A11yResult<bool> {
     ))
 }
 
+pub fn top_level_root_hwnd(_hwnd: i64) -> A11yResult<i64> {
+    Err(A11yError::not_available(
+        "top-level root HWND readback requires Windows",
+    ))
+}
+
 pub fn close_window(_hwnd: i64) -> A11yResult<()> {
     Err(A11yError::not_available("window close requires Windows"))
 }
@@ -201,13 +207,13 @@ pub fn focus_element(_id: &ElementId) -> A11yResult<()> {
 
 pub fn set_element_value(_id: &ElementId, _value: &str) -> A11yResult<ElementValueSetReadback> {
     Err(A11yError::not_available(
-        "UIA element ValuePattern text entry requires Windows",
+        "UIA/native element text entry requires Windows",
     ))
 }
 
 pub fn element_value(_id: &ElementId) -> A11yResult<ElementValueReadback> {
     Err(A11yError::not_available(
-        "UIA element ValuePattern readback requires Windows",
+        "UIA/native element text readback requires Windows",
     ))
 }
 

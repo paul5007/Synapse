@@ -117,24 +117,26 @@ pub fn focus_element(id: &ElementId) -> A11yResult<()> {
     platform::focus_element(id)
 }
 
-/// Sets a re-resolved element's native `ValuePattern` text and reads it back.
+/// Sets a re-resolved element's text/value and reads it back.
 ///
 /// # Errors
 ///
 /// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
-/// structured UIA error when the element does not expose writable `ValuePattern`
-/// or SetValue/readback fails, and `A11Y_NOT_AVAILABLE` on non-Windows.
+/// structured UIA/native-message error when the element exposes neither
+/// writable `ValuePattern` nor a native edit HWND text-message route, and
+/// `A11Y_NOT_AVAILABLE` on non-Windows.
 pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValueSetReadback> {
     platform::set_element_value(id, value)
 }
 
-/// Reads a re-resolved element's native `ValuePattern` text.
+/// Reads a re-resolved element's current text/value.
 ///
 /// # Errors
 ///
 /// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
-/// structured UIA error when the element does not expose `ValuePattern` or
-/// readback fails, and `A11Y_NOT_AVAILABLE` on non-Windows.
+/// structured UIA/native-message error when the element exposes neither
+/// `ValuePattern` nor a native edit HWND text-message readback route, and
+/// `A11Y_NOT_AVAILABLE` on non-Windows.
 pub fn element_value(id: &ElementId) -> A11yResult<ElementValueReadback> {
     platform::element_value(id)
 }

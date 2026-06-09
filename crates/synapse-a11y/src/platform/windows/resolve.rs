@@ -13,7 +13,7 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::{
         ES_MULTILINE, GWL_STYLE, GetWindowLongW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT,
-        WM_GETTEXTLENGTH,
+        WM_GETTEXTLENGTH, WM_SETTEXT,
     },
 };
 
@@ -29,8 +29,7 @@ use super::common::{
 };
 
 const RE_RESOLVE_NODE_BUDGET: usize = 20_000;
-const EM_SETSEL: u32 = 0x00B1;
-const EM_REPLACESEL: u32 = 0x00C2;
+const ES_READONLY_STYLE: i32 = 0x0800;
 const PASSWORD_LENGTH_READ_TIMEOUT_MS: u32 = 500;
 const NATIVE_TEXT_MESSAGE_TIMEOUT_MS: u32 = 500;
 const SUPPORTED_CLICK_PATTERNS: [&str; 5] = [
@@ -448,22 +447,31 @@ pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValue
                 detail: format!("element {id} IsEnabled=false before ValuePattern.SetValue"),
             });
         }
-        let pattern: UIValuePattern =
-            element
-                .get_pattern()
-                .map_err(|err| A11yError::ElementValueUnsupported {
-                    detail: format!("ValuePattern not exposed for element {id}: {err}"),
-                })?;
+        let is_password = cached_bool(&element, UIProperty::IsPassword);
+        if let Some(hwnd) = native_text_hwnd(&element)? {
+            if native_is_readonly(hwnd) {
+                return Err(A11yError::ElementValueReadOnly {
+                    detail: format!("native edit HWND is read-only for element {id}"),
+                });
+            }
+            return set_native_text_value(&id, hwnd, &value, is_password);
+        }
+        let pattern: UIValuePattern = match element.get_pattern() {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                return set_element_value_via_native_text(
+                    &id,
+                    &element,
+                    &value,
+                    is_password,
+                    &error.to_string(),
+                );
+            }
+        };
         if pattern.is_readonly().map_err(map_uia_error)? {
             return Err(A11yError::ElementValueReadOnly {
                 detail: format!("ValuePattern is read-only for element {id}"),
             });
-        }
-        let is_password = cached_bool(&element, UIProperty::IsPassword);
-        if native_text_message_supported(&element)
-            && let Some(hwnd) = native_hwnd(&element)?
-        {
-            return set_native_text_value(&id, hwnd, &value, is_password);
         }
 
         let before_password_len = if is_password {
@@ -496,6 +504,32 @@ pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValue
             before_password_len,
             after_password_len,
         })
+    })
+}
+
+fn set_element_value_via_native_text(
+    id: &ElementId,
+    element: &UIElement,
+    value: &str,
+    is_password: bool,
+    value_pattern_error: &str,
+) -> A11yResult<ElementValueSetReadback> {
+    if let Some(hwnd) = native_text_hwnd(element)? {
+        if native_is_readonly(hwnd) {
+            return Err(A11yError::ElementValueReadOnly {
+                detail: format!(
+                    "native edit HWND is read-only for element {id}; ValuePattern was not exposed: {value_pattern_error}"
+                ),
+            });
+        }
+        return set_native_text_value(id, hwnd, value, is_password);
+    }
+    Err(A11yError::ElementValueUnsupported {
+        detail: format!(
+            "ValuePattern not exposed for element {id}: {value_pattern_error}; native text-message fallback unavailable because role={:?} native_hwnd={:?}",
+            cached_role(element),
+            native_hwnd(element)?.map(|hwnd| format!("0x{:x}", hwnd.0 as isize))
+        ),
     })
 }
 
@@ -545,14 +579,38 @@ pub fn element_value(id: &ElementId) -> A11yResult<ElementValueReadback> {
     let id = id.clone();
     with_automation(move |automation| {
         let element = re_resolve_on_worker(automation, &id)?;
-        let pattern: UIValuePattern =
-            element
-                .get_pattern()
-                .map_err(|err| A11yError::ElementValueUnsupported {
-                    detail: format!("ValuePattern not exposed for element {id}: {err}"),
-                })?;
-        let is_readonly = pattern.is_readonly().map_err(map_uia_error)?;
         let is_password = cached_bool(&element, UIProperty::IsPassword);
+        if let Some(hwnd) = native_text_hwnd(&element)? {
+            let password_len = if is_password {
+                Some(native_text_len(&id, hwnd)?)
+            } else {
+                None
+            };
+            let value = if is_password {
+                String::new()
+            } else {
+                native_text_value(&id, hwnd)?
+            };
+            return Ok(ElementValueReadback {
+                method: "uia_native_window_text_message".to_owned(),
+                value,
+                is_readonly: native_is_readonly(hwnd),
+                is_password,
+                password_len,
+            });
+        }
+        let pattern: UIValuePattern = match element.get_pattern() {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                return element_value_via_native_text(
+                    &id,
+                    &element,
+                    is_password,
+                    &error.to_string(),
+                );
+            }
+        };
+        let is_readonly = pattern.is_readonly().map_err(map_uia_error)?;
         let password_len = if is_password {
             Some(password_text_len(&id, &element)?)
         } else {
@@ -573,6 +631,40 @@ pub fn element_value(id: &ElementId) -> A11yResult<ElementValueReadback> {
     })
 }
 
+fn element_value_via_native_text(
+    id: &ElementId,
+    element: &UIElement,
+    is_password: bool,
+    value_pattern_error: &str,
+) -> A11yResult<ElementValueReadback> {
+    if let Some(hwnd) = native_text_hwnd(element)? {
+        let password_len = if is_password {
+            Some(native_text_len(id, hwnd)?)
+        } else {
+            None
+        };
+        let value = if is_password {
+            String::new()
+        } else {
+            native_text_value(id, hwnd)?
+        };
+        return Ok(ElementValueReadback {
+            method: "uia_native_window_text_message".to_owned(),
+            value,
+            is_readonly: native_is_readonly(hwnd),
+            is_password,
+            password_len,
+        });
+    }
+    Err(A11yError::ElementValueUnsupported {
+        detail: format!(
+            "ValuePattern not exposed for element {id}: {value_pattern_error}; native text-message readback unavailable because role={:?} native_hwnd={:?}",
+            cached_role(element),
+            native_hwnd(element)?.map(|hwnd| format!("0x{:x}", hwnd.0 as isize))
+        ),
+    })
+}
+
 fn password_text_len(id: &ElementId, element: &UIElement) -> A11yResult<usize> {
     let hwnd = native_hwnd(element)?.ok_or_else(|| {
         A11yError::internal(format!(
@@ -583,7 +675,24 @@ fn password_text_len(id: &ElementId, element: &UIElement) -> A11yResult<usize> {
 }
 
 fn native_text_message_supported(element: &UIElement) -> bool {
-    cached_role(element).to_ascii_lowercase().contains("edit")
+    let role = cached_role(element);
+    let class_name = element.get_cached_classname().unwrap_or_default();
+    native_text_class_supported(&class_name) && role.to_ascii_lowercase().contains("edit")
+}
+
+fn native_text_class_supported(class_name: &str) -> bool {
+    let class_name = class_name.to_ascii_lowercase();
+    class_name == "edit"
+        || class_name.starts_with("richedit")
+        || class_name.contains(".edit.")
+        || class_name.starts_with("windowsforms10.edit.")
+}
+
+fn native_text_hwnd(element: &UIElement) -> A11yResult<Option<HWND>> {
+    if !native_text_message_supported(element) {
+        return Ok(None);
+    }
+    native_hwnd(element)
 }
 
 fn native_hwnd(element: &UIElement) -> A11yResult<Option<HWND>> {
@@ -642,14 +751,18 @@ fn native_set_text(id: &ElementId, hwnd: HWND, value: &str) -> A11yResult<String
     } else {
         value.to_owned()
     };
-    native_select_all(id, hwnd)?;
-    native_replace_selection(id, hwnd, &expected_value)?;
+    native_set_window_text(id, hwnd, &expected_value)?;
     Ok(expected_value)
 }
 
 fn native_is_multiline(hwnd: HWND) -> bool {
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
     style & ES_MULTILINE != 0
+}
+
+fn native_is_readonly(hwnd: HWND) -> bool {
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
+    style & ES_READONLY_STYLE != 0
 }
 
 fn normalize_multiline_edit_newlines(value: &str) -> String {
@@ -676,32 +789,41 @@ fn normalize_multiline_edit_newlines(value: &str) -> String {
     normalized
 }
 
-fn native_select_all(id: &ElementId, hwnd: HWND) -> A11yResult<()> {
-    let mut result = 0_usize;
-    send_native_text_message(
-        id,
-        hwnd,
-        EM_SETSEL,
-        WPARAM(0),
-        LPARAM(-1),
-        NATIVE_TEXT_MESSAGE_TIMEOUT_MS,
-        "EM_SETSEL",
-        &mut result,
-    )
+#[cfg(test)]
+mod tests {
+    use super::native_text_class_supported;
+
+    #[test]
+    fn native_text_class_supported_accepts_classic_edit_classes() {
+        assert!(native_text_class_supported("Edit"));
+        assert!(native_text_class_supported("RICHEDIT50W"));
+        assert!(native_text_class_supported(
+            "WindowsForms10.EDIT.app.0.1d38a05_r8_ad1"
+        ));
+    }
+
+    #[test]
+    fn native_text_class_supported_rejects_non_edit_window_classes() {
+        assert!(!native_text_class_supported("Button"));
+        assert!(!native_text_class_supported("Static"));
+        assert!(!native_text_class_supported(
+            "SynapseIssue784NativeHostWindow"
+        ));
+    }
 }
 
-fn native_replace_selection(id: &ElementId, hwnd: HWND, value: &str) -> A11yResult<()> {
+fn native_set_window_text(id: &ElementId, hwnd: HWND, value: &str) -> A11yResult<()> {
     let mut wide: Vec<u16> = value.encode_utf16().collect();
     wide.push(0);
     let mut result = 0_usize;
     send_native_text_message(
         id,
         hwnd,
-        EM_REPLACESEL,
-        WPARAM(1),
+        WM_SETTEXT,
+        WPARAM(0),
         LPARAM(wide.as_ptr().cast::<c_void>() as isize),
         NATIVE_TEXT_MESSAGE_TIMEOUT_MS,
-        "EM_REPLACESEL",
+        "WM_SETTEXT",
         &mut result,
     )
 }
