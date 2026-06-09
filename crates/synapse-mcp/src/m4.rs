@@ -718,6 +718,8 @@ pub struct ActSpawnAgentResponse {
     pub session_id: String,
     pub mcp_url: String,
     pub working_dir: String,
+    pub launch_target: String,
+    pub launch_target_source: String,
     pub launched_at_unix_ms: u64,
     pub registered_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

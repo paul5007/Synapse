@@ -23,7 +23,7 @@ use std::{
 };
 
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 
 use super::{
@@ -32,9 +32,28 @@ use super::{
 };
 
 const ACT_SPAWN_AGENT: &str = "act_spawn_agent";
-const AGENT_SPAWN_LAUNCH_TARGET: &str = "pwsh.exe";
+const AGENT_SPAWN_SHELL_ENV_VAR: &str = "SYNAPSE_AGENT_SPAWN_SHELL";
+const AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT: usize = 80;
 const AGENT_SPAWN_POLL_INTERVAL_MS: u64 = 250;
 const AGENT_SPAWN_LOG_TAIL_BYTES: usize = 8 * 1024;
+
+#[cfg(windows)]
+const AGENT_SPAWN_WINDOWS_SHELL_CANDIDATES: &[(&str, &str)] = &[
+    ("path:pwsh.exe", "pwsh.exe"),
+    (
+        "known_path:powershell7_x64",
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+    ),
+    (
+        "known_path:powershell7_x86",
+        r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+    ),
+    ("path:powershell.exe", "powershell.exe"),
+    (
+        "known_path:windows_powershell",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    ),
+];
 
 #[tool_router(router = m4_tool_router, vis = "pub(super)")]
 impl SynapseService {
@@ -392,6 +411,32 @@ impl SynapseService {
         let launched_at_unix_ms = unix_time_ms_now();
         let files = prepare_agent_spawn_files(&spawn_id, &params, &working_dir)?;
         let script = agent_spawn_powershell_script(&params, &files, &working_dir)?;
+        let launch_host = match resolve_agent_spawn_powershell_host() {
+            Ok(launch_host) => launch_host,
+            Err(error) => {
+                let completion_artifacts = write_agent_spawn_daemon_terminal_artifacts(
+                    &files,
+                    &params,
+                    &spawn_id,
+                    "failed",
+                    "agent spawn PowerShell host preflight failed before launching a child process",
+                    json!({
+                        "reason": "agent_spawn_shell_preflight_failed",
+                        "source_error_message": error.message.clone(),
+                        "source_error_data": error.data.clone(),
+                    }),
+                );
+                return Err(augment_agent_spawn_error_with_artifacts(
+                    error,
+                    &files,
+                    &params,
+                    &spawn_id,
+                    "agent_spawn_shell_preflight_failed",
+                    None,
+                    completion_artifacts,
+                ));
+            }
+        };
 
         let mut env = BTreeMap::new();
         env.insert("SYNAPSE_BEARER_TOKEN".to_owned(), token);
@@ -400,10 +445,18 @@ impl SynapseService {
             "SYNAPSE_AGENT_KIND".to_owned(),
             params.cli.as_str().to_owned(),
         );
+        env.insert(
+            "SYNAPSE_AGENT_SPAWN_LAUNCH_TARGET".to_owned(),
+            launch_host.target.clone(),
+        );
+        env.insert(
+            "SYNAPSE_AGENT_SPAWN_LAUNCH_SOURCE".to_owned(),
+            launch_host.source.clone(),
+        );
         env.insert("SYNAPSE_MCP_URL".to_owned(), params.mcp_url.clone());
 
         let launch_params = ActLaunchParams {
-            target: AGENT_SPAWN_LAUNCH_TARGET.to_owned(),
+            target: launch_host.target.clone(),
             args: vec![
                 "-NoLogo".to_owned(),
                 "-NoProfile".to_owned(),
@@ -423,7 +476,33 @@ impl SynapseService {
             windows_console_window_state: Some(LaunchWindowState::Hidden),
         };
 
-        let launch_response = launch(&self.m4_config, launch_params.clone()).await?;
+        let launch_response = match launch(&self.m4_config, launch_params.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                let completion_artifacts = write_agent_spawn_daemon_terminal_artifacts(
+                    &files,
+                    &params,
+                    &spawn_id,
+                    "failed",
+                    "agent spawn PowerShell host launch failed before MCP session registration",
+                    json!({
+                        "reason": "agent_spawn_shell_launch_failed",
+                        "launch_host": launch_host.to_json(),
+                        "source_error_message": error.message.clone(),
+                        "source_error_data": error.data.clone(),
+                    }),
+                );
+                return Err(augment_agent_spawn_error_with_artifacts(
+                    error,
+                    &files,
+                    &params,
+                    &spawn_id,
+                    "agent_spawn_shell_launch_failed",
+                    Some(&launch_host.target),
+                    completion_artifacts,
+                ));
+            }
+        };
         let process_job = match assign_owned_process_job(
             launch_response.pid,
             ACT_SPAWN_AGENT,
@@ -637,6 +716,8 @@ impl SynapseService {
             session_id: matched.session_id,
             mcp_url: params.mcp_url,
             working_dir: working_dir.display().to_string(),
+            launch_target: launch_params.target,
+            launch_target_source: launch_host.source,
             launched_at_unix_ms,
             registered_at_unix_ms: matched.registered_at_unix_ms,
             target: params.target,
@@ -798,9 +879,332 @@ fn agent_spawn_request_details(
         "prompt_bytes": params.prompt.as_ref().map_or(0, String::len),
         "started_by_session_id": started_by_session_id,
         "required_foreground": false,
-        "launch_target": AGENT_SPAWN_LAUNCH_TARGET,
+        "launch_target_resolution": "runtime_powershell_host_preflight",
+        "launch_target_env_var": AGENT_SPAWN_SHELL_ENV_VAR,
         "windows_console_window_state": "hidden",
     })
+}
+
+#[derive(Clone, Debug)]
+struct AgentSpawnLaunchHost {
+    target: String,
+    source: String,
+    attempted: Vec<String>,
+}
+
+impl AgentSpawnLaunchHost {
+    fn to_json(&self) -> Value {
+        json!({
+            "target": self.target,
+            "source": self.source,
+            "attempted": self.attempted,
+            "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+        })
+    }
+}
+
+fn resolve_agent_spawn_powershell_host() -> Result<AgentSpawnLaunchHost, ErrorData> {
+    if let Some(configured) = std::env::var_os(AGENT_SPAWN_SHELL_ENV_VAR) {
+        let configured = configured.into_string().map_err(|_| {
+            agent_spawn_shell_error(
+                "agent_spawn_shell_env_not_unicode",
+                "act_spawn_agent launcher shell preflight failed because SYNAPSE_AGENT_SPAWN_SHELL is not valid Unicode",
+                json!({
+                    "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+                    "supported_shells": ["pwsh.exe", "powershell.exe"],
+                }),
+            )
+        })?;
+        let candidate = trim_configured_agent_spawn_shell(&configured);
+        if candidate.is_empty() {
+            return Err(agent_spawn_shell_error(
+                "agent_spawn_shell_env_empty",
+                "act_spawn_agent launcher shell preflight failed because SYNAPSE_AGENT_SPAWN_SHELL is empty",
+                json!({
+                    "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+                    "configured_value": configured,
+                    "supported_shells": ["pwsh.exe", "powershell.exe"],
+                }),
+            ));
+        }
+        ensure_supported_agent_spawn_shell(candidate)?;
+        let mut attempted = Vec::new();
+        if let Some(target) = resolve_agent_spawn_shell_candidate(candidate, &mut attempted) {
+            return Ok(AgentSpawnLaunchHost {
+                target,
+                source: format!("env:{AGENT_SPAWN_SHELL_ENV_VAR}"),
+                attempted,
+            });
+        }
+        return Err(agent_spawn_shell_error(
+            "agent_spawn_shell_env_target_missing",
+            "act_spawn_agent launcher shell preflight failed because SYNAPSE_AGENT_SPAWN_SHELL did not resolve to an executable file",
+            json!({
+                "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+                "configured_value": configured,
+                "normalized_candidate": candidate,
+                "attempted": attempted,
+                "supported_shells": ["pwsh.exe", "powershell.exe"],
+            }),
+        ));
+    }
+
+    resolve_default_agent_spawn_powershell_host()
+}
+
+fn trim_configured_agent_spawn_shell(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some(stripped) = trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+    {
+        return stripped.trim();
+    }
+    if let Some(stripped) = trimmed
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
+        return stripped.trim();
+    }
+    trimmed
+}
+
+#[cfg(windows)]
+fn resolve_default_agent_spawn_powershell_host() -> Result<AgentSpawnLaunchHost, ErrorData> {
+    let mut attempted = Vec::new();
+    for (source, candidate) in AGENT_SPAWN_WINDOWS_SHELL_CANDIDATES {
+        ensure_supported_agent_spawn_shell(candidate)?;
+        if let Some(target) = resolve_agent_spawn_shell_candidate(candidate, &mut attempted) {
+            return Ok(AgentSpawnLaunchHost {
+                target,
+                source: (*source).to_owned(),
+                attempted,
+            });
+        }
+    }
+
+    Err(agent_spawn_shell_error(
+        "agent_spawn_shell_not_found",
+        "act_spawn_agent launcher shell preflight failed because no supported PowerShell host was found",
+        json!({
+            "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+            "attempted": attempted,
+            "supported_shells": ["pwsh.exe", "powershell.exe"],
+            "setup_action": "Install PowerShell 7 or ensure Windows PowerShell exists at C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe, then restart the synapse-mcp daemon so the process environment is current.",
+        }),
+    ))
+}
+
+#[cfg(not(windows))]
+fn resolve_default_agent_spawn_powershell_host() -> Result<AgentSpawnLaunchHost, ErrorData> {
+    let mut attempted = Vec::new();
+    let candidate = "pwsh";
+    if let Some(target) = resolve_agent_spawn_shell_candidate(candidate, &mut attempted) {
+        return Ok(AgentSpawnLaunchHost {
+            target,
+            source: "path:pwsh".to_owned(),
+            attempted,
+        });
+    }
+
+    Err(agent_spawn_shell_error(
+        "agent_spawn_shell_not_found",
+        "act_spawn_agent launcher shell preflight failed because no supported PowerShell host was found",
+        json!({
+            "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+            "attempted": attempted,
+            "supported_shells": ["pwsh"],
+        }),
+    ))
+}
+
+fn ensure_supported_agent_spawn_shell(candidate: &str) -> Result<(), ErrorData> {
+    let name = Path::new(candidate)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(candidate)
+        .to_ascii_lowercase();
+    let supported = if cfg!(windows) {
+        matches!(
+            name.as_str(),
+            "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe"
+        )
+    } else {
+        matches!(name.as_str(), "pwsh")
+    };
+    if supported {
+        return Ok(());
+    }
+
+    Err(agent_spawn_shell_error(
+        "agent_spawn_shell_unsupported",
+        "act_spawn_agent launcher shell preflight failed because the configured shell is not a supported PowerShell host",
+        json!({
+            "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+            "candidate": candidate,
+            "observed_file_name": name,
+            "supported_shells": if cfg!(windows) {
+                json!(["pwsh.exe", "powershell.exe"])
+            } else {
+                json!(["pwsh"])
+            },
+        }),
+    ))
+}
+
+fn resolve_agent_spawn_shell_candidate(
+    candidate: &str,
+    attempted: &mut Vec<String>,
+) -> Option<String> {
+    let candidate_path = Path::new(candidate);
+    if is_path_like_agent_spawn_shell(candidate) {
+        record_agent_spawn_shell_attempt(attempted, candidate_path);
+        return candidate_path
+            .is_file()
+            .then(|| display_agent_spawn_shell_path(candidate_path));
+    }
+
+    let names = agent_spawn_executable_names(candidate);
+    if let Some(path_value) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path_value) {
+            for name in &names {
+                let path = directory.join(name);
+                record_agent_spawn_shell_attempt(attempted, &path);
+                if path.is_file() {
+                    return Some(display_agent_spawn_shell_path(&path));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_path_like_agent_spawn_shell(candidate: &str) -> bool {
+    let path = Path::new(candidate);
+    path.is_absolute()
+        || candidate.contains('\\')
+        || candidate.contains('/')
+        || candidate
+            .as_bytes()
+            .get(1)
+            .is_some_and(|second| *second == b':')
+}
+
+fn agent_spawn_executable_names(candidate: &str) -> Vec<String> {
+    if Path::new(candidate).extension().is_some() {
+        return vec![candidate.to_owned()];
+    }
+
+    let mut names = vec![candidate.to_owned()];
+    for extension in agent_spawn_path_extensions() {
+        names.push(format!("{candidate}{extension}"));
+    }
+    names
+}
+
+#[cfg(windows)]
+fn agent_spawn_path_extensions() -> Vec<String> {
+    let mut extensions = std::env::var_os("PATHEXT")
+        .and_then(|value| value.into_string().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .filter_map(|extension| {
+                    let extension = extension.trim();
+                    (!extension.is_empty()).then(|| extension.to_owned())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                ".COM".to_owned(),
+                ".EXE".to_owned(),
+                ".BAT".to_owned(),
+                ".CMD".to_owned(),
+            ]
+        });
+    if !extensions
+        .iter()
+        .any(|extension| extension.eq_ignore_ascii_case(".exe"))
+    {
+        extensions.push(".EXE".to_owned());
+    }
+    extensions
+}
+
+#[cfg(not(windows))]
+fn agent_spawn_path_extensions() -> Vec<String> {
+    Vec::new()
+}
+
+fn record_agent_spawn_shell_attempt(attempted: &mut Vec<String>, path: &Path) {
+    if attempted.len() < AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT {
+        attempted.push(path.display().to_string());
+    }
+}
+
+fn display_agent_spawn_shell_path(path: &Path) -> String {
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path).display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn agent_spawn_shell_error(
+    reason: &'static str,
+    message: &'static str,
+    detail: Value,
+) -> ErrorData {
+    let mut data = Map::new();
+    data.insert("code".to_owned(), json!(error_codes::ACTION_TARGET_INVALID));
+    data.insert("reason".to_owned(), json!(reason));
+    data.insert("tool".to_owned(), json!(ACT_SPAWN_AGENT));
+    data.insert("detail".to_owned(), detail);
+    agent_spawn_tool_error(
+        error_codes::ACTION_TARGET_INVALID,
+        message,
+        Value::Object(data),
+    )
+}
+
+fn augment_agent_spawn_error_with_artifacts(
+    mut error: ErrorData,
+    files: &AgentSpawnFiles,
+    params: &ActSpawnAgentParams,
+    spawn_id: &str,
+    failure_stage: &'static str,
+    launch_target: Option<&str>,
+    completion_artifacts: Value,
+) -> ErrorData {
+    let mut data = match error.data.take() {
+        Some(Value::Object(data)) => data,
+        Some(source_data) => {
+            let mut data = Map::new();
+            data.insert("source_error_data".to_owned(), source_data);
+            data
+        }
+        None => Map::new(),
+    };
+    data.entry("code".to_owned())
+        .or_insert_with(|| json!(error_codes::ACTION_AGENT_SPAWN_FAILED));
+    data.entry("reason".to_owned())
+        .or_insert_with(|| json!(failure_stage));
+    data.insert("agent_spawn_failure_stage".to_owned(), json!(failure_stage));
+    data.insert("spawn_id".to_owned(), json!(spawn_id));
+    data.insert("cli".to_owned(), json!(params.cli.as_str()));
+    data.insert("mcp_url".to_owned(), json!(params.mcp_url));
+    data.insert(
+        "log_dir".to_owned(),
+        json!(files.log_dir.display().to_string()),
+    );
+    if let Some(launch_target) = launch_target {
+        data.insert("launch_target".to_owned(), json!(launch_target));
+    }
+    data.insert("completion_artifacts".to_owned(), completion_artifacts);
+    error.data = Some(Value::Object(data));
+    error
 }
 
 fn write_agent_spawn_daemon_terminal_artifacts(
