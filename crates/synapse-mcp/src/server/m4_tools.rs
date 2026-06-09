@@ -593,7 +593,7 @@ impl SynapseService {
         files: &AgentSpawnFiles,
     ) -> Result<MatchedSpawnSession, serde_json::Value> {
         let started = Instant::now();
-        let timeout = Duration::from_millis(u64::from(params.wait_timeout_ms));
+        let timeout = Duration::from_millis(params.wait_timeout_ms);
         let mut last_observed = json!({
             "reason": "no_matching_session_observed",
             "sessions": [],

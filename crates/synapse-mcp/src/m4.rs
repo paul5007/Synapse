@@ -34,16 +34,13 @@ use crate::{
 const MAX_COMBO_STEPS: usize = 256;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS: u64 = 90_000;
-const DEFAULT_LAUNCH_TIMEOUT_MS: u32 = 10_000;
-const MAX_LAUNCH_TIMEOUT_MS: u32 = 600_000;
+const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 10_000;
 #[cfg(windows)]
 const SW_HIDE: u16 = 0;
 #[cfg(windows)]
 const SW_SHOWNOACTIVATE: u16 = 4;
-const DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS: u32 = 120_000;
-const MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS: u32 = 600_000;
-const DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS: u32 = 60_000;
-const MAX_AGENT_SPAWN_HOLD_OPEN_MS: u32 = 3_600_000;
+const DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS: u64 = 60_000;
 const MAX_AGENT_SPAWN_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_SHELL_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
@@ -393,6 +390,10 @@ pub struct ActRunShellResponse {
     pub stderr: String,
     pub duration_ms: u32,
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -536,7 +537,10 @@ pub struct ShellSessionCleanupReadback {
     pub session_id: String,
     pub job_root: Option<String>,
     pub status_files_read: usize,
+    pub skipped_invalid_job_dirs: usize,
+    pub skipped_unreadable_status_files: usize,
     pub live_jobs_before: usize,
+    pub retained_live_jobs: usize,
     pub termination_attempted: usize,
     pub termination_succeeded: usize,
     pub failed: usize,
@@ -602,8 +606,8 @@ pub struct ActLaunchParams {
     pub env: BTreeMap<String, String>,
     pub wait_for_window_title_regex: Option<String>,
     #[serde(default = "default_launch_timeout_ms")]
-    #[schemars(default = "default_launch_timeout_ms", range(min = 1, max = 600_000))]
-    pub timeout_ms: u32,
+    #[schemars(default = "default_launch_timeout_ms", range(min = 1))]
+    pub timeout_ms: u64,
     pub idempotency_key: Option<String>,
     /// Controls CDP debug-port injection for Chromium-family targets (#684).
     /// `None` (default) = auto: inject `--remote-debugging-port=0` + a dedicated
@@ -693,20 +697,14 @@ pub struct ActSpawnAgentParams {
     pub mcp_url: String,
     /// Time to wait for a distinct MCP session/target registry readback.
     #[serde(default = "default_agent_spawn_wait_timeout_ms")]
-    #[schemars(
-        default = "default_agent_spawn_wait_timeout_ms",
-        range(min = 1, max = 600_000)
-    )]
-    pub wait_timeout_ms: u32,
+    #[schemars(default = "default_agent_spawn_wait_timeout_ms", range(min = 1))]
+    pub wait_timeout_ms: u64,
     /// Provision-only agents hold the primary process open long enough for
     /// manual readback; task prompts may continue doing useful work during this
     /// interval.
     #[serde(default = "default_agent_spawn_hold_open_ms")]
-    #[schemars(
-        default = "default_agent_spawn_hold_open_ms",
-        range(min = 0, max = 3_600_000)
-    )]
-    pub hold_open_ms: u32,
+    #[schemars(default = "default_agent_spawn_hold_open_ms", range(min = 0))]
+    pub hold_open_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -747,12 +745,12 @@ pub fn default_agent_spawn_mcp_url() -> String {
 }
 
 #[must_use]
-pub const fn default_agent_spawn_wait_timeout_ms() -> u32 {
+pub const fn default_agent_spawn_wait_timeout_ms() -> u64 {
     DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS
 }
 
 #[must_use]
-pub const fn default_agent_spawn_hold_open_ms() -> u32 {
+pub const fn default_agent_spawn_hold_open_ms() -> u64 {
     DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS
 }
 
@@ -781,18 +779,10 @@ pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), E
             "act_spawn_agent mcp_url must be an http:// or https:// URL",
         ));
     }
-    if params.wait_timeout_ms == 0 || params.wait_timeout_ms > MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS {
+    if params.wait_timeout_ms == 0 {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_spawn_agent wait_timeout_ms must be 1..={MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS}"
-            ),
-        ));
-    }
-    if params.hold_open_ms > MAX_AGENT_SPAWN_HOLD_OPEN_MS {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("act_spawn_agent hold_open_ms must be <= {MAX_AGENT_SPAWN_HOLD_OPEN_MS}"),
+            "act_spawn_agent wait_timeout_ms must be >= 1",
         ));
     }
     if let Some(prompt) = &params.prompt {
@@ -1096,6 +1086,8 @@ fn act_run_shell_background_response(
         stderr: String::new(),
         duration_ms,
         timed_out: false,
+        error_code: None,
+        error_message: None,
         stdout_truncated: false,
         stderr_truncated: false,
         session_id: job.session_id.clone(),
@@ -1233,10 +1225,7 @@ pub fn start_authorized_shell_job(
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
     let request_sha256 = run_shell_start_request_sha256(&params)?;
-    let (job_id, paths) = create_shell_job_paths(
-        context.map(ShellExecutionContext::session_id),
-        params.job_id.as_deref(),
-    )?;
+    let (job_id, paths) = create_shell_job_paths(params.job_id.as_deref())?;
     write_shell_job_request(&paths, &params, &request_sha256, context)?;
 
     let stdout_file = open_shell_job_output(&paths.stdout_path, "stdout", &job_id)?;
@@ -1360,7 +1349,6 @@ pub fn shell_job_status(
     }
     let paths = shell_job_paths_for_id(session_id, &params.job_id)?;
     let mut job = read_shell_job_status(&paths.status_path, &params.job_id)?;
-    ensure_shell_job_session_owner(&job, session_id)?;
     job = reconcile_shell_job_process_state(job, &paths)?;
     let mut running = shell_job_process_still_running(&job);
     if shell_job_live_status(&job.status) && !running {
@@ -1407,7 +1395,6 @@ pub fn cancel_shell_job(
     validate_shell_job_id(&params.job_id)?;
     let paths = shell_job_paths_for_id(session_id, &params.job_id)?;
     let mut job = read_shell_job_status(&paths.status_path, &params.job_id)?;
-    ensure_shell_job_session_owner(&job, session_id)?;
     let before_status = job.status.clone();
     let mut cancel_requested = false;
     let mut termination_attempted = false;
@@ -1462,14 +1449,17 @@ pub fn cleanup_shell_jobs_for_session(
     reason: &str,
 ) -> Result<ShellSessionCleanupReadback, ErrorData> {
     validate_shell_session_id(session_id)?;
-    let root = shell_job_root_dir_for_session(Some(session_id))?;
+    let root = shell_durable_job_root_dir()?;
     if !root.exists() {
         return Ok(ShellSessionCleanupReadback {
             reason: reason.to_owned(),
             session_id: session_id.to_owned(),
             job_root: Some(path_string(&root)),
             status_files_read: 0,
+            skipped_invalid_job_dirs: 0,
+            skipped_unreadable_status_files: 0,
             live_jobs_before: 0,
+            retained_live_jobs: 0,
             termination_attempted: 0,
             termination_succeeded: 0,
             failed: 0,
@@ -1483,7 +1473,10 @@ pub fn cleanup_shell_jobs_for_session(
         session_id: session_id.to_owned(),
         job_root: Some(path_string(&root)),
         status_files_read: 0,
+        skipped_invalid_job_dirs: 0,
+        skipped_unreadable_status_files: 0,
         live_jobs_before: 0,
+        retained_live_jobs: 0,
         termination_attempted: 0,
         termination_succeeded: 0,
         failed: 0,
@@ -1526,78 +1519,56 @@ pub fn cleanup_shell_jobs_for_session(
             .and_then(|name| name.to_str())
             .map(ToOwned::to_owned)
         else {
-            readback.failed = readback.failed.saturating_add(1);
+            readback.skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs.saturating_add(1);
+            tracing::warn!(
+                code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_JOB_DIR_NAME_INVALID",
+                session_id,
+                reason,
+                path = %path_string(&job_dir),
+                "act_run_shell session cleanup skipped a job directory with a non-utf8 name"
+            );
             continue;
         };
         if validate_shell_job_id(&job_id).is_err() {
-            readback.failed = readback.failed.saturating_add(1);
+            readback.skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs.saturating_add(1);
+            tracing::warn!(
+                code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_JOB_ID_INVALID",
+                session_id,
+                reason,
+                job_id,
+                path = %path_string(&job_dir),
+                "act_run_shell session cleanup skipped a job directory with an invalid job id"
+            );
             continue;
         }
         let paths = shell_job_paths_from_root(&root, &job_id);
-        let mut job = match read_shell_job_status(&paths.status_path, &job_id) {
+        let job = match read_shell_job_status(&paths.status_path, &job_id) {
             Ok(job) => job,
             Err(error) => {
-                readback.failed = readback.failed.saturating_add(1);
-                tracing::error!(
-                    code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_STATUS_READ_FAILED",
+                readback.skipped_unreadable_status_files =
+                    readback.skipped_unreadable_status_files.saturating_add(1);
+                tracing::warn!(
+                    code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_STATUS_READ_SKIPPED",
                     session_id,
                     reason,
                     job_id,
+                    path = %path_string(&paths.status_path),
                     detail = %error.message,
-                    "act_run_shell session cleanup could not read a job status file"
+                    "act_run_shell session cleanup skipped a durable job whose status was not readable yet"
                 );
                 continue;
             }
         };
         readback.status_files_read = readback.status_files_read.saturating_add(1);
         if ensure_shell_job_session_owner(&job, Some(session_id)).is_err() {
-            readback.failed = readback.failed.saturating_add(1);
             continue;
         }
         if !shell_job_live_status(&job.status) {
             continue;
         }
         readback.live_jobs_before = readback.live_jobs_before.saturating_add(1);
+        readback.retained_live_jobs = readback.retained_live_jobs.saturating_add(1);
         readback.job_ids.push(job_id.clone());
-        job.cancel_requested = true;
-        job.status = "cancel_requested".to_owned();
-        if let Err(error) = write_shell_job_status(&paths.status_path, &job) {
-            readback.failed = readback.failed.saturating_add(1);
-            tracing::error!(
-                code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_STATUS_WRITE_FAILED",
-                session_id,
-                reason,
-                job_id,
-                detail = %error.message,
-                "act_run_shell session cleanup could not mark a job cancel_requested"
-            );
-            continue;
-        }
-        let Some(pid) = job.pid else {
-            readback.failed = readback.failed.saturating_add(1);
-            continue;
-        };
-        readback.termination_attempted = readback.termination_attempted.saturating_add(1);
-        let termination = terminate_shell_job_process_tree(pid);
-        readback
-            .remaining_process_ids
-            .extend(termination.remaining_process_ids.iter().copied());
-        if termination.remaining_process_ids.is_empty() {
-            readback.termination_succeeded = readback.termination_succeeded.saturating_add(1);
-        } else {
-            readback.failed = readback.failed.saturating_add(1);
-        }
-        if let Err(error) = reconcile_shell_job_process_state(job, &paths) {
-            readback.failed = readback.failed.saturating_add(1);
-            tracing::error!(
-                code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_RECONCILE_FAILED",
-                session_id,
-                reason,
-                job_id,
-                detail = %error.message,
-                "act_run_shell session cleanup could not reconcile a terminated job"
-            );
-        }
     }
     readback.remaining_process_ids.sort_unstable();
     readback.remaining_process_ids.dedup();
@@ -1607,7 +1578,10 @@ pub fn cleanup_shell_jobs_for_session(
         reason,
         job_root = ?readback.job_root,
         status_files_read = readback.status_files_read,
+        skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs,
+        skipped_unreadable_status_files = readback.skipped_unreadable_status_files,
         live_jobs_before = readback.live_jobs_before,
+        retained_live_jobs = readback.retained_live_jobs,
         termination_attempted = readback.termination_attempted,
         termination_succeeded = readback.termination_succeeded,
         failed = readback.failed,
@@ -2138,7 +2112,7 @@ async fn verify_launched_chromium_url(
     params: &ActLaunchParams,
     cdp_launch: Option<&ChromiumCdpLaunch>,
     cdp: &LaunchedCdp,
-    timeout_ms: u32,
+    timeout_ms: u64,
 ) -> Result<Option<VerifiedCdpTarget>, ErrorData> {
     let Some(expected_url) = launch_requested_url(&params.args) else {
         return Ok(None);
@@ -2173,7 +2147,7 @@ async fn verify_launched_chromium_url(
             )
         })?;
     let started = Instant::now();
-    let timeout = Duration::from_millis(u64::from(timeout_ms));
+    let timeout = Duration::from_millis(timeout_ms);
     let mut last_error: Option<String>;
     let mut last_targets = Vec::new();
     loop {
@@ -2295,7 +2269,7 @@ fn launch_url_verification_error(
     reason: &'static str,
     expected_url: &str,
     endpoint: Option<&str>,
-    timeout_ms: u32,
+    timeout_ms: u64,
     last_error: Option<String>,
     observed_targets: &[serde_json::Value],
 ) -> ErrorData {
@@ -2657,10 +2631,10 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
             "act_launch target must not be empty",
         ));
     }
-    if params.timeout_ms == 0 || params.timeout_ms > MAX_LAUNCH_TIMEOUT_MS {
+    if params.timeout_ms == 0 {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("act_launch timeout_ms must be 1..={MAX_LAUNCH_TIMEOUT_MS}"),
+            "act_launch timeout_ms must be >= 1",
         ));
     }
     if let Some(pattern) = &params.wait_for_window_title_regex {
@@ -3443,13 +3417,13 @@ impl WindowWaitResult {
 async fn wait_for_launch_window(
     pid: u32,
     title_regex: &regex::Regex,
-    timeout_ms: u32,
+    timeout_ms: u64,
     excluded_hwnds: &HashSet<i64>,
     launch_target_name: &str,
     launch_args: &[String],
 ) -> Result<WindowWaitResult, ErrorData> {
     let started = Instant::now();
-    let timeout = Duration::from_millis(u64::from(timeout_ms));
+    let timeout = Duration::from_millis(timeout_ms);
     let mut last_error: Option<String>;
     let mut last_windows = Vec::new();
     loop {
@@ -3536,7 +3510,7 @@ fn launch_window_error(
     reason: &'static str,
     pid: u32,
     title_regex: &str,
-    timeout_ms: u32,
+    timeout_ms: u64,
     last_error: Option<String>,
     observed_windows: &[serde_json::Value],
 ) -> ErrorData {
@@ -3722,10 +3696,9 @@ fn validate_shell_job_id(job_id: &str) -> Result<(), ErrorData> {
 }
 
 fn create_shell_job_paths(
-    session_id: Option<&str>,
     requested_job_id: Option<&str>,
 ) -> Result<(String, ShellJobPaths), ErrorData> {
-    let root = shell_job_root_dir_for_session(session_id)?;
+    let root = shell_durable_job_root_dir()?;
     fs::create_dir_all(&root).map_err(|error| {
         shell_tool_error(
             error_codes::STORAGE_WRITE_FAILED,
@@ -3808,8 +3781,18 @@ fn shell_job_paths_for_id(
     job_id: &str,
 ) -> Result<ShellJobPaths, ErrorData> {
     validate_shell_job_id(job_id)?;
-    let root = shell_job_root_dir_for_session(session_id)?;
-    Ok(shell_job_paths_from_root(&root, job_id))
+    let durable_paths = shell_job_paths_from_root(&shell_durable_job_root_dir()?, job_id);
+    if durable_paths.status_path.exists() {
+        return Ok(durable_paths);
+    }
+    if let Some(session_id) = session_id {
+        let legacy_paths =
+            shell_job_paths_from_root(&shell_job_root_dir_for_session(Some(session_id))?, job_id);
+        if legacy_paths.status_path.exists() {
+            return Ok(legacy_paths);
+        }
+    }
+    Ok(durable_paths)
 }
 
 fn shell_job_paths_from_root(root: &Path, job_id: &str) -> ShellJobPaths {
@@ -3871,6 +3854,10 @@ fn shell_job_root_dir_for_session(session_id: Option<&str>) -> Result<PathBuf, E
     };
     validate_shell_session_id(session_id)?;
     Ok(root.join(shell_session_dir_name(session_id)))
+}
+
+fn shell_durable_job_root_dir() -> Result<PathBuf, ErrorData> {
+    Ok(shell_job_root_dir()?.join("jobs"))
 }
 
 fn shell_session_root_dir() -> Result<PathBuf, ErrorData> {
@@ -4356,6 +4343,15 @@ async fn monitor_shell_job(
         status.status = "wait_failed".to_owned();
         status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
         status.error_message = Some(error);
+    } else if status.timed_out {
+        status.status =
+            terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
+                .to_owned();
+        let timeout_ms = status.timeout_ms.unwrap_or_default();
+        status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
+        status.error_message = Some(format!(
+            "caller timeout_ms budget expired after {timeout_ms} ms; process tree termination was requested"
+        ));
     } else {
         status.status =
             terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
@@ -4863,12 +4859,15 @@ async fn run_allowlisted_shell(
     let (exit_code, timed_out) = wait_shell_child(&mut spawned.child, params.timeout_ms).await?;
     let stdout = join_capped_stream(stdout_task, "stdout").await?;
     let stderr = join_capped_stream(stderr_task, "stderr").await?;
+    let (error_code, error_message) = shell_budget_error(timed_out, params.timeout_ms);
     Ok(ActRunShellResponse {
         exit_code,
         stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
         duration_ms: elapsed_ms_u32(started),
         timed_out,
+        error_code,
+        error_message,
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
         session_id: context.map(|context| context.session_id().to_owned()),
@@ -4883,6 +4882,19 @@ async fn run_allowlisted_shell(
         job_id: None,
         job: None,
     })
+}
+
+fn shell_budget_error(timed_out: bool, timeout_ms: u64) -> (Option<String>, Option<String>) {
+    if timed_out {
+        (
+            Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned()),
+            Some(format!(
+                "caller timeout_ms budget expired after {timeout_ms} ms; process tree termination was requested"
+            )),
+        )
+    } else {
+        (None, None)
+    }
 }
 
 struct SpawnedShellChild {
@@ -5388,7 +5400,7 @@ const fn default_shell_job_tail_bytes() -> u64 {
     SHELL_JOB_TAIL_DEFAULT_BYTES
 }
 
-const fn default_launch_timeout_ms() -> u32 {
+const fn default_launch_timeout_ms() -> u64 {
     DEFAULT_LAUNCH_TIMEOUT_MS
 }
 
@@ -5737,7 +5749,7 @@ mod tests {
         }
     }
 
-    fn launch_params(target: &str, args: Vec<&str>, timeout_ms: u32) -> ActLaunchParams {
+    fn launch_params(target: &str, args: Vec<&str>, timeout_ms: u64) -> ActLaunchParams {
         ActLaunchParams {
             target: target.to_owned(),
             args: args.into_iter().map(str::to_owned).collect(),
@@ -6623,6 +6635,17 @@ mod tests {
 
         assert_eq!(response.exit_code, None);
         assert!(response.timed_out);
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some(error_codes::ACTION_BUDGET_EXPIRED)
+        );
+        assert!(
+            response
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("500 ms")),
+            "{response:?}"
+        );
         assert!(response.duration_ms < 2_000, "{response:?}");
     }
 
@@ -6704,26 +6727,162 @@ mod tests {
         panic!("background job {job_id} did not complete within the regression readback window");
     }
 
-    #[test]
-    fn launch_rejects_timeout_outside_schema_bounds() {
-        for timeout_ms in [0, MAX_LAUNCH_TIMEOUT_MS + 1] {
-            let params = launch_params("notepad.exe", Vec::new(), timeout_ms);
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_durable_timeout_persists_budget_expired_code() {
+        let timeout_ms = 200;
+        let args = vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "Start-Sleep -Milliseconds 2000".to_owned(),
+        ];
+        let auth_params = shell_params(
+            "powershell.exe",
+            args.iter().map(String::as_str).collect(),
+            timeout_ms,
+        );
+        let authorization = authorize_run_shell(&shell_config_for(&auth_params), &auth_params)
+            .unwrap_or_else(|error| panic!("durable timeout shell should authorize: {error}"));
+        let started = start_authorized_shell_job(
+            ActRunShellStartParams {
+                command: "powershell.exe".to_owned(),
+                args,
+                working_dir: None,
+                env: BTreeMap::new(),
+                timeout_ms: Some(timeout_ms),
+                job_id: None,
+            },
+            &authorization,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("durable timeout shell should start: {error}"));
+        let job_id = started.job.job_id.clone();
 
-            let error = match validate_launch_params(&params) {
-                Ok(()) => panic!("timeout {timeout_ms} should reject"),
-                Err(error) => error,
-            };
-
+        for _ in 0..100 {
+            let status = shell_job_status(
+                &ActRunShellStatusParams {
+                    job_id: job_id.clone(),
+                    tail_bytes: 4096,
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("durable timeout status should read: {error}"));
+            println!("readback=act_run_shell_start edge=timeout_budget after=status:{status:?}");
+            if status.job.status == "finalizing" || status.running {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            assert_eq!(status.job.status, "timed_out");
+            assert!(status.job.timed_out);
             assert_eq!(
-                error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("code"))
-                    .and_then(|code| code.as_str()),
-                Some(error_codes::TOOL_PARAMS_INVALID)
+                status.job.error_code.as_deref(),
+                Some(error_codes::ACTION_BUDGET_EXPIRED)
             );
-            assert!(error.message.contains("timeout_ms must be"));
+            assert!(
+                status
+                    .job
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("200 ms")),
+                "{status:?}"
+            );
+            return;
         }
+
+        panic!("durable timeout job {job_id} did not finish within the regression readback window");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_session_cleanup_retains_live_durable_jobs() {
+        let args = vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "Start-Sleep -Milliseconds 5000".to_owned(),
+        ];
+        let auth_params = shell_params(
+            "powershell.exe",
+            args.iter().map(String::as_str).collect(),
+            30_000,
+        );
+        let authorization = authorize_run_shell(&shell_config_for(&auth_params), &auth_params)
+            .unwrap_or_else(|error| panic!("durable cleanup shell should authorize: {error}"));
+        let context = shell_execution_context_for_session("issue812-cleanup-retain-session")
+            .unwrap_or_else(|error| panic!("shell context should build: {error}"));
+        let started = start_authorized_shell_job(
+            ActRunShellStartParams {
+                command: "powershell.exe".to_owned(),
+                args,
+                working_dir: None,
+                env: BTreeMap::new(),
+                timeout_ms: Some(30_000),
+                job_id: None,
+            },
+            &authorization,
+            Some(&context),
+        )
+        .unwrap_or_else(|error| panic!("durable cleanup shell should start: {error}"));
+        let job_id = started.job.job_id.clone();
+
+        let cleanup = cleanup_shell_jobs_for_session(context.session_id(), "regression_stale")
+            .unwrap_or_else(|error| panic!("session cleanup readback should succeed: {error}"));
+        println!("readback=act_run_shell_session_cleanup edge=retain after={cleanup:?}");
+        assert_eq!(cleanup.live_jobs_before, 1);
+        assert_eq!(cleanup.retained_live_jobs, 1);
+        assert_eq!(cleanup.termination_attempted, 0);
+        assert_eq!(cleanup.failed, 0);
+        assert!(cleanup.job_ids.contains(&job_id));
+
+        let retained = shell_job_status(
+            &ActRunShellStatusParams {
+                job_id: job_id.clone(),
+                tail_bytes: 4096,
+            },
+            Some("fresh-session-after-cleanup"),
+        )
+        .unwrap_or_else(|error| panic!("fresh session should read retained durable job: {error}"));
+        println!("readback=act_run_shell_status edge=retained after={retained:?}");
+        assert!(retained.running);
+        assert_eq!(retained.job.status, "running");
+        assert!(!retained.job.cancel_requested);
+
+        let cancelled = cancel_shell_job(
+            &ActRunShellJobIdParams {
+                job_id: job_id.clone(),
+            },
+            Some("fresh-session-after-cleanup"),
+        )
+        .unwrap_or_else(|error| {
+            panic!("fresh session should cancel retained durable job: {error}")
+        });
+        println!("readback=act_run_shell_cancel edge=retained_cleanup after={cancelled:?}");
+        assert!(matches!(
+            cancelled.status.job.status.as_str(),
+            "cancelled" | "timed_out" | "exited_unobserved"
+        ));
+    }
+
+    #[test]
+    fn launch_rejects_zero_timeout_and_accepts_large_caller_budget() {
+        let zero = launch_params("notepad.exe", Vec::new(), 0);
+        let error = match validate_launch_params(&zero) {
+            Ok(()) => panic!("zero timeout should reject"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(|code| code.as_str()),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(error.message.contains("timeout_ms must be >= 1"));
+
+        let large = launch_params("notepad.exe", Vec::new(), 1_200_000);
+        validate_launch_params(&large)
+            .unwrap_or_else(|error| panic!("large explicit caller timeout should accept: {error}"));
     }
 
     #[test]
@@ -6881,6 +7040,8 @@ mod tests {
             stderr: String::new(),
             duration_ms: 12,
             timed_out: false,
+            error_code: None,
+            error_message: None,
             stdout_truncated: false,
             stderr_truncated: false,
             session_id: Some("session-a".to_owned()),
@@ -6918,6 +7079,8 @@ mod tests {
             stderr: String::new(),
             duration_ms: 10,
             timed_out: false,
+            error_code: None,
+            error_message: None,
             stdout_truncated: false,
             stderr_truncated: false,
             session_id: Some("session-a".to_owned()),

@@ -212,7 +212,10 @@ pub struct SessionCdpCleanupReport {
 pub struct SessionShellCleanupReport {
     pub job_root: Option<String>,
     pub status_files_read: usize,
+    pub skipped_invalid_job_dirs: usize,
+    pub skipped_unreadable_status_files: usize,
     pub live_jobs_before: usize,
+    pub retained_live_jobs: usize,
     pub termination_attempted: usize,
     pub termination_succeeded: usize,
     pub failed: usize,
@@ -977,7 +980,10 @@ fn cleanup_shell_jobs(session_id: &str, reason: &str) -> SessionShellCleanupRepo
         Ok(readback) => SessionShellCleanupReport {
             job_root: readback.job_root,
             status_files_read: readback.status_files_read,
+            skipped_invalid_job_dirs: readback.skipped_invalid_job_dirs,
+            skipped_unreadable_status_files: readback.skipped_unreadable_status_files,
             live_jobs_before: readback.live_jobs_before,
+            retained_live_jobs: readback.retained_live_jobs,
             termination_attempted: readback.termination_attempted,
             termination_succeeded: readback.termination_succeeded,
             failed: readback.failed,
