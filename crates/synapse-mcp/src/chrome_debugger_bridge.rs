@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
+    path::PathBuf,
     process::ExitCode,
     sync::{
         Mutex, OnceLock,
@@ -9,7 +10,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use axum::{
     Json,
     extract::Query,
@@ -33,6 +34,8 @@ const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger and register the native host with scripts\\install-synapse-chrome-debugger.ps1; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk native_host=com.synapse.chrome_debugger";
+const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
+const APPDATA_ENV: &str = "APPDATA";
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeHostInvocation {
@@ -829,7 +832,7 @@ pub(crate) async fn run_native_host(
     bind: &str,
     invocation: NativeHostInvocation,
 ) -> anyhow::Result<ExitCode> {
-    let token = crate::http::load_token_value().context("load Synapse HTTP bearer token")?;
+    let token = load_token_value().context("load Synapse HTTP bearer token")?;
     let base_url = http_base_url(bind);
     let client = reqwest::Client::new();
     let pid = std::process::id();
@@ -906,6 +909,35 @@ pub(crate) async fn run_native_host(
             }
         }
     }
+}
+
+fn load_token_value() -> anyhow::Result<String> {
+    match token_file_path() {
+        Some(path) if path.is_file() => {
+            let token = std::fs::read_to_string(&path)
+                .with_context(|| format!("read HTTP bearer token file {}", path.display()))?;
+            normalize_token(&token)
+                .with_context(|| format!("HTTP bearer token file is empty: {}", path.display()))
+        }
+        Some(_) | None => {
+            let token = std::env::var(TOKEN_ENV)
+                .with_context(|| format!("{TOKEN_ENV} is unset and token.txt is absent"))?;
+            normalize_token(&token).with_context(|| format!("{TOKEN_ENV} is empty"))
+        }
+    }
+}
+
+fn token_file_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os(APPDATA_ENV)?;
+    Some(PathBuf::from(appdata).join("synapse").join("token.txt"))
+}
+
+fn normalize_token(raw: &str) -> anyhow::Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        bail!("empty token")
+    }
+    Ok(token.to_owned())
 }
 
 async fn read_native_messages(

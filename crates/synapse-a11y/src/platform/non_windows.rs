@@ -5,8 +5,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     A11yError, A11yResult, AccessibleEvent, ElementClickAction, ElementMetadataReadback,
-    ElementSearchScope, ElementValueReadback, ElementValueSetReadback, ExpandState,
-    ForegroundActivationIntent, UIElement, UiaWorkerReadback, WinEventHookReadback,
+    ElementScrollReadback, ElementSearchScope, ElementValueReadback, ElementValueSetReadback,
+    ExpandState, ForegroundActivationIntent, UIElement, UiaWorkerReadback, WinEventHookReadback,
 };
 
 pub struct WinEventSubscription {
@@ -220,6 +220,18 @@ pub fn element_value(_id: &ElementId) -> A11yResult<ElementValueReadback> {
 pub fn element_metadata(_id: &ElementId) -> A11yResult<ElementMetadataReadback> {
     Err(A11yError::not_available(
         "UIA element metadata readback requires Windows",
+    ))
+}
+
+pub fn scroll_element(_id: &ElementId, _dy: i32, _dx: i32) -> A11yResult<ElementScrollReadback> {
+    Err(A11yError::not_available(
+        "UIA element scrolling requires Windows",
+    ))
+}
+
+pub fn element_scroll_state(_id: &ElementId) -> A11yResult<crate::ElementScrollStateReadback> {
+    Err(A11yError::not_available(
+        "UIA element scroll state readback requires Windows",
     ))
 }
 

@@ -932,6 +932,32 @@ impl SynapseService {
         let verify_timeout_ms = params.verify_timeout_ms;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
+        let foreground_guard = if params.uses_element_target() {
+            match act_scroll_target_foreground_guard(&params) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    let result: Result<ActScrollResponse, ErrorData> = Err(error);
+                    self.audit_action_result_for_request("act_scroll", &result, &request_context)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
+        let foreground_before = if foreground_guard.is_some() {
+            match self.current_audit_foreground() {
+                Ok(foreground) => Some(foreground),
+                Err(error) => {
+                    let result: Result<ActScrollResponse, ErrorData> = Err(
+                        act_scroll_foreground_read_error("before", "unknown", &error),
+                    );
+                    self.audit_action_result_for_request("act_scroll", &result, &request_context)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
         let _lease_guard = if params.requires_input_lease() {
             match acquire_tool_foreground_input_lease("act_scroll", &request_context) {
                 Ok(guard) => Some(guard),
@@ -951,6 +977,35 @@ impl SynapseService {
                     .await
             }
             (other, _) => other,
+        };
+        let result = match (result, foreground_guard, foreground_before) {
+            (Ok(response), Some(guard), Some(before)) if !response.required_foreground => {
+                let source_of_truth = response
+                    .postcondition
+                    .source_of_truth
+                    .as_deref()
+                    .unwrap_or("act_scroll.background_target");
+                match self.current_audit_foreground() {
+                    Ok(after) => {
+                        match verify_background_target_not_activated(
+                            "act_scroll",
+                            source_of_truth,
+                            guard,
+                            &before,
+                            &after,
+                        ) {
+                            Ok(()) => Ok(response),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(act_scroll_foreground_read_error(
+                        "after",
+                        source_of_truth,
+                        &error,
+                    )),
+                }
+            }
+            (other, _, _) => other,
         };
         self.audit_action_result_for_request("act_scroll", &result, &request_context)?;
         result.map(Json)
@@ -3984,6 +4039,43 @@ fn act_set_value_target_foreground_guard(
     })
 }
 
+fn act_scroll_target_foreground_guard(
+    params: &ActScrollParams,
+) -> Result<BackgroundTargetForegroundGuard, ErrorData> {
+    let Some(target) = params.target.as_ref() else {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            "act_scroll foreground guard requires target.element_id",
+        ));
+    };
+    let hwnd = target
+        .element_id
+        .parts()
+        .map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "act_scroll element id {} could not be parsed for foreground guard: {error}",
+                    target.element_id
+                ),
+            )
+        })?
+        .hwnd;
+    let root_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "act_scroll element id {} HWND 0x{hwnd:x} could not be normalized to a live top-level target root for foreground guard: {error}",
+                target.element_id
+            ),
+        )
+    })?;
+    Ok(BackgroundTargetForegroundGuard {
+        element_hwnd: hwnd,
+        root_hwnd,
+    })
+}
+
 fn verify_background_target_not_activated(
     tool: &'static str,
     action_source_of_truth: &str,
@@ -4104,6 +4196,40 @@ fn act_set_value_foreground_read_error(
                 "message": error.message.to_string(),
                 "data": error.data.clone(),
             },
+        })),
+    )
+}
+
+fn act_scroll_foreground_read_error(
+    stage: &'static str,
+    action_source_of_truth: &str,
+    error: &ErrorData,
+) -> ErrorData {
+    let detail = format!(
+        "act_scroll could not read foreground {stage} background dispatch: {}",
+        error.message
+    );
+    tracing::error!(
+        code = error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+        tool = "act_scroll",
+        stage,
+        source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+        action_source_of_truth,
+        error = %error.message,
+        "background scroll foreground read failed"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            "reason": "background_foreground_read_failed",
+            "tool": "act_scroll",
+            "stage": stage,
+            "source_of_truth": BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+            "action_source_of_truth": action_source_of_truth,
+            "required_foreground": false,
+            "detail": detail,
         })),
     )
 }
@@ -4306,6 +4432,36 @@ mod tests {
             data.pointer("/foreground_after/hwnd")
                 .and_then(Value::as_i64),
             Some(200)
+        );
+    }
+
+    #[test]
+    fn act_scroll_background_guard_rejects_target_activation() {
+        let before = foreground_context(100, 10, "Code.exe", "before");
+        let after = foreground_context(200, 20, "notepad.exe", "after");
+        let target = BackgroundTargetForegroundGuard {
+            element_hwnd: 150,
+            root_hwnd: 200,
+        };
+
+        let error = verify_background_target_not_activated(
+            "act_scroll",
+            "uia_scroll_pattern.scroll_state",
+            target,
+            &before,
+            &after,
+        )
+        .expect_err("background scroll must fail if a UIA provider activates the target");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(data.get("tool").and_then(Value::as_str), Some("act_scroll"));
+        assert_eq!(
+            data.get("action_source_of_truth").and_then(Value::as_str),
+            Some("uia_scroll_pattern.scroll_state")
         );
     }
 

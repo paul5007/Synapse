@@ -4,10 +4,13 @@ use synapse_core::{ElementId, Rect};
 use uiautomation::{
     UIAutomation, UIElement,
     patterns::{
-        UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern,
-        UISelectionItemPattern, UITogglePattern, UIValuePattern,
+        UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern, UIScrollItemPattern,
+        UIScrollPattern, UISelectionItemPattern, UITogglePattern, UIValuePattern,
     },
-    types::{ElementMode, ExpandCollapseState, Handle, Rect as UiaRect, TreeScope, UIProperty},
+    types::{
+        ElementMode, ExpandCollapseState, Handle, Rect as UiaRect, ScrollAmount, TreeScope,
+        UIProperty,
+    },
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
@@ -18,8 +21,8 @@ use windows::Win32::{
 };
 
 use crate::{
-    A11yError, A11yResult, ElementClickAction, ElementMetadataReadback, ElementValueReadback,
-    ElementValueSetReadback, ExpandState,
+    A11yError, A11yResult, ElementClickAction, ElementMetadataReadback, ElementScrollReadback,
+    ElementScrollStateReadback, ElementValueReadback, ElementValueSetReadback, ExpandState,
 };
 
 use super::common::{
@@ -39,6 +42,8 @@ const SUPPORTED_CLICK_PATTERNS: [&str; 5] = [
     "ExpandCollapsePattern",
     "LegacyIAccessiblePattern.DoDefaultAction",
 ];
+const SUPPORTED_SCROLL_PATTERNS: [&str; 2] = ["ScrollPattern", "ScrollItemPattern"];
+const MAX_UIA_SCROLL_PATTERN_CALLS: u32 = 1024;
 
 #[derive(Clone, Copy, Debug)]
 enum ClickPatternKind {
@@ -877,6 +882,216 @@ pub fn element_metadata(id: &ElementId) -> A11yResult<ElementMetadataReadback> {
             value: cached_value(&element),
         })
     })
+}
+
+pub fn scroll_element(id: &ElementId, dy: i32, dx: i32) -> A11yResult<ElementScrollReadback> {
+    let id = id.clone();
+    with_automation(move |automation| {
+        let element = re_resolve_on_worker(automation, &id)?;
+        if !cached_bool(&element, UIProperty::IsEnabled) {
+            return Err(A11yError::ElementNotEnabled {
+                detail: format!("element {id} IsEnabled=false before UIA scroll dispatch"),
+            });
+        }
+
+        let before = scroll_state_from_element(&element)?;
+        let mut unsupported_reasons = Vec::new();
+        let scroll_pattern: Result<UIScrollPattern, _> = element.get_pattern();
+        match scroll_pattern {
+            Ok(pattern) => {
+                let steps = uia_scroll_steps(dy, dx)?;
+                for step in &steps {
+                    pattern
+                        .scroll(step.horizontal, step.vertical)
+                        .map_err(|err| {
+                            pattern_operation_error(&id, "ScrollPattern", "scroll", &err)
+                        })?;
+                }
+                let after = scroll_state_from_element(&element)?;
+                return Ok(ElementScrollReadback {
+                    method: "uia_scroll_pattern".to_owned(),
+                    before,
+                    after,
+                    requested_dy: dy,
+                    requested_dx: dx,
+                    scroll_call_count: u32::try_from(steps.len()).unwrap_or(u32::MAX),
+                });
+            }
+            Err(err) => unsupported_reasons.push(format!("ScrollPattern not exposed: {err}")),
+        }
+
+        let scroll_item_pattern: Result<UIScrollItemPattern, _> = element.get_pattern();
+        match scroll_item_pattern {
+            Ok(pattern) => {
+                pattern.scroll_into_view().map_err(|err| {
+                    pattern_operation_error(&id, "ScrollItemPattern", "scroll_into_view", &err)
+                })?;
+                let after = scroll_state_from_element(&element)?;
+                Ok(ElementScrollReadback {
+                    method: "uia_scroll_item_pattern".to_owned(),
+                    before,
+                    after,
+                    requested_dy: dy,
+                    requested_dx: dx,
+                    scroll_call_count: 1,
+                })
+            }
+            Err(err) => {
+                unsupported_reasons.push(format!("ScrollItemPattern not exposed: {err}"));
+                Err(unsupported_scroll_pattern(
+                    &id,
+                    &element,
+                    &unsupported_reasons,
+                ))
+            }
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+struct UiaScrollStep {
+    horizontal: ScrollAmount,
+    vertical: ScrollAmount,
+}
+
+fn uia_scroll_steps(dy: i32, dx: i32) -> A11yResult<Vec<UiaScrollStep>> {
+    let step_count = dy.unsigned_abs().max(dx.unsigned_abs());
+    if step_count > MAX_UIA_SCROLL_PATTERN_CALLS {
+        return Err(A11yError::ElementPatternUnsupported {
+            detail: format!(
+                "requested UIA ScrollPattern call count {step_count} exceeds max {MAX_UIA_SCROLL_PATTERN_CALLS}"
+            ),
+        });
+    }
+    let capacity = usize::try_from(step_count)
+        .map_err(|err| A11yError::internal(format!("UIA scroll step count overflow: {err}")))?;
+    let mut vertical_ticks_remaining = dy;
+    let mut horizontal_ticks_remaining = dx;
+    let mut steps = Vec::with_capacity(capacity);
+    for _ in 0..step_count {
+        let vertical_tick = take_scroll_tick(&mut vertical_ticks_remaining);
+        let horizontal_tick = take_scroll_tick(&mut horizontal_ticks_remaining);
+        steps.push(UiaScrollStep {
+            horizontal: horizontal_scroll_amount(horizontal_tick),
+            vertical: vertical_scroll_amount(vertical_tick),
+        });
+    }
+    Ok(steps)
+}
+
+fn take_scroll_tick(value: &mut i32) -> i32 {
+    match (*value).cmp(&0) {
+        std::cmp::Ordering::Less => {
+            *value += 1;
+            -1
+        }
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => {
+            *value -= 1;
+            1
+        }
+    }
+}
+
+const fn vertical_scroll_amount(tick: i32) -> ScrollAmount {
+    if tick > 0 {
+        ScrollAmount::SmallDecrement
+    } else if tick < 0 {
+        ScrollAmount::SmallIncrement
+    } else {
+        ScrollAmount::NoAmount
+    }
+}
+
+const fn horizontal_scroll_amount(tick: i32) -> ScrollAmount {
+    if tick > 0 {
+        ScrollAmount::SmallDecrement
+    } else if tick < 0 {
+        ScrollAmount::SmallIncrement
+    } else {
+        ScrollAmount::NoAmount
+    }
+}
+
+pub fn element_scroll_state(id: &ElementId) -> A11yResult<ElementScrollStateReadback> {
+    let id = id.clone();
+    with_automation(move |automation| {
+        let element = re_resolve_on_worker(automation, &id)?;
+        scroll_state_from_element(&element)
+    })
+}
+
+fn scroll_state_from_element(element: &UIElement) -> A11yResult<ElementScrollStateReadback> {
+    let bbox = element_rect(element)?;
+    let scroll_pattern: Result<UIScrollPattern, _> = element.get_pattern();
+    let Ok(pattern) = scroll_pattern else {
+        return Ok(ElementScrollStateReadback {
+            bbox,
+            horizontal_scroll_percent: None,
+            vertical_scroll_percent: None,
+            horizontal_view_size: None,
+            vertical_view_size: None,
+            horizontally_scrollable: None,
+            vertically_scrollable: None,
+        });
+    };
+
+    Ok(ElementScrollStateReadback {
+        bbox,
+        horizontal_scroll_percent: finite_scroll_value(
+            pattern
+                .get_horizontal_scroll_percent()
+                .map_err(map_uia_error)?,
+        ),
+        vertical_scroll_percent: finite_scroll_value(
+            pattern
+                .get_vertical_scroll_percent()
+                .map_err(map_uia_error)?,
+        ),
+        horizontal_view_size: finite_scroll_value(
+            pattern.get_horizontal_view_size().map_err(map_uia_error)?,
+        ),
+        vertical_view_size: finite_scroll_value(
+            pattern.get_vertical_view_size().map_err(map_uia_error)?,
+        ),
+        horizontally_scrollable: Some(
+            pattern
+                .is_horizontally_scrollable()
+                .map_err(map_uia_error)?,
+        ),
+        vertically_scrollable: Some(pattern.is_vertically_scrollable().map_err(map_uia_error)?),
+    })
+}
+
+fn finite_scroll_value(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn unsupported_scroll_pattern(
+    id: &ElementId,
+    element: &UIElement,
+    unsupported_reasons: &[String],
+) -> A11yError {
+    let name = element.get_cached_name().unwrap_or_default();
+    let role = cached_role(element);
+    let automation_id = element.get_cached_automation_id().unwrap_or_default();
+    let patterns = cached_patterns(element);
+    tracing::warn!(
+        code = "A11Y_SCROLL_CONTROL_PATTERN_UNSUPPORTED",
+        element_id = %id,
+        element_name = %name,
+        element_role = %role,
+        automation_id = %automation_id,
+        patterns = ?patterns,
+        attempted_patterns = ?SUPPORTED_SCROLL_PATTERNS,
+        unsupported_reasons = ?unsupported_reasons,
+        "UIA element does not expose a supported scroll control pattern; no coordinate fallback synthesized"
+    );
+    A11yError::ElementPatternUnsupported {
+        detail: format!(
+            "element {id} does not expose a supported UIA scroll control pattern; name={name:?} role={role:?} automation_id={automation_id:?}; patterns={patterns:?}; attempted_patterns={SUPPORTED_SCROLL_PATTERNS:?}; unsupported_reasons={unsupported_reasons:?}"
+        ),
+    }
 }
 
 pub fn expand_state_of(element: &UIElement) -> A11yResult<ExpandState> {

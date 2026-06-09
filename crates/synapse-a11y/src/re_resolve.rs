@@ -78,6 +78,31 @@ pub struct ElementMetadataReadback {
     pub value: Option<String>,
 }
 
+/// UIA scroll state read separately from the target element.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ElementScrollStateReadback {
+    pub bbox: Rect,
+    pub horizontal_scroll_percent: Option<f64>,
+    pub vertical_scroll_percent: Option<f64>,
+    pub horizontal_view_size: Option<f64>,
+    pub vertical_view_size: Option<f64>,
+    pub horizontally_scrollable: Option<bool>,
+    pub vertically_scrollable: Option<bool>,
+}
+
+/// Readback from scrolling an element through UIA control patterns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ElementScrollReadback {
+    pub method: String,
+    pub before: ElementScrollStateReadback,
+    pub after: ElementScrollStateReadback,
+    pub requested_dy: i32,
+    pub requested_dx: i32,
+    pub scroll_call_count: u32,
+}
+
 /// Resolves an element and reads its current bounding rectangle as plain data.
 ///
 /// # Errors
@@ -150,6 +175,30 @@ pub fn element_value(id: &ElementId) -> A11yResult<ElementValueReadback> {
 /// non-Windows.
 pub fn element_metadata(id: &ElementId) -> A11yResult<ElementMetadataReadback> {
     platform::element_metadata(id)
+}
+
+/// Scrolls a re-resolved element through UIA `ScrollPattern` or
+/// `ScrollItemPattern` and returns before/after target readback.
+///
+/// # Errors
+///
+/// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
+/// typed unsupported-pattern error when neither scroll pattern is available, a
+/// structured UIA error for pattern method failures, or `A11Y_NOT_AVAILABLE`
+/// on non-Windows platforms.
+pub fn scroll_element(id: &ElementId, dy: i32, dx: i32) -> A11yResult<ElementScrollReadback> {
+    platform::scroll_element(id, dy, dx)
+}
+
+/// Reads a re-resolved element's current UIA scroll state without mutating it.
+///
+/// # Errors
+///
+/// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
+/// structured UIA error for state read failures, or `A11Y_NOT_AVAILABLE` on
+/// non-Windows platforms.
+pub fn element_scroll_state(id: &ElementId) -> A11yResult<ElementScrollStateReadback> {
+    platform::element_scroll_state(id)
 }
 
 /// Read-only mirror of `uiautomation::types::ExpandCollapseState`. Kept

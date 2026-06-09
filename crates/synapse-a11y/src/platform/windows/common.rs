@@ -217,6 +217,7 @@ pub(super) fn create_cache_request(
         UIProperty::IsExpandCollapsePatternAvailable,
         UIProperty::IsLegacyIAccessiblePatternAvailable,
         UIProperty::IsScrollPatternAvailable,
+        UIProperty::IsScrollItemPatternAvailable,
         UIProperty::IsTextPatternAvailable,
         UIProperty::IsWindowPatternAvailable,
         UIProperty::IsTransformPatternAvailable,
@@ -292,6 +293,12 @@ pub(super) fn cached_patterns(element: &UIElement) -> Vec<UiaPattern> {
         &mut patterns,
         UIProperty::IsScrollPatternAvailable,
         UiaPattern::Scroll,
+    );
+    push_pattern(
+        element,
+        &mut patterns,
+        UIProperty::IsScrollItemPatternAvailable,
+        UiaPattern::ScrollItem,
     );
     push_pattern(
         element,
@@ -421,6 +428,7 @@ pub(super) const fn pattern_property(pattern: UiaPattern) -> UIProperty {
         UiaPattern::ExpandCollapse => UIProperty::IsExpandCollapsePatternAvailable,
         UiaPattern::LegacyIAccessible => UIProperty::IsLegacyIAccessiblePatternAvailable,
         UiaPattern::Scroll => UIProperty::IsScrollPatternAvailable,
+        UiaPattern::ScrollItem => UIProperty::IsScrollItemPatternAvailable,
         UiaPattern::Text => UIProperty::IsTextPatternAvailable,
         UiaPattern::Window => UIProperty::IsWindowPatternAvailable,
         UiaPattern::Transform => UIProperty::IsTransformPatternAvailable,

@@ -24,10 +24,11 @@ use chromiumoxide::cdp::browser_protocol::input::{
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, GetLayoutMetricsParams, Viewport,
 };
-use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
+use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
 
 use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
 
@@ -90,6 +91,18 @@ pub struct CdpActiveElementState {
     pub value: String,
     pub selection_start: Option<u32>,
     pub selection_end: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CdpRuntimeScrollDispatch {
+    is_connected: bool,
+    default_prevented: bool,
+    target_scroll_left_before: f64,
+    target_scroll_top_before: f64,
+    target_scroll_left_after: f64,
+    target_scroll_top_after: f64,
+    target_tag: String,
+    target_id: String,
 }
 
 /// Which pointer button a CDP click uses.
@@ -343,25 +356,34 @@ pub async fn cdp_scroll_node(
     deltas: Vec<CdpWheelDelta>,
     interval_ms: u32,
 ) -> A11yResult<CdpActionPoint> {
-    with_node_center(
+    with_node_page(
         endpoint,
         page_title_hint,
         target_id_hint,
         backend_node_id,
-        |page, center| async move {
-            page.execute(mouse_event(
-                DispatchMouseEventType::MouseMoved,
-                center,
-                MouseButton::None,
-                0,
-            ))
-            .await
-            .map_err(|err| dispatch_err(&err))?;
+        |page| async move {
+            let rect = node_content_rect(&page, backend_node_id).await?;
+            let center = CdpActionPoint {
+                x: f64::from(rect.x) + f64::from(rect.w) / 2.0,
+                y: f64::from(rect.y) + f64::from(rect.h) / 2.0,
+            };
             let last_index = deltas.len().saturating_sub(1);
             for (index, delta) in deltas.into_iter().enumerate() {
-                page.execute(wheel_event(center, delta))
-                    .await
-                    .map_err(|err| dispatch_err(&err))?;
+                let dispatch = dispatch_dom_scroll(&page, backend_node_id, delta).await?;
+                tracing::debug!(
+                    code = "A11Y_CDP_DOM_SCROLL_DISPATCHED",
+                    backend_node_id,
+                    delta_x = delta.delta_x,
+                    delta_y = delta.delta_y,
+                    target_tag = %dispatch.target_tag,
+                    target_id = %dispatch.target_id,
+                    default_prevented = dispatch.default_prevented,
+                    before_left = dispatch.target_scroll_left_before,
+                    before_top = dispatch.target_scroll_top_before,
+                    after_left = dispatch.target_scroll_left_after,
+                    after_top = dispatch.target_scroll_top_after,
+                    "CDP Runtime.callFunctionOn dispatched background DOM scroll"
+                );
                 if interval_ms > 0 && index < last_index {
                     tokio::time::sleep(std::time::Duration::from_millis(u64::from(interval_ms)))
                         .await;
@@ -371,6 +393,109 @@ pub async fn cdp_scroll_node(
         },
     )
     .await
+}
+
+async fn dispatch_dom_scroll(
+    page: &chromiumoxide::Page,
+    backend_node_id: i64,
+    delta: CdpWheelDelta,
+) -> A11yResult<CdpRuntimeScrollDispatch> {
+    let resolve = ResolveNodeParams::builder()
+        .backend_node_id(BackendNodeId::new(backend_node_id))
+        .object_group("synapse_scroll_dispatch")
+        .build();
+    let resolved = page
+        .execute(resolve)
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
+        })?;
+    let object_id =
+        resolved
+            .object
+            .object_id
+            .clone()
+            .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "resolveNode for backendNodeId {backend_node_id} returned no objectId"
+                ),
+            })?;
+    let call = CallFunctionOnParams::builder()
+        .function_declaration(
+            r#"function(deltaX, deltaY) {
+                const node = this;
+                const doc = (node && node.ownerDocument) || document;
+                const win = doc.defaultView || window;
+                const root = doc.scrollingElement || doc.documentElement || doc.body;
+                function isElement(value) {
+                    return Boolean(value && value.nodeType === 1);
+                }
+                function isScrollable(element) {
+                    if (!isElement(element)) { return false; }
+                    const style = win.getComputedStyle(element);
+                    const overflowY = style.overflowY || "";
+                    const overflowX = style.overflowX || "";
+                    const canY = /(auto|scroll|overlay)/.test(overflowY)
+                        && element.scrollHeight > element.clientHeight;
+                    const canX = /(auto|scroll|overlay)/.test(overflowX)
+                        && element.scrollWidth > element.clientWidth;
+                    return canY || canX;
+                }
+                let container = isElement(node) ? node : node.parentElement;
+                while (container && container !== root && !isScrollable(container)) {
+                    container = container.parentElement;
+                }
+                const target = (container && isScrollable(container)) ? container : root;
+                const beforeLeft = Number(target.scrollLeft || win.scrollX || 0);
+                const beforeTop = Number(target.scrollTop || win.scrollY || 0);
+                const eventTarget = isElement(node) ? node : target;
+                const event = new win.WheelEvent("wheel", {
+                    deltaX,
+                    deltaY,
+                    bubbles: true,
+                    cancelable: true,
+                    view: win
+                });
+                const defaultAllowed = eventTarget.dispatchEvent(event);
+                if (defaultAllowed) {
+                    if (target === root) {
+                        win.scrollBy(deltaX, deltaY);
+                    } else if (typeof target.scrollBy === "function") {
+                        target.scrollBy({ left: deltaX, top: deltaY, behavior: "auto" });
+                    } else {
+                        target.scrollLeft += deltaX;
+                        target.scrollTop += deltaY;
+                    }
+                }
+                return {
+                    is_connected: Boolean(node && node.isConnected),
+                    default_prevented: !defaultAllowed,
+                    target_scroll_left_before: beforeLeft,
+                    target_scroll_top_before: beforeTop,
+                    target_scroll_left_after: Number(target.scrollLeft || win.scrollX || 0),
+                    target_scroll_top_after: Number(target.scrollTop || win.scrollY || 0),
+                    target_tag: String(target.tagName || "DOCUMENT"),
+                    target_id: String(target.id || "")
+                };
+            }"#,
+        )
+        .object_id(object_id)
+        .argument(CallArgument::builder().value(json!(delta.delta_x)).build())
+        .argument(CallArgument::builder().value(json!(delta.delta_y)).build())
+        .return_by_value(true)
+        .silent(true)
+        .build()
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("build Runtime.callFunctionOn scroll-dispatch params: {err}"),
+        })?;
+    let dispatch: CdpRuntimeScrollDispatch =
+        call_function_on_value(page, call, "scroll-dispatch").await?;
+    if !dispatch.is_connected {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!("backendNodeId {backend_node_id} resolved to a detached DOM node"),
+        });
+    }
+    Ok(dispatch)
 }
 
 /// Reads a web node's semantic value/text via CDP after resolving the exact
@@ -629,16 +754,6 @@ fn mouse_event(
     params.click_count = Some(click_count);
     params.buttons = Some(if is_pressed { bit } else { 0 });
     params.button = Some(button);
-    params
-}
-
-fn wheel_event(point: CdpActionPoint, delta: CdpWheelDelta) -> DispatchMouseEventParams {
-    let mut params =
-        DispatchMouseEventParams::new(DispatchMouseEventType::MouseWheel, point.x, point.y);
-    params.delta_x = Some(delta.delta_x);
-    params.delta_y = Some(delta.delta_y);
-    params.buttons = Some(0);
-    params.button = Some(MouseButton::None);
     params
 }
 

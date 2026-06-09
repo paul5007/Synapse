@@ -1,5 +1,5 @@
 param(
-    [string]$SynapseMcpExe = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
+    [string]$SynapseNativeHostExe = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
     [string]$ExtensionId = "leoocgnkjnplbfdbklajepahofecgfbk"
 )
 
@@ -11,8 +11,8 @@ $manifestPath = Join-Path $extensionDir 'manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     throw "SYNAPSE_CHROME_EXTENSION_MANIFEST_MISSING path=$manifestPath"
 }
-if (-not (Test-Path -LiteralPath $SynapseMcpExe -PathType Leaf)) {
-    throw "SYNAPSE_CHROME_NATIVE_HOST_BINARY_MISSING path=$SynapseMcpExe remediation=build/install synapse-mcp first"
+if (-not (Test-Path -LiteralPath $SynapseNativeHostExe -PathType Leaf)) {
+    throw "SYNAPSE_CHROME_NATIVE_HOST_BINARY_MISSING path=$SynapseNativeHostExe remediation=build/install synapse-chrome-native-host first"
 }
 
 $nativeRoot = Join-Path $env:APPDATA 'synapse\chrome-debugger'
@@ -22,8 +22,8 @@ $hostName = 'com.synapse.chrome_debugger'
 $hostManifestPath = Join-Path $nativeRoot "$hostName.json"
 $hostManifest = [ordered]@{
     name = $hostName
-    description = 'Synapse Chrome debugger native-messaging bridge'
-    path = (Resolve-Path -LiteralPath $SynapseMcpExe).Path
+    description = 'Synapse Chrome debugger native-messaging bridge (no-console host)'
+    path = (Resolve-Path -LiteralPath $SynapseNativeHostExe).Path
     type = 'stdio'
     allowed_origins = @("chrome-extension://$ExtensionId/")
 }

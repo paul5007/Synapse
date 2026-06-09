@@ -83,6 +83,7 @@ pub enum UiaPattern {
     ExpandCollapse,
     LegacyIAccessible,
     Scroll,
+    ScrollItem,
     Text,
     Window,
     Transform,

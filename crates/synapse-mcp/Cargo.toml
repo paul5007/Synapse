@@ -10,6 +10,10 @@ repository.workspace = true
 name = "synapse-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "synapse-chrome-native-host"
+path = "src/bin/synapse-chrome-native-host.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

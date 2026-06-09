@@ -39,6 +39,10 @@ const MAX_SMOOTH_SCROLL_STEPS: u32 = 120;
 const WHEEL_DELTA: i32 = 120;
 #[cfg(windows)]
 const MAX_TARGETED_WHEEL_MESSAGES: usize = 1024;
+#[cfg(windows)]
+const SOURCE_UIA_SCROLL_PATTERN: &str = "uia_scroll_pattern.scroll_state";
+#[cfg(windows)]
+const SOURCE_UIA_SCROLL_ITEM: &str = "uia_scroll_item_pattern.bounding_rect";
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -116,14 +120,18 @@ pub async fn act_scroll_with_handle(
                 return execute_cdp_scroll(&params, &target.element_id, backend_node_id, started)
                     .await;
             }
+            return execute_uia_scroll(&params, &target.element_id, started).await;
         }
-        return Err(mcp_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!(
-                "act_scroll target.element_id {} is not a CDP web element id; element-target scroll currently requires a cdcd backendNodeId",
-                target.element_id
-            ),
-        ));
+        #[cfg(not(windows))]
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "act_scroll target.element_id {} is not a CDP web element id; UIA element-target scroll requires Windows ScrollPattern or ScrollItemPattern",
+                    target.element_id
+                ),
+            ));
+        }
     }
 
     let actions = scroll_actions(&params)?;
@@ -301,6 +309,114 @@ async fn execute_cdp_scroll(
     let mut response = response(params, true, wheel_event_count, "cdp", started);
     response.postcondition = postcondition;
     Ok(response)
+}
+
+#[cfg(windows)]
+async fn execute_uia_scroll(
+    params: &ActScrollParams,
+    element_id: &ElementId,
+    started: Instant,
+) -> Result<ActScrollResponse, ErrorData> {
+    let mut readback =
+        synapse_a11y::scroll_element(element_id, params.dy, params.dx).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("act_scroll UIA target scroll failed for element {element_id}: {error}"),
+            )
+        })?;
+    if params.verify_delta {
+        tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
+        readback.after = synapse_a11y::element_scroll_state(element_id).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "act_scroll UIA Source-of-Truth readback failed for element {element_id}: {error}"
+                ),
+            )
+        })?;
+    }
+
+    let postcondition = uia_scroll_postcondition(params, &readback)?;
+    let backend_used = uia_scroll_backend_used(&readback);
+    tracing::info!(
+        code = "M2_ACT_SCROLL_UIA_PATTERN",
+        kind = "act_scroll",
+        element_id = %element_id,
+        method = %readback.method,
+        backend_used,
+        dy = params.dy,
+        dx = params.dx,
+        scroll_call_count = readback.scroll_call_count,
+        verify_delta = params.verify_delta,
+        before = ?readback.before,
+        after = ?readback.after,
+        "readback=uia_scroll_state tool=act_scroll uia_scroll_after"
+    );
+
+    let mut response = response(
+        params,
+        true,
+        usize::try_from(readback.scroll_call_count).unwrap_or(usize::MAX),
+        backend_used,
+        started,
+    );
+    response.postcondition = postcondition;
+    Ok(response)
+}
+
+#[cfg(windows)]
+fn uia_scroll_postcondition(
+    params: &ActScrollParams,
+    readback: &synapse_a11y::ElementScrollReadback,
+) -> Result<ActPostcondition, ErrorData> {
+    let source_of_truth = uia_scroll_source_of_truth(readback);
+    if !params.verify_delta {
+        return Ok(postcondition_not_requested("act_scroll", source_of_truth));
+    }
+    let before_signature = hash_json(&readback.before)?;
+    let after_signature = hash_json(&readback.after)?;
+    if readback.before == readback.after {
+        return Err(no_observed_delta_error(
+            "act_scroll",
+            source_of_truth,
+            params.verify_timeout_ms,
+            before_signature,
+            after_signature,
+            json!({
+                "method": readback.method,
+                "requested_dy": readback.requested_dy,
+                "requested_dx": readback.requested_dx,
+                "scroll_call_count": readback.scroll_call_count,
+                "before": &readback.before,
+                "after": &readback.after,
+            }),
+        ));
+    }
+    Ok(postcondition_observed_delta(
+        "act_scroll",
+        source_of_truth,
+        before_signature,
+        after_signature,
+        "observed UIA target scroll state change after control-pattern dispatch",
+    ))
+}
+
+#[cfg(windows)]
+fn uia_scroll_backend_used(readback: &synapse_a11y::ElementScrollReadback) -> &'static str {
+    if readback.method == "uia_scroll_item_pattern" {
+        "uia_scroll_item_pattern"
+    } else {
+        "uia_scroll_pattern"
+    }
+}
+
+#[cfg(windows)]
+fn uia_scroll_source_of_truth(readback: &synapse_a11y::ElementScrollReadback) -> &'static str {
+    if readback.method == "uia_scroll_item_pattern" {
+        SOURCE_UIA_SCROLL_ITEM
+    } else {
+        SOURCE_UIA_SCROLL_PATTERN
+    }
 }
 
 #[cfg(windows)]
@@ -554,12 +670,19 @@ fn response(
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested(
             "act_scroll",
-            if params.target.is_some() {
-                "cdp_node.scroll_state"
-            } else {
-                "target_point_pixels_or_foreground_ui"
-            },
+            response_source_of_truth(params, scrolled),
         ),
+    }
+}
+
+fn response_source_of_truth(params: &ActScrollParams, scrolled: bool) -> &'static str {
+    if !scrolled {
+        return "not_applicable.no_scroll";
+    }
+    if params.target.is_some() {
+        "cdp_node.scroll_state"
+    } else {
+        "target_point_pixels_or_foreground_ui"
     }
 }
 
@@ -570,6 +693,9 @@ fn scroll_backend_tier_used(
 ) -> &'static str {
     if !scrolled {
         return "none";
+    }
+    if backend_used == "uia_scroll_pattern" || backend_used == "uia_scroll_item_pattern" {
+        return "uia";
     }
     if params.target.is_some() || backend_used == "cdp" {
         return "cdp";
@@ -981,5 +1107,21 @@ mod tests {
             "readback=act_scroll_targeted_chunks edge=negative before_ticks={before_ticks} after_chunks={after:?}"
         );
         assert_eq!(after, [-2400]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uia_target_backend_tier_reports_uia_not_cdp() {
+        let params = ActScrollParams {
+            dy: -1,
+            target: Some(ActScrollElementTarget {
+                element_id: synapse_core::element_id(1, "aa"),
+            }),
+            ..ActScrollParams::default()
+        };
+
+        let tier = scroll_backend_tier_used(&params, true, "uia_scroll_pattern");
+        assert_eq!(tier, "uia");
+        assert!(!scroll_required_foreground(tier));
     }
 }
