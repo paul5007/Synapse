@@ -30,6 +30,9 @@ The normal-profile `chrome.tabs` bridge is also refused at runtime when the
 current Chrome profile/process readback shows any external extension or native
 host with `debugger` or `nativeMessaging`, because those surfaces can create the
 same operator-visible debugger/native-host popup when tab events occur.
+On unsafe hosts, the daemon refuses the direct bridge registration itself with
+`A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED`, and the extension backs off its
+reconnect alarm instead of repeatedly waking the normal Chrome profile.
 
 ## Diagnostics
 

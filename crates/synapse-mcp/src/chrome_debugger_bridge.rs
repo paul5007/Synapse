@@ -171,6 +171,16 @@ impl ChromeDebuggerBridgeError {
             ),
         }
     }
+
+    fn normal_bridge_registration_external_popup_risk(risks: &[String]) -> Self {
+        Self {
+            code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+            detail: format!(
+                "normal Synapse Chrome Bridge refused direct registration before accepting a Chrome-hosted command channel; reason=the current Chrome profile/process Source of Truth is not popup-free because another active extension or native host can use debugger/nativeMessaging; external_chrome_popup_risk={} remediation=apply Chrome ExtensionSettings wildcard blocked_permissions=[debugger,nativeMessaging], disable/remove the named external extension/native host, refresh or restart Chrome, then rerun scripts\\install-synapse-chrome-debugger.ps1; use raw CDP from a Synapse-launched automation profile for background browser work until the normal profile is certified",
+                format_external_chrome_popup_risks(risks)
+            ),
+        }
+    }
 }
 
 fn external_chrome_surface_hint() -> String {
@@ -220,6 +230,21 @@ fn ensure_normal_bridge_popup_safe(
         risk_count = risks.len(),
         detail = %error.detail(),
         "normal Chrome bridge refused command because live Chrome popup-risk Source of Truth is not clean"
+    );
+    Err(error)
+}
+
+fn ensure_normal_bridge_registration_popup_safe() -> Result<(), ChromeDebuggerBridgeError> {
+    let risks = external_chrome_popup_risks();
+    if risks.is_empty() {
+        return Ok(());
+    }
+    let error = ChromeDebuggerBridgeError::normal_bridge_registration_external_popup_risk(&risks);
+    tracing::warn!(
+        code = error.code(),
+        risk_count = risks.len(),
+        detail = %error.detail(),
+        "normal Chrome bridge refused registration because live Chrome popup-risk Source of Truth is not clean"
     );
     Err(error)
 }
@@ -1379,6 +1404,19 @@ pub(crate) fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: 
 }
 
 pub(crate) async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Response {
+    if request.transport.as_deref() == Some("direct_http") {
+        if let Err(error) = ensure_normal_bridge_registration_popup_safe() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "code": error.code(),
+                    "detail": error.detail(),
+                })),
+            )
+                .into_response();
+        }
+    }
     match bridge().register(request) {
         Ok(response) => Json(response).into_response(),
         Err(detail) => (
@@ -2179,6 +2217,30 @@ mod tests {
         assert!(error.detail().contains("before queueing it to Chrome"));
         assert!(error.detail().contains("Source of Truth is not popup-free"));
         assert!(error.detail().contains("ExtensionSettings wildcard"));
+        assert!(error.detail().contains("fcoeoabgfenejglbffodgkkbkcdhcgfn"));
+        assert!(error.detail().contains("raw CDP"));
+    }
+
+    #[test]
+    fn normal_bridge_registration_external_popup_risk_is_local_refusal() {
+        let risks = vec![
+            "profile=Profile 5 pref=Secure Preferences extension_id=fcoeoabgfenejglbffodgkkbkcdhcgfn name=\"Claude\" active_api=debugger,nativeMessaging".to_owned(),
+            "native_messaging_process pid=26616 name=cmd.exe extension_id=fcoeoabgfenejglbffodgkkbkcdhcgfn".to_owned(),
+        ];
+        let error =
+            ChromeDebuggerBridgeError::normal_bridge_registration_external_popup_risk(&risks);
+
+        assert_eq!(
+            error.code(),
+            error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED
+        );
+        assert_eq!(error.cdp_status(), CdpStatus::AttachFailed);
+        assert!(
+            error
+                .detail()
+                .contains("refused direct registration before accepting")
+        );
+        assert!(error.detail().contains("Source of Truth is not popup-free"));
         assert!(error.detail().contains("fcoeoabgfenejglbffodgkkbkcdhcgfn"));
         assert!(error.detail().contains("raw CDP"));
     }

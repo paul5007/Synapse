@@ -30,6 +30,14 @@ daemon asks through the fixed extension origin and daemon-issued bridge token.
 The normal bridge does not call `runtime.connectNative()`, so Chrome does not
 create a native-host `cmd.exe` wrapper on end-user systems.
 
+Registration is also fail-closed. If the daemon sees any live Chrome
+profile/process Source of Truth that is not popup-free, it refuses the direct
+bridge registration with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before
+accepting a Chrome-hosted command channel. The service worker treats that exact
+error as an unsafe-profile condition and backs off to a 30 minute reconnect
+alarm instead of retrying every second. This keeps the failure visible while
+preventing repeated background wakeups on an unsafe end-user Chrome profile.
+
 Background tab commands (`openTab`, `closeTab`, and `navigateTab`) use
 `chrome.tabs.create`, `chrome.tabs.remove`, `chrome.tabs.update`,
 `chrome.tabs.reload`, `chrome.tabs.goBack`, and `chrome.tabs.goForward`. They do
@@ -63,7 +71,9 @@ surface found at that moment. A remaining end-user debugger/native-host popup is
 therefore attributed to a concrete extension or process instead of being
 reported as an ambiguous Synapse bridge failure. Background normal-profile tab
 commands follow the same runtime guard; they are available only after the
-external profile/process readback is popup-free.
+external profile/process readback is popup-free. If registration itself is
+refused, normal-profile tab commands are unavailable; use raw CDP on a dedicated
+Synapse-launched automation profile until policy/profile readback is clean.
 
 The full Windows setup script applies the supported Chrome policy remediation by
 default:

@@ -10,6 +10,9 @@ const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
 const WEBSOCKET_KEEPALIVE_MS = 20000;
 const RECONNECT_ALARM_NAME = "synapse-daemon-reconnect";
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
+const RECONNECT_DELAY_MS = 30000;
+const UNSAFE_PROFILE_RECONNECT_ALARM_PERIOD_MINUTES = 30;
+const UNSAFE_PROFILE_RECONNECT_DELAY_MS = UNSAFE_PROFILE_RECONNECT_ALARM_PERIOD_MINUTES * 60 * 1000;
 
 let hostId = null;
 let bridgeToken = null;
@@ -19,15 +22,29 @@ let webSocket = null;
 let keepAliveTimer = null;
 
 function startBridge() {
-  ensureReconnectAlarm();
+  ensureReconnectAlarm(RECONNECT_ALARM_PERIOD_MINUTES, { preserveLonger: true });
   connectDaemon();
 }
 
-function ensureReconnectAlarm() {
+async function ensureReconnectAlarm(periodInMinutes, options = {}) {
+  const preserveLonger = Boolean(options.preserveLonger);
+  let existing = null;
+  try {
+    existing = await chrome.alarms.get(RECONNECT_ALARM_NAME);
+  } catch (error) {
+    console.error(`Synapse daemon bridge alarm read failed: ${errorMessage(error)}`);
+  }
+  if (
+    preserveLonger &&
+    typeof existing?.periodInMinutes === "number" &&
+    existing.periodInMinutes > periodInMinutes
+  ) {
+    return;
+  }
   chrome.alarms
     .create(RECONNECT_ALARM_NAME, {
-      delayInMinutes: RECONNECT_ALARM_PERIOD_MINUTES,
-      periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES
+      delayInMinutes: periodInMinutes,
+      periodInMinutes
     })
     .catch((error) => {
       console.error(`Synapse daemon bridge alarm setup failed: ${errorMessage(error)}`);
@@ -50,7 +67,13 @@ function connectDaemon() {
   }
   connectInFlight = registerDaemon()
     .catch((error) => {
-      scheduleReconnect(`direct daemon register failed: ${errorMessage(error)}`);
+      const unsafeProfile = error?.code === ERROR_DEBUGGER_WARNING_UNSUPPRESSED;
+      scheduleReconnect(`direct daemon register failed: ${errorMessage(error)}`, {
+        delayMs: unsafeProfile ? UNSAFE_PROFILE_RECONNECT_DELAY_MS : RECONNECT_DELAY_MS,
+        alarmPeriodMinutes: unsafeProfile
+          ? UNSAFE_PROFILE_RECONNECT_ALARM_PERIOD_MINUTES
+          : RECONNECT_ALARM_PERIOD_MINUTES
+      });
     })
     .finally(() => {
       connectInFlight = null;
@@ -79,6 +102,7 @@ async function registerDaemon() {
   }
   hostId = registered.host_id;
   bridgeToken = registered.bridge_token;
+  ensureReconnectAlarm(RECONNECT_ALARM_PERIOD_MINUTES);
   await postDaemonMessage({
     type: "hello",
     extensionId: chrome.runtime.id,
@@ -90,18 +114,26 @@ async function registerDaemon() {
   connectWebSocket();
 }
 
-function scheduleReconnect(detail) {
+function scheduleReconnect(detail, options = {}) {
   closeWebSocket();
   hostId = null;
   bridgeToken = null;
+  const delayMs = Number.isFinite(options.delayMs) ? Math.max(1000, options.delayMs) : RECONNECT_DELAY_MS;
+  const alarmPeriodMinutes = Number.isFinite(options.alarmPeriodMinutes)
+    ? Math.max(RECONNECT_ALARM_PERIOD_MINUTES, options.alarmPeriodMinutes)
+    : RECONNECT_ALARM_PERIOD_MINUTES;
+  ensureReconnectAlarm(alarmPeriodMinutes);
   if (reconnectTimer) {
     return;
   }
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectDaemon();
-  }, 1000);
-  console.warn(`Synapse daemon bridge disconnected: ${detail}`);
+  }, delayMs);
+  console.warn(
+    `Synapse daemon bridge disconnected: ${detail}; reconnectDelayMs=${delayMs}; ` +
+      `alarmPeriodMinutes=${alarmPeriodMinutes}`
+  );
 }
 
 function connectWebSocket() {
@@ -676,9 +708,15 @@ async function daemonFetchJson(path, options = {}) {
     }
   }
   if (!response.ok) {
-    throw new Error(
+    const error = new Error(
       `daemon ${init.method} ${path} failed status=${response.status} body=${JSON.stringify(value ?? text)}`
     );
+    if (value?.code) {
+      error.code = value.code;
+    }
+    error.status = response.status;
+    error.responseBody = value ?? text;
+    throw error;
   }
   return value;
 }
