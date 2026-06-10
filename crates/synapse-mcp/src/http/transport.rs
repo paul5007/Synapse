@@ -347,6 +347,10 @@ fn router(
             "/chrome-debugger/native/next",
             get(crate::chrome_debugger_bridge::http_next),
         )
+        .route(
+            "/chrome-debugger/native/ws",
+            get(crate::chrome_debugger_bridge::http_ws),
+        )
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn_with_state(
             session_request,

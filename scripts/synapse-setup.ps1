@@ -56,9 +56,10 @@
   Loopback address the daemon binds. Default 127.0.0.1:7700.
 
 .PARAMETER ChromeNativeHostExePath
-  Installed path for the Chrome native-messaging bridge. Setup builds this
-  binary with the daemon and installs it next to synapse-mcp.exe so Chrome
-  bridge restart fixes are not left stale after daemon updates.
+  Legacy diagnostic native-host path. The normal end-user Chrome bridge uses
+  direct localhost HTTP registration plus WebSocket command delivery; setup
+  does not install or launch native messaging because Chrome may create a
+  visible cmd.exe wrapper for native hosts.
 
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
@@ -2108,9 +2109,6 @@ if (-not $SkipBuild) {
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
-    $builtChromeNativeHost = Join-Path $CargoTarget 'release\synapse-chrome-native-host.exe'
-    if (-not (Test-Path $builtChromeNativeHost)) { Die "Build reported success but $builtChromeNativeHost is missing." }
-    Info "Built Chrome native host: $builtChromeNativeHost ($([math]::Round((Get-Item $builtChromeNativeHost).Length/1MB,1)) MB)"
 }
 
 # ---------------------------------------------------------------------------
@@ -2221,34 +2219,20 @@ $ver = (& $ExePath --version) 2>&1
 Info "Installed binary reports: $ver"
 Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
 
-if (-not $SkipBuild) {
-    Step "Installing Chrome native host -> $ChromeNativeHostExePath"
-    $nativeHostSourceHash = Get-SynapseFileSha256 -Path $builtChromeNativeHost
-    Stop-SynapseChromeNativeHostProcesses -Reason 'install_chrome_native_host' -NativeHostExePath $ChromeNativeHostExePath
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ChromeNativeHostExePath) | Out-Null
-    $nativeHostOldHash = $null
-    if (Test-Path -LiteralPath $ChromeNativeHostExePath) {
-        $nativeHostOldHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
-        $nativeHostBackupPath = "$ChromeNativeHostExePath.bak"
-        Copy-Item -LiteralPath $ChromeNativeHostExePath -Destination $nativeHostBackupPath -Force
-        $nativeHostBackupHash = Get-SynapseFileSha256 -Path $nativeHostBackupPath
-        if ($nativeHostBackupHash -ne $nativeHostOldHash) {
-            Die "SYNAPSE_CHROME_NATIVE_HOST_BACKUP_HASH_MISMATCH installed=$ChromeNativeHostExePath backup=$nativeHostBackupPath installed_hash=$nativeHostOldHash backup_hash=$nativeHostBackupHash remediation=backup bytes changed during copy; refusing to install candidate"
-        }
-        Info "Backed up old Chrome native host -> $nativeHostBackupPath sha256=$nativeHostBackupHash"
-    }
-    Copy-Item -LiteralPath $builtChromeNativeHost -Destination $ChromeNativeHostExePath -Force
-    if (-not (Test-Path -LiteralPath $ChromeNativeHostExePath)) {
-        Die "SYNAPSE_CHROME_NATIVE_HOST_INSTALL_MISSING path=$ChromeNativeHostExePath remediation=setup could not find the installed Chrome native host binary after copy"
-    }
-    $nativeHostInstalledHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
-    if ($nativeHostInstalledHash -ne $nativeHostSourceHash) {
-        Die "SYNAPSE_CHROME_NATIVE_HOST_HASH_MISMATCH path=$ChromeNativeHostExePath expected_sha256=$nativeHostSourceHash actual_sha256=$nativeHostInstalledHash remediation=installed Chrome native host bytes do not match the release build"
-    }
-    Info "Installed Chrome native host verified path=$ChromeNativeHostExePath sha256=$nativeHostInstalledHash previous_sha256=$nativeHostOldHash"
-} else {
-    Info "SkipBuild: leaving Chrome native host binary unchanged path=$ChromeNativeHostExePath"
+Step "Verifying Chrome direct localhost bridge"
+$chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
+if (-not (Test-Path -LiteralPath $chromeBridgeInstaller -PathType Leaf)) {
+    Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_MISSING path=$chromeBridgeInstaller remediation=setup requires the repo script that verifies the direct localhost Chrome bridge and removes stale nativeMessaging registration"
 }
+$chromeBridgeReadback = & $chromeBridgeInstaller -SynapseNativeHostExe $ChromeNativeHostExePath
+if (-not $chromeBridgeReadback.ok) {
+    Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_FAILED path=$chromeBridgeInstaller remediation=installer did not return ok=true"
+}
+Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3}" -f `
+    $chromeBridgeReadback.daemon_bridge_transport, `
+    $chromeBridgeReadback.extension_id, `
+    $chromeBridgeReadback.native_host_registry_present, `
+    $chromeBridgeReadback.native_host_manifest_present)
 
 # ---------------------------------------------------------------------------
 # 6. Deploy bundled profiles next to the exe (executable-relative lookup) +

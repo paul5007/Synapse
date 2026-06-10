@@ -99,6 +99,15 @@ pub(super) async fn require_http_security(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if auth.bind_addr.ip().is_loopback()
+        && validate_host(request.headers()).is_ok()
+        && crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
+            request.headers(),
+            request.uri(),
+        )
+    {
+        return next.run(request).await;
+    }
     if let Err(failure) = auth.validate_origin_and_host(request.headers()) {
         return forbidden(failure);
     }
@@ -317,5 +326,42 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:7700"));
         assert!(auth.validate_origin_and_host(&headers).is_err());
+    }
+
+    #[test]
+    fn direct_chrome_bridge_origin_is_limited_to_bridge_routes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk"),
+        );
+
+        assert!(
+            crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
+                &headers,
+                &"/chrome-debugger/native/register"
+                    .parse()
+                    .expect("static uri parses"),
+            )
+        );
+        assert!(
+            !crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
+                &headers,
+                &"/mcp".parse().expect("static uri parses"),
+            )
+        );
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        assert!(
+            !crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
+                &headers,
+                &"/chrome-debugger/native/register"
+                    .parse()
+                    .expect("static uri parses"),
+            )
+        );
     }
 }

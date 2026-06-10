@@ -13,30 +13,40 @@ use std::{
 use anyhow::{Context, bail};
 use axum::{
     Json,
-    extract::Query,
-    http::StatusCode,
+    extract::{
+        Query,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use synapse_core::{AccessibleNode, CdpCapability, CdpStatus, Rect, error_codes};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Notify, RwLock, oneshot},
     time::timeout,
 };
+use uuid::Uuid;
 
 const EXTENSION_ID: &str = "leoocgnkjnplbfdbklajepahofecgfbk";
 const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
+const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const CHROME_DEBUGGER_SILENT_FLAG: &str = "--silent-debugger-extension-api";
+const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
+const DIRECT_WS_COMMAND_WAIT: Duration = Duration::from_secs(25);
 const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger and register the native host with scripts\\install-synapse-chrome-debugger.ps1; the normal end-user bridge uses chrome.tabs without the debugger permission, and attach-capable debugger commands require an explicit debugger-enabled bridge plus Chrome launched with --silent-debugger-extension-api; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk native_host=com.synapse.chrome_debugger";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the normal end-user bridge uses chrome.tabs over direct localhost WebSocket without nativeMessaging or debugger permissions, and attach-capable debugger commands require an explicit debugger-enabled bridge plus Chrome launched with --silent-debugger-extension-api; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
@@ -97,7 +107,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
             detail: format!(
-                "Chrome debugger extension/native host is not connected; {INSTALL_GUIDANCE}"
+                "Chrome debugger extension bridge is not connected; {INSTALL_GUIDANCE}"
             ),
         }
     }
@@ -299,6 +309,7 @@ struct ExtensionDomNode {
 struct NativeRegisterResponse {
     ok: bool,
     host_id: String,
+    bridge_token: String,
     bridge_protocol_version: u32,
     native_host_name: String,
     expected_extension_id: String,
@@ -310,6 +321,7 @@ pub(crate) struct NativeRegisterRequest {
     pid: u32,
     parent_window: Option<String>,
     bridge_protocol_version: u32,
+    transport: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -322,6 +334,12 @@ pub(crate) struct NativeMessageRequest {
 pub(crate) struct NativeNextQuery {
     host_id: String,
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct NativeWsQuery {
+    host_id: String,
+    bridge_token: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -363,6 +381,8 @@ struct HostRecord {
     extension_id: Option<String>,
     pid: u32,
     parent_window: Option<String>,
+    transport: Option<String>,
+    bridge_token_digest: [u8; 32],
     registered_unix_ms: u64,
     last_seen_unix_ms: u64,
     last_disconnect_detail: Option<String>,
@@ -404,31 +424,45 @@ impl ChromeDebuggerBridge {
         }
         let now = now_unix_ms();
         let host_id = format!("chrome-native-{}-{}", request.pid, now);
+        let bridge_token = Uuid::new_v4().to_string();
         let record = HostRecord {
             origin: request.origin,
             extension_id: None,
             pid: request.pid,
             parent_window: request.parent_window,
+            transport: request.transport,
+            bridge_token_digest: digest_bridge_token(&bridge_token),
             registered_unix_ms: now,
             last_seen_unix_ms: now,
             last_disconnect_detail: None,
             last_detach_reason: None,
         };
+        let transport_label = record
+            .transport
+            .as_deref()
+            .unwrap_or("native_messaging")
+            .to_owned();
+        let is_direct_http = transport_label == "direct_http";
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| "chrome debugger bridge lock poisoned during register".to_owned())?;
+        if is_direct_http {
+            replace_active_direct_http_host(&mut inner, &host_id);
+        }
         inner.active_host_id = Some(host_id.clone());
         inner.hosts.insert(host_id.clone(), record);
         tracing::info!(
             code = "CHROME_DEBUGGER_NATIVE_HOST_REGISTERED",
             host_id = %host_id,
             pid = request.pid,
+            transport = %transport_label,
             "Chrome debugger native host registered"
         );
         Ok(NativeRegisterResponse {
             ok: true,
             host_id,
+            bridge_token,
             bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
             native_host_name: NATIVE_HOST_NAME.to_owned(),
             expected_extension_id: EXTENSION_ID.to_owned(),
@@ -466,6 +500,7 @@ impl ChromeDebuggerBridge {
                     extension_id = host.extension_id.as_deref().unwrap_or_default(),
                     pid = host.pid,
                     parent_window = host.parent_window.as_deref().unwrap_or_default(),
+                    transport = host.transport.as_deref().unwrap_or("native_messaging"),
                     registered_unix_ms = host.registered_unix_ms,
                     "Chrome debugger extension connected through native host"
                 );
@@ -474,6 +509,19 @@ impl ChromeDebuggerBridge {
                 let response = serde_json::from_value::<ChromeResponse>(request.message)
                     .map_err(|error| format!("decode chrome debugger response: {error}"))?;
                 let id = response.id.clone();
+                if inner
+                    .pending
+                    .get(&id)
+                    .is_some_and(|pending| pending.host_id != request.host_id)
+                {
+                    tracing::warn!(
+                        code = "CHROME_DEBUGGER_RESPONSE_HOST_MISMATCH",
+                        host_id = %request.host_id,
+                        command_id = %id,
+                        "Chrome debugger response came from a different host than the pending command owner"
+                    );
+                    return Ok(());
+                }
                 let Some(pending) = inner.pending.remove(&id) else {
                     tracing::warn!(
                         code = "CHROME_DEBUGGER_RESPONSE_WITHOUT_PENDING_COMMAND",
@@ -483,6 +531,17 @@ impl ChromeDebuggerBridge {
                     );
                     return Ok(());
                 };
+                let readback_summary =
+                    chrome_response_readback_summary(&pending.kind, response.result.as_ref());
+                tracing::info!(
+                    code = "CHROME_DEBUGGER_RESPONSE_ACCEPTED",
+                    host_id = %request.host_id,
+                    command_id = %id,
+                    command_kind = %pending.kind,
+                    response_ok = response.ok,
+                    readback = %readback_summary.as_deref().unwrap_or(""),
+                    "Chrome debugger response accepted"
+                );
                 let _ = pending.sender.send(response);
             }
             "event" => {
@@ -609,6 +668,13 @@ impl ChromeDebuggerBridge {
                         .commands
                         .remove(index)
                         .ok_or_else(|| "queued command disappeared".to_owned())?;
+                    tracing::info!(
+                        code = "CHROME_DEBUGGER_COMMAND_DELIVERED",
+                        host_id = %host_id,
+                        command_id = %queued.command.id,
+                        command_kind = %queued.command.kind,
+                        "Chrome debugger command delivered to bridge host"
+                    );
                     return Ok(Some(queued.command));
                 }
                 self.notify.notified()
@@ -653,6 +719,12 @@ impl ChromeDebuggerBridge {
                 inner.active_host_id = None;
                 return Err(ChromeDebuggerBridgeError::unavailable());
             }
+            let transport_label = inner
+                .hosts
+                .get(&host_id)
+                .and_then(|host| host.transport.as_deref())
+                .unwrap_or("native_messaging")
+                .to_owned();
             inner.pending.insert(
                 id.clone(),
                 PendingResponse {
@@ -661,7 +733,19 @@ impl ChromeDebuggerBridge {
                     sender,
                 },
             );
-            inner.commands.push_back(QueuedCommand { host_id, command });
+            inner.commands.push_back(QueuedCommand {
+                host_id: host_id.clone(),
+                command,
+            });
+            tracing::info!(
+                code = "CHROME_DEBUGGER_COMMAND_QUEUED",
+                host_id = %host_id,
+                command_id = %id,
+                command_kind = %kind,
+                transport = %transport_label,
+                queue_depth = inner.commands.len(),
+                "Chrome debugger command queued for bridge host"
+            );
         }
         self.notify.notify_waiters();
 
@@ -705,6 +789,119 @@ impl ChromeDebuggerBridge {
                 );
             }
         }
+    }
+
+    fn direct_http_bridge_token_matches(&self, token: &str) -> bool {
+        let token = token.trim();
+        if token.is_empty() {
+            return false;
+        }
+        let candidate = digest_bridge_token(token);
+        self.inner.lock().is_ok_and(|inner| {
+            inner.hosts.values().any(|host| {
+                host.transport.as_deref() == Some("direct_http")
+                    && bool::from(
+                        host.bridge_token_digest
+                            .as_slice()
+                            .ct_eq(candidate.as_slice()),
+                    )
+            })
+        })
+    }
+
+    fn direct_http_bridge_token_matches_host(&self, host_id: &str, token: &str) -> bool {
+        let token = token.trim();
+        if token.is_empty() {
+            return false;
+        }
+        let candidate = digest_bridge_token(token);
+        self.inner.lock().is_ok_and(|inner| {
+            inner.hosts.get(host_id).is_some_and(|host| {
+                host.transport.as_deref() == Some("direct_http")
+                    && bool::from(
+                        host.bridge_token_digest
+                            .as_slice()
+                            .ct_eq(candidate.as_slice()),
+                    )
+            })
+        })
+    }
+
+    fn touch_host(&self, host_id: &str) -> bool {
+        let now = now_unix_ms();
+        self.inner.lock().is_ok_and(|mut inner| {
+            inner.hosts.get_mut(host_id).is_some_and(|host| {
+                if host.transport.as_deref() != Some("direct_http") {
+                    return false;
+                }
+                host.last_seen_unix_ms = now;
+                true
+            })
+        })
+    }
+
+    fn disconnect_direct_http_host(&self, host_id: &str, detail: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            tracing::error!(
+                code = "CHROME_DEBUGGER_DIRECT_HTTP_WS_DISCONNECT_LOCK_POISONED",
+                host_id = %host_id,
+                detail = %detail,
+                "Chrome debugger direct HTTP bridge disconnect could not acquire lock"
+            );
+            return;
+        };
+        if inner
+            .hosts
+            .get(host_id)
+            .and_then(|host| host.transport.as_deref())
+            != Some("direct_http")
+        {
+            return;
+        }
+        if let Some(host) = inner.hosts.get_mut(host_id) {
+            host.last_disconnect_detail = Some(detail.to_owned());
+        }
+        if inner.active_host_id.as_deref() == Some(host_id) {
+            inner.active_host_id = None;
+        }
+        let queued_before = inner.commands.len();
+        inner.commands.retain(|queued| queued.host_id != host_id);
+        let queued_removed = queued_before.saturating_sub(inner.commands.len());
+        let pending_ids = inner
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| {
+                if pending.host_id == host_id {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for id in &pending_ids {
+            if let Some(pending) = inner.pending.remove(id) {
+                let _ = pending.sender.send(ChromeResponse {
+                    id: id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(ChromeResponseError {
+                        code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
+                        detail: Some(format!(
+                            "Chrome debugger direct HTTP bridge host {host_id} disconnected before command response: {detail}"
+                        )),
+                    }),
+                });
+            }
+        }
+        inner.hosts.remove(host_id);
+        tracing::warn!(
+            code = "CHROME_DEBUGGER_DIRECT_HTTP_WS_DISCONNECTED",
+            host_id = %host_id,
+            detail = %detail,
+            queued_removed,
+            pending_failed = pending_ids.len(),
+            "Chrome debugger direct HTTP WebSocket disconnected"
+        );
     }
 }
 
@@ -1109,6 +1306,41 @@ pub(crate) fn cdp_capabilities() -> Vec<CdpCapability> {
     synapse_a11y::cdp_capabilities()
 }
 
+pub(crate) fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -> bool {
+    let path = uri.path();
+    if !path.starts_with("/chrome-debugger/native/") {
+        return false;
+    }
+    if headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|origin| origin == EXTENSION_ORIGIN)
+    {
+        return true;
+    }
+    if !matches!(
+        path,
+        "/chrome-debugger/native/next"
+            | "/chrome-debugger/native/message"
+            | "/chrome-debugger/native/ws"
+    ) {
+        return false;
+    }
+    if path == "/chrome-debugger/native/ws"
+        && uri
+            .query()
+            .and_then(bridge_token_from_query)
+            .is_some_and(|token| bridge().direct_http_bridge_token_matches(token))
+    {
+        return true;
+    }
+    headers
+        .get(BRIDGE_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| bridge().direct_http_bridge_token_matches(token))
+}
+
 pub(crate) async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Response {
     match bridge().register(request) {
         Ok(response) => Json(response).into_response(),
@@ -1159,6 +1391,92 @@ pub(crate) async fn http_next(Query(query): Query<NativeNextQuery>) -> Response 
         )
             .into_response(),
     }
+}
+
+pub(crate) async fn http_ws(Query(query): Query<NativeWsQuery>, ws: WebSocketUpgrade) -> Response {
+    if !bridge().direct_http_bridge_token_matches_host(&query.host_id, &query.bridge_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "ok": false,
+                "code": error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+                "detail": "direct Chrome debugger bridge WebSocket token did not match registered host",
+            })),
+        )
+            .into_response();
+    }
+    let host_id = query.host_id;
+    ws.on_upgrade(move |socket| direct_http_ws_loop(socket, host_id))
+}
+
+async fn direct_http_ws_loop(socket: WebSocket, host_id: String) {
+    tracing::info!(
+        code = "CHROME_DEBUGGER_DIRECT_HTTP_WS_CONNECTED",
+        host_id = %host_id,
+        "Chrome debugger direct HTTP WebSocket connected"
+    );
+    let (mut sender, mut receiver) = socket.split();
+    let mut disconnect_detail = "client closed direct HTTP WebSocket".to_owned();
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {
+                        if !bridge().touch_host(&host_id) {
+                            disconnect_detail = "registered direct HTTP host disappeared while processing WebSocket keepalive".to_owned();
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if !bridge().touch_host(&host_id) {
+                            disconnect_detail = "registered direct HTTP host disappeared while processing WebSocket ping".to_owned();
+                            break;
+                        }
+                        if let Err(error) = sender.send(Message::Pong(payload)).await {
+                            disconnect_detail = format!("failed to send direct HTTP WebSocket pong: {error}");
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        disconnect_detail = format!("client closed direct HTTP WebSocket frame={frame:?}");
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        disconnect_detail = format!("direct HTTP WebSocket receive failed: {error}");
+                        break;
+                    }
+                    None => {
+                        disconnect_detail = "direct HTTP WebSocket receive stream ended".to_owned();
+                        break;
+                    }
+                }
+            }
+            command_result = bridge().next_command(&host_id, DIRECT_WS_COMMAND_WAIT) => {
+                let payload = match command_result {
+                    Ok(command) => json!({
+                        "ok": true,
+                        "command": command,
+                    }),
+                    Err(detail) => {
+                        disconnect_detail = format!("direct HTTP WebSocket command wait failed: {detail}");
+                        json!({
+                            "ok": false,
+                            "code": error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+                            "detail": disconnect_detail,
+                        })
+                    }
+                };
+                if let Err(error) = sender.send(Message::Text(payload.to_string().into())).await {
+                    disconnect_detail = format!("failed to send direct HTTP WebSocket payload: {error}");
+                    break;
+                }
+                if payload.get("ok").and_then(Value::as_bool) == Some(false) {
+                    break;
+                }
+            }
+        }
+    }
+    bridge().disconnect_direct_http_host(&host_id, &disconnect_detail);
 }
 
 pub(crate) async fn run_native_host(
@@ -1250,6 +1568,7 @@ async fn register_native_host(
         pid,
         parent_window: invocation.parent_window.clone(),
         bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
+        transport: Some("native_messaging".to_owned()),
     };
     let response = client
         .post(format!("{base_url}/chrome-debugger/native/register"))
@@ -1579,8 +1898,126 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn digest_bridge_token(token: &str) -> [u8; 32] {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Option<String> {
+    let result = result?;
+    let summary = match kind {
+        "openTab" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "url": result.get("url"),
+            "target_attached": result.get("target_attached"),
+            "target_count_before": result.get("target_count_before"),
+            "target_count_after": result.get("target_count_after"),
+            "extension_id": result.get("extension_id"),
+        }),
+        "closeTab" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "target_count_before": result.get("target_count_before"),
+            "target_count_after": result.get("target_count_after"),
+            "extension_id": result.get("extension_id"),
+        }),
+        "navigateTab" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "action": result.get("action"),
+            "requested_url": result.get("requested_url"),
+            "before_url": result.get("before_url"),
+            "after_url": result.get("after_url"),
+            "ready_state": result.get("ready_state"),
+            "readback_backend": result.get("readback_backend"),
+        }),
+        "targetInfo" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "target_type": result.get("target_type"),
+            "url": result.get("url"),
+            "title": result.get("title"),
+            "target_candidate_count": result.get("target_candidate_count"),
+            "target_selection_reason": result.get("target_selection_reason"),
+            "extension_id": result.get("extension_id"),
+        }),
+        _ => return None,
+    };
+    serde_json::to_string(&summary).ok()
+}
+
+fn bridge_token_from_query(query: &str) -> Option<&str> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        if key == "bridge_token" {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn replace_active_direct_http_host(inner: &mut BridgeInner, new_host_id: &str) {
+    let Some(old_host_id) = inner.active_host_id.clone() else {
+        return;
+    };
+    if old_host_id == new_host_id {
+        return;
+    }
+    let Some(old_host) = inner.hosts.get(&old_host_id) else {
+        return;
+    };
+    if old_host.transport.as_deref() != Some("direct_http") {
+        return;
+    }
+    let queued_before = inner.commands.len();
+    inner
+        .commands
+        .retain(|queued| queued.host_id != old_host_id);
+    let queued_removed = queued_before.saturating_sub(inner.commands.len());
+    let pending_ids = inner
+        .pending
+        .iter()
+        .filter_map(|(id, pending)| {
+            if pending.host_id == old_host_id {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for id in &pending_ids {
+        if let Some(pending) = inner.pending.remove(id) {
+            let _ = pending.sender.send(ChromeResponse {
+                id: id.clone(),
+                ok: false,
+                result: None,
+                error: Some(ChromeResponseError {
+                    code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
+                    detail: Some(format!(
+                        "Chrome debugger direct HTTP bridge host {old_host_id} was replaced by {new_host_id} before command response"
+                    )),
+                }),
+            });
+        }
+    }
+    tracing::warn!(
+        code = "CHROME_DEBUGGER_DIRECT_HTTP_HOST_REPLACED",
+        old_host_id = %old_host_id,
+        new_host_id = %new_host_id,
+        queued_removed,
+        pending_failed = pending_ids.len(),
+        "Chrome debugger direct HTTP bridge host replaced"
+    );
+}
+
 #[cfg(test)]
 mod tests {
+    use axum::http::{HeaderMap, HeaderValue, Uri, header};
+
     use super::*;
 
     #[test]
@@ -1607,6 +2044,49 @@ mod tests {
         assert!(is_unknown_native_host_detail(detail));
         assert!(is_unknown_native_host_error(&error));
         assert!(!is_unknown_native_host_detail("bridge protocol mismatch"));
+    }
+
+    #[test]
+    fn direct_http_bridge_token_authorizes_next_without_origin_only_after_register() {
+        let registered = bridge()
+            .register(NativeRegisterRequest {
+                origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+                pid: 0,
+                parent_window: None,
+                bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
+                transport: Some("direct_http".to_owned()),
+            })
+            .expect("direct bridge register should issue a host token");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:7700"));
+        headers.insert(
+            BRIDGE_TOKEN_HEADER,
+            HeaderValue::from_str(&registered.bridge_token)
+                .expect("bridge token should be a valid header value"),
+        );
+
+        assert!(is_direct_http_extension_bridge_request(
+            &headers,
+            &Uri::from_static("/chrome-debugger/native/next?host_id=anything"),
+        ));
+        let ws_uri = format!(
+            "/chrome-debugger/native/ws?host_id={}&bridge_token={}",
+            registered.host_id, registered.bridge_token
+        )
+        .parse::<Uri>()
+        .expect("websocket uri with token should parse");
+        assert!(is_direct_http_extension_bridge_request(
+            &HeaderMap::new(),
+            &ws_uri
+        ));
+        assert!(!is_direct_http_extension_bridge_request(
+            &headers,
+            &Uri::from_static("/chrome-debugger/native/register"),
+        ));
+        assert!(!is_direct_http_extension_bridge_request(
+            &headers,
+            &Uri::from_static("/mcp"),
+        ));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-const HOST_NAME = "com.synapse.chrome_debugger";
 const PROTOCOL_VERSION = 1;
+const DAEMON_BASE_URL = "http://127.0.0.1:7700";
 const ERROR_ATTACH_FAILED = "A11Y_CDP_ATTACH_FAILED";
 const ERROR_AXTREE_FAILED = "A11Y_CDP_AXTREE_FAILED";
 const ERROR_DEBUGGER_WARNING_UNSUPPRESSED = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
@@ -9,56 +9,168 @@ const ERROR_EXTENSION_UNAVAILABLE = "A11Y_CDP_EXTENSION_UNAVAILABLE";
 const SILENT_DEBUGGER_SWITCH = "--silent-debugger-extension-api";
 const DETACH_SURFACE_MS = 5000;
 const TAB_TARGET_PREFIX = "chrome-tab:";
+const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
+const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
+const WEBSOCKET_KEEPALIVE_MS = 20000;
 
-let nativePort = null;
+let hostId = null;
+let bridgeToken = null;
+let connectInFlight = null;
 let reconnectTimer = null;
+let webSocket = null;
+let keepAliveTimer = null;
 const attachedTabs = new Set();
 const intentionalDetachTabs = new Set();
 const recentDetachByTab = new Map();
 
-function connectNative() {
-  if (nativePort) {
+function connectDaemon() {
+  if (hostId || webSocket || connectInFlight) {
     return;
   }
-  try {
-    nativePort = chrome.runtime.connectNative(HOST_NAME);
-  } catch (error) {
-    nativePort = null;
-    scheduleReconnect(`connectNative failed: ${errorMessage(error)}`);
-    return;
-  }
-  nativePort.onMessage.addListener((message) => {
-    handleCommand(message).catch((error) => {
-      postResponse(message?.id ?? "", false, null, errorPayload(error));
+  connectInFlight = registerDaemon()
+    .catch((error) => {
+      scheduleReconnect(`direct daemon register failed: ${errorMessage(error)}`);
+    })
+    .finally(() => {
+      connectInFlight = null;
     });
+}
+
+async function registerDaemon() {
+  const registered = await daemonFetchJson("/chrome-debugger/native/register", {
+    method: "POST",
+    body: {
+      origin: chrome.runtime.getURL(""),
+      pid: 0,
+      parent_window: null,
+      bridge_protocol_version: PROTOCOL_VERSION,
+      transport: "direct_http"
+    }
   });
-  nativePort.onDisconnect.addListener(() => {
-    const detail = chrome.runtime.lastError?.message || "native port disconnected";
-    nativePort = null;
-    scheduleReconnect(detail);
-  });
-  postNative({
+  if (
+    !registered?.ok ||
+    typeof registered.host_id !== "string" ||
+    !registered.host_id ||
+    typeof registered.bridge_token !== "string" ||
+    !registered.bridge_token
+  ) {
+    throw new Error(`daemon register returned invalid response ${JSON.stringify(registered)}`);
+  }
+  hostId = registered.host_id;
+  bridgeToken = registered.bridge_token;
+  await postDaemonMessage({
     type: "hello",
     extensionId: chrome.runtime.id,
     version: chrome.runtime.getManifest().version,
     protocolVersion: PROTOCOL_VERSION,
+    transport: "direct_http",
     userAgent: navigator.userAgent
   });
+  connectWebSocket();
 }
 
 function scheduleReconnect(detail) {
+  closeWebSocket();
+  hostId = null;
+  bridgeToken = null;
   if (reconnectTimer) {
     return;
   }
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    connectNative();
+    connectDaemon();
   }, 1000);
-  console.warn(`Synapse native bridge disconnected: ${detail}`);
+  console.warn(`Synapse daemon bridge disconnected: ${detail}`);
 }
 
-chrome.runtime.onInstalled.addListener(connectNative);
-chrome.runtime.onStartup.addListener(connectNative);
+function connectWebSocket() {
+  if (!hostId || !bridgeToken || webSocket) {
+    return;
+  }
+  const url = new URL("/chrome-debugger/native/ws", DAEMON_WS_BASE_URL);
+  url.searchParams.set("host_id", hostId);
+  url.searchParams.set("bridge_token", bridgeToken);
+  const socket = new WebSocket(url.toString());
+  webSocket = socket;
+  socket.onopen = () => {
+    startWebSocketKeepAlive(socket);
+  };
+  socket.onmessage = (event) => {
+    handleWebSocketMessage(event.data).catch((error) => {
+      scheduleReconnect(`direct daemon websocket message failed: ${errorMessage(error)}`);
+    });
+  };
+  socket.onerror = () => {
+    if (webSocket === socket) {
+      scheduleReconnect("direct daemon websocket error");
+    }
+  };
+  socket.onclose = () => {
+    if (webSocket === socket) {
+      scheduleReconnect("direct daemon websocket closed");
+    }
+  };
+}
+
+async function handleWebSocketMessage(raw) {
+  if (typeof raw !== "string") {
+    throw new Error(`daemon websocket returned non-text payload type=${typeof raw}`);
+  }
+  let message;
+  try {
+    message = JSON.parse(raw);
+  } catch (_) {
+    throw new Error(`daemon websocket returned non-JSON payload=${JSON.stringify(raw.slice(0, 512))}`);
+  }
+  if (message?.ok === false) {
+    throw new Error(`daemon websocket refused command delivery: ${JSON.stringify(message)}`);
+  }
+  if (message?.command) {
+    await handleCommand(message.command);
+  }
+}
+
+function startWebSocketKeepAlive(socket) {
+  stopWebSocketKeepAlive();
+  keepAliveTimer = setInterval(() => {
+    if (webSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+      stopWebSocketKeepAlive();
+      return;
+    }
+    try {
+      socket.send(JSON.stringify({
+        type: "keepalive",
+        host_id: hostId,
+        sent_at_unix_ms: Date.now()
+      }));
+    } catch (error) {
+      scheduleReconnect(`direct daemon websocket keepalive failed: ${errorMessage(error)}`);
+    }
+  }, WEBSOCKET_KEEPALIVE_MS);
+}
+
+function stopWebSocketKeepAlive() {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+}
+
+function closeWebSocket() {
+  stopWebSocketKeepAlive();
+  const socket = webSocket;
+  webSocket = null;
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+    try {
+      socket.close();
+    } catch (_) {
+      // Closing is best-effort during reconnect cleanup.
+    }
+  }
+}
+
+chrome.runtime.onInstalled.addListener(connectDaemon);
+chrome.runtime.onStartup.addListener(connectDaemon);
 if (chrome.debugger?.onDetach) {
   chrome.debugger.onDetach.addListener((source, reason) => {
     const tabId = source.tabId;
@@ -71,18 +183,20 @@ if (chrome.debugger?.onDetach) {
         recentDetachByTab.set(source.tabId, Date.now());
       }
     }
-    postNative({
+    postDaemonMessage({
       type: "event",
       event: "debuggerDetached",
       tabId: source.tabId ?? null,
       targetId: source.targetId ?? null,
       intentional,
       reason
+    }).catch((error) => {
+      console.warn(`Synapse daemon bridge detach event post failed: ${errorMessage(error)}`);
     });
   });
 }
 
-connectNative();
+connectDaemon();
 
 async function handleCommand(command) {
   if (!command || typeof command !== "object") {
@@ -113,9 +227,9 @@ async function handleCommand(command) {
     } else {
       throw bridgeError(ERROR_ATTACH_FAILED, `unknown command kind ${String(kind)}`);
     }
-    postResponse(id, true, result, null);
+    await postResponse(id, true, result, null);
   } catch (error) {
-    postResponse(id, false, null, errorPayload(error));
+    await postResponse(id, false, null, errorPayload(error));
   }
 }
 
@@ -981,8 +1095,8 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function postResponse(id, ok, result, error) {
-  postNative({
+async function postResponse(id, ok, result, error) {
+  await postDaemonMessage({
     type: "response",
     id,
     ok,
@@ -991,12 +1105,56 @@ function postResponse(id, ok, result, error) {
   });
 }
 
-function postNative(message) {
-  if (!nativePort) {
-    console.warn("Synapse native bridge unavailable; message dropped");
+async function postDaemonMessage(message) {
+  if (!hostId) {
+    console.warn("Synapse daemon bridge unavailable; message dropped");
     return;
   }
-  nativePort.postMessage(message);
+  try {
+    await daemonFetchJson("/chrome-debugger/native/message", {
+      method: "POST",
+      body: {
+        host_id: hostId,
+        message
+      }
+    });
+  } catch (error) {
+    scheduleReconnect(`direct daemon message failed: ${errorMessage(error)}`);
+    throw error;
+  }
+}
+
+async function daemonFetchJson(path, options = {}) {
+  const init = {
+    method: options.method || "GET",
+    cache: "no-store",
+    headers: {}
+  };
+  if (bridgeToken) {
+    init.headers[BRIDGE_TOKEN_HEADER] = bridgeToken;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, "body")) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(options.body);
+  }
+  const response = await fetch(`${DAEMON_BASE_URL}${path}`, init);
+  const text = await response.text();
+  let value = null;
+  if (text) {
+    try {
+      value = JSON.parse(text);
+    } catch (_) {
+      throw new Error(
+        `daemon ${init.method} ${path} returned non-JSON status=${response.status} body=${JSON.stringify(text.slice(0, 512))}`
+      );
+    }
+  }
+  if (!response.ok) {
+    throw new Error(
+      `daemon ${init.method} ${path} failed status=${response.status} body=${JSON.stringify(value ?? text)}`
+    );
+  }
+  return value;
 }
 
 function bridgeError(code, detail) {

@@ -22,12 +22,12 @@ actionable by `act_click`, `act_type`, and `act_stroke`.
 
 When no endpoint is reachable, Synapse does not silently pretend the DOM was
 observed. For the user's normal Chrome profile, Synapse can use the bundled
-Chrome extension/native-messaging bridge for background tab control through
-`chrome.tabs`. DOM attach through the debugger API is intentionally unavailable
-in the normal end-user bridge unless a debugger-enabled path is explicitly
-configured and popup suppression is proven. If no CDP endpoint or debugger path
-is available, the UIA tree is still returned, but it is the browser shell, not
-the page DOM.
+Chrome extension direct-localhost WebSocket bridge for background tab control
+through `chrome.tabs`. DOM attach through the debugger API is intentionally
+unavailable in the normal end-user bridge unless a debugger-enabled path is
+explicitly configured and popup suppression is proven. If no CDP endpoint or
+debugger path is available, the UIA tree is still returned, but it is the
+browser shell, not the page DOM.
 
 ## Diagnostics
 
@@ -50,8 +50,8 @@ Browser observations carry diagnostics so agents can tell the difference between
   popup suppression is proven.
 - `diagnostics.cdp.status = "A11Y_CDP_EXTENSION_UNAVAILABLE"` with matching
   `reason_code = "A11Y_CDP_EXTENSION_UNAVAILABLE"`: raw CDP was unreachable and
-  the normal-profile Chrome extension/native host is not connected. The detail
-  field names the bundled extension directory, native host name, expected
+  the normal-profile Chrome extension loopback WebSocket bridge is not
+  connected. The detail field names the bundled extension directory, expected
   extension ID, and registration script. Synapse then attempts OCR over tiled
   browser content. If readable text is found,
   `diagnostics.web_path = "ocr"` and OCR text nodes appear in `elements`; if OCR
@@ -68,8 +68,9 @@ The intended strategy ladder is:
 1. Raw CDP DOM and accessibility tree for Chromium page content when a real
    loopback debug endpoint exists.
 2. Non-attach Chrome extension `chrome.tabs` navigation for normal-profile
-   background tab open, close, navigate, reload, back, and forward.
-3. Explicit debugger-enabled extension/native-messaging CDP only when popup
+   background tab open, close, navigate, reload, back, and forward over the
+   direct localhost WebSocket bridge.
+3. Explicit debugger-enabled extension/native bridge CDP only when popup
    suppression is proven by Chrome process command-line readback.
 4. OCR/capture over tiled browser content when CDP is down or attach fails.
 5. Explicit `uia_only` for browser chrome/native UI when neither DOM nor OCR
@@ -124,10 +125,13 @@ Chrome session, the supported attach path is:
    browser, treat that as the Chrome 144+ auto-connect permission flow. Do not
    expect it to make `/json/version` reachable through `SYNAPSE_CDP_PORTS`.
 6. For the user's normal Chrome profile, install the bundled extension at
-   `extensions/synapse-chrome-debugger` and register the native host with
-   `scripts\install-synapse-chrome-debugger.ps1`. The stable extension ID is
-   `leoocgnkjnplbfdbklajepahofecgfbk`; the native host name is
-   `com.synapse.chrome_debugger`.
+   `extensions/synapse-chrome-debugger` and verify the direct localhost bridge
+   with `scripts\install-synapse-chrome-debugger.ps1`. The stable extension ID
+   is `leoocgnkjnplbfdbklajepahofecgfbk`. The normal bridge must not request
+   `nativeMessaging`; Chrome can launch native hosts through a visible
+   `cmd.exe` intermediary on Windows. The extension uses a daemon-issued bridge
+   token and a 20s WebSocket keepalive so the MV3 service worker stays available
+   without native messaging.
 7. Use the non-attach `chrome.tabs` bridge for normal-profile Chrome tab
    navigation (`cdp_open_tab`, `cdp_close_tab`, and extension-backed
    `cdp_navigate_tab`). This path uses `chrome.tabs.create`,
