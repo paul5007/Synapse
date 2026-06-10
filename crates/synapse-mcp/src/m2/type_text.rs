@@ -22,6 +22,8 @@ const TYPE_TIER_CDP: &str = "cdp";
 const TYPE_TIER_UIA: &str = "uia";
 const TYPE_TIER_WIN32_MESSAGE: &str = "win32_message";
 const TYPE_TIER_FOREGROUND: &str = "foreground";
+const MIN_VERIFY_TIMEOUT_MS: u32 = 50;
+const MAX_VERIFY_TIMEOUT_MS: u32 = 5000;
 const TEXT_INTEGRITY_DISPATCH_ONLY: &str = "dispatch_only_requires_target_readback";
 const TEXT_INTEGRITY_UIA_VALUE_PATTERN: &str = "uia_value_pattern_readback";
 const TEXT_INTEGRITY_UIA_PASSWORD_LENGTH: &str = "uia_value_pattern_password_length_readback";
@@ -420,7 +422,48 @@ async fn verified_set_element_value(
 ) -> Result<synapse_a11y::ElementValueSetReadback, ErrorData> {
     let before = synapse_a11y::element_value(element_id).map_err(a11y_error_to_mcp)?;
     match synapse_a11y::set_element_value(element_id, emitted) {
-        Ok(readback) => Ok(readback),
+        Ok(dispatch_readback) => {
+            tokio::time::sleep(std::time::Duration::from_millis(u64::from(
+                verify_timeout_ms,
+            )))
+            .await;
+            let after = synapse_a11y::element_value(element_id).map_err(|error| {
+                postcondition_failed_error(
+                    "act_type",
+                    set_source_of_truth(&dispatch_readback),
+                    format!(
+                        "ValuePattern SetValue returned success but separate target value readback failed: {error}"
+                    ),
+                    value_readback_signature(&before),
+                    value_set_after_signature(&dispatch_readback),
+                    json!({
+                        "element_id": element_id.to_string(),
+                        "method": dispatch_readback.method.clone(),
+                        "requested_len": emitted.chars().count(),
+                        "before_len": value_readback_len(&before),
+                        "immediate_after_len": value_set_after_len(&dispatch_readback),
+                        "readback_error_code": error.code(),
+                        "readback_error": error.to_string(),
+                    }),
+                )
+            })?;
+            let verified_readback =
+                set_readback_from_separate_reads(&dispatch_readback, &before, &after);
+            if !uia_set_readbacks_equivalent(&dispatch_readback, &verified_readback) {
+                tracing::warn!(
+                    code = "M2_ACT_TYPE_ELEMENT_IMMEDIATE_READBACK_STALE",
+                    element_id = %element_id,
+                    method = %dispatch_readback.method,
+                    requested_len = emitted.chars().count(),
+                    immediate_before_len = value_set_before_len(&dispatch_readback),
+                    immediate_after_len = value_set_after_len(&dispatch_readback),
+                    verified_before_len = value_set_before_len(&verified_readback),
+                    verified_after_len = value_set_after_len(&verified_readback),
+                    "act_type into_element immediate UIA/native readback differed from separate post-dispatch Source-of-Truth readback"
+                );
+            }
+            Ok(verified_readback)
+        }
         Err(error) => {
             tokio::time::sleep(std::time::Duration::from_millis(u64::from(
                 verify_timeout_ms,
@@ -476,6 +519,41 @@ async fn verified_set_element_value(
     }
 }
 
+fn set_readback_from_separate_reads(
+    dispatch_readback: &synapse_a11y::ElementValueSetReadback,
+    before: &synapse_a11y::ElementValueReadback,
+    after: &synapse_a11y::ElementValueReadback,
+) -> synapse_a11y::ElementValueSetReadback {
+    let is_password = dispatch_readback.is_password || before.is_password || after.is_password;
+    synapse_a11y::ElementValueSetReadback {
+        method: dispatch_readback.method.clone(),
+        before_value: if is_password {
+            String::new()
+        } else {
+            before.value.clone()
+        },
+        after_value: if is_password {
+            String::new()
+        } else {
+            after.value.clone()
+        },
+        expected_after_value: dispatch_readback.expected_after_value.clone(),
+        is_password,
+        before_password_len: if is_password {
+            before
+                .password_len
+                .or(dispatch_readback.before_password_len)
+        } else {
+            None
+        },
+        after_password_len: if is_password {
+            after.password_len.or(dispatch_readback.after_password_len)
+        } else {
+            None
+        },
+    }
+}
+
 fn verify_uia_type_delta(
     verify_timeout_ms: u32,
     emitted: &str,
@@ -494,6 +572,18 @@ fn verify_uia_type_delta(
     }
     if readback.before_value == readback.after_value {
         let expected_value = expected_set_value(readback, emitted);
+        if readback.after_value == expected_value {
+            return Ok(ActPostcondition {
+                status: "verified_state".to_owned(),
+                observed_delta: Some(false),
+                source_of_truth: Some(set_source_of_truth(readback).to_owned()),
+                before_signature: Some(before_signature),
+                after_signature: Some(after_signature),
+                detail: Some(format!(
+                    "act_type verify_delta verified target value equals requested text after delivery; no Source-of-Truth delta was needed within {verify_timeout_ms} ms"
+                )),
+            });
+        }
         return Err(no_observed_delta_error(
             "act_type",
             set_source_of_truth(readback),
@@ -683,6 +773,23 @@ fn uia_readbacks_equivalent(
     before.value == after.value
 }
 
+fn uia_set_readbacks_equivalent(
+    left: &synapse_a11y::ElementValueSetReadback,
+    right: &synapse_a11y::ElementValueSetReadback,
+) -> bool {
+    if left.method != right.method
+        || left.expected_after_value != right.expected_after_value
+        || left.is_password != right.is_password
+    {
+        return false;
+    }
+    if left.is_password || right.is_password {
+        return left.before_password_len == right.before_password_len
+            && left.after_password_len == right.after_password_len;
+    }
+    left.before_value == right.before_value && left.after_value == right.after_value
+}
+
 fn value_set_before_len(readback: &synapse_a11y::ElementValueSetReadback) -> usize {
     value_set_len(
         readback.before_value.as_str(),
@@ -823,6 +930,9 @@ fn validate_type_params(params: &ActTypeParams) -> Result<(), ErrorData> {
                 .to_owned(),
         }));
     }
+    if !(MIN_VERIFY_TIMEOUT_MS..=MAX_VERIFY_TIMEOUT_MS).contains(&params.verify_timeout_ms) {
+        return Err(verify_timeout_params_error(params.verify_timeout_ms));
+    }
     if params.dynamics == TypeDynamics::Linear
         && params.linear_ms_per_char < MIN_SAFE_LINEAR_MS_PER_CHAR
     {
@@ -914,6 +1024,23 @@ fn type_params_error(requested_linear_ms_per_char: u32, message: impl Into<Strin
     )
 }
 
+fn verify_timeout_params_error(requested_verify_timeout_ms: u32) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act_type verify_timeout_ms must be in {MIN_VERIFY_TIMEOUT_MS}..={MAX_VERIFY_TIMEOUT_MS}, got {requested_verify_timeout_ms}"
+        ),
+        Some(json!({
+            "code": synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "reason": "verify_timeout_ms_out_of_range",
+            "requested_verify_timeout_ms": requested_verify_timeout_ms,
+            "minimum_verify_timeout_ms": MIN_VERIFY_TIMEOUT_MS,
+            "maximum_verify_timeout_ms": MAX_VERIFY_TIMEOUT_MS,
+            "target_readback_required": true,
+        })),
+    )
+}
+
 const fn default_type_dynamics() -> TypeDynamics {
     TypeDynamics::Natural
 }
@@ -948,13 +1075,14 @@ mod tests {
     use super::{
         ActTypeParams, METHOD_NATIVE_TEXT_MESSAGE, MIN_SAFE_LINEAR_MS_PER_CHAR,
         SOURCE_NATIVE_PASSWORD_LENGTH, SOURCE_NATIVE_TEXT, SOURCE_UIA_PASSWORD_LENGTH,
-        TEXT_INTEGRITY_DISPATCH_ONLY, TEXT_INTEGRITY_NATIVE_PASSWORD_LENGTH,
+        SOURCE_UIA_VALUE, TEXT_INTEGRITY_DISPATCH_ONLY, TEXT_INTEGRITY_NATIVE_PASSWORD_LENGTH,
         TEXT_INTEGRITY_NATIVE_TEXT_MESSAGE, TYPE_TIER_FOREGROUND, TYPE_TIER_WIN32_MESSAGE,
         TypeBackend, TypeDynamics, act_type_with_handle, action_from_type_params,
         default_linear_ms_per_char, default_press_enter_after, default_type_backend,
         default_type_dynamics, default_use_scancodes, default_verify_delta,
-        default_verify_timeout_ms, recorded_ikis, set_backend_tier, set_source_of_truth,
-        set_text_integrity, uia_readback_matches_emitted, verify_uia_type_delta,
+        default_verify_timeout_ms, recorded_ikis, set_backend_tier,
+        set_readback_from_separate_reads, set_source_of_truth, set_text_integrity,
+        uia_readback_matches_emitted, validate_type_params, verify_uia_type_delta,
     };
 
     #[tokio::test]
@@ -1104,6 +1232,32 @@ mod tests {
                 backend: synapse_core::Backend::Software,
             }
         );
+    }
+
+    #[test]
+    fn verify_timeout_below_minimum_fails_before_dispatch() {
+        let params = ActTypeParams {
+            text: "should-not-dispatch".to_owned(),
+            into_element: Some(
+                ElementId::parse("0x1234:0000002a00000001")
+                    .expect("synthetic element id should parse"),
+            ),
+            dynamics: default_type_dynamics(),
+            linear_ms_per_char: default_linear_ms_per_char(),
+            use_scancodes: false,
+            press_enter_after: false,
+            backend: default_type_backend(),
+            verify_delta: true,
+            expected_browser_url_regex: None,
+            verify_timeout_ms: 1,
+        };
+
+        let error = validate_type_params(&params)
+            .expect_err("invalid verify timeout must fail validation before dispatch");
+        let data = error.data.expect("validation error should include data");
+        assert_eq!(data["code"], synapse_core::error_codes::TOOL_PARAMS_INVALID);
+        assert_eq!(data["reason"], "verify_timeout_ms_out_of_range");
+        assert_eq!(data["requested_verify_timeout_ms"], 1);
     }
 
     #[test]
@@ -1340,6 +1494,72 @@ mod tests {
         assert_eq!(
             postcondition.source_of_truth.as_deref(),
             Some(SOURCE_NATIVE_TEXT)
+        );
+    }
+
+    #[test]
+    fn stale_immediate_value_pattern_readback_uses_separate_after_sot() {
+        let dispatch_readback = synapse_a11y::ElementValueSetReadback {
+            method: "uia_value_pattern".to_owned(),
+            before_value: String::new(),
+            after_value: String::new(),
+            expected_after_value: None,
+            is_password: false,
+            before_password_len: None,
+            after_password_len: None,
+        };
+        let before = synapse_a11y::ElementValueReadback {
+            method: "uia_value_pattern".to_owned(),
+            value: String::new(),
+            is_readonly: false,
+            is_password: false,
+            password_len: None,
+        };
+        let after = synapse_a11y::ElementValueReadback {
+            method: "uia_value_pattern".to_owned(),
+            value: "GH-CODE-825".to_owned(),
+            is_readonly: false,
+            is_password: false,
+            password_len: None,
+        };
+
+        let verified = set_readback_from_separate_reads(&dispatch_readback, &before, &after);
+
+        assert_eq!(verified.before_value, "");
+        assert_eq!(verified.after_value, "GH-CODE-825");
+        assert!(uia_readback_matches_emitted(&verified, "GH-CODE-825"));
+        let postcondition =
+            verify_uia_type_delta(default_verify_timeout_ms(), "GH-CODE-825", &verified)
+                .expect("separate after SoT should verify the actual mutation");
+        assert_eq!(postcondition.status, "observed_delta");
+        assert_eq!(postcondition.observed_delta, Some(true));
+        assert_eq!(
+            postcondition.source_of_truth.as_deref(),
+            Some(SOURCE_UIA_VALUE)
+        );
+    }
+
+    #[test]
+    fn value_pattern_already_matching_requested_text_verifies_state() {
+        let readback = synapse_a11y::ElementValueSetReadback {
+            method: "uia_value_pattern".to_owned(),
+            before_value: "READY-825".to_owned(),
+            after_value: "READY-825".to_owned(),
+            expected_after_value: None,
+            is_password: false,
+            before_password_len: None,
+            after_password_len: None,
+        };
+
+        let postcondition =
+            verify_uia_type_delta(default_verify_timeout_ms(), "READY-825", &readback)
+                .expect("matching final state should not be reported as no delta");
+
+        assert_eq!(postcondition.status, "verified_state");
+        assert_eq!(postcondition.observed_delta, Some(false));
+        assert_eq!(
+            postcondition.source_of_truth.as_deref(),
+            Some(SOURCE_UIA_VALUE)
         );
     }
 }
