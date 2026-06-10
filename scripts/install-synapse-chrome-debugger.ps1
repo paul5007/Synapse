@@ -4,6 +4,8 @@ param(
     [switch]$ApplyExternalChromeDebuggerPolicy,
     [ValidateSet('HKCU', 'HKLM')]
     [string]$ChromePolicyHive = 'HKCU',
+    [ValidateSet('AllExtensions', 'DetectedExtensions')]
+    [string]$ChromePolicyBlockScope = 'AllExtensions',
     [switch]$AllowExternalChromeDebuggerOrNativeMessaging
 )
 
@@ -65,16 +67,27 @@ function Write-ChromeExternalDebuggerPolicy {
     param(
         [ValidateSet('HKCU', 'HKLM')]
         [string]$Hive,
-        [string[]]$ExternalExtensionIds
+        [string[]]$ExternalExtensionIds,
+        [ValidateSet('AllExtensions', 'DetectedExtensions')]
+        [string]$BlockScope = 'AllExtensions'
     )
 
     $ids = @($ExternalExtensionIds | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique)
-    if ($ids.Count -eq 0) {
+    $policyEntries = @()
+    if ($BlockScope -eq 'AllExtensions') {
+        $policyEntries += '*'
+    }
+    $policyEntries += $ids
+    $policyEntries = @($policyEntries | Sort-Object -Unique)
+
+    if ($policyEntries.Count -eq 0) {
         return [pscustomobject]@{
             hive = $Hive
             path = Get-ChromePolicyRoot -Hive $Hive
             value_name = 'ExtensionSettings'
             blocked_extension_ids = @()
+            block_scope = $BlockScope
+            policy_entries = @()
             readback_ok = $true
             policy_json = ConvertTo-CompressedJson -Value ([ordered]@{})
         }
@@ -84,11 +97,11 @@ function Write-ChromeExternalDebuggerPolicy {
     try {
         New-Item -ItemType Directory -Force -Path $policyRoot | Out-Null
         $settings = Read-ChromeExtensionSettingsPolicy -Hive $Hive
-        foreach ($id in $ids) {
-            if (-not $settings.Contains($id)) {
-                $settings[$id] = [ordered]@{}
+        foreach ($policyEntry in $policyEntries) {
+            if (-not $settings.Contains($policyEntry)) {
+                $settings[$policyEntry] = [ordered]@{}
             }
-            $entry = $settings[$id]
+            $entry = $settings[$policyEntry]
             $blocked = @()
             if ($entry.Contains('blocked_permissions')) {
                 $blocked = @($entry['blocked_permissions'])
@@ -103,15 +116,15 @@ function Write-ChromeExternalDebuggerPolicy {
         New-ItemProperty -LiteralPath $policyRoot -Name ExtensionSettings -PropertyType String -Value $json -Force | Out-Null
         $readback = Read-ChromeExtensionSettingsPolicy -Hive $Hive
         $missing = @()
-        foreach ($id in $ids) {
-            if (-not $readback.Contains($id)) {
-                $missing += "${id}:missing_entry"
+        foreach ($policyEntry in $policyEntries) {
+            if (-not $readback.Contains($policyEntry)) {
+                $missing += "${policyEntry}:missing_entry"
                 continue
             }
-            $blocked = @($readback[$id]['blocked_permissions'])
+            $blocked = @($readback[$policyEntry]['blocked_permissions'])
             foreach ($permission in @('debugger', 'nativeMessaging')) {
                 if ($blocked -notcontains $permission) {
-                    $missing += "${id}:missing_$permission"
+                    $missing += "${policyEntry}:missing_$permission"
                 }
             }
         }
@@ -123,11 +136,13 @@ function Write-ChromeExternalDebuggerPolicy {
             path = $policyRoot
             value_name = 'ExtensionSettings'
             blocked_extension_ids = $ids
+            block_scope = $BlockScope
+            policy_entries = $policyEntries
             readback_ok = $true
             policy_json = ConvertTo-CompressedJson -Value $readback
         }
     } catch {
-        throw "SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED hive=$Hive path=$policyRoot blocked_extension_ids=$($ids -join ',') detail=$($_.Exception.Message) remediation=run setup from a principal that can write Chrome policy or disable/remove the named external Chrome extension, then refresh/restart Chrome and rerun this verifier"
+        throw "SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED hive=$Hive path=$policyRoot block_scope=$BlockScope policy_entries=$($policyEntries -join ',') blocked_extension_ids=$($ids -join ',') detail=$($_.Exception.Message) remediation=run setup from a principal that can write Chrome policy or disable/remove the named external Chrome extension, then refresh/restart Chrome and rerun this verifier"
     }
 }
 
@@ -284,8 +299,12 @@ $externalHazardExtensionIds = @(
 ) | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique
 
 $chromePolicyReadback = $null
-if ($ApplyExternalChromeDebuggerPolicy -and $externalHazardExtensionIds.Count -gt 0) {
-    $chromePolicyReadback = Write-ChromeExternalDebuggerPolicy -Hive $ChromePolicyHive -ExternalExtensionIds $externalHazardExtensionIds
+if ($ApplyExternalChromeDebuggerPolicy -and
+    ($externalHazardExtensionIds.Count -gt 0 -or $ChromePolicyBlockScope -eq 'AllExtensions')) {
+    $chromePolicyReadback = Write-ChromeExternalDebuggerPolicy `
+        -Hive $ChromePolicyHive `
+        -ExternalExtensionIds $externalHazardExtensionIds `
+        -BlockScope $ChromePolicyBlockScope
 }
 
 if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
@@ -297,7 +316,7 @@ if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
         external_hazard_extension_ids = $externalHazardExtensionIds
         current_chrome_processes = $chromeProcesses
         chrome_policy_readback = $chromePolicyReadback
-        chrome_policy_remediation = 'HKCU/HKLM Chrome ExtensionSettings blocked_permissions=[debugger,nativeMessaging] for the offending extension, or disable/remove that extension, then refresh/restart Chrome and rerun this verifier'
+        chrome_policy_remediation = 'HKCU/HKLM Chrome ExtensionSettings wildcard "*" blocked_permissions=[debugger,nativeMessaging], or disable/remove the offending extension, then refresh/restart Chrome and rerun this verifier'
     } | ConvertTo-Json -Depth 8 -Compress
     throw "SYNAPSE_CHROME_EXTERNAL_DEBUGGER_OR_NATIVE_SURFACE_PRESENT detail=$detail remediation=normal end-user systems cannot be certified banner-free while another active Chrome extension can call chrome.debugger or a live external native-messaging wrapper can surface a console/window; pass -AllowExternalChromeDebuggerOrNativeMessaging only for diagnostic attribution, never for popup-free acceptance"
 }
@@ -329,6 +348,7 @@ if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
     silent_debugger_switch = $null
     current_chrome_processes = $chromeProcesses
     chrome_policy_scope = $ChromePolicyHive
+    chrome_policy_block_scope = $ChromePolicyBlockScope
     chrome_policy_readback = $chromePolicyReadback
     synapse_chrome_profile_readback = $synapseChromeProfileReadback
     external_hazard_extension_ids = $externalHazardExtensionIds

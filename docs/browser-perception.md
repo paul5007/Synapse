@@ -148,16 +148,18 @@ Chrome session, the supported attach path is:
    external native-messaging wrapper process. Those surfaces can display the
    same user-visible debugger/native-host popup even though Synapse is not the
    caller. The remediation is to disable/remove the external extension or apply
-   a Chrome `ExtensionSettings.blocked_permissions` policy to that extension.
+   a Chrome `ExtensionSettings.blocked_permissions` policy.
    `scripts\install-synapse-chrome-debugger.ps1
    -ApplyExternalChromeDebuggerPolicy` merges
-   `blocked_permissions=["debugger","nativeMessaging"]` for the exact external
-   extension IDs discovered in the Chrome profile/process SoT. The script fails
-   with `SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED` if the current
-   principal cannot write the policy key. After policy is written,
-   refresh/restart Chrome and rerun the verifier; do not certify popup-free
-   readiness until the separate profile/process readback shows the external
-   surface is gone. Runtime `observe` diagnostics also include a live
+   `blocked_permissions=["debugger","nativeMessaging"]` into the wildcard `"*"`
+   policy entry by default, so current and future extensions cannot load with
+   those permissions. `-ChromePolicyBlockScope DetectedExtensions` limits the
+   merge to currently discovered extension IDs. The script fails with
+   `SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED` if the current principal
+   cannot write the policy key. After policy is written, refresh/restart Chrome
+   and rerun the verifier; do not certify popup-free readiness until the
+   separate profile/process readback shows the external surface is gone.
+   Runtime `observe` diagnostics also include a live
    `external_chrome_popup_risk` profile/process summary when Synapse refuses a
    normal-profile attach-capable command, so remaining popups are attributed to
    the exact external browser surface instead of to Synapse's tabs-only bridge.

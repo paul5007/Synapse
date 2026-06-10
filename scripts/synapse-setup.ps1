@@ -64,13 +64,22 @@
 .PARAMETER ApplyExternalChromeDebuggerPolicy
   When Chrome has active external extensions with debugger/nativeMessaging
   permissions, attempt the supported Chrome ExtensionSettings remediation by
-  merging blocked_permissions=["debugger","nativeMessaging"] for the exact
-  offending extension IDs. Setup still fails closed until Chrome policy/profile
-  and process readback prove the external surface is gone.
+  merging blocked_permissions=["debugger","nativeMessaging"]. The default
+  policy scope is the wildcard "*" entry so current and future external
+  debugger/nativeMessaging extensions cannot load. Setup still fails closed
+  until Chrome policy/profile and process readback prove the external surface is
+  gone.
 
 .PARAMETER ChromePolicyHive
   Chrome policy hive used with -ApplyExternalChromeDebuggerPolicy. Defaults to
   HKCU. HKLM requires a principal that can write machine policy.
+
+.PARAMETER ChromePolicyBlockScope
+  Chrome ExtensionSettings scope used with -ApplyExternalChromeDebuggerPolicy.
+  The default, AllExtensions, writes the wildcard "*" blocked_permissions entry
+  so current and future extensions cannot request debugger/nativeMessaging.
+  DetectedExtensions limits the policy merge to the offending extension IDs
+  found in the current Chrome profile/process Source of Truth.
 
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
@@ -98,6 +107,8 @@ param(
     [switch]$ApplyExternalChromeDebuggerPolicy,
     [ValidateSet('HKCU', 'HKLM')]
     [string]$ChromePolicyHive = 'HKCU',
+    [ValidateSet('AllExtensions', 'DetectedExtensions')]
+    [string]$ChromePolicyBlockScope = 'AllExtensions',
     [string]$CargoTarget = "$env:LOCALAPPDATA\synapse\build-target",
     [string]$DbPath      = "$env:LOCALAPPDATA\synapse\db-daemon",
     [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles",
@@ -126,7 +137,9 @@ function Invoke-SynapseChromeBridgeVerifier {
         [string]$NativeHostExePath,
         [switch]$ApplyExternalPolicy,
         [ValidateSet('HKCU', 'HKLM')]
-        [string]$PolicyHive = 'HKCU'
+        [string]$PolicyHive = 'HKCU',
+        [ValidateSet('AllExtensions', 'DetectedExtensions')]
+        [string]$PolicyBlockScope = 'AllExtensions'
     )
 
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
@@ -135,6 +148,7 @@ function Invoke-SynapseChromeBridgeVerifier {
     $chromeBridgeArgs = @{
         SynapseNativeHostExe = $NativeHostExePath
         ChromePolicyHive = $PolicyHive
+        ChromePolicyBlockScope = $PolicyBlockScope
     }
     if ($ApplyExternalPolicy) {
         $chromeBridgeArgs.ApplyExternalChromeDebuggerPolicy = $true
@@ -2229,13 +2243,15 @@ $chromeBridgePreflight = Invoke-SynapseChromeBridgeVerifier `
     -InstallerPath $chromeBridgeInstaller `
     -NativeHostExePath $ChromeNativeHostExePath `
     -ApplyExternalPolicy:$ApplyExternalChromeDebuggerPolicy `
-    -PolicyHive $ChromePolicyHive
-Info ("Chrome direct bridge preflight accepted transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4}" -f `
+    -PolicyHive $ChromePolicyHive `
+    -PolicyBlockScope $ChromePolicyBlockScope
+Info ("Chrome direct bridge preflight accepted transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4} policy_block_scope={5}" -f `
     $chromeBridgePreflight.daemon_bridge_transport, `
     $chromeBridgePreflight.extension_id, `
     $chromeBridgePreflight.native_host_registry_present, `
     $chromeBridgePreflight.native_host_manifest_present, `
-    $chromeBridgePreflight.chrome_policy_scope)
+    $chromeBridgePreflight.chrome_policy_scope, `
+    $chromeBridgePreflight.chrome_policy_block_scope)
 
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon, then install the proven binary
@@ -2280,13 +2296,15 @@ $chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
     -InstallerPath $chromeBridgeInstaller `
     -NativeHostExePath $ChromeNativeHostExePath `
     -ApplyExternalPolicy:$ApplyExternalChromeDebuggerPolicy `
-    -PolicyHive $ChromePolicyHive
-Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4}" -f `
+    -PolicyHive $ChromePolicyHive `
+    -PolicyBlockScope $ChromePolicyBlockScope
+Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4} policy_block_scope={5}" -f `
     $chromeBridgeReadback.daemon_bridge_transport, `
     $chromeBridgeReadback.extension_id, `
     $chromeBridgeReadback.native_host_registry_present, `
     $chromeBridgeReadback.native_host_manifest_present, `
-    $chromeBridgeReadback.chrome_policy_scope)
+    $chromeBridgeReadback.chrome_policy_scope, `
+    $chromeBridgeReadback.chrome_policy_block_scope)
 
 # ---------------------------------------------------------------------------
 # 6. Deploy bundled profiles next to the exe (executable-relative lookup) +
