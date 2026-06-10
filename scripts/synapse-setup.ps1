@@ -62,13 +62,14 @@
   visible cmd.exe wrapper for native hosts.
 
 .PARAMETER ApplyExternalChromeDebuggerPolicy
-  When Chrome has active external extensions with debugger/nativeMessaging
-  permissions, attempt the supported Chrome ExtensionSettings remediation by
-  merging blocked_permissions=["debugger","nativeMessaging"]. The default
-  policy scope is the wildcard "*" entry so current and future external
-  debugger/nativeMessaging extensions cannot load. Setup still fails closed
-  until Chrome policy/profile and process readback prove the external surface is
-  gone.
+  Enabled by default for end-user setup. Attempt the supported Chrome
+  ExtensionSettings remediation by merging
+  blocked_permissions=["debugger","nativeMessaging"]. The default policy scope
+  is the wildcard "*" entry so current and future external debugger/nativeMessaging
+  extensions cannot load. Setup still fails closed until Chrome policy/profile
+  and process readback prove the external surface is gone. Passing
+  -ApplyExternalChromeDebuggerPolicy:$false is diagnostic-only and cannot certify
+  a popup-free end-user host.
 
 .PARAMETER ChromePolicyHive
   Chrome policy hive used with -ApplyExternalChromeDebuggerPolicy. Defaults to
@@ -104,7 +105,7 @@ param(
     [string]$Bind        = '127.0.0.1:7700',
     [string]$ExePath     = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
     [string]$ChromeNativeHostExePath = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
-    [switch]$ApplyExternalChromeDebuggerPolicy,
+    [switch]$ApplyExternalChromeDebuggerPolicy = $true,
     [ValidateSet('HKCU', 'HKLM')]
     [string]$ChromePolicyHive = 'HKCU',
     [ValidateSet('AllExtensions', 'DetectedExtensions')]

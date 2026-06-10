@@ -149,12 +149,17 @@ Chrome session, the supported attach path is:
    same user-visible debugger/native-host popup even though Synapse is not the
    caller. The remediation is to disable/remove the external extension or apply
    a Chrome `ExtensionSettings.blocked_permissions` policy.
-   `scripts\install-synapse-chrome-debugger.ps1
-   -ApplyExternalChromeDebuggerPolicy` merges
+   Windows setup applies the supported policy remediation by default:
+   `scripts\synapse-setup.ps1` merges
    `blocked_permissions=["debugger","nativeMessaging"]` into the wildcard `"*"`
-   policy entry by default, so current and future extensions cannot load with
-   those permissions. `-ChromePolicyBlockScope DetectedExtensions` limits the
-   merge to currently discovered extension IDs. The script fails with
+   policy entry, so current and future extensions cannot load with those
+   permissions. Passing `-ApplyExternalChromeDebuggerPolicy:$false` is
+   diagnostic-only and cannot certify a popup-free end-user host. The standalone
+   bridge verifier can apply the same policy with
+   `scripts\install-synapse-chrome-debugger.ps1
+   -ApplyExternalChromeDebuggerPolicy`. `-ChromePolicyBlockScope
+   DetectedExtensions` limits the merge to currently discovered extension IDs.
+   The scripts fail with
    `SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED` if the current principal
    cannot write the policy key. After policy is written, refresh/restart Chrome
    and rerun the verifier; do not certify popup-free readiness until the

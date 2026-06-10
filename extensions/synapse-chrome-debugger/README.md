@@ -55,21 +55,26 @@ surface found at that moment. A remaining end-user debugger/native-host popup is
 therefore attributed to a concrete extension or process instead of being
 reported as an ambiguous Synapse bridge failure.
 
-To apply the supported Chrome policy remediation for external extensions, run:
+The full Windows setup script applies the supported Chrome policy remediation by
+default:
+
+```powershell
+scripts\synapse-setup.ps1
+```
+
+That default setup path merges `blocked_permissions=["debugger","nativeMessaging"]`
+into the current user's Chrome `ExtensionSettings` wildcard `"*"` policy entry,
+which blocks current and future extensions from loading with those permissions.
+Passing `-ApplyExternalChromeDebuggerPolicy:$false` is diagnostic-only and cannot
+certify an end-user host as popup-free.
+
+To apply the same supported Chrome policy remediation from the standalone
+bridge verifier, run:
 
 ```powershell
 scripts\install-synapse-chrome-debugger.ps1 -ApplyExternalChromeDebuggerPolicy
 ```
 
-The full Windows setup script exposes the same remediation switch:
-
-```powershell
-scripts\synapse-setup.ps1 -ApplyExternalChromeDebuggerPolicy
-```
-
-By default this merges `blocked_permissions=["debugger","nativeMessaging"]`
-into the current user's Chrome `ExtensionSettings` wildcard `"*"` policy entry,
-which blocks current and future extensions from loading with those permissions.
 Use `-ChromePolicyBlockScope DetectedExtensions` only when the operator
 intentionally wants to limit remediation to the currently discovered extension
 IDs. If the current Windows principal cannot write the policy key, the script
