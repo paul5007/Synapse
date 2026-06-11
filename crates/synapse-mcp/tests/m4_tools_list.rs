@@ -213,7 +213,9 @@ fn assert_act_run_shell_semantics_described(tools: &[Value]) -> anyhow::Result<(
         .context("act_run_shell description missing")?;
     ensure!(
         tool_description.contains("executable path/name only")
-            && tool_description.contains("explicit shell executable"),
+            && tool_description.contains("explicit shell executable")
+            && tool_description.contains("inline wait budget")
+            && tool_description.contains("no inferred durable lifetime cap"),
         "act_run_shell description must explain executable-plus-args semantics: {tool_description}"
     );
 
@@ -233,6 +235,37 @@ fn assert_act_run_shell_semantics_described(tools: &[Value]) -> anyhow::Result<(
         args_description.contains("Arguments passed literally")
             && args_description.contains("not parsed by a shell"),
         "act_run_shell args schema must explain literal argument passing: {args_description}"
+    );
+
+    let timeout_description = value_at(tool, "inputSchema.properties.timeout_ms.description")?
+        .as_str()
+        .context("act_run_shell timeout_ms description missing")?;
+    ensure!(
+        timeout_description.contains("Inline wait budget")
+            && timeout_description.contains("does not infer a durable lifetime timeout"),
+        "act_run_shell timeout_ms schema must separate inline and durable timeout semantics: {timeout_description}"
+    );
+
+    let start_tool = tool_by_name(tools, "act_run_shell_start")?;
+    let start_description = start_tool
+        .get("description")
+        .and_then(Value::as_str)
+        .context("act_run_shell_start description missing")?;
+    ensure!(
+        start_description.contains("Omitting timeout_ms")
+            && start_description.contains("unbounded")
+            && start_description.contains("explicit lifetime cap"),
+        "act_run_shell_start description must explain durable lifetime cap semantics: {start_description}"
+    );
+
+    let start_timeout_description =
+        value_at(start_tool, "inputSchema.properties.timeout_ms.description")?
+            .as_str()
+            .context("act_run_shell_start timeout_ms description missing")?;
+    ensure!(
+        start_timeout_description.contains("Optional explicit durable job lifetime cap")
+            && start_timeout_description.contains("Omit for an unbounded job"),
+        "act_run_shell_start timeout_ms schema must explain unbounded default: {start_timeout_description}"
     );
     Ok(())
 }

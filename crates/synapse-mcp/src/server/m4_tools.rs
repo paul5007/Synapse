@@ -88,7 +88,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required. Requests with timeout_ms above the inline await budget return immediately as a durable background job with job_id/status/stdout/stderr paths; poll act_run_shell_status and cancel with act_run_shell_cancel."
+        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required. timeout_ms is the direct inline wait budget. Requests with timeout_ms above the inline await budget return immediately as a durable background job with job_id/status/stdout/stderr paths and no inferred durable lifetime cap; poll act_run_shell_status and cancel with act_run_shell_cancel."
     )]
     pub async fn act_run_shell(
         &self,
@@ -132,7 +132,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Start an allowlisted executable as a durable background shell job. Returns immediately with a job id plus status/stdout/stderr file paths; use act_run_shell_status to poll and act_run_shell_cancel to terminate by job id."
+        description = "Start an allowlisted executable as a durable background shell job. Returns immediately with a job id plus status/stdout/stderr file paths. Omitting timeout_ms leaves the durable job unbounded until normal exit, explicit act_run_shell_cancel, or session cleanup; providing timeout_ms is an explicit lifetime cap for that job only."
     )]
     pub async fn act_run_shell_start(
         &self,

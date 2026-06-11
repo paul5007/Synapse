@@ -386,6 +386,12 @@ impl SynapseService {
                         run_shell_inline_await_limit_ms: Some(
                             self.m4_config.run_shell_inline_await_limit_ms(),
                         ),
+                        run_shell_durable_default_timeout_ms: Some(
+                            self.m4_config.run_shell_durable_default_timeout_ms(),
+                        ),
+                        run_shell_durable_max_timeout_ms: Some(
+                            self.m4_config.run_shell_durable_max_timeout_ms(),
+                        ),
                         ..SubsystemHealth::default()
                     }
                 }

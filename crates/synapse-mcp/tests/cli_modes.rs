@@ -212,6 +212,14 @@ async fn http_health_reads_m4_policy_counts_from_repeated_cli_flags() -> anyhow:
         response.contains("\"run_shell_inline_await_limit_ms\":1234"),
         "{response}"
     );
+    assert!(
+        response.contains("\"run_shell_durable_default_timeout_ms\":null"),
+        "{response}"
+    );
+    assert!(
+        response.contains("\"run_shell_durable_max_timeout_ms\":null"),
+        "{response}"
+    );
     Ok(())
 }
 

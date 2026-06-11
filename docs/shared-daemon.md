@@ -119,6 +119,26 @@ both exit **4** instead of failing later inside a tool call.
   `SYNAPSE_DAEMON_CMD_ANCESTOR_FORBIDDEN` if the healthy daemon's process
   lineage still contains `cmd.exe`.
 
+## Durable Shell Jobs
+
+`act_run_shell.timeout_ms` is the direct inline wait budget. When it is greater
+than the daemon's inline await limit, the request returns a durable job handle
+instead of waiting. That handoff does not copy the inline budget into the
+durable job lifetime; the persisted job `status.json` records
+`"timeout_ms": null`.
+
+`act_run_shell_start.timeout_ms` is different: it is an explicit lifetime cap
+for that one durable job. Omit it for an unbounded job that exits normally or is
+stopped by `act_run_shell_cancel` or session cleanup. Cancellation and timeout
+termination are limited to the recorded job-owned PID/process tree from
+`status.json`; terminal/IDE/WSL host processes are never broad cleanup targets.
+
+The action subsystem health payload exposes these policies separately:
+`run_shell_inline_await_limit_ms`,
+`run_shell_durable_default_timeout_ms`, and
+`run_shell_durable_max_timeout_ms`. The durable timeout fields are `null` when
+there is no default cap and no configured maximum cap.
+
 ## Health
 
 `GET http://127.0.0.1:7700/health` (with `Authorization: Bearer <token>`) returns

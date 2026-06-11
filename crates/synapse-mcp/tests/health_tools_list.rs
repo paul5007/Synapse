@@ -152,6 +152,17 @@ async fn health_and_action_tools_appear_in_tools_list_with_schema() -> anyhow::R
         health["subsystems"]["action"]["run_shell_inline_await_limit_ms"],
         Value::from(90_000)
     );
+    let action_health = health["subsystems"]["action"]
+        .as_object()
+        .context("action health object missing")?;
+    assert_eq!(
+        action_health.get("run_shell_durable_default_timeout_ms"),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        action_health.get("run_shell_durable_max_timeout_ms"),
+        Some(&Value::Null)
+    );
     let status = client.shutdown().await?;
     assert!(status.success());
     Ok(())

@@ -76,6 +76,12 @@ pub struct SubsystemHealth {
     pub backend_resolution: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_shell_inline_await_limit_ms: Option<u64>,
+    /// Outer `None` omits the field for unrelated subsystems; inner `None`
+    /// serializes as JSON null to make an unbounded durable shell policy visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_shell_durable_default_timeout_ms: Option<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_shell_durable_max_timeout_ms: Option<Option<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perception_mode: Option<PerceptionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

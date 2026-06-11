@@ -254,6 +254,16 @@ impl M4ServiceConfig {
         self.run_shell_inline_await_limit_ms
     }
 
+    #[must_use]
+    pub const fn run_shell_durable_default_timeout_ms(&self) -> Option<u64> {
+        None
+    }
+
+    #[must_use]
+    pub const fn run_shell_durable_max_timeout_ms(&self) -> Option<u64> {
+        None
+    }
+
     fn shell_match<'a>(&'a self, command_line: &str) -> Option<&'a str> {
         if self.allow_shell_any {
             return Some(ANY_PERMITTED_SENTINEL);
@@ -378,7 +388,11 @@ pub struct ActRunShellParams {
     #[schemars(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default = "default_shell_timeout_ms")]
-    #[schemars(default = "default_shell_timeout_ms", range(min = 1))]
+    #[schemars(
+        default = "default_shell_timeout_ms",
+        range(min = 1),
+        description = "Inline wait budget for direct act_run_shell. If this value exceeds the configured inline await limit, act_run_shell returns a durable job handle and does not infer a durable lifetime timeout; use act_run_shell_start.timeout_ms for an explicit durable job cap."
+    )]
     pub timeout_ms: u64,
     pub idempotency_key: Option<String>,
 }
@@ -431,7 +445,10 @@ pub struct ActRunShellStartParams {
     #[schemars(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(
+        range(min = 1),
+        description = "Optional explicit durable job lifetime cap in milliseconds. Omit for an unbounded job that exits normally or is stopped only by act_run_shell_cancel/session cleanup."
+    )]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     #[schemars(length(max = 128))]
@@ -1088,7 +1105,7 @@ fn run_shell_params_to_start_params(params: ActRunShellParams) -> ActRunShellSta
         args: params.args,
         working_dir: params.working_dir,
         env: params.env,
-        timeout_ms: Some(params.timeout_ms),
+        timeout_ms: None,
         job_id: None,
     }
 }
@@ -1123,6 +1140,7 @@ pub fn run_shell_request_details(
     params: &ActRunShellParams,
     inline_await_limit_ms: u64,
 ) -> serde_json::Value {
+    let will_background = should_background_direct_shell(params, inline_await_limit_ms);
     json!({
         "command": params.command,
         "args": params.args,
@@ -1130,7 +1148,13 @@ pub fn run_shell_request_details(
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
         "timeout_ms": params.timeout_ms,
         "inline_await_limit_ms": inline_await_limit_ms,
-        "will_background": should_background_direct_shell(params, inline_await_limit_ms),
+        "will_background": will_background,
+        "durable_timeout_ms_if_backgrounded": Option::<u64>::None,
+        "durable_timeout_policy": if will_background {
+            "unbounded_after_direct_handoff"
+        } else {
+            "inline_timeout_only"
+        },
         "idempotency_key_present": params.idempotency_key.is_some(),
         "request_sha256": run_shell_request_sha256(params).ok(),
     })
@@ -1156,6 +1180,11 @@ pub fn run_shell_start_request_details(params: &ActRunShellStartParams) -> serde
         "working_dir": params.working_dir,
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
         "timeout_ms": params.timeout_ms,
+        "durable_timeout_policy": if params.timeout_ms.is_some() {
+            "explicit_timeout_ms"
+        } else {
+            "unbounded_until_exit_or_cancel"
+        },
         "job_id": params.job_id,
         "request_sha256": run_shell_start_request_sha256(params).ok(),
     })
@@ -4512,7 +4541,7 @@ async fn monitor_shell_job(
         let timeout_ms = status.timeout_ms.unwrap_or_default();
         status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
         status.error_message = Some(format!(
-            "caller timeout_ms budget expired after {timeout_ms} ms; process tree termination was requested"
+            "durable job timeout_ms cap expired after {timeout_ms} ms; process tree termination was requested"
         ));
     } else {
         status.status =
@@ -6937,7 +6966,7 @@ mod tests {
             .expect("background response should include job");
         assert_eq!(job.job_id, job_id);
         assert_eq!(job.status, "running");
-        assert_eq!(job.timeout_ms, Some(timeout_ms));
+        assert_eq!(job.timeout_ms, None);
 
         for _ in 0..100 {
             let status = shell_job_status(
