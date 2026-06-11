@@ -20,13 +20,13 @@ use crate::m2::postcondition::{
 };
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA,
-    CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, HwndKeyboardTargetState, PressBackend,
-    ResolvedKeymapPress, act_click_postmessage_with_params, act_keymap_response_from_press,
-    act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
-    act_stroke_error_details, act_stroke_request_details, action_from_press_params,
-    attach_click_tier_attempts, click_params_can_route_background_first, click_target_root_hwnd,
-    click_tier_delivered, click_tier_failed, emitted_text, hwnd_keyboard_target_state,
-    resolve_keymap_press,
+    CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, ForegroundClickPolicy, HwndKeyboardTargetState,
+    PressBackend, ResolvedKeymapPress, act_click_postmessage_with_params,
+    act_keymap_response_from_press, act_press_cdp_target, act_press_normalized_labels,
+    act_press_postmessage_target, act_stroke_error_details, act_stroke_request_details,
+    action_from_press_params, attach_click_tier_attempts, click_params_can_route_background_first,
+    click_target_root_hwnd, click_tier_delivered, click_tier_failed, emitted_text,
+    hwnd_keyboard_target_state, resolve_keymap_press,
 };
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -200,7 +200,7 @@ impl SynapseService {
             None
         };
         let verify_timeout_ms = params.verify_timeout_ms;
-        let foreground_lease_session_id = foreground_lease_session_id(&request_context)?;
+        let foreground_click_policy = self.foreground_click_policy_for_request(&request_context)?;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         let started = Instant::now();
@@ -212,18 +212,13 @@ impl SynapseService {
                 before,
                 verify_timeout_ms,
                 target_window_hwnd,
-                foreground_lease_session_id,
+                foreground_click_policy,
                 started,
             )
             .await
         } else {
-            act_click_with_handle_and_lease(
-                handle,
-                recording,
-                params,
-                foreground_lease_session_id.as_deref(),
-            )
-            .await
+            act_click_with_handle_and_lease(handle, recording, params, foreground_click_policy)
+                .await
         };
         self.audit_action_result_for_request("act_click", &result, &request_context)?;
         result.map(Json)
@@ -280,7 +275,7 @@ impl SynapseService {
             return result.map(Json);
         }
         let _lease_guard = if params.into_element.is_none() {
-            match acquire_tool_foreground_input_lease("act_type", &request_context) {
+            match acquire_tool_foreground_input_lease(self, "act_type", &request_context) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let result: Result<ActTypeResponse, ErrorData> = Err(error);
@@ -467,7 +462,7 @@ impl SynapseService {
             return audit_target_claim_denial(self, "act_focus_window", error, &request_context);
         }
         let mut lease_guard =
-            match acquire_tool_foreground_input_lease("act_focus_window", &request_context) {
+            match acquire_tool_foreground_input_lease(self, "act_focus_window", &request_context) {
                 Ok(guard) => guard,
                 Err(error) => {
                     self.audit_action_error_with_details_for_request(
@@ -565,6 +560,7 @@ impl SynapseService {
         };
         let verify_timeout_ms = params.verify_timeout_ms;
         let _lease_guard = match acquire_tool_foreground_input_lease_with_ttl(
+            self,
             "act_press",
             &request_context,
             lease_ttl_for_hold_ms(params.hold_ms),
@@ -687,6 +683,7 @@ impl SynapseService {
             }
         }
         let _lease_guard = match acquire_tool_foreground_input_lease_with_ttl(
+            self,
             "act_keymap",
             &request_context,
             lease_ttl_for_hold_ms(params.hold_ms),
@@ -791,7 +788,7 @@ impl SynapseService {
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         let _lease_guard = if plan.requires_input_lease() {
-            match acquire_tool_foreground_input_lease("act_stroke", &request_context) {
+            match acquire_tool_foreground_input_lease(self, "act_stroke", &request_context) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let failure_details =
@@ -965,7 +962,7 @@ impl SynapseService {
             None
         };
         let _lease_guard = if params.requires_input_lease() {
-            match acquire_tool_foreground_input_lease("act_scroll", &request_context) {
+            match acquire_tool_foreground_input_lease(self, "act_scroll", &request_context) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let result: Result<ActScrollResponse, ErrorData> = Err(error);
@@ -1361,6 +1358,49 @@ fn foreground_lease_session_id(
     super::context::mcp_session_id_from_request_context(request_context)
 }
 
+impl SynapseService {
+    fn foreground_click_policy_for_request(
+        &self,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<ForegroundClickPolicy, ErrorData> {
+        let session_id = foreground_lease_session_id(request_context)?;
+        let Some(session_id_ref) = session_id.as_deref() else {
+            return Ok(ForegroundClickPolicy::allowed(None));
+        };
+        let Some(hidden_desktop) = self.session_hidden_desktop_readback(session_id_ref)? else {
+            return Ok(ForegroundClickPolicy::allowed(session_id));
+        };
+        Ok(ForegroundClickPolicy::refuse_hidden_desktop(
+            session_id_ref.to_owned(),
+            hidden_desktop.desktop_names,
+        ))
+    }
+}
+
+fn hidden_desktop_foreground_refusal(
+    tool: &'static str,
+    hidden_desktop: &super::session_lifecycle::SessionHiddenDesktopReadback,
+) -> ErrorData {
+    let detail = format!(
+        "{tool} cannot use the visible foreground input tier because MCP session {:?} owns hidden desktop(s) {:?}; hidden Win32 desktops are not the active input desktop, so raw SendInput/cursor/foreground activation is refused. Use a background CDP/UIA/PostMessage target route or a separate Windows session/RDP path for raw-input-required apps.",
+        hidden_desktop.session_id, hidden_desktop.desktop_names
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail,
+        Some(json!({
+            "code": error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            "reason": "hidden_desktop_foreground_tier_refused",
+            "tool": tool,
+            "session_id": hidden_desktop.session_id,
+            "desktop_names": hidden_desktop.desktop_names,
+            "launch_pids": hidden_desktop.launch_pids,
+            "resource_count": hidden_desktop.resource_count,
+            "foreground_tier_allowed": false,
+        })),
+    )
+}
+
 fn audit_target_claim_denial<T: Serialize>(
     service: &SynapseService,
     tool: &'static str,
@@ -1402,10 +1442,12 @@ const fn click_delta_source_of_truth(target_window_hwnd: Option<i64>) -> &'stati
 }
 
 fn acquire_tool_foreground_input_lease(
+    service: &SynapseService,
     tool: &'static str,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<crate::m2::ForegroundInputLeaseGuard, ErrorData> {
     acquire_tool_foreground_input_lease_with_ttl(
+        service,
         tool,
         request_context,
         synapse_action::DEFAULT_LEASE_TTL_MS,
@@ -1413,11 +1455,17 @@ fn acquire_tool_foreground_input_lease(
 }
 
 fn acquire_tool_foreground_input_lease_with_ttl(
+    service: &SynapseService,
     tool: &'static str,
     request_context: &RequestContext<RoleServer>,
     ttl_ms: u64,
 ) -> Result<crate::m2::ForegroundInputLeaseGuard, ErrorData> {
     let session_id = foreground_lease_session_id(request_context)?;
+    if let Some(session_id_ref) = session_id.as_deref()
+        && let Some(hidden_desktop) = service.session_hidden_desktop_readback(session_id_ref)?
+    {
+        return Err(hidden_desktop_foreground_refusal(tool, &hidden_desktop));
+    }
     crate::m2::acquire_foreground_input_lease_with_ttl(tool, session_id.as_deref(), ttl_ms)
 }
 
@@ -1652,14 +1700,14 @@ impl SynapseService {
         before: ClickDeltaSignature,
         verify_timeout_ms: u32,
         target_window_hwnd: Option<i64>,
-        foreground_lease_session_id: Option<String>,
+        foreground_click_policy: ForegroundClickPolicy,
         started: Instant,
     ) -> Result<ActClickResponse, ErrorData> {
         match act_click_with_handle_and_lease(
             handle.clone(),
             recording.clone(),
             params.clone(),
-            foreground_lease_session_id.as_deref(),
+            foreground_click_policy.clone(),
         )
         .await
         {
@@ -1690,7 +1738,7 @@ impl SynapseService {
                                 verify_timeout_ms,
                                 target_window_hwnd,
                                 tier_attempts,
-                                foreground_lease_session_id,
+                                foreground_click_policy,
                             )
                             .await
                         } else if should_try_click_foreground_tier(&tier_attempts) {
@@ -1702,7 +1750,7 @@ impl SynapseService {
                                 verify_timeout_ms,
                                 target_window_hwnd,
                                 tier_attempts,
-                                foreground_lease_session_id,
+                                foreground_click_policy,
                             )
                             .await
                         } else {
@@ -1752,7 +1800,7 @@ impl SynapseService {
                         verify_timeout_ms,
                         target_window_hwnd,
                         tier_attempts,
-                        foreground_lease_session_id,
+                        foreground_click_policy,
                     )
                     .await
                 } else if should_try_click_foreground_tier(&tier_attempts) {
@@ -1764,7 +1812,7 @@ impl SynapseService {
                         verify_timeout_ms,
                         target_window_hwnd,
                         tier_attempts,
-                        foreground_lease_session_id,
+                        foreground_click_policy,
                     )
                     .await
                 } else {
@@ -1784,7 +1832,7 @@ impl SynapseService {
         verify_timeout_ms: u32,
         target_window_hwnd: Option<i64>,
         tier_attempts: Vec<ActClickTierAttempt>,
-        foreground_lease_session_id: Option<String>,
+        foreground_click_policy: ForegroundClickPolicy,
     ) -> Result<ActClickResponse, ErrorData> {
         match act_click_postmessage_with_params(&params, tier_attempts).await {
             Ok(response) => {
@@ -1809,7 +1857,7 @@ impl SynapseService {
                                 verify_timeout_ms,
                                 target_window_hwnd,
                                 tier_attempts,
-                                foreground_lease_session_id,
+                                foreground_click_policy,
                             )
                             .await
                         } else {
@@ -1830,7 +1878,7 @@ impl SynapseService {
                         verify_timeout_ms,
                         target_window_hwnd,
                         tier_attempts,
-                        foreground_lease_session_id,
+                        foreground_click_policy,
                     )
                     .await
                 } else {
@@ -1850,16 +1898,11 @@ impl SynapseService {
         verify_timeout_ms: u32,
         target_window_hwnd: Option<i64>,
         prior_attempts: Vec<ActClickTierAttempt>,
-        foreground_lease_session_id: Option<String>,
+        foreground_click_policy: ForegroundClickPolicy,
     ) -> Result<ActClickResponse, ErrorData> {
         params.use_invoke_pattern = false;
-        match act_click_with_handle_and_lease(
-            handle,
-            recording,
-            params,
-            foreground_lease_session_id.as_deref(),
-        )
-        .await
+        match act_click_with_handle_and_lease(handle, recording, params, foreground_click_policy)
+            .await
         {
             Ok(mut response) => {
                 let current_attempts = std::mem::take(&mut response.tier_attempts);
@@ -4799,6 +4842,44 @@ mod tests {
         assert_eq!(
             lease_ttl_for_hold_ms(u32::MAX),
             synapse_action::MAX_LEASE_TTL_MS
+        );
+    }
+
+    #[test]
+    fn hidden_desktop_foreground_refusal_carries_physical_route_context() {
+        let hidden_desktop = crate::server::session_lifecycle::SessionHiddenDesktopReadback {
+            session_id: "session-743".to_owned(),
+            desktop_names: vec!["SynapseAgent_abc123".to_owned()],
+            launch_pids: vec![4242],
+            resource_count: 1,
+        };
+
+        let error = hidden_desktop_foreground_refusal("act_press", &hidden_desktop);
+        let data = error.data.as_ref().expect("structured error data");
+        println!(
+            "readback=hidden_desktop_foreground_refusal before=session:{} desktop:{:?} after=data:{}",
+            hidden_desktop.session_id, hidden_desktop.desktop_names, data
+        );
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::FOREGROUND_ACTIVATION_REFUSED)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("hidden_desktop_foreground_tier_refused")
+        );
+        assert_eq!(data.get("tool").and_then(Value::as_str), Some("act_press"));
+        assert_eq!(
+            data.get("foreground_tier_allowed").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            data.get("desktop_names")
+                .and_then(Value::as_array)
+                .and_then(|names| names.first())
+                .and_then(Value::as_str),
+            Some("SynapseAgent_abc123")
         );
     }
 

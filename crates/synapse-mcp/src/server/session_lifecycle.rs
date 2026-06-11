@@ -59,6 +59,15 @@ pub(crate) struct SessionProcessResource {
     pub desktop_lease: Option<m4::LaunchDesktopLease>,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionHiddenDesktopReadback {
+    pub session_id: String,
+    pub desktop_names: Vec<String>,
+    pub launch_pids: Vec<u32>,
+    pub resource_count: usize,
+}
+
 impl SessionProcessResource {
     pub(crate) fn new(
         session_id: String,
@@ -669,6 +678,44 @@ impl SynapseService {
             "readback=session_process_ledger after=registered"
         );
         Ok(())
+    }
+
+    pub(crate) fn session_hidden_desktop_readback(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionHiddenDesktopReadback>, ErrorData> {
+        let guard = self.session_processes.lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session process resource lock poisoned while reading hidden desktop ownership",
+            )
+        })?;
+        let Some(resources) = guard.get(session_id) else {
+            return Ok(None);
+        };
+        let mut desktop_names = BTreeSet::new();
+        let mut launch_pids = Vec::new();
+        for resource in resources.values() {
+            let Some(desktop) = resource.desktop_lease.as_ref() else {
+                continue;
+            };
+            if !desktop.is_session_owned() {
+                continue;
+            }
+            desktop_names.insert(desktop.name().to_owned());
+            launch_pids.push(resource.pid);
+        }
+        if desktop_names.is_empty() {
+            return Ok(None);
+        }
+        launch_pids.sort_unstable();
+        launch_pids.dedup();
+        Ok(Some(SessionHiddenDesktopReadback {
+            session_id: session_id.to_owned(),
+            desktop_names: desktop_names.into_iter().collect(),
+            resource_count: launch_pids.len(),
+            launch_pids,
+        }))
     }
 
     pub(crate) fn terminated_sessions_handle(&self) -> SharedTerminatedSessions {

@@ -3354,6 +3354,10 @@ impl LaunchDesktopLease {
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
+
+    pub(crate) const fn is_session_owned(&self) -> bool {
+        self.terminate_windows_on_close
+    }
 }
 
 #[cfg(windows)]

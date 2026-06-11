@@ -29,10 +29,10 @@ use windows::{
 
 use super::{
     CLICK_REASON_SELECTION_ONLY, CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, CLICK_TIER_UIA,
-    acquire_click_foreground_lease, action_error_to_mcp, attach_click_tier_attempts,
-    backend_used_name, click_backend_tier_used, click_error_code, click_reason_for_error_code,
-    click_required_foreground, click_tier_delivered, click_tier_failed,
-    error_has_click_tier_attempts, record,
+    ForegroundClickPolicy, acquire_click_foreground_lease, action_error_to_mcp,
+    attach_click_tier_attempts, backend_used_name, click_backend_tier_used, click_error_code,
+    click_reason_for_error_code, click_required_foreground, click_tier_delivered,
+    click_tier_failed, error_has_click_tier_attempts, record,
     schema::{
         ActClickElementTarget, ActClickParams, ActClickResponse, ActClickTierAttempt,
         postcondition_not_requested,
@@ -46,7 +46,7 @@ pub(super) async fn execute_element_click(
     recording: Option<&RecordingBackend>,
     timing: DoubleClickTiming,
     started: Instant,
-    foreground_lease_session_id: Option<&str>,
+    foreground_click_policy: ForegroundClickPolicy,
 ) -> Result<ActClickResponse, ErrorData> {
     if element_is_coordinate_only(&element.element_id) || !params.use_invoke_pattern {
         return execute_coordinate_element_click(
@@ -58,7 +58,7 @@ pub(super) async fn execute_element_click(
             started,
             Vec::new(),
             "coordinate_direct",
-            foreground_lease_session_id,
+            foreground_click_policy,
         )
         .await;
     }
@@ -94,7 +94,7 @@ pub(super) async fn execute_element_click(
                 started,
                 tier_attempts,
                 "coordinate_fallback_on_selection_only_list_item",
-                foreground_lease_session_id,
+                foreground_click_policy,
             )
             .await;
         }
@@ -164,7 +164,7 @@ pub(super) async fn execute_element_click(
                             started,
                             tier_attempts,
                             "coordinate_fallback_on_unsupported",
-                            foreground_lease_session_id,
+                            foreground_click_policy,
                         )
                         .await;
                     }
@@ -218,7 +218,7 @@ pub(super) async fn execute_element_click(
                             started,
                             tier_attempts,
                             "coordinate_fallback_on_selection_readback_failure",
-                            foreground_lease_session_id,
+                            foreground_click_policy,
                         )
                         .await;
                     }
@@ -405,7 +405,7 @@ async fn execute_coordinate_element_click(
     started: Instant,
     mut tier_attempts: Vec<ActClickTierAttempt>,
     trace_outcome: &'static str,
-    foreground_lease_session_id: Option<&str>,
+    foreground_click_policy: ForegroundClickPolicy,
 ) -> Result<ActClickResponse, ErrorData> {
     let screen_point = match element_center(&element.element_id) {
         Ok(screen_point) => screen_point,
@@ -480,7 +480,7 @@ async fn execute_coordinate_element_click(
                     "act_click element coordinate route could not use the background HWND message tier; escalating to leased foreground input"
                 );
                 let _lease_guard = acquire_click_foreground_lease(
-                    foreground_lease_session_id,
+                    &foreground_click_policy,
                     params.hold_ms,
                     &mut tier_attempts,
                 )?;

@@ -41,7 +41,63 @@ pub(crate) const CLICK_REASON_TARGET_INVALID: &str = "target_invalid";
 pub(crate) const CLICK_REASON_PARAMS_INVALID: &str = "params_invalid";
 pub(crate) const CLICK_REASON_NO_OBSERVED_DELTA: &str = "no_observed_delta";
 pub(crate) const CLICK_REASON_SELECTION_ONLY: &str = "selection_only";
+pub(crate) const CLICK_REASON_FOREGROUND_REFUSED: &str = "foreground_refused";
 pub(crate) const CLICK_REASON_ERROR: &str = "error";
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ForegroundClickPolicy {
+    session_id: Option<String>,
+    hidden_desktop_refusal: Option<HiddenDesktopForegroundRefusal>,
+}
+
+#[derive(Clone, Debug)]
+struct HiddenDesktopForegroundRefusal {
+    session_id: String,
+    desktop_names: Vec<String>,
+}
+
+impl ForegroundClickPolicy {
+    pub(crate) fn allowed(session_id: Option<String>) -> Self {
+        Self {
+            session_id,
+            hidden_desktop_refusal: None,
+        }
+    }
+
+    pub(crate) fn refuse_hidden_desktop(session_id: String, desktop_names: Vec<String>) -> Self {
+        Self {
+            session_id: Some(session_id.clone()),
+            hidden_desktop_refusal: Some(HiddenDesktopForegroundRefusal {
+                session_id,
+                desktop_names,
+            }),
+        }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    fn foreground_refusal_error(&self, tool: &'static str) -> Option<ErrorData> {
+        let refusal = self.hidden_desktop_refusal.as_ref()?;
+        let detail = format!(
+            "{tool} cannot use the visible foreground input tier because MCP session {:?} owns hidden desktop(s) {:?}; hidden Win32 desktops are not the active input desktop, so raw SendInput/cursor delivery is refused. Use a background CDP/UIA/PostMessage target route or a separate Windows session/RDP path for raw-input-required apps.",
+            refusal.session_id, refusal.desktop_names
+        );
+        Some(ErrorData::new(
+            ErrorCode(-32099),
+            detail,
+            Some(json!({
+                "code": error_codes::FOREGROUND_ACTIVATION_REFUSED,
+                "reason": "hidden_desktop_foreground_tier_refused",
+                "tool": tool,
+                "session_id": refusal.session_id,
+                "desktop_names": refusal.desktop_names,
+                "foreground_tier_allowed": false,
+            })),
+        ))
+    }
+}
 
 #[allow(dead_code)]
 pub async fn act_click_with_handle(
@@ -49,14 +105,15 @@ pub async fn act_click_with_handle(
     recording: Option<Arc<RecordingBackend>>,
     params: ActClickParams,
 ) -> Result<ActClickResponse, ErrorData> {
-    act_click_with_handle_and_lease(handle, recording, params, None).await
+    act_click_with_handle_and_lease(handle, recording, params, ForegroundClickPolicy::default())
+        .await
 }
 
 pub(crate) async fn act_click_with_handle_and_lease(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActClickParams,
-    foreground_lease_session_id: Option<&str>,
+    foreground_click_policy: ForegroundClickPolicy,
 ) -> Result<ActClickResponse, ErrorData> {
     validate_click_params(&params)?;
     if params.deprecated_curve_alias_used {
@@ -86,7 +143,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
             recording.as_deref(),
             double_click_timing,
             started,
-            foreground_lease_session_id,
+            foreground_click_policy,
         )
         .await;
     }
@@ -135,7 +192,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
     } else {
         let mut tier_attempts = Vec::new();
         let _lease_guard = acquire_click_foreground_lease(
-            foreground_lease_session_id,
+            &foreground_click_policy,
             params.hold_ms,
             &mut tier_attempts,
         )?;
@@ -537,6 +594,7 @@ pub(crate) fn error_has_click_tier_attempts(error: &ErrorData) -> bool {
 
 pub(crate) fn click_reason_for_error_code(error_code: &str) -> &'static str {
     match error_code {
+        error_codes::FOREGROUND_ACTIVATION_REFUSED => CLICK_REASON_FOREGROUND_REFUSED,
         error_codes::ACTION_FOREGROUND_LEASE_BUSY => "foreground_lease_busy",
         error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED => CLICK_REASON_PATTERN_UNSUPPORTED,
         error_codes::TRANSIENT_ELEMENT_EXPIRED | error_codes::A11Y_ELEMENT_STALE => {
@@ -559,13 +617,23 @@ pub(crate) fn click_reason_for_error_code(error_code: &str) -> &'static str {
 }
 
 pub(super) fn acquire_click_foreground_lease(
-    foreground_lease_session_id: Option<&str>,
+    foreground_click_policy: &ForegroundClickPolicy,
     hold_ms: u32,
     tier_attempts: &mut Vec<ActClickTierAttempt>,
 ) -> Result<crate::m2::ForegroundInputLeaseGuard, ErrorData> {
+    if let Some(error) = foreground_click_policy.foreground_refusal_error("act_click") {
+        tier_attempts.push(click_tier_failed(
+            CLICK_TIER_FOREGROUND,
+            CLICK_REASON_FOREGROUND_REFUSED,
+            error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            true,
+            error.message.to_string(),
+        ));
+        return Err(attach_click_tier_attempts(error, tier_attempts.clone()));
+    }
     match crate::m2::acquire_foreground_input_lease_with_ttl(
         "act_click",
-        foreground_lease_session_id,
+        foreground_click_policy.session_id(),
         crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms),
     ) {
         Ok(guard) => Ok(guard),

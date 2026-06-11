@@ -33,6 +33,7 @@ const FOREGROUND_RESTORE_LEASE_MARGIN_MS: u64 = 1_000;
 pub(crate) const FOREGROUND_CONTEXT_RESTORE_STABILITY_MS: u64 =
     FOREGROUND_RESTORE_STABILITY_INTERVAL_MS * FOREGROUND_RESTORE_STABILITY_SAMPLES as u64;
 
+pub(crate) use click::ForegroundClickPolicy;
 #[allow(unused_imports)]
 pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, act_click_with_handle};
 pub(crate) use click::{
