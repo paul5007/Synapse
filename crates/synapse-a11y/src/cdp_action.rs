@@ -86,6 +86,7 @@ pub struct CdpScrollState {
 pub struct CdpActiveElementState {
     pub target_id: String,
     pub has_active_element: bool,
+    pub is_editable: bool,
     pub tag_name: String,
     pub id: String,
     pub name: String,
@@ -370,6 +371,7 @@ pub async fn cdp_active_element_state(
                     return {{
                         target_id: {target_id_json},
                         has_active_element: false,
+                        is_editable: false,
                         tag_name: "",
                         id: "",
                         name: "",
@@ -378,6 +380,21 @@ pub async fn cdp_active_element_state(
                         selection_end: null
                     }};
                 }}
+                const tagName = String(el.tagName || "");
+                const tag = tagName.toUpperCase();
+                const inputType = String(el.getAttribute("type") || "text").toLowerCase();
+                const textInputTypes = new Set([
+                    "text", "search", "url", "tel", "email", "password", "number",
+                    "date", "datetime-local", "month", "time", "week", "color"
+                ]);
+                const ariaDisabled = String(el.getAttribute("aria-disabled") || "").toLowerCase() === "true";
+                const isDisabled = Boolean(el.disabled) || ariaDisabled;
+                const isReadOnly = Boolean(el.readOnly);
+                const isEditable =
+                    (tag === "TEXTAREA" && !isDisabled && !isReadOnly) ||
+                    (tag === "INPUT" && textInputTypes.has(inputType) && !isDisabled && !isReadOnly) ||
+                    (Boolean(el.isContentEditable) && !isDisabled) ||
+                    (String(el.getAttribute("role") || "").toLowerCase() === "textbox" && !isDisabled);
                 const value = ("value" in el)
                     ? String(el.value ?? "")
                     : String(el.textContent ?? "");
@@ -390,7 +407,8 @@ pub async fn cdp_active_element_state(
                 return {{
                     target_id: {target_id_json},
                     has_active_element: true,
-                    tag_name: String(el.tagName || ""),
+                    is_editable: isEditable,
+                    tag_name: tagName,
                     id: String(el.id || ""),
                     name: String(el.getAttribute("name") || ""),
                     value,

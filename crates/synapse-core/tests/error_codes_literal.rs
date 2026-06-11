@@ -49,6 +49,9 @@ fn error_codes_match_literal_names() {
     assert_literal!(ACTION_ELEMENT_PATTERN_UNSUPPORTED);
     assert_literal!(TRANSIENT_ELEMENT_EXPIRED);
     assert_literal!(ACTION_FOREGROUND_LOST);
+    assert_literal!(ACTION_NO_OBSERVED_DELTA);
+    assert_literal!(ACTION_VERIFY_SURFACE_UNAVAILABLE);
+    assert_literal!(ACTION_POSTCONDITION_FAILED);
     assert_literal!(ACTION_UNSUPPORTED_KEY);
     assert_literal!(ACTION_DRAG_DISTANCE_EXCEEDS_LIMIT);
     assert_literal!(STUCK_KEY_AUTO_RELEASED);
@@ -61,6 +64,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED);
     assert_literal!(ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED);
     assert_literal!(FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED);
+    assert_literal!(ACTION_ELEMENT_VALUE_READ_ONLY);
 
     assert_literal!(REFLEX_CAP_REACHED);
     assert_literal!(REFLEX_KIND_INVALID);

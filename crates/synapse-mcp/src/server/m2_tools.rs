@@ -59,6 +59,12 @@ const ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS: u32 = 250;
 const ACTION_DIAGNOSTIC_QUEUE_SETTLE_MS: u64 = 50;
 const ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH: &str = "cdp_target.url";
 const ACT_TYPE_BROWSER_URL_TEXT_INTEGRITY: &str = "cdp_target_url_readback";
+const ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH: &str = "foreground_text_readback";
+const ACT_TYPE_TEXT_INTEGRITY_PREFIX: &str = "verify_delta_text_readback";
+const ACT_TYPE_TEXT_SOURCE_UIA_VALUE: &str = "uia_focused_value";
+const ACT_TYPE_TEXT_SOURCE_UIA_EMPTY: &str = "uia_focused_empty_value_or_text";
+const ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE: &str = "cdp_active_element_value";
+const ACT_TYPE_TEXT_SOURCE_OCR_FOCUSED_RECT: &str = "ocr_focused_rect_text";
 const BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH: &str = "os_foreground_window";
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1530,10 +1536,52 @@ struct ActTypeTextSignature {
     focused_bbox: Option<Rect>,
     readback_source: Option<String>,
     has_text_readback: bool,
+    text_readback_attempts: Vec<String>,
+    cdp_status: Option<String>,
+    cdp_endpoint_present: bool,
+    cdp_selected_target_id: Option<String>,
+    cdp_active_has_element: Option<bool>,
+    cdp_active_is_editable: Option<bool>,
+    cdp_active_tag_name: Option<String>,
+    cdp_active_id_sha256: Option<String>,
+    cdp_active_name_sha256: Option<String>,
+    cdp_active_value_len: Option<usize>,
+    cdp_active_value_sha256: Option<String>,
+    cdp_active_error_code: Option<String>,
+    cdp_active_error_detail_sha256: Option<String>,
+    ocr_word_count: usize,
+    ocr_text_len: Option<usize>,
+    ocr_text_sha256: Option<String>,
+    web_path: Option<String>,
     browser_url_len: Option<usize>,
     browser_url_sha256: Option<String>,
     browser_cdp_target_id: Option<String>,
     browser_url_readback_source: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CdpActiveTextReadback {
+    value: Option<String>,
+    target_id: Option<String>,
+    has_active_element: Option<bool>,
+    is_editable: Option<bool>,
+    tag_name: Option<String>,
+    id_sha256: Option<String>,
+    name_sha256: Option<String>,
+    value_len: Option<usize>,
+    value_sha256: Option<String>,
+    error_code: Option<String>,
+    error_detail_sha256: Option<String>,
+    attempt: String,
+}
+
+#[derive(Clone, Debug)]
+struct OcrTextReadback {
+    value: Option<String>,
+    word_count: usize,
+    value_len: Option<usize>,
+    value_sha256: Option<String>,
+    attempt: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1937,7 +1985,23 @@ impl SynapseService {
         let browser_url = Self::cdp_selected_target_url(&input, require_browser_url).await?;
 
         let focused = focused_text_candidate(input.focused.as_ref(), &input.elements);
-        let (value, readback_source) = focused_text_readback(focused.as_ref());
+        let (uia_value, uia_readback_source) = focused_text_readback(focused.as_ref());
+        let cdp_readback = cdp_active_text_readback(&input).await;
+        let ocr_readback = ocr_focused_rect_text_readback(focused.as_ref(), &input.elements);
+        let mut text_readback_attempts = Vec::new();
+        text_readback_attempts.push(match uia_readback_source {
+            Some(source) => format!("{source}:available"),
+            None => "uia_focused_value:unavailable".to_owned(),
+        });
+        text_readback_attempts.push(cdp_readback.attempt.clone());
+        text_readback_attempts.push(ocr_readback.attempt.clone());
+        let (value, readback_source) = choose_act_type_text_readback(
+            focused.as_ref(),
+            uia_value,
+            uia_readback_source,
+            &cdp_readback,
+            &ocr_readback,
+        );
         let signature = ActTypeTextSignature {
             foreground_hwnd: input.foreground.hwnd,
             foreground_pid: input.foreground.pid,
@@ -1955,8 +2019,30 @@ impl SynapseService {
                 .and_then(|item| item.selected_text.as_deref())
                 .and_then(non_empty_sha256),
             focused_bbox: focused.as_ref().map(|item| item.bbox),
-            readback_source: readback_source.map(str::to_owned),
+            readback_source,
             has_text_readback: value.is_some(),
+            text_readback_attempts,
+            cdp_status: input.cdp.as_ref().map(|cdp| cdp.status.as_str().to_owned()),
+            cdp_endpoint_present: input.cdp.as_ref().is_some_and(|cdp| cdp.endpoint.is_some()),
+            cdp_selected_target_id: cdp_readback.target_id.clone().or_else(|| {
+                input
+                    .cdp
+                    .as_ref()
+                    .and_then(|cdp| cdp.selected_target_id.clone())
+            }),
+            cdp_active_has_element: cdp_readback.has_active_element,
+            cdp_active_is_editable: cdp_readback.is_editable,
+            cdp_active_tag_name: cdp_readback.tag_name,
+            cdp_active_id_sha256: cdp_readback.id_sha256,
+            cdp_active_name_sha256: cdp_readback.name_sha256,
+            cdp_active_value_len: cdp_readback.value_len,
+            cdp_active_value_sha256: cdp_readback.value_sha256,
+            cdp_active_error_code: cdp_readback.error_code,
+            cdp_active_error_detail_sha256: cdp_readback.error_detail_sha256,
+            ocr_word_count: ocr_readback.word_count,
+            ocr_text_len: ocr_readback.value_len,
+            ocr_text_sha256: ocr_readback.value_sha256,
+            web_path: input.web_path.map(|path| path.as_str().to_owned()),
             browser_url_len: browser_url.url.as_ref().map(|url| url.chars().count()),
             browser_url_sha256: browser_url.url.as_deref().and_then(non_empty_sha256),
             browser_cdp_target_id: browser_url.target_id.clone(),
@@ -1964,15 +2050,10 @@ impl SynapseService {
         };
         if require_focused_text_value && value.is_none() {
             let signature_hash = verify_hash_json(&signature)?;
-            return Err(postcondition_failed_error(
-                "act_type",
-                "foreground_focused_text_value",
-                "focused element does not expose a UIA Value/Text readback for fail-closed text verification",
-                signature_hash.clone(),
+            return Err(act_type_verify_surface_unavailable_error(
+                "no UIA Value/Text, CDP active-element, or focused-rectangle OCR text readback was available for act_type verify_delta",
                 signature_hash,
-                json!({
-                    "readback": signature,
-                }),
+                signature,
             ));
         }
 
@@ -2188,7 +2269,7 @@ impl SynapseService {
 
     async fn verify_act_type_response(
         &self,
-        mut response: ActTypeResponse,
+        response: ActTypeResponse,
         before: ActTypeTextReadback,
         verify_timeout_ms: u32,
         emitted: &str,
@@ -2215,67 +2296,15 @@ impl SynapseService {
                 policy,
             );
         }
-        if act_type_foreground_identity_changed(&before.signature, &after.signature) {
-            return Err(act_type_text_foreground_lost_error(
-                verify_timeout_ms,
-                &before_hash,
-                &after_hash,
-                &before.signature,
-                &after.signature,
-            ));
-        }
-        if before.signature.focused_element_id != after.signature.focused_element_id {
-            return Err(postcondition_failed_error(
-                "act_type",
-                "foreground_focused_text_value",
-                "focused text target changed before postcondition readback",
-                before_hash,
-                after_hash,
-                json!({
-                    "before": before.signature,
-                    "after": after.signature,
-                }),
-            ));
-        }
-        if before.value == after.value {
-            return Err(source_no_observed_delta_error(
-                "act_type",
-                "foreground_focused_text_value",
-                verify_timeout_ms,
-                before_hash,
-                after_hash,
-                json!({
-                    "before": before.signature,
-                    "after": after.signature,
-                }),
-            ));
-        }
-        let after_value = after.value.as_deref().unwrap_or_default();
-        if !normalized_text_contains(after_value, emitted) {
-            return Err(postcondition_failed_error(
-                "act_type",
-                "foreground_focused_text_value",
-                "focused text value changed but did not contain the emitted text",
-                before_hash,
-                after_hash,
-                json!({
-                    "expected_emitted_len": emitted.chars().count(),
-                    "expected_emitted_sha256": text_sha256(emitted),
-                    "before": before.signature,
-                    "after": after.signature,
-                }),
-            ));
-        }
-        response.postcondition = postcondition_observed_delta(
-            "act_type",
-            "foreground_focused_text_value",
+        verify_act_type_text_response(
+            response,
+            before,
+            after,
             before_hash,
             after_hash,
-            "observed focused text value changed and containing emitted text after delivery",
-        );
-        response.target_readback_required = false;
-        response.target_text_integrity = "foreground_focused_text_value_readback".to_owned();
-        Ok(response)
+            verify_timeout_ms,
+            emitted,
+        )
     }
 
     async fn verify_act_press_response(
@@ -3326,12 +3355,269 @@ fn focused_text_readback(
         return (None, None);
     };
     if let Some(value) = &focused.value {
-        return (Some(value.clone()), Some("uia_focused_value"));
+        return (Some(value.clone()), Some(ACT_TYPE_TEXT_SOURCE_UIA_VALUE));
     }
     if has_text_readback_pattern(&focused.patterns) {
-        return (Some(String::new()), Some("uia_focused_empty_value_or_text"));
+        return (Some(String::new()), Some(ACT_TYPE_TEXT_SOURCE_UIA_EMPTY));
     }
     (None, None)
+}
+
+fn choose_act_type_text_readback(
+    focused: Option<&ActTypeFocusedTextCandidate>,
+    uia_value: Option<String>,
+    uia_readback_source: Option<&'static str>,
+    cdp_readback: &CdpActiveTextReadback,
+    ocr_readback: &OcrTextReadback,
+) -> (Option<String>, Option<String>) {
+    if should_prefer_cdp_active_text(focused, uia_value.as_deref(), cdp_readback) {
+        if let Some(value) = cdp_readback.value.clone() {
+            return (
+                Some(value),
+                Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE.to_owned()),
+            );
+        }
+    }
+
+    let skip_uia = is_browser_shell_uia_readback(focused, uia_value.as_deref());
+    if !skip_uia {
+        if let Some(value) = uia_value {
+            return (Some(value), uia_readback_source.map(str::to_owned));
+        }
+    }
+
+    if let Some(value) = cdp_readback.value.clone() {
+        return (
+            Some(value),
+            Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE.to_owned()),
+        );
+    }
+    if !skip_uia {
+        if let Some(value) = ocr_readback.value.clone() {
+            return (
+                Some(value),
+                Some(ACT_TYPE_TEXT_SOURCE_OCR_FOCUSED_RECT.to_owned()),
+            );
+        }
+    }
+    (None, None)
+}
+
+fn should_prefer_cdp_active_text(
+    focused: Option<&ActTypeFocusedTextCandidate>,
+    uia_value: Option<&str>,
+    cdp_readback: &CdpActiveTextReadback,
+) -> bool {
+    if cdp_readback.value.is_none()
+        || cdp_readback.has_active_element != Some(true)
+        || cdp_readback.is_editable != Some(true)
+    {
+        return false;
+    }
+    let tag = cdp_readback.tag_name.as_deref().unwrap_or("").trim();
+    if tag.is_empty() || tag.eq_ignore_ascii_case("BODY") || tag.eq_ignore_ascii_case("HTML") {
+        return false;
+    }
+    is_browser_shell_uia_readback(focused, uia_value)
+}
+
+fn is_browser_shell_uia_readback(
+    focused: Option<&ActTypeFocusedTextCandidate>,
+    uia_value: Option<&str>,
+) -> bool {
+    let Some(focused) = focused else {
+        return false;
+    };
+    if !is_shell_text_focus_role(&focused.role) {
+        return false;
+    }
+    match uia_value.map(str::trim) {
+        Some(value) if value.is_empty() => true,
+        Some(value) => looks_like_browser_page_value(value),
+        None => false,
+    }
+}
+
+fn is_shell_text_focus_role(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "window" | "document" | "pane" | "region" | "rootwebarea" | "webarea" | "web view"
+    )
+}
+
+fn looks_like_browser_page_value(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("data:")
+        || value.starts_with("about:")
+        || value.starts_with("chrome://")
+        || value.starts_with("edge://")
+        || value.starts_with("file://")
+}
+
+async fn cdp_active_text_readback(input: &ObservationInput) -> CdpActiveTextReadback {
+    let Some(cdp) = input.cdp.as_ref() else {
+        return CdpActiveTextReadback {
+            value: None,
+            target_id: None,
+            has_active_element: None,
+            is_editable: None,
+            tag_name: None,
+            id_sha256: None,
+            name_sha256: None,
+            value_len: None,
+            value_sha256: None,
+            error_code: None,
+            error_detail_sha256: None,
+            attempt: "cdp_active_element_value:unavailable:no_cdp_diagnostics".to_owned(),
+        };
+    };
+    let Some(endpoint) = cdp.endpoint.as_deref() else {
+        return CdpActiveTextReadback {
+            value: None,
+            target_id: cdp.selected_target_id.clone(),
+            has_active_element: None,
+            is_editable: None,
+            tag_name: None,
+            id_sha256: None,
+            name_sha256: None,
+            value_len: None,
+            value_sha256: None,
+            error_code: cdp.reason_code.clone(),
+            error_detail_sha256: cdp.detail.as_deref().and_then(non_empty_sha256),
+            attempt: format!(
+                "cdp_active_element_value:unavailable:status={}",
+                cdp.status.as_str()
+            ),
+        };
+    };
+    let Some(target_id) = cdp.selected_target_id.as_deref() else {
+        return CdpActiveTextReadback {
+            value: None,
+            target_id: None,
+            has_active_element: None,
+            is_editable: None,
+            tag_name: None,
+            id_sha256: None,
+            name_sha256: None,
+            value_len: None,
+            value_sha256: None,
+            error_code: Some(error_codes::A11Y_CDP_ATTACH_FAILED.to_owned()),
+            error_detail_sha256: None,
+            attempt: "cdp_active_element_value:unavailable:no_selected_target".to_owned(),
+        };
+    };
+
+    match synapse_a11y::cdp_active_element_state(endpoint, target_id).await {
+        Ok(state) => {
+            let value =
+                (state.has_active_element && state.is_editable).then(|| state.value.clone());
+            CdpActiveTextReadback {
+                value,
+                target_id: Some(state.target_id),
+                has_active_element: Some(state.has_active_element),
+                is_editable: Some(state.is_editable),
+                tag_name: (!state.tag_name.trim().is_empty()).then_some(state.tag_name),
+                id_sha256: non_empty_sha256(&state.id),
+                name_sha256: non_empty_sha256(&state.name),
+                value_len: Some(state.value.chars().count()),
+                value_sha256: Some(text_sha256(&state.value)),
+                error_code: None,
+                error_detail_sha256: None,
+                attempt: if state.has_active_element && state.is_editable {
+                    "cdp_active_element_value:available".to_owned()
+                } else if state.has_active_element {
+                    "cdp_active_element_value:unavailable:active_element_not_editable".to_owned()
+                } else {
+                    "cdp_active_element_value:unavailable:no_active_element".to_owned()
+                },
+            }
+        }
+        Err(error) => CdpActiveTextReadback {
+            value: None,
+            target_id: Some(target_id.to_owned()),
+            has_active_element: None,
+            is_editable: None,
+            tag_name: None,
+            id_sha256: None,
+            name_sha256: None,
+            value_len: None,
+            value_sha256: None,
+            error_code: Some(error.code().to_owned()),
+            error_detail_sha256: non_empty_sha256(&error.to_string()),
+            attempt: format!("cdp_active_element_value:error:{}", error.code()),
+        },
+    }
+}
+
+fn ocr_focused_rect_text_readback(
+    focused: Option<&ActTypeFocusedTextCandidate>,
+    elements: &[AccessibleNode],
+) -> OcrTextReadback {
+    let Some(focused) = focused else {
+        return OcrTextReadback {
+            value: None,
+            word_count: 0,
+            value_len: None,
+            value_sha256: None,
+            attempt: "ocr_focused_rect_text:unavailable:no_focused_element".to_owned(),
+        };
+    };
+    if focused.bbox.w <= 0 || focused.bbox.h <= 0 {
+        return OcrTextReadback {
+            value: None,
+            word_count: 0,
+            value_len: None,
+            value_sha256: None,
+            attempt: "ocr_focused_rect_text:unavailable:empty_focused_bbox".to_owned(),
+        };
+    }
+
+    let mut words = elements
+        .iter()
+        .filter(|node| {
+            node.automation_id
+                .as_deref()
+                .is_some_and(|automation_id| automation_id.starts_with("ocr:word:"))
+                && rects_intersect(node.bbox, focused.bbox)
+                && !node.name.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
+    words.sort_by_key(|node| (node.bbox.y, node.bbox.x));
+    let text = words
+        .iter()
+        .map(|node| node.name.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let word_count = words.len();
+    if word_count == 0 {
+        return OcrTextReadback {
+            value: None,
+            word_count,
+            value_len: None,
+            value_sha256: None,
+            attempt: "ocr_focused_rect_text:unavailable:no_ocr_words_in_focused_bbox".to_owned(),
+        };
+    }
+    OcrTextReadback {
+        value: Some(text.clone()),
+        word_count,
+        value_len: Some(text.chars().count()),
+        value_sha256: Some(text_sha256(&text)),
+        attempt: "ocr_focused_rect_text:available".to_owned(),
+    }
+}
+
+fn rects_intersect(a: Rect, b: Rect) -> bool {
+    if a.w <= 0 || a.h <= 0 || b.w <= 0 || b.h <= 0 {
+        return false;
+    }
+    let a_right = a.x.saturating_add(a.w);
+    let a_bottom = a.y.saturating_add(a.h);
+    let b_right = b.x.saturating_add(b.w);
+    let b_bottom = b.y.saturating_add(b.h);
+    a.x < b_right && a_right > b.x && a.y < b_bottom && a_bottom > b.y
 }
 
 fn has_text_readback_pattern(patterns: &[UiaPattern]) -> bool {
@@ -3462,6 +3748,157 @@ fn verify_act_type_browser_url_response(
     Ok(response)
 }
 
+fn verify_act_type_text_response(
+    mut response: ActTypeResponse,
+    before: ActTypeTextReadback,
+    after: ActTypeTextReadback,
+    before_hash: String,
+    after_hash: String,
+    verify_timeout_ms: u32,
+    emitted: &str,
+) -> Result<ActTypeResponse, ErrorData> {
+    let source_of_truth = act_type_text_source_of_truth(&before.signature, &after.signature);
+    if act_type_foreground_identity_changed(&before.signature, &after.signature) {
+        return Err(act_type_text_foreground_lost_error(
+            verify_timeout_ms,
+            &before_hash,
+            &after_hash,
+            &before.signature,
+            &after.signature,
+        ));
+    }
+    if act_type_text_target_changed(&before.signature, &after.signature) {
+        return Err(postcondition_failed_error(
+            "act_type",
+            &source_of_truth,
+            "focused text target changed before postcondition readback",
+            before_hash,
+            after_hash,
+            json!({
+                "before": before.signature,
+                "after": after.signature,
+            }),
+        ));
+    }
+    if before.value == after.value {
+        return Err(source_no_observed_delta_error(
+            "act_type",
+            &source_of_truth,
+            verify_timeout_ms,
+            before_hash,
+            after_hash,
+            json!({
+                "before": before.signature,
+                "after": after.signature,
+            }),
+        ));
+    }
+    let Some(after_value) = after.value.as_deref() else {
+        return Err(act_type_verify_surface_unavailable_error(
+            "after-read had no UIA, CDP, or OCR text Source-of-Truth surface for act_type verify_delta",
+            after_hash,
+            after.signature,
+        ));
+    };
+    if !normalized_text_contains(after_value, emitted) {
+        return Err(postcondition_failed_error(
+            "act_type",
+            &source_of_truth,
+            "text Source-of-Truth changed but did not contain the emitted text",
+            before_hash,
+            after_hash,
+            json!({
+                "expected_emitted_len": emitted.chars().count(),
+                "expected_emitted_sha256": text_sha256(emitted),
+                "before": before.signature,
+                "after": after.signature,
+            }),
+        ));
+    }
+    response.postcondition = postcondition_observed_delta(
+        "act_type",
+        &source_of_truth,
+        before_hash,
+        after_hash,
+        "observed selected text Source-of-Truth changed and containing emitted text after delivery",
+    );
+    response.target_readback_required = false;
+    response.target_text_integrity = format!(
+        "{}:{}",
+        ACT_TYPE_TEXT_INTEGRITY_PREFIX,
+        after
+            .signature
+            .readback_source
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    Ok(response)
+}
+
+fn act_type_text_source_of_truth(
+    before: &ActTypeTextSignature,
+    after: &ActTypeTextSignature,
+) -> String {
+    after
+        .readback_source
+        .as_ref()
+        .or(before.readback_source.as_ref())
+        .map(|source| format!("{ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH}:{source}"))
+        .unwrap_or_else(|| ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH.to_owned())
+}
+
+fn act_type_text_target_changed(
+    before: &ActTypeTextSignature,
+    after: &ActTypeTextSignature,
+) -> bool {
+    if before.focused_element_id != after.focused_element_id {
+        return true;
+    }
+    if before.readback_source.as_deref() == Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE)
+        || after.readback_source.as_deref() == Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE)
+    {
+        return before.cdp_selected_target_id != after.cdp_selected_target_id
+            || before.cdp_active_tag_name != after.cdp_active_tag_name
+            || before.cdp_active_id_sha256 != after.cdp_active_id_sha256
+            || before.cdp_active_name_sha256 != after.cdp_active_name_sha256;
+    }
+    if before.readback_source.as_deref() == Some(ACT_TYPE_TEXT_SOURCE_OCR_FOCUSED_RECT)
+        || after.readback_source.as_deref() == Some(ACT_TYPE_TEXT_SOURCE_OCR_FOCUSED_RECT)
+    {
+        return before.focused_bbox != after.focused_bbox;
+    }
+    false
+}
+
+fn act_type_verify_surface_unavailable_error(
+    detail: impl Into<String>,
+    signature_hash: String,
+    readback: ActTypeTextSignature,
+) -> ErrorData {
+    let detail = detail.into();
+    tracing::error!(
+        code = error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE,
+        tool = "act_type",
+        source_of_truth = ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH,
+        signature = %signature_hash,
+        readback_source = ?readback.readback_source,
+        attempts = ?readback.text_readback_attempts,
+        "act_type verify_delta text Source-of-Truth surface unavailable"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("act_type verify_delta Source-of-Truth surface unavailable: {detail}"),
+        Some(json!({
+            "code": error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE,
+            "tool": "act_type",
+            "source_of_truth": ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH,
+            "detail": detail,
+            "signature": signature_hash,
+            "readback": readback,
+        })),
+    )
+}
+
 fn act_type_browser_url_readback_error(
     code: &str,
     detail: impl Into<String>,
@@ -3505,7 +3942,7 @@ fn act_type_text_foreground_lost_error(
     tracing::warn!(
         code = error_codes::ACTION_FOREGROUND_LOST,
         tool = "act_type",
-        source_of_truth = "foreground_focused_text_value",
+        source_of_truth = ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH,
         timeout_ms,
         before_hwnd = before.foreground_hwnd,
         after_hwnd = after.foreground_hwnd,
@@ -3525,7 +3962,7 @@ fn act_type_text_foreground_lost_error(
         Some(json!({
             "code": error_codes::ACTION_FOREGROUND_LOST,
             "tool": "act_type",
-            "source_of_truth": "foreground_focused_text_value",
+            "source_of_truth": ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH,
             "verify_delta": {
                 "timeout_ms": timeout_ms,
                 "before_signature": before_hash,
@@ -4931,6 +5368,150 @@ mod tests {
     }
 
     #[test]
+    fn act_type_verify_delta_accepts_cdp_active_element_text_surface() {
+        let before = act_type_text_readback_with_source(
+            None,
+            Some("document"),
+            Some("draft"),
+            Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE),
+        );
+        let after = act_type_text_readback_with_source(
+            None,
+            Some("document"),
+            Some("draft issue786-cdp-text"),
+            Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE),
+        );
+        let response = act_type_response_for_verify_delta();
+
+        let verified = verify_act_type_text_response(
+            response,
+            before,
+            after,
+            "before-cdp-hash".to_owned(),
+            "after-cdp-hash".to_owned(),
+            250,
+            "issue786-cdp-text",
+        )
+        .expect("CDP active-element text readback should satisfy act_type verify_delta");
+
+        assert_eq!(verified.postcondition.status, "observed_delta");
+        assert_eq!(verified.postcondition.observed_delta, Some(true));
+        assert_eq!(
+            verified.postcondition.source_of_truth.as_deref(),
+            Some("foreground_text_readback:cdp_active_element_value")
+        );
+        assert_eq!(
+            verified.target_text_integrity,
+            "verify_delta_text_readback:cdp_active_element_value"
+        );
+        assert!(!verified.target_readback_required);
+    }
+
+    #[test]
+    fn act_type_verify_delta_keeps_no_delta_distinct_from_no_surface() {
+        let before = act_type_text_readback_with_source(
+            None,
+            Some("document"),
+            Some("unchanged"),
+            Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE),
+        );
+        let after = before.clone();
+        let response = act_type_response_for_verify_delta();
+
+        let error = verify_act_type_text_response(
+            response,
+            before,
+            after,
+            "before-same-hash".to_owned(),
+            "after-same-hash".to_owned(),
+            250,
+            "issue786",
+        )
+        .expect_err("same CDP active-element text must be verified no-delta, not no-surface");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_NO_OBSERVED_DELTA)
+        );
+    }
+
+    #[test]
+    fn act_type_verify_delta_reports_distinct_surface_unavailable_code() {
+        let no_surface = act_type_text_readback_with_source(None, Some("document"), None, None);
+
+        let error = act_type_verify_surface_unavailable_error(
+            "synthetic no-surface regression",
+            "no-surface-hash".to_owned(),
+            no_surface.signature,
+        );
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE)
+        );
+        assert_ne!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_NO_OBSERVED_DELTA)
+        );
+    }
+
+    #[test]
+    fn act_type_text_readback_prefers_editable_cdp_when_uia_is_browser_shell_url() {
+        let focused = act_type_focused_candidate("document", Some("data:text/html,issue786"));
+        let cdp = cdp_active_text_readback_for_test(Some("alpha issue786"), true, "DIV");
+        let ocr = ocr_text_readback_for_test(Some("visible page words"));
+
+        let (value, source) = choose_act_type_text_readback(
+            Some(&focused),
+            Some("data:text/html,issue786".to_owned()),
+            Some(ACT_TYPE_TEXT_SOURCE_UIA_VALUE),
+            &cdp,
+            &ocr,
+        );
+
+        assert_eq!(value.as_deref(), Some("alpha issue786"));
+        assert_eq!(source.as_deref(), Some(ACT_TYPE_TEXT_SOURCE_CDP_ACTIVE));
+    }
+
+    #[test]
+    fn act_type_text_readback_rejects_browser_shell_url_without_editable_cdp() {
+        let focused = act_type_focused_candidate("document", Some("data:text/html,issue786"));
+        let cdp = cdp_active_text_readback_for_test(None, false, "BODY");
+        let ocr = ocr_text_readback_for_test(Some("visible page words"));
+
+        let (value, source) = choose_act_type_text_readback(
+            Some(&focused),
+            Some("data:text/html,issue786".to_owned()),
+            Some(ACT_TYPE_TEXT_SOURCE_UIA_VALUE),
+            &cdp,
+            &ocr,
+        );
+
+        assert_eq!(value, None);
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn act_type_text_readback_keeps_real_uia_edit_control_authoritative() {
+        let focused = act_type_focused_candidate("Edit", Some("https://example.test/search"));
+        let cdp = cdp_active_text_readback_for_test(Some("dom editor text"), true, "DIV");
+        let ocr = ocr_text_readback_for_test(Some("visible words"));
+
+        let (value, source) = choose_act_type_text_readback(
+            Some(&focused),
+            Some("https://example.test/search".to_owned()),
+            Some(ACT_TYPE_TEXT_SOURCE_UIA_VALUE),
+            &cdp,
+            &ocr,
+        );
+
+        assert_eq!(value.as_deref(), Some("https://example.test/search"));
+        assert_eq!(source.as_deref(), Some(ACT_TYPE_TEXT_SOURCE_UIA_VALUE));
+    }
+
+    #[test]
     fn click_router_respects_coordinate_fallback_disabled() {
         let mut params = act_click_element_params();
         params.use_invoke_pattern = true;
@@ -5127,6 +5708,20 @@ mod tests {
         focused_element_id: Option<&str>,
         focused_value: Option<&str>,
     ) -> ActTypeTextReadback {
+        act_type_text_readback_with_source(
+            browser_url,
+            focused_element_id,
+            focused_value,
+            focused_value.map(|_| "focused.value"),
+        )
+    }
+
+    fn act_type_text_readback_with_source(
+        browser_url: Option<&str>,
+        focused_element_id: Option<&str>,
+        focused_value: Option<&str>,
+        readback_source: Option<&str>,
+    ) -> ActTypeTextReadback {
         let focused_value = focused_value.map(str::to_owned);
         let browser_url_owned = browser_url.map(str::to_owned);
         ActTypeTextReadback {
@@ -5147,8 +5742,29 @@ mod tests {
                     w: 400,
                     h: 32,
                 }),
-                readback_source: focused_value.as_ref().map(|_| "focused.value".to_owned()),
+                readback_source: readback_source.map(str::to_owned),
                 has_text_readback: focused_value.is_some(),
+                text_readback_attempts: vec![
+                    readback_source
+                        .map(|source| format!("{source}:available"))
+                        .unwrap_or_else(|| "all_text_surfaces:unavailable".to_owned()),
+                ],
+                cdp_status: Some("ok".to_owned()),
+                cdp_endpoint_present: true,
+                cdp_selected_target_id: Some("TARGET810".to_owned()),
+                cdp_active_has_element: Some(true),
+                cdp_active_is_editable: Some(true),
+                cdp_active_tag_name: Some("DIV".to_owned()),
+                cdp_active_id_sha256: non_empty_sha256("issue786-editor"),
+                cdp_active_name_sha256: None,
+                cdp_active_value_len: focused_value.as_ref().map(|value| value.chars().count()),
+                cdp_active_value_sha256: focused_value.as_deref().map(text_sha256),
+                cdp_active_error_code: None,
+                cdp_active_error_detail_sha256: None,
+                ocr_word_count: 0,
+                ocr_text_len: None,
+                ocr_text_sha256: None,
+                web_path: None,
                 browser_url_len: browser_url_owned
                     .as_ref()
                     .map(|value| value.chars().count()),
@@ -5158,6 +5774,81 @@ mod tests {
             },
             value: focused_value,
             browser_url: browser_url_owned,
+        }
+    }
+
+    fn act_type_focused_candidate(role: &str, value: Option<&str>) -> ActTypeFocusedTextCandidate {
+        ActTypeFocusedTextCandidate {
+            element_id: "issue786-focused".to_owned(),
+            role: role.to_owned(),
+            name: String::new(),
+            selected_text: None,
+            bbox: Rect {
+                x: 10,
+                y: 10,
+                w: 400,
+                h: 40,
+            },
+            value: value.map(str::to_owned),
+            patterns: Vec::new(),
+        }
+    }
+
+    fn cdp_active_text_readback_for_test(
+        value: Option<&str>,
+        is_editable: bool,
+        tag_name: &str,
+    ) -> CdpActiveTextReadback {
+        CdpActiveTextReadback {
+            value: value.map(str::to_owned),
+            target_id: Some("TARGET810".to_owned()),
+            has_active_element: Some(true),
+            is_editable: Some(is_editable),
+            tag_name: Some(tag_name.to_owned()),
+            id_sha256: non_empty_sha256("issue786-editor"),
+            name_sha256: None,
+            value_len: value.map(|value| value.chars().count()),
+            value_sha256: value.map(text_sha256),
+            error_code: None,
+            error_detail_sha256: None,
+            attempt: if value.is_some() {
+                "cdp_active_element_value:available".to_owned()
+            } else {
+                "cdp_active_element_value:unavailable:active_element_not_editable".to_owned()
+            },
+        }
+    }
+
+    fn ocr_text_readback_for_test(value: Option<&str>) -> OcrTextReadback {
+        OcrTextReadback {
+            value: value.map(str::to_owned),
+            word_count: value
+                .map(|value| value.split_whitespace().count())
+                .unwrap_or(0),
+            value_len: value.map(|value| value.chars().count()),
+            value_sha256: value.map(text_sha256),
+            attempt: if value.is_some() {
+                "ocr_focused_rect_text:available".to_owned()
+            } else {
+                "ocr_focused_rect_text:unavailable:no_ocr_words_in_focused_bbox".to_owned()
+            },
+        }
+    }
+
+    fn act_type_response_for_verify_delta() -> ActTypeResponse {
+        ActTypeResponse {
+            ok: true,
+            chars_typed: 16,
+            elapsed_ms: 10,
+            backend_tier_used: "foreground".to_owned(),
+            required_foreground: true,
+            target_text_integrity: "dispatch_only_requires_target_readback".to_owned(),
+            target_readback_required: true,
+            minimum_linear_ms_per_char: 20,
+            postcondition: crate::m2::postcondition::postcondition_not_requested(
+                "act_type",
+                "foreground_focused_ui_or_pixels",
+            ),
         }
     }
 
