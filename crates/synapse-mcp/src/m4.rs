@@ -98,6 +98,11 @@ const WINDOWS_DEFAULT_PATHEXT: &str =
 const LAUNCH_WINDOW_POLL_INTERVAL_MS: u64 = 20;
 const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
 const SHELL_JOB_FINALIZING_GRACE_MS: u64 = 30_000;
+const SHELL_REMOTE_TRANSPORT_LOCAL: &str = "local";
+const SHELL_REMOTE_TRANSPORT_SSH: &str = "ssh";
+const SHELL_REMOTE_CLEANUP_NOT_APPLICABLE: &str = "not_applicable";
+const SHELL_REMOTE_CLEANUP_NOT_TRACKED: &str = "remote_process_not_tracked";
+const SHELL_REMOTE_CLEANUP_UNVERIFIED: &str = "remote_cleanup_unverified";
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
 
@@ -501,7 +506,48 @@ pub struct ActRunShellCancelResponse {
     pub termination_attempted: bool,
     pub termination_status: String,
     pub remaining_process_ids: Vec<u32>,
+    pub remote_process_scope: ActRunShellRemoteProcessScope,
     pub status: ActRunShellStatusResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActRunShellRemoteProcessScope {
+    pub transport: String,
+    pub local_process_scope: String,
+    pub remote_cleanup_required: bool,
+    pub remote_cleanup_verified: bool,
+    pub remote_cleanup_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_process_group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cleanup_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cleanup_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detection_evidence: Vec<String>,
+}
+
+impl Default for ActRunShellRemoteProcessScope {
+    fn default() -> Self {
+        Self {
+            transport: SHELL_REMOTE_TRANSPORT_LOCAL.to_owned(),
+            local_process_scope: "job_owned_process_tree".to_owned(),
+            remote_cleanup_required: false,
+            remote_cleanup_verified: true,
+            remote_cleanup_status: SHELL_REMOTE_CLEANUP_NOT_APPLICABLE.to_owned(),
+            remote_identity: None,
+            remote_process_id: None,
+            remote_process_group_id: None,
+            remote_cleanup_error_code: None,
+            remote_cleanup_message: None,
+            detection_evidence: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -538,6 +584,8 @@ pub struct ActRunShellJobStatus {
     pub status_path: String,
     pub request_sha256: String,
     pub matched_pattern: String,
+    #[serde(default)]
+    pub remote_process_scope: ActRunShellRemoteProcessScope,
 }
 
 #[derive(Clone, Debug)]
@@ -1451,6 +1499,7 @@ pub fn cancel_shell_job(
 
     if shell_job_live_status(&job.status) {
         cancel_requested = true;
+        ensure_shell_job_remote_scope_from_process_tree(&mut job);
         job.cancel_requested = true;
         job.status = "cancel_requested".to_owned();
         write_shell_job_status(&paths.status_path, &job)?;
@@ -1462,6 +1511,25 @@ pub fn cancel_shell_job(
         } else {
             termination_status = "pid_unavailable".to_owned();
         }
+        mark_shell_job_remote_cleanup_unverified(
+            &mut job,
+            "act_run_shell_cancel",
+            &termination_status,
+        );
+        termination_status =
+            remote_aware_termination_status(&termination_status, &job.remote_process_scope);
+        write_shell_job_status(&paths.status_path, &job)?;
+    } else if job.remote_process_scope.remote_cleanup_required
+        && !job.remote_process_scope.remote_cleanup_verified
+    {
+        mark_shell_job_remote_cleanup_unverified(
+            &mut job,
+            "act_run_shell_cancel",
+            &termination_status,
+        );
+        termination_status =
+            remote_aware_termination_status(&termination_status, &job.remote_process_scope);
+        write_shell_job_status(&paths.status_path, &job)?;
     }
 
     let status = shell_job_status(
@@ -1479,8 +1547,25 @@ pub fn cancel_shell_job(
         after_status = %status.job.status,
         termination_status = %termination_status,
         remaining_process_ids = ?remaining_process_ids,
+        remote_transport = %status.job.remote_process_scope.transport,
+        remote_cleanup_status = %status.job.remote_process_scope.remote_cleanup_status,
+        remote_cleanup_verified = status.job.remote_process_scope.remote_cleanup_verified,
         "readback=act_run_shell_cancel after=status_file_and_process_table"
     );
+    if status.job.remote_process_scope.remote_cleanup_required
+        && !status.job.remote_process_scope.remote_cleanup_verified
+    {
+        tracing::warn!(
+            code = error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED,
+            job_id = %params.job_id,
+            session_id = ?session_id,
+            remote_identity = ?status.job.remote_process_scope.remote_identity,
+            remote_cleanup_status = %status.job.remote_process_scope.remote_cleanup_status,
+            remote_cleanup_message = ?status.job.remote_process_scope.remote_cleanup_message,
+            "act_run_shell_cancel verified local SSH client cleanup only; remote process cleanup is unverified"
+        );
+    }
+    let remote_process_scope = status.job.remote_process_scope.clone();
     Ok(ActRunShellCancelResponse {
         job_id: params.job_id.clone(),
         before_status,
@@ -1488,6 +1573,7 @@ pub fn cancel_shell_job(
         termination_attempted,
         termination_status,
         remaining_process_ids,
+        remote_process_scope,
         status,
     })
 }
@@ -4326,7 +4412,7 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
             }),
         )
     })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
+    let mut job: ActRunShellJobStatus = serde_json::from_slice(&bytes).map_err(|error| {
         shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
             format!("act_run_shell job status JSON is invalid: {error}"),
@@ -4337,7 +4423,211 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
                 "reason": "job_status_decode_failed",
             }),
         )
-    })
+    })?;
+    normalize_shell_job_remote_process_scope(&mut job);
+    Ok(job)
+}
+
+fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_LOCAL {
+        return;
+    }
+    if is_ssh_executable(&job.command) {
+        job.remote_process_scope =
+            ssh_remote_process_scope(&job.command, &job.args, "direct_command_ssh");
+    }
+}
+
+fn shell_job_remote_process_scope_from_start_params(
+    params: &ActRunShellStartParams,
+) -> ActRunShellRemoteProcessScope {
+    if is_ssh_executable(&params.command) {
+        ssh_remote_process_scope(&params.command, &params.args, "direct_command_ssh")
+    } else {
+        ActRunShellRemoteProcessScope::default()
+    }
+}
+
+fn ssh_remote_process_scope(
+    command: &str,
+    args: &[String],
+    evidence: impl Into<String>,
+) -> ActRunShellRemoteProcessScope {
+    ActRunShellRemoteProcessScope {
+        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
+        local_process_scope: "local_ssh_client_process_tree".to_owned(),
+        remote_cleanup_required: true,
+        remote_cleanup_verified: false,
+        remote_cleanup_status: SHELL_REMOTE_CLEANUP_NOT_TRACKED.to_owned(),
+        remote_identity: ssh_remote_identity(args),
+        remote_process_id: None,
+        remote_process_group_id: None,
+        remote_cleanup_error_code: None,
+        remote_cleanup_message: None,
+        detection_evidence: vec![format!("{}:{}", evidence.into(), executable_leaf(command))],
+    }
+}
+
+fn is_ssh_executable(command: &str) -> bool {
+    let leaf = executable_leaf(command).to_ascii_lowercase();
+    leaf == "ssh" || leaf == "ssh.exe"
+}
+
+fn executable_leaf(command: &str) -> &str {
+    trim_arg_quotes(command)
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(command)
+}
+
+fn ssh_remote_identity(args: &[String]) -> Option<String> {
+    let mut index = 0;
+    let mut options_done = false;
+    while index < args.len() {
+        let arg = trim_arg_quotes(&args[index]);
+        if arg.is_empty() {
+            index += 1;
+            continue;
+        }
+        if !options_done && arg == "--" {
+            options_done = true;
+            index += 1;
+            continue;
+        }
+        if !options_done && arg.starts_with('-') && arg != "-" {
+            index += if ssh_option_consumes_next(arg, args.get(index + 1)) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return Some(arg.to_owned());
+    }
+    None
+}
+
+fn ssh_option_consumes_next(arg: &str, next: Option<&String>) -> bool {
+    if arg.contains('=') || next.is_none() {
+        return false;
+    }
+    matches!(
+        arg,
+        "-B" | "-b"
+            | "-c"
+            | "-D"
+            | "-E"
+            | "-e"
+            | "-F"
+            | "-I"
+            | "-i"
+            | "-J"
+            | "-L"
+            | "-l"
+            | "-m"
+            | "-O"
+            | "-o"
+            | "-p"
+            | "-Q"
+            | "-R"
+            | "-S"
+            | "-W"
+            | "-w"
+    )
+}
+
+fn ensure_shell_job_remote_scope_from_process_tree(job: &mut ActRunShellJobStatus) {
+    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH {
+        return;
+    }
+    let Some(pid) = job.pid else {
+        return;
+    };
+    let process_ids = shell_job_process_tree_ids(pid);
+    let evidence = shell_job_ssh_process_evidence(&process_ids);
+    if evidence.is_empty() {
+        return;
+    }
+    job.remote_process_scope = ActRunShellRemoteProcessScope {
+        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
+        local_process_scope: "job_owned_process_tree_contains_ssh".to_owned(),
+        remote_cleanup_required: true,
+        remote_cleanup_verified: false,
+        remote_cleanup_status: SHELL_REMOTE_CLEANUP_NOT_TRACKED.to_owned(),
+        remote_identity: None,
+        remote_process_id: None,
+        remote_process_group_id: None,
+        remote_cleanup_error_code: None,
+        remote_cleanup_message: None,
+        detection_evidence: evidence,
+    };
+}
+
+fn shell_job_ssh_process_evidence(process_ids: &[u32]) -> Vec<String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let pids = process_ids
+        .iter()
+        .copied()
+        .map(Pid::from_u32)
+        .collect::<Vec<_>>();
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&pids), true);
+    process_ids
+        .iter()
+        .copied()
+        .filter_map(|pid| {
+            let process = system.process(Pid::from_u32(pid))?;
+            let name = process.name().to_string_lossy();
+            is_ssh_executable(&name).then(|| format!("process_tree_ssh:{pid}:{name}"))
+        })
+        .collect()
+}
+
+fn mark_shell_job_remote_cleanup_unverified(
+    job: &mut ActRunShellJobStatus,
+    trigger: &'static str,
+    local_termination_status: &str,
+) {
+    if !job.remote_process_scope.remote_cleanup_required {
+        return;
+    }
+    let remote_identity = job
+        .remote_process_scope
+        .remote_identity
+        .as_deref()
+        .unwrap_or("unknown_remote");
+    let message = format!(
+        "{trigger} verified only the local process scope '{}' with local termination status '{local_termination_status}'; SSH remote cleanup for '{remote_identity}' is not tracked or verified because no remote pid/process-group metadata exists in the job status",
+        job.remote_process_scope.local_process_scope
+    );
+    job.remote_process_scope.remote_cleanup_verified = false;
+    job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_UNVERIFIED.to_owned();
+    job.remote_process_scope.remote_cleanup_error_code =
+        Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
+    job.remote_process_scope.remote_cleanup_message = Some(message.clone());
+    if job.error_code.is_none() {
+        job.error_code = Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
+        job.error_message = Some(message);
+    }
+}
+
+fn remote_aware_termination_status(
+    local_termination_status: &str,
+    remote_process_scope: &ActRunShellRemoteProcessScope,
+) -> String {
+    if !remote_process_scope.remote_cleanup_required || remote_process_scope.remote_cleanup_verified
+    {
+        return local_termination_status.to_owned();
+    }
+    match local_termination_status {
+        "terminated" => "local_ssh_client_terminated_remote_cleanup_unverified".to_owned(),
+        "already_exited" => "local_ssh_client_already_exited_remote_cleanup_unverified".to_owned(),
+        "pid_unavailable" => {
+            "local_ssh_client_pid_unavailable_remote_cleanup_unverified".to_owned()
+        }
+        other => format!("{other}:remote_cleanup_unverified"),
+    }
 }
 
 fn ensure_shell_job_session_owner(
@@ -4375,7 +4665,7 @@ fn shell_job_status_record(
     context: Option<&ShellExecutionContext>,
 ) -> ActRunShellJobStatus {
     ActRunShellJobStatus {
-        schema_version: 2,
+        schema_version: 3,
         job_id: job_id.to_owned(),
         session_id: context.map(|context| context.session_id().to_owned()),
         status: status.to_owned(),
@@ -4402,6 +4692,7 @@ fn shell_job_status_record(
         status_path: path_string(&paths.status_path),
         request_sha256: request_sha256.to_owned(),
         matched_pattern: authorization.matched_pattern.clone(),
+        remote_process_scope: shell_job_remote_process_scope_from_start_params(params),
     }
 }
 
@@ -4525,6 +4816,16 @@ async fn monitor_shell_job(
         if latest.status == "cancel_requested" {
             status.status = latest.status;
         }
+        if latest.remote_process_scope.remote_cleanup_required {
+            status.remote_process_scope = latest.remote_process_scope;
+        }
+        if latest.error_code.as_deref()
+            == Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+            && status.error_code.is_none()
+        {
+            status.error_code = latest.error_code;
+            status.error_message = latest.error_message;
+        }
     }
     status.exit_code = exit_code;
     status.timed_out = timed_out;
@@ -4543,6 +4844,11 @@ async fn monitor_shell_job(
         status.error_message = Some(format!(
             "durable job timeout_ms cap expired after {timeout_ms} ms; process tree termination was requested"
         ));
+        mark_shell_job_remote_cleanup_unverified(
+            &mut status,
+            "act_run_shell_start_timeout",
+            "timeout_local_process_tree_termination_requested",
+        );
     } else {
         status.status =
             terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
@@ -6380,6 +6686,180 @@ mod tests {
             shell_command_line(&params),
             "cmd.exe /c \"echo hello\" \"\""
         );
+    }
+
+    #[test]
+    fn shell_remote_scope_classifies_direct_ssh_with_destination() {
+        let args = vec![
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-p".to_owned(),
+            "22".to_owned(),
+            "aiwonder".to_owned(),
+            "sleep".to_owned(),
+            "60".to_owned(),
+        ];
+
+        let scope = ssh_remote_process_scope(
+            r"C:\Windows\System32\OpenSSH\ssh.exe",
+            &args,
+            "regression_direct",
+        );
+
+        println!(
+            "readback=act_run_shell_remote_scope edge=direct_ssh before=args:{args:?} after={scope:?}"
+        );
+        assert_eq!(scope.transport, SHELL_REMOTE_TRANSPORT_SSH);
+        assert_eq!(scope.remote_identity.as_deref(), Some("aiwonder"));
+        assert!(scope.remote_cleanup_required);
+        assert!(!scope.remote_cleanup_verified);
+        assert_eq!(
+            scope.remote_cleanup_status,
+            SHELL_REMOTE_CLEANUP_NOT_TRACKED
+        );
+    }
+
+    #[test]
+    fn shell_remote_scope_ssh_option_parser_is_case_sensitive() {
+        let background_args = vec!["-f".to_owned(), "aiwonder".to_owned()];
+        let config_args = vec![
+            "-F".to_owned(),
+            r"C:\tmp\ssh_config".to_owned(),
+            "aiwonder".to_owned(),
+        ];
+
+        let background_identity = ssh_remote_identity(&background_args);
+        let config_identity = ssh_remote_identity(&config_args);
+
+        println!(
+            "readback=act_run_shell_remote_scope edge=ssh_option_case before=-f:{background_args:?},-F:{config_args:?} after=-f:{background_identity:?},-F:{config_identity:?}"
+        );
+        assert_eq!(background_identity.as_deref(), Some("aiwonder"));
+        assert_eq!(config_identity.as_deref(), Some("aiwonder"));
+    }
+
+    #[test]
+    fn shell_remote_scope_normalizes_legacy_direct_ssh_status_file() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = ShellJobPaths {
+            job_dir: temp.path().to_path_buf(),
+            stdout_path: temp.path().join("stdout.log"),
+            stderr_path: temp.path().join("stderr.log"),
+            status_path: temp.path().join("status.json"),
+            request_path: temp.path().join("request.json"),
+        };
+        let params = ActRunShellStartParams {
+            command: "ssh.exe".to_owned(),
+            args: vec!["aiwonder".to_owned(), "sleep".to_owned(), "60".to_owned()],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue827-legacy".to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: "ssh.exe aiwonder sleep 60".to_owned(),
+            matched_pattern: "^ssh".to_owned(),
+        };
+        let mut status = serde_json::to_value(shell_job_status_record(
+            "issue827-legacy",
+            "running",
+            &params,
+            &paths,
+            "request-sha",
+            &authorization,
+            "2026-06-10T00:00:00Z".to_owned(),
+            Some(1234),
+            None,
+        ))
+        .unwrap_or_else(|error| panic!("status should encode to JSON: {error}"));
+        status["schema_version"] = json!(2);
+        status
+            .as_object_mut()
+            .expect("status is an object")
+            .remove("remote_process_scope");
+        std::fs::write(
+            &paths.status_path,
+            serde_json::to_vec_pretty(&status).unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("write legacy status file: {error}"));
+
+        let read = read_shell_job_status(&paths.status_path, "issue827-legacy")
+            .unwrap_or_else(|error| panic!("legacy status should read: {error}"));
+
+        println!(
+            "readback=act_run_shell_remote_scope edge=legacy_status before={status} after={:?}",
+            read.remote_process_scope
+        );
+        assert_eq!(
+            read.remote_process_scope.transport,
+            SHELL_REMOTE_TRANSPORT_SSH
+        );
+        assert_eq!(
+            read.remote_process_scope.remote_identity.as_deref(),
+            Some("aiwonder")
+        );
+    }
+
+    #[test]
+    fn shell_remote_scope_marks_cancelled_ssh_cleanup_unverified() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = ShellJobPaths {
+            job_dir: temp.path().to_path_buf(),
+            stdout_path: temp.path().join("stdout.log"),
+            stderr_path: temp.path().join("stderr.log"),
+            status_path: temp.path().join("status.json"),
+            request_path: temp.path().join("request.json"),
+        };
+        let params = ActRunShellStartParams {
+            command: "ssh.exe".to_owned(),
+            args: vec!["aiwonder".to_owned(), "sleep".to_owned(), "60".to_owned()],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue827-cancel".to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: "ssh.exe aiwonder sleep 60".to_owned(),
+            matched_pattern: "^ssh".to_owned(),
+        };
+        let mut status = shell_job_status_record(
+            "issue827-cancel",
+            "cancel_requested",
+            &params,
+            &paths,
+            "request-sha",
+            &authorization,
+            "2026-06-10T00:00:00Z".to_owned(),
+            Some(1234),
+            None,
+        );
+
+        mark_shell_job_remote_cleanup_unverified(&mut status, "act_run_shell_cancel", "terminated");
+        let termination_status =
+            remote_aware_termination_status("terminated", &status.remote_process_scope);
+
+        println!(
+            "readback=act_run_shell_remote_scope edge=cancel_unverified before=terminated after=status:{termination_status} scope:{:?}",
+            status.remote_process_scope
+        );
+        assert_eq!(
+            termination_status,
+            "local_ssh_client_terminated_remote_cleanup_unverified"
+        );
+        assert_eq!(
+            status.error_code.as_deref(),
+            Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+        );
+        assert_eq!(
+            status
+                .remote_process_scope
+                .remote_cleanup_error_code
+                .as_deref(),
+            Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+        );
+        assert!(!status.remote_process_scope.remote_cleanup_verified);
     }
 
     #[test]
