@@ -320,6 +320,8 @@ impl ObservationAssembler {
             at: Utc::now(),
             mode,
             foreground: input.foreground,
+            perceived_text_notice: None,
+            suspected_injection: Vec::new(),
             focused: include.focused.then_some(input.focused).flatten(),
             elements,
             entities,

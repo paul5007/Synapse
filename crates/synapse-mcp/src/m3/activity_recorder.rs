@@ -1828,6 +1828,8 @@ mod tests {
             at: Utc::now(),
             mode: synapse_core::PerceptionMode::A11yOnly,
             foreground: context,
+            perceived_text_notice: None,
+            suspected_injection: Vec::new(),
             focused: None,
             elements: Vec::new(),
             entities: Vec::new(),

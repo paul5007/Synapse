@@ -245,6 +245,10 @@ pub enum FindScope {
 #[serde(deny_unknown_fields)]
 pub struct FindResponse {
     pub results: Vec<FindResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perceived_text_notice: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspected_injection: Vec<synapse_core::SuspectedInjectionAnnotation>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1874,7 +1878,11 @@ pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindRe
     }
     results.sort_by(|left, right| right.score.total_cmp(&left.score));
     results.truncate(limit);
-    FindResponse { results }
+    FindResponse {
+        results,
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
+    }
 }
 
 pub fn set_capture_target_in_state(

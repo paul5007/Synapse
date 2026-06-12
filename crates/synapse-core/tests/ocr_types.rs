@@ -122,6 +122,8 @@ fn empty_ocr_result() -> OcrResult {
         confidence: 0.0,
         region: rect(0, 0, 0, 0),
         lang: "und".to_owned(),
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
     }
 }
 
@@ -132,6 +134,8 @@ fn single_word_ocr_result() -> OcrResult {
         confidence: 0.99,
         region: rect(5, 7, 256, 64),
         lang: "en".to_owned(),
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
     }
 }
 
@@ -145,6 +149,8 @@ fn full_ocr_result() -> OcrResult {
         confidence: 0.935,
         region: rect(5, 7, 256, 64),
         lang: "en-US".to_owned(),
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
     }
 }
 
@@ -190,6 +196,8 @@ fn ocr_result_strategy() -> impl Strategy<Value = OcrResult> {
             confidence,
             region,
             lang,
+            perceived_text_notice: None,
+            suspected_injection: Vec::new(),
         })
 }
 

@@ -72,6 +72,8 @@ pub fn sample_observation() -> Result<Observation, chrono::ParseError> {
             is_fullscreen: false,
             is_dwm_composed: true,
         },
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
         focused: Some(FocusedElement {
             element_id: focused_id.clone(),
             name: "Text Editor".to_owned(),
@@ -208,6 +210,8 @@ pub fn observation_strategy() -> impl Strategy<Value = Observation> {
                     is_fullscreen: false,
                     is_dwm_composed: true,
                 },
+                perceived_text_notice: None,
+                suspected_injection: Vec::new(),
                 focused: Some(FocusedElement {
                     element_id: element.clone(),
                     name: "Focused".to_owned(),

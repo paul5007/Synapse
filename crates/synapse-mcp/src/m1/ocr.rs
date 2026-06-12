@@ -367,6 +367,8 @@ fn ocr_result_from_text_regions(
         confidence,
         region: request.region,
         lang: request.lang(),
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
     }
 }
 

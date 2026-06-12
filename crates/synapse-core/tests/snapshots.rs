@@ -148,6 +148,8 @@ fn sample_observation() -> Observation {
             is_fullscreen: false,
             is_dwm_composed: true,
         },
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
         focused: Some(FocusedElement {
             element_id: focused_id.clone(),
             name: "Text Editor".to_owned(),
