@@ -37,12 +37,41 @@ pub fn routine_key(routine_id: &str) -> StorageResult<Vec<u8>> {
 /// Returns [`StorageError::ReadFailed`] when the key is not a well-formed
 /// routine id.
 pub fn decode_routine_key(key: &[u8]) -> StorageResult<String> {
+    decode_id_key(key, cf::CF_ROUTINES)
+}
+
+/// Encodes a `CF_ROUTINE_STATE` row key from a routine id (#849). State rows
+/// share the routine id keyspace so lifecycle anchors on the stable id.
+///
+/// # Errors
+///
+/// Returns [`StorageError::WriteFailed`] when the id is not a well-formed
+/// `rt1-` + 16 lowercase hex id.
+pub fn routine_state_key(routine_id: &str) -> StorageResult<Vec<u8>> {
+    validate_routine_id(routine_id).map_err(|detail| StorageError::WriteFailed {
+        cf_name: cf::CF_ROUTINE_STATE.to_owned(),
+        detail,
+    })?;
+    Ok(routine_id.as_bytes().to_vec())
+}
+
+/// Decodes a `CF_ROUTINE_STATE` row key into the routine id.
+///
+/// # Errors
+///
+/// Returns [`StorageError::ReadFailed`] when the key is not a well-formed
+/// routine id.
+pub fn decode_routine_state_key(key: &[u8]) -> StorageResult<String> {
+    decode_id_key(key, cf::CF_ROUTINE_STATE)
+}
+
+fn decode_id_key(key: &[u8], cf_name: &str) -> StorageResult<String> {
     let text = std::str::from_utf8(key).map_err(|_e| StorageError::ReadFailed {
-        cf_name: cf::CF_ROUTINES.to_owned(),
+        cf_name: cf_name.to_owned(),
         detail: "ROUTINE_KEY_INVALID: key is not UTF-8".to_owned(),
     })?;
     validate_routine_id(text).map_err(|detail| StorageError::ReadFailed {
-        cf_name: cf::CF_ROUTINES.to_owned(),
+        cf_name: cf_name.to_owned(),
         detail,
     })?;
     Ok(text.to_owned())
@@ -74,6 +103,20 @@ mod tests {
         assert_eq!(key.len(), ROUTINE_KEY_LEN);
         let decoded = decode_routine_key(&key).expect("roundtrip");
         assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn state_key_roundtrips_and_errors_name_the_state_cf() {
+        let id = "rt1-0123456789abcdef";
+        let key = routine_state_key(id).expect("valid id encodes");
+        assert_eq!(key, routine_key(id).expect("same keyspace"));
+        let decoded = decode_routine_state_key(&key).expect("roundtrip");
+        assert_eq!(decoded, id);
+        let error = routine_state_key("rt1-NOPE").expect_err("invalid id");
+        assert!(
+            error.to_string().contains(cf::CF_ROUTINE_STATE),
+            "state codec errors must name CF_ROUTINE_STATE: {error}"
+        );
     }
 
     #[test]

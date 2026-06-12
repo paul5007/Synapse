@@ -17,7 +17,7 @@ pub enum RetentionTtl {
 }
 
 /// PRD §4/§6 storage retention defaults.
-pub const DEFAULTS: [RetentionDefault; 14] = [
+pub const DEFAULTS: [RetentionDefault; 15] = [
     RetentionDefault {
         cf: "CF_EVENTS",
         ttl: RetentionTtl::Hours(24),
@@ -107,6 +107,16 @@ pub const DEFAULTS: [RetentionDefault; 14] = [
     // content, so no TTL — stale rows cannot outlive a re-mine.
     RetentionDefault {
         cf: "CF_ROUTINES",
+        ttl: RetentionTtl::None,
+        soft_cap_mb: 16,
+        hard_cap_mb: 64,
+    },
+    // Operator routine lifecycle state (#849): confirmations, disables,
+    // labels, transition audit trails. Operator decisions must never
+    // silently expire, so no TTL; the store is bounded by the routine id
+    // space (a few hundred rows) and per-row history caps.
+    RetentionDefault {
+        cf: "CF_ROUTINE_STATE",
         ttl: RetentionTtl::None,
         soft_cap_mb: 16,
         hard_cap_mb: 64,

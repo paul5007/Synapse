@@ -104,7 +104,11 @@ use crate::{
             cancel_reflex, history_reflexes, list_reflexes, register_reflex,
         },
         replay::{ReplayRecordParams, ReplayRecordResponse, record_replay},
-        routines::{RoutineMineParams, RoutineMineResponse, mine_and_store_routines},
+        routines::{
+            RoutineInspectParams, RoutineInspectResponse, RoutineListParams, RoutineListResponse,
+            RoutineMineParams, RoutineMineResponse, RoutineUpdateParams, RoutineUpdateResponse,
+            inspect_routine, list_routines, mine_and_store_routines, update_routine,
+        },
         shared_m3_state_from_config_with_shutdown_reason_and_sse_state, shared_m3_state_from_env,
         storage::{
             StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams,

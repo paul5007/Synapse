@@ -28,9 +28,14 @@ pub const CF_EPISODES: &str = "CF_EPISODES";
 /// Derived routines mined from `CF_EPISODES` (#848). Fully rebuildable:
 /// re-mining replaces the entire CF atomically.
 pub const CF_ROUTINES: &str = "CF_ROUTINES";
+/// Operator-owned routine lifecycle state (#849): confirmations, disables,
+/// labels, transition audit trail, confidence history. NOT derived state —
+/// it must survive every `CF_ROUTINES` replace-all, keyed by the same
+/// stable routine id.
+pub const CF_ROUTINE_STATE: &str = "CF_ROUTINE_STATE";
 
 /// PRD §4 column family names, excluding `RocksDB`'s implicit `default` CF.
-pub const ALL_COLUMN_FAMILIES: [&str; 14] = [
+pub const ALL_COLUMN_FAMILIES: [&str; 15] = [
     CF_EVENTS,
     CF_OBSERVATIONS,
     CF_PROFILES,
@@ -45,4 +50,5 @@ pub const ALL_COLUMN_FAMILIES: [&str; 14] = [
     CF_TIMELINE,
     CF_EPISODES,
     CF_ROUTINES,
+    CF_ROUTINE_STATE,
 ];

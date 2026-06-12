@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 /// Envelope schema version for [`RoutineRecord`] rows.
 pub const ROUTINE_RECORD_VERSION: u32 = 1;
 
+/// Envelope schema version for [`RoutineStateRecord`] rows.
+pub const ROUTINE_STATE_RECORD_VERSION: u32 = 1;
+
+/// Newest-last cap on [`RoutineStateRecord::transitions`]. Overflow drops the
+/// oldest entry and increments `transitions_truncated` so the loss is visible.
+pub const ROUTINE_STATE_MAX_TRANSITIONS: usize = 64;
+
+/// Newest-last cap on [`RoutineStateRecord::confidence_history`].
+pub const ROUTINE_STATE_MAX_CONFIDENCE_POINTS: usize = 180;
+
 /// Identity granularity a routine was mined at (#848).
 ///
 /// `App` patterns generalize across documents ("opens Excel every morning");
@@ -104,4 +114,102 @@ pub struct RoutineRecord {
     pub last_seen_day_start_ns: u64,
     /// Most recent occurrences (capped), newest last.
     pub evidence: Vec<RoutineEvidence>,
+}
+
+/// Operator-owned lifecycle of a routine (#849).
+///
+/// `CF_ROUTINES` rows are disposable derived state; lifecycle decisions are
+/// not. They live in `CF_ROUTINE_STATE`, anchored on the same deterministic
+/// `routine_id`, so re-mining can replace every derived row without touching
+/// a single operator decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineLifecycle {
+    /// Mined but not yet reviewed by the operator.
+    Candidate,
+    /// Operator confirmed the routine as real and useful.
+    Confirmed,
+    /// Operator disabled it: the miner keeps re-deriving the record, but
+    /// intent matching and suggestion surfaces must ignore it, and nothing
+    /// may re-promote it automatically.
+    Disabled,
+    /// Operator archived it: hidden from default listings.
+    Archived,
+}
+
+/// Operation kinds recorded in a routine's transition audit trail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineStateAction {
+    /// The miner materialized the state row for a newly mined routine.
+    Discovered,
+    Confirm,
+    Disable,
+    Enable,
+    Archive,
+    Rename,
+}
+
+/// One audit entry in a routine's lifecycle history: what happened, when,
+/// by whom, and the before/after states (append-only, newest last).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineTransition {
+    pub ts_ns: u64,
+    pub action: RoutineStateAction,
+    /// `None` only for the creation entry ([`RoutineStateAction::Discovered`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<RoutineLifecycle>,
+    pub to: RoutineLifecycle,
+    /// Who performed it: an MCP session id, `"stdio"`, or `"miner"`.
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// One confidence observation appended by a mining run (only when the value
+/// actually changed, so the history records change-points, not heartbeats).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineConfidencePoint {
+    /// Mining instant that produced this observation.
+    pub ts_ns: u64,
+    pub confidence: f64,
+    pub support_days: u32,
+    pub opportunity_days: u32,
+}
+
+/// Durable operator state for one routine, persisted in `CF_ROUTINE_STATE`
+/// (#849), keyed by the routine's stable deterministic id.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineStateRecord {
+    pub record_version: u32,
+    pub routine_id: String,
+    pub lifecycle: RoutineLifecycle,
+    /// Operator-assigned display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_ts_ns: u64,
+    /// Last write of any kind to this row.
+    pub updated_ts_ns: u64,
+    /// Mining instant of the last run that produced this routine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mined_ts_ns: Option<u64>,
+    /// Whether the most recent mining run still derived this routine.
+    pub present_in_last_mine: bool,
+    /// Lifecycle audit trail, newest last, capped at
+    /// [`ROUTINE_STATE_MAX_TRANSITIONS`].
+    pub transitions: Vec<RoutineTransition>,
+    /// Oldest entries dropped from `transitions` after the cap.
+    pub transitions_truncated: u64,
+    /// Confidence change-points, newest last, capped at
+    /// [`ROUTINE_STATE_MAX_CONFIDENCE_POINTS`].
+    pub confidence_history: Vec<RoutineConfidencePoint>,
+    /// Oldest entries dropped from `confidence_history` after the cap.
+    pub confidence_history_truncated: u64,
 }

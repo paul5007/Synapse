@@ -16,24 +16,26 @@ use super::{
     ProfileRegistryQueryParams, ProfileRegistryQueryResponse, ProfileRegistryRollbackParams,
     ProfileRegistryRollbackResponse, ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams,
     ReflexHistoryResponse, ReflexListParams, ReflexListResponse, ReflexRegisterParams,
-    ReflexRegisterResponse, ReplayRecordParams, ReplayRecordResponse, RoutineMineParams,
-    RoutineMineResponse, StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams,
-    StorageInspectResponse, StoragePressureSampleParams, StoragePressureSampleResponse,
-    StoragePutProbeRowsParams, StoragePutProbeRowsResponse, SubscribeCancelParams,
-    SubscribeCancelResponse, SubscribeParams, SubscribeResponse, SynapseService,
-    TimelineExclusionsParams, TimelineExclusionsResponse, TimelinePauseParams,
-    TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse, TimelineResumeParams,
-    TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
+    ReflexRegisterResponse, ReplayRecordParams, ReplayRecordResponse, RoutineInspectParams,
+    RoutineInspectResponse, RoutineListParams, RoutineListResponse, RoutineMineParams,
+    RoutineMineResponse, RoutineUpdateParams, RoutineUpdateResponse, StorageGcOnceParams,
+    StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
+    StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
+    StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
+    SubscribeResponse, SynapseService, TimelineExclusionsParams, TimelineExclusionsResponse,
+    TimelinePauseParams, TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse,
+    TimelineResumeParams, TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
     apply_storage_pressure_sample, cancel_reflex, cancel_subscription,
     decide_profile_authoring_candidate, disable_registry_profile, export_audit_bundle,
     export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
     get_episode, history_reflexes, import_registry, inspect_profile_authoring_candidate,
-    inspect_storage, install_registry_package, list_episodes, list_profile_authoring_candidates,
-    list_profiles, list_reflexes, mine_and_store_routines, pause_timeline, purge_timeline,
-    put_probe_rows, query_audit_intelligence, query_flags, query_registry, record_replay,
+    inspect_routine, inspect_storage, install_registry_package, list_episodes,
+    list_profile_authoring_candidates, list_profiles, list_reflexes, list_routines,
+    mine_and_store_routines, pause_timeline, purge_timeline, put_probe_rows,
+    query_audit_intelligence, query_flags, query_registry, record_replay,
     refresh_profile_quality, register_reflex, resume_timeline, rollback_registry_profile,
     run_storage_gc_once, scan_storage, scan_text_tool, search_timeline, segment_episodes,
-    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio, update_routine,
     update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
@@ -878,18 +880,82 @@ impl SynapseService {
             "routine_mine",
             &crate::m3::routines::required_permissions(&params.0),
         )?;
-        let db = {
-            let mut state = self.m3_state.lock().map_err(|_err| {
-                super::mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    "M3 service state lock poisoned",
-                )
-            })?;
-            state
-                .ensure_storage()
-                .map_err(|error| super::mcp_error(error.code(), error.to_string()))?
-        };
+        let db = self.m3_storage()?;
         mine_and_store_routines(&db, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "List mined routines (CF_ROUTINES) joined with their operator lifecycle state (CF_ROUTINE_STATE): candidate/confirmed/disabled/archived, labels, confidence, schedule. Filters by lifecycle, minimum confidence, app, and granularity; include_unmined also lists lifecycle rows whose routine the last mine no longer derived. Run routine_mine first to materialize routines"
+    )]
+    pub async fn routine_list(
+        &self,
+        params: Parameters<RoutineListParams>,
+    ) -> Result<Json<RoutineListResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "routine_list",
+            lifecycle = ?params.0.lifecycle,
+            min_confidence = params.0.min_confidence,
+            app = params.0.app.as_deref(),
+            granularity = ?params.0.granularity,
+            include_unmined = params.0.include_unmined,
+            limit = params.0.limit,
+            "tool.invocation kind=routine_list"
+        );
+        self.require_m3_permissions(
+            "routine_list",
+            &crate::m3::routines::required_permissions_list(&params.0),
+        )?;
+        let db = self.m3_storage()?;
+        list_routines(&db, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Fetch one routine by stable id: the full mined record (template steps, schedule signature, support evidence with episode ids resolvable via episode_get) plus its operator lifecycle state (transitions audit trail, confidence history)"
+    )]
+    pub async fn routine_inspect(
+        &self,
+        params: Parameters<RoutineInspectParams>,
+    ) -> Result<Json<RoutineInspectResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "routine_inspect",
+            routine_id = %params.0.routine_id,
+            "tool.invocation kind=routine_inspect"
+        );
+        self.require_m3_permissions(
+            "routine_inspect",
+            &crate::m3::routines::required_permissions_inspect(&params.0),
+        )?;
+        let db = self.m3_storage()?;
+        inspect_routine(&db, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Apply one routine lifecycle mutation (confirm: candidate→confirmed, disable: candidate|confirmed→disabled, enable: disabled|archived→candidate, archive: →archived, rename: set label) to CF_ROUTINE_STATE. Transitions are audit-logged in the row, written synchronously, and read back from storage; disabled routines are never re-promoted by mining"
+    )]
+    pub async fn routine_update(
+        &self,
+        params: Parameters<RoutineUpdateParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<RoutineUpdateResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "routine_update",
+            routine_id = %params.0.routine_id,
+            action = ?params.0.action,
+            has_label = params.0.label.is_some(),
+            has_note = params.0.note.is_some(),
+            "tool.invocation kind=routine_update"
+        );
+        self.require_m3_permissions(
+            "routine_update",
+            &crate::m3::routines::required_permissions_update(&params.0),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let db = self.m3_storage()?;
+        update_routine(&db, &params.0, &by_session).map(Json)
     }
 
     #[tool(description = "Write bounded synthetic probe rows to a storage column family")]

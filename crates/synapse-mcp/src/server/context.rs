@@ -282,6 +282,19 @@ impl SynapseService {
             })
     }
 
+    /// Opened M3 storage handle (the daemon-wide `RocksDB` instance).
+    pub(super) fn m3_storage(&self) -> Result<Arc<synapse_storage::Db>, ErrorData> {
+        let mut state = self.m3_state.lock().map_err(|_err| {
+            mcp_error(
+                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                "M3 service state lock poisoned",
+            )
+        })?;
+        state
+            .ensure_storage()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))
+    }
+
     pub(super) fn reflex_runtime(
         &self,
     ) -> Result<Arc<Mutex<synapse_reflex::ReflexRuntime>>, ErrorData> {
@@ -1137,7 +1150,7 @@ mod scope_gate_tests {
         let profiles = TempDir::new()?;
         let service = service_with_profiles(profiles.path(), false)?;
 
-        assert_eq!(crate::m3::m3_tool_stubs().len(), 41);
+        assert_eq!(crate::m3::m3_tool_stubs().len(), 44);
         assert!(service.instructions().contains("M3 scaffold"));
 
         Ok(())

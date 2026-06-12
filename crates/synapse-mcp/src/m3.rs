@@ -560,7 +560,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 41] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 44] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -600,6 +600,9 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 41] {
         episodes::episode_list(),
         episodes::episode_get(),
         routines::routine_mine(),
+        routines::routine_list(),
+        routines::routine_inspect(),
+        routines::routine_update(),
         timeline_control::timeline_pause(),
         timeline_control::timeline_resume(),
         timeline_control::timeline_exclusions(),

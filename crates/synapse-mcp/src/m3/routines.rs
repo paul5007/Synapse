@@ -1,19 +1,32 @@
-//! `routine_mine` MCP tool (#848, epic #830).
+//! Routine MCP tools (#848 `routine_mine`; #849 `routine_list`,
+//! `routine_inspect`, `routine_update`) for epic #830.
 //!
-//! Runs the deterministic routine mining engine
+//! `routine_mine` runs the deterministic routine mining engine
 //! ([`synapse_core::routines::mine_routines`]) over `CF_EPISODES` and
 //! replaces `CF_ROUTINES` with the result in one atomic flushed batch.
 //! Routines are derived state: the store always holds exactly one mining
 //! run's complete output, so re-mining is idempotent by construction.
 //!
-//! The same entry point serves the on-demand MCP tool and the periodic
-//! in-daemon batch job ([`super::routine_miner_job`]); a process-wide mining
-//! lock serializes the two so concurrent replace-alls can never interleave.
+//! `CF_ROUTINE_STATE` (#849) is the opposite: operator-owned lifecycle
+//! state (candidate → confirmed → disabled/archived, labels, transition
+//! audit trail, confidence history) keyed by the same stable routine id.
+//! The miner reconciles it after every replace-all — creating candidate
+//! rows for new routines, appending confidence change-points, and flagging
+//! rows whose routine vanished — but NEVER changes a lifecycle the operator
+//! set, so a disabled routine stays disabled across every re-mine.
+//!
+//! The same mining entry point serves the on-demand MCP tool and the
+//! periodic in-daemon batch job ([`super::routine_miner_job`]); a
+//! process-wide mining lock serializes the two so concurrent replace-alls
+//! can never interleave.
 //!
 //! Failure policy: disk pressure refusal, undecodable derived rows, scan
 //! budget exhaustion, and engine errors are loud and structured. The tool
-//! never replaces rows it could not fully re-derive.
+//! never replaces rows it could not fully re-derive. Lifecycle writes are
+//! synchronous flushed batches followed by a physical read-back check —
+//! never the sheddable async write path.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Datelike, Local, TimeZone};
@@ -21,8 +34,12 @@ use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use synapse_core::error_codes;
 use synapse_core::routines::{MiningDay, RoutineMiningConfig, mine_routines};
-use synapse_core::types::RoutineRecord;
-use synapse_storage::{Db, cf, encode_json, routines as routine_codec};
+use synapse_core::types::{
+    ROUTINE_STATE_MAX_CONFIDENCE_POINTS, ROUTINE_STATE_MAX_TRANSITIONS,
+    ROUTINE_STATE_RECORD_VERSION, RoutineConfidencePoint, RoutineGranularity, RoutineLifecycle,
+    RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep, RoutineTransition,
+};
+use synapse_storage::{Db, cf, decode_json, encode_json, routines as routine_codec};
 
 use crate::m1::mcp_error;
 
@@ -110,6 +127,15 @@ pub struct RoutineMineResponse {
     pub routines_written: u64,
     /// Stale rows deleted from `CF_ROUTINES` (0 on dry runs).
     pub routines_deleted: u64,
+    /// New candidate `CF_ROUTINE_STATE` rows created for routines mined for
+    /// the first time (0 on dry runs).
+    pub state_rows_created: u64,
+    /// Existing `CF_ROUTINE_STATE` rows refreshed for re-mined routines
+    /// (0 on dry runs).
+    pub state_rows_updated: u64,
+    /// `CF_ROUTINE_STATE` rows flagged `present_in_last_mine=false` because
+    /// this run no longer derived their routine (0 on dry runs).
+    pub state_rows_marked_unmined: u64,
     pub dry_run: bool,
     /// The mined routines, strongest first (full persisted records).
     pub routines: Vec<RoutineRecord>,
@@ -298,6 +324,310 @@ fn existing_routine_keys(db: &Db, scanned_rows: &mut u64) -> Result<Vec<Vec<u8>>
     Ok(keys)
 }
 
+/// Actor recorded on state transitions performed by the mining engine.
+pub const MINER_ACTOR: &str = "miner";
+
+/// Decodes one `CF_ROUTINE_STATE` row, failing loudly on key/value/id
+/// mismatches: this CF holds operator decisions, so corruption is surfaced,
+/// never skipped.
+fn decode_state_row(key: &[u8], value: &[u8]) -> Result<RoutineStateRecord, ErrorData> {
+    let routine_id = routine_codec::decode_routine_state_key(key).map_err(|error| {
+        tracing::error!(
+            code = "ROUTINE_STATE_KEY_INVALID",
+            key_hex = %hex_encode(key),
+            %error,
+            "CF_ROUTINE_STATE holds a key its codec cannot decode"
+        );
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "ROUTINE_STATE_KEY_INVALID in CF_ROUTINE_STATE at {}: {error}; this CF holds \
+                 operator lifecycle decisions — inspect the row before removing anything",
+                hex_encode(key)
+            ),
+        )
+    })?;
+    let record = decode_json::<RoutineStateRecord>(value).map_err(|error| {
+        tracing::error!(
+            code = "ROUTINE_STATE_ROW_DECODE_FAILED",
+            key_hex = %hex_encode(key),
+            %error,
+            "CF_ROUTINE_STATE holds a value that does not decode as a RoutineStateRecord"
+        );
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_STATE_ROW_DECODE_FAILED in CF_ROUTINE_STATE at {}: {error}; this CF \
+                 holds operator lifecycle decisions — inspect the row before removing anything",
+                hex_encode(key)
+            ),
+        )
+    })?;
+    if record.record_version != ROUTINE_STATE_RECORD_VERSION {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_STATE_VERSION_UNSUPPORTED in CF_ROUTINE_STATE at {routine_id}: \
+                 record_version {} (this binary supports {ROUTINE_STATE_RECORD_VERSION})",
+                record.record_version
+            ),
+        ));
+    }
+    if record.routine_id != routine_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_STATE_ID_MISMATCH in CF_ROUTINE_STATE: row key {routine_id} holds a \
+                 record claiming routine_id {}",
+                record.routine_id
+            ),
+        ));
+    }
+    Ok(record)
+}
+
+/// Loads every `CF_ROUTINE_STATE` row, budget-guarded.
+fn load_all_state_rows(
+    db: &Db,
+    scanned_rows: &mut u64,
+) -> Result<BTreeMap<String, RoutineStateRecord>, ErrorData> {
+    let mut rows_out: BTreeMap<String, RoutineStateRecord> = BTreeMap::new();
+    let mut start: Vec<u8> = Vec::new();
+    loop {
+        if usize::try_from(*scanned_rows).unwrap_or(usize::MAX) >= MAX_SCAN_ROWS_PER_CALL {
+            return Err(internal(format!(
+                "ROUTINE_SCAN_BUDGET_EXHAUSTED after {MAX_SCAN_ROWS_PER_CALL} CF_ROUTINE_STATE \
+                 rows; the state store should hold at most a few hundred rows — inspect \
+                 CF_ROUTINE_STATE"
+            )));
+        }
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_ROUTINE_STATE, &start, SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in &rows {
+            *scanned_rows += 1;
+            let record = decode_state_row(key, value)?;
+            rows_out.insert(record.routine_id.clone(), record);
+        }
+        if !more {
+            break;
+        }
+        let Some((last, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last);
+    }
+    Ok(rows_out)
+}
+
+/// Point lookup of one `CF_ROUTINE_STATE` row by routine id.
+fn load_state_row(db: &Db, routine_id: &str) -> Result<Option<RoutineStateRecord>, ErrorData> {
+    let key = routine_codec::routine_state_key(routine_id)
+        .map_err(|error| invalid(error.to_string()))?;
+    let rows = db
+        .scan_cf_prefix(cf::CF_ROUTINE_STATE, &key)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let Some((row_key, value)) = rows.first() else {
+        return Ok(None);
+    };
+    if rows.len() > 1 || row_key != &key {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_STATE_KEY_COLLISION in CF_ROUTINE_STATE: prefix lookup for \
+                 {routine_id} returned {} rows, first key {}",
+                rows.len(),
+                hex_encode(row_key)
+            ),
+        ));
+    }
+    decode_state_row(row_key, value).map(Some)
+}
+
+/// Point lookup of one `CF_ROUTINES` row by routine id.
+fn load_routine_record(db: &Db, routine_id: &str) -> Result<Option<RoutineRecord>, ErrorData> {
+    let key =
+        routine_codec::routine_key(routine_id).map_err(|error| invalid(error.to_string()))?;
+    let rows = db
+        .scan_cf_prefix(cf::CF_ROUTINES, &key)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let Some((row_key, value)) = rows.first() else {
+        return Ok(None);
+    };
+    if rows.len() > 1 || row_key != &key {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_KEY_COLLISION in CF_ROUTINES: prefix lookup for {routine_id} \
+                 returned {} rows, first key {}",
+                rows.len(),
+                hex_encode(row_key)
+            ),
+        ));
+    }
+    decode_routine_record_row(row_key, value).map(Some)
+}
+
+/// Decodes one `CF_ROUTINES` row (key + JSON value) into a [`RoutineRecord`].
+fn decode_routine_record_row(key: &[u8], value: &[u8]) -> Result<RoutineRecord, ErrorData> {
+    let routine_id = routine_codec::decode_routine_key(key)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let record = decode_json::<RoutineRecord>(value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES at {routine_id}: {error}; \
+                 CF_ROUTINES is derived state — re-run routine_mine"
+            ),
+        )
+    })?;
+    if record.routine_id != routine_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_ID_MISMATCH in CF_ROUTINES: row key {routine_id} holds a record \
+                 claiming routine_id {}",
+                record.routine_id
+            ),
+        ));
+    }
+    Ok(record)
+}
+
+/// Writes state rows in one synchronous flushed batch (never the sheddable
+/// async path: these are operator decisions and miner bookkeeping that must
+/// not vanish silently). Callers gate on disk pressure first.
+fn put_state_rows(db: &Db, records: &[RoutineStateRecord]) -> Result<(), ErrorData> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(records.len());
+    for record in records {
+        let key = routine_codec::routine_state_key(&record.routine_id)
+            .map_err(|error| internal(format!("state row has an invalid routine id: {error}")))?;
+        let value =
+            encode_json(record).map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        rows.push((key, value));
+    }
+    db.mutate_batch_pressure_bypass(cf::CF_ROUTINE_STATE, Vec::<Vec<u8>>::new(), rows)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("failed to write CF_ROUTINE_STATE rows: {error}"),
+            )
+        })
+}
+
+/// Appends a transition, enforcing the newest-last cap loudly via the
+/// truncation counter.
+fn push_transition(record: &mut RoutineStateRecord, transition: RoutineTransition) {
+    record.transitions.push(transition);
+    while record.transitions.len() > ROUTINE_STATE_MAX_TRANSITIONS {
+        record.transitions.remove(0);
+        record.transitions_truncated = record.transitions_truncated.saturating_add(1);
+    }
+}
+
+/// Appends a confidence change-point if it differs from the latest one.
+/// Returns whether the history changed.
+fn push_confidence_point(record: &mut RoutineStateRecord, point: RoutineConfidencePoint) -> bool {
+    let unchanged = record.confidence_history.last().is_some_and(|last| {
+        (last.confidence - point.confidence).abs() < f64::EPSILON
+            && last.support_days == point.support_days
+            && last.opportunity_days == point.opportunity_days
+    });
+    if unchanged {
+        return false;
+    }
+    record.confidence_history.push(point);
+    while record.confidence_history.len() > ROUTINE_STATE_MAX_CONFIDENCE_POINTS {
+        record.confidence_history.remove(0);
+        record.confidence_history_truncated =
+            record.confidence_history_truncated.saturating_add(1);
+    }
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StateReconcileCounters {
+    created: u64,
+    updated: u64,
+    marked_unmined: u64,
+}
+
+/// Reconciles `CF_ROUTINE_STATE` with the routines a mining run just
+/// persisted. Creates candidate rows for first-time routines, refreshes
+/// presence/confidence bookkeeping for re-mined ones, and flags rows whose
+/// routine vanished. Lifecycle and labels are operator property: this
+/// function never changes them — a disabled routine cannot be re-promoted
+/// by mining.
+fn reconcile_state_rows(
+    db: &Db,
+    mined: &[RoutineRecord],
+    mined_at: u64,
+    scanned_rows: &mut u64,
+) -> Result<StateReconcileCounters, ErrorData> {
+    let mut existing = load_all_state_rows(db, scanned_rows)?;
+    let mut counters = StateReconcileCounters::default();
+    let mut writes: Vec<RoutineStateRecord> = Vec::new();
+    for routine in mined {
+        let point = RoutineConfidencePoint {
+            ts_ns: mined_at,
+            confidence: routine.confidence,
+            support_days: routine.support_days,
+            opportunity_days: routine.opportunity_days,
+        };
+        if let Some(mut state) = existing.remove(&routine.routine_id) {
+            state.present_in_last_mine = true;
+            state.last_mined_ts_ns = Some(mined_at);
+            state.updated_ts_ns = mined_at;
+            push_confidence_point(&mut state, point);
+            counters.updated += 1;
+            writes.push(state);
+        } else {
+            let mut state = RoutineStateRecord {
+                record_version: ROUTINE_STATE_RECORD_VERSION,
+                routine_id: routine.routine_id.clone(),
+                lifecycle: RoutineLifecycle::Candidate,
+                label: None,
+                created_ts_ns: mined_at,
+                updated_ts_ns: mined_at,
+                last_mined_ts_ns: Some(mined_at),
+                present_in_last_mine: true,
+                transitions: vec![RoutineTransition {
+                    ts_ns: mined_at,
+                    action: RoutineStateAction::Discovered,
+                    from: None,
+                    to: RoutineLifecycle::Candidate,
+                    by: MINER_ACTOR.to_owned(),
+                    label_before: None,
+                    label_after: None,
+                    note: None,
+                }],
+                transitions_truncated: 0,
+                confidence_history: Vec::new(),
+                confidence_history_truncated: 0,
+            };
+            push_confidence_point(&mut state, point);
+            counters.created += 1;
+            writes.push(state);
+        }
+    }
+    for (_routine_id, mut state) in existing {
+        if state.present_in_last_mine {
+            state.present_in_last_mine = false;
+            state.updated_ts_ns = mined_at;
+            counters.marked_unmined += 1;
+            writes.push(state);
+        }
+    }
+    put_state_rows(db, &writes)?;
+    Ok(counters)
+}
+
 /// Mines routines from `CF_EPISODES` and (unless `dry_run`) replaces
 /// `CF_ROUTINES` atomically. Shared by the MCP tool and the periodic job.
 #[allow(clippy::too_many_lines)]
@@ -318,13 +648,17 @@ pub fn mine_and_store_routines(
         .lock()
         .map_err(|_poisoned| internal("routine mining lock poisoned"))?;
 
-    if !params.dry_run && !db.pressure_permits_write(cf::CF_ROUTINES) {
+    if !params.dry_run
+        && !(db.pressure_permits_write(cf::CF_ROUTINES)
+            && db.pressure_permits_write(cf::CF_ROUTINE_STATE))
+    {
         return Err(mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!(
-                "routine_mine refused under disk pressure: cf_name={} pressure_level={:?}; \
+                "routine_mine refused under disk pressure: cf_names={}/{} pressure_level={:?}; \
                  nothing was deleted or written",
                 cf::CF_ROUTINES,
+                cf::CF_ROUTINE_STATE,
                 db.pressure_level()
             ),
         ));
@@ -338,17 +672,23 @@ pub fn mine_and_store_routines(
             None => {
                 // Empty episode store: an honest empty mine. A non-dry run
                 // still clears stale routines (derived state must reflect
-                // its source).
+                // its source) and reconciles the state store so no row
+                // still claims to be present in the last mine.
                 let stale_keys = existing_routine_keys(db, &mut scanned_rows)?;
                 let deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
-                if !params.dry_run && !stale_keys.is_empty() {
-                    db.mutate_batch_pressure_bypass(
-                        cf::CF_ROUTINES,
-                        stale_keys,
-                        Vec::<(Vec<u8>, Vec<u8>)>::new(),
-                    )
-                    .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-                }
+                let state_counters = if params.dry_run {
+                    StateReconcileCounters::default()
+                } else {
+                    if !stale_keys.is_empty() {
+                        db.mutate_batch_pressure_bypass(
+                            cf::CF_ROUTINES,
+                            stale_keys,
+                            Vec::<(Vec<u8>, Vec<u8>)>::new(),
+                        )
+                        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+                    }
+                    reconcile_state_rows(db, &[], now_ts_ns(), &mut scanned_rows)?
+                };
                 return Ok(RoutineMineResponse {
                     range_start_ns: 0,
                     range_end_ns: 0,
@@ -369,6 +709,9 @@ pub fn mine_and_store_routines(
                     routines_dropped_over_cap: 0,
                     routines_written: 0,
                     routines_deleted: if params.dry_run { 0 } else { deleted },
+                    state_rows_created: state_counters.created,
+                    state_rows_updated: state_counters.updated,
+                    state_rows_marked_unmined: state_counters.marked_unmined,
                     dry_run: params.dry_run,
                     routines: Vec::new(),
                 });
@@ -407,6 +750,7 @@ pub fn mine_and_store_routines(
     }
     let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
     let mut deleted = 0_u64;
+    let mut state_counters = StateReconcileCounters::default();
     if params.dry_run {
         tracing::info!(
             code = "ROUTINE_MINE_DRY_RUN",
@@ -428,6 +772,11 @@ pub fn mine_and_store_routines(
                     ),
                 )
             })?;
+        // CF_ROUTINES and CF_ROUTINE_STATE are separate flushed batches; if
+        // this reconcile fails the error is loud, lifecycle rows are intact,
+        // and the next mining run repairs the presence bookkeeping.
+        state_counters =
+            reconcile_state_rows(db, &mining.routines, mined_at, &mut scanned_rows)?;
         tracing::info!(
             code = "ROUTINE_MINE_REPLACED",
             range_start_ns = range_start_snapped,
@@ -436,6 +785,9 @@ pub fn mine_and_store_routines(
             routines_deleted = deleted,
             active_days = mining.active_days,
             candidates = mining.candidates_evaluated,
+            state_rows_created = state_counters.created,
+            state_rows_updated = state_counters.updated,
+            state_rows_marked_unmined = state_counters.marked_unmined,
             "routine_mine replaced the routine store"
         );
     }
@@ -460,8 +812,645 @@ pub fn mine_and_store_routines(
         routines_dropped_over_cap: mining.routines_dropped_over_cap,
         routines_written: if params.dry_run { 0 } else { written },
         routines_deleted: deleted,
+        state_rows_created: state_counters.created,
+        state_rows_updated: state_counters.updated,
+        state_rows_marked_unmined: state_counters.marked_unmined,
         dry_run: params.dry_run,
         routines: mining.routines,
+    })
+}
+
+/// Default and maximum `routine_list` page sizes.
+pub const DEFAULT_ROUTINE_LIST_LIMIT: u32 = 100;
+pub const MAX_ROUTINE_LIST_LIMIT: u32 = 500;
+/// Operator label and note bounds for `routine_update`.
+pub const MAX_LABEL_CHARS: usize = 120;
+pub const MAX_NOTE_CHARS: usize = 500;
+
+/// A mined routine with no state row yet (older binary mined it, or a
+/// reconcile failed): present it honestly as an unreviewed candidate.
+fn synthesized_default_state(routine: &RoutineRecord) -> RoutineStateRecord {
+    RoutineStateRecord {
+        record_version: ROUTINE_STATE_RECORD_VERSION,
+        routine_id: routine.routine_id.clone(),
+        lifecycle: RoutineLifecycle::Candidate,
+        label: None,
+        created_ts_ns: routine.ts_ns,
+        updated_ts_ns: routine.ts_ns,
+        last_mined_ts_ns: Some(routine.ts_ns),
+        present_in_last_mine: true,
+        transitions: Vec::new(),
+        transitions_truncated: 0,
+        confidence_history: Vec::new(),
+        confidence_history_truncated: 0,
+    }
+}
+
+/// Loads every `CF_ROUTINES` row, budget-guarded.
+fn load_all_routine_records(
+    db: &Db,
+    scanned_rows: &mut u64,
+) -> Result<BTreeMap<String, RoutineRecord>, ErrorData> {
+    let mut records: BTreeMap<String, RoutineRecord> = BTreeMap::new();
+    let mut start: Vec<u8> = Vec::new();
+    loop {
+        if usize::try_from(*scanned_rows).unwrap_or(usize::MAX) >= MAX_SCAN_ROWS_PER_CALL {
+            return Err(internal(format!(
+                "ROUTINE_SCAN_BUDGET_EXHAUSTED after {MAX_SCAN_ROWS_PER_CALL} CF_ROUTINES rows; \
+                 the routine store should hold at most a few hundred rows — inspect CF_ROUTINES"
+            )));
+        }
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_ROUTINES, &start, SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in &rows {
+            *scanned_rows += 1;
+            let record = decode_routine_record_row(key, value)?;
+            records.insert(record.routine_id.clone(), record);
+        }
+        if !more {
+            break;
+        }
+        let Some((last, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last);
+    }
+    Ok(records)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineListParams {
+    /// Lifecycle states to include. Defaults to candidate, confirmed, and
+    /// disabled (everything except archived).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Vec<RoutineLifecycle>>,
+    /// Keep only routines whose confidence (Wilson lower bound) is at least
+    /// this value. Unmined entries use their last recorded confidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_confidence: Option<f64>,
+    /// Keep only routines with a template step in this app (lowercased
+    /// process executable name, exact match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<RoutineGranularity>,
+    /// Also list state rows whose routine the last mining run no longer
+    /// derived (lifecycle decisions outlive derived rows).
+    #[serde(default)]
+    pub include_unmined: bool,
+    /// Maximum entries returned (default 100, max 500).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One `routine_list` entry: lifecycle joined onto the mined record.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineListEntry {
+    pub routine_id: String,
+    pub lifecycle: RoutineLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Whether the last mining run derived this routine.
+    pub mined: bool,
+    /// Whether a physical `CF_ROUTINE_STATE` row exists (false means the
+    /// lifecycle shown is the synthesized candidate default).
+    pub state_row_exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<RoutineGranularity>,
+    /// Ordered template steps (empty for unmined entries).
+    pub steps: Vec<RoutineStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_label: Option<String>,
+    /// Mined entries: the current record's confidence. Unmined entries: the
+    /// last recorded confidence change-point, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mined_ts_ns: Option<u64>,
+    pub updated_ts_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineListResponse {
+    /// Rows currently in `CF_ROUTINES` (the last mining run's output).
+    pub total_mined: u64,
+    /// Rows currently in `CF_ROUTINE_STATE`.
+    pub total_state_rows: u64,
+    /// Entries matching the filters before the limit was applied.
+    pub matched: u64,
+    pub returned: u64,
+    /// True when `matched > returned` (raise `limit` to see the rest).
+    pub truncated: bool,
+    pub entries: Vec<RoutineListEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineInspectParams {
+    /// Stable routine id (`rt1-` + 16 hex chars).
+    pub routine_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineInspectResponse {
+    pub routine_id: String,
+    /// Whether the last mining run derived this routine.
+    pub mined: bool,
+    /// Whether a physical `CF_ROUTINE_STATE` row exists.
+    pub state_row_exists: bool,
+    /// Full mined record, including schedule signature and support evidence
+    /// (contributing episode ids resolvable via `episode_get`). `None` when
+    /// the routine is no longer derived by the current mine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<RoutineRecord>,
+    /// Lifecycle state, transition audit trail, and confidence history.
+    pub state: RoutineStateRecord,
+}
+
+/// Lifecycle operations accepted by `routine_update`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineUpdateAction {
+    /// candidate → confirmed.
+    Confirm,
+    /// candidate or confirmed → disabled.
+    Disable,
+    /// disabled or archived → candidate (re-earns confirmation).
+    Enable,
+    /// candidate, confirmed, or disabled → archived.
+    Archive,
+    /// Set the operator label; lifecycle unchanged.
+    Rename,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineUpdateParams {
+    /// Stable routine id (`rt1-` + 16 hex chars).
+    pub routine_id: String,
+    pub action: RoutineUpdateAction,
+    /// New display name; required for rename, rejected otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Free-form audit note recorded on the transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineUpdateResponse {
+    pub routine_id: String,
+    pub action: RoutineUpdateAction,
+    pub lifecycle_before: RoutineLifecycle,
+    pub lifecycle_after: RoutineLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_after: Option<String>,
+    /// True when this call materialized the state row (first operator
+    /// action on a routine the miner had not yet reconciled).
+    pub state_row_created: bool,
+    /// The post-write state row, read back from `CF_ROUTINE_STATE` after
+    /// the flush — physical storage truth, not the in-memory value.
+    pub state: RoutineStateRecord,
+}
+
+#[must_use]
+pub const fn routine_list() -> M3ToolStub {
+    M3ToolStub::new("routine_list")
+}
+
+#[must_use]
+pub const fn routine_inspect() -> M3ToolStub {
+    M3ToolStub::new("routine_inspect")
+}
+
+#[must_use]
+pub const fn routine_update() -> M3ToolStub {
+    M3ToolStub::new("routine_update")
+}
+
+#[must_use]
+pub fn required_permissions_list(_params: &RoutineListParams) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_inspect(_params: &RoutineInspectParams) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_update(_params: &RoutineUpdateParams) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+fn validate_routine_id_param(tool: &str, routine_id: &str) -> Result<(), ErrorData> {
+    routine_codec::routine_key(routine_id).map(|_key| ()).map_err(|_error| {
+        invalid(format!(
+            "{tool} routine_id is invalid: ROUTINE_KEY_INVALID: expected \
+             {:?} + 16 lowercase hex chars, got {routine_id:?}",
+            routine_codec::ROUTINE_ID_PREFIX
+        ))
+    })
+}
+
+/// Builds one list entry from a mined record and its (possibly synthesized)
+/// state row.
+fn list_entry_mined(record: &RoutineRecord, state: &RoutineStateRecord, exists: bool)
+-> RoutineListEntry {
+    RoutineListEntry {
+        routine_id: record.routine_id.clone(),
+        lifecycle: state.lifecycle,
+        label: state.label.clone(),
+        mined: true,
+        state_row_exists: exists,
+        granularity: Some(record.granularity),
+        steps: record.steps.clone(),
+        schedule_label: Some(record.schedule_label.clone()),
+        confidence: Some(record.confidence),
+        support_days: Some(record.support_days),
+        occurrence_count: Some(record.occurrence_count),
+        last_mined_ts_ns: state.last_mined_ts_ns.or(Some(record.ts_ns)),
+        updated_ts_ns: state.updated_ts_ns,
+    }
+}
+
+fn list_entry_unmined(state: &RoutineStateRecord) -> RoutineListEntry {
+    let last_point = state.confidence_history.last();
+    RoutineListEntry {
+        routine_id: state.routine_id.clone(),
+        lifecycle: state.lifecycle,
+        label: state.label.clone(),
+        mined: false,
+        state_row_exists: true,
+        granularity: None,
+        steps: Vec::new(),
+        schedule_label: None,
+        confidence: last_point.map(|point| point.confidence),
+        support_days: last_point.map(|point| point.support_days),
+        occurrence_count: None,
+        last_mined_ts_ns: state.last_mined_ts_ns,
+        updated_ts_ns: state.updated_ts_ns,
+    }
+}
+
+/// Lists routines with lifecycle state joined onto mined records.
+pub fn list_routines(
+    db: &Arc<Db>,
+    params: &RoutineListParams,
+) -> Result<RoutineListResponse, ErrorData> {
+    if let Some(min_confidence) = params.min_confidence
+        && !(0.0..=1.0).contains(&min_confidence)
+    {
+        return Err(invalid(format!(
+            "routine_list min_confidence must be within [0.0, 1.0]; got {min_confidence}"
+        )));
+    }
+    if let Some(app) = &params.app
+        && app.trim().is_empty()
+    {
+        return Err(invalid("routine_list app filter must not be blank"));
+    }
+    if let Some(states) = &params.lifecycle
+        && states.is_empty()
+    {
+        return Err(invalid(
+            "routine_list lifecycle filter must not be an empty list; omit it for the default",
+        ));
+    }
+    let limit = match params.limit {
+        None => DEFAULT_ROUTINE_LIST_LIMIT,
+        Some(limit) if (1..=MAX_ROUTINE_LIST_LIMIT).contains(&limit) => limit,
+        Some(limit) => {
+            return Err(invalid(format!(
+                "routine_list limit must be between 1 and {MAX_ROUTINE_LIST_LIMIT}; got {limit}"
+            )));
+        }
+    };
+
+    let mut scanned_rows = 0_u64;
+    let records = load_all_routine_records(db, &mut scanned_rows)?;
+    let states = load_all_state_rows(db, &mut scanned_rows)?;
+    let total_mined = u64::try_from(records.len()).unwrap_or(u64::MAX);
+    let total_state_rows = u64::try_from(states.len()).unwrap_or(u64::MAX);
+
+    let lifecycle_allowed = |lifecycle: RoutineLifecycle| match &params.lifecycle {
+        Some(states) => states.contains(&lifecycle),
+        None => lifecycle != RoutineLifecycle::Archived,
+    };
+    let app_filter = params.app.as_deref().map(str::trim).map(str::to_lowercase);
+
+    let mut entries: Vec<RoutineListEntry> = Vec::new();
+    for (routine_id, record) in &records {
+        let (state, exists) = match states.get(routine_id) {
+            Some(state) => (state.clone(), true),
+            None => (synthesized_default_state(record), false),
+        };
+        let entry = list_entry_mined(record, &state, exists);
+        if !lifecycle_allowed(entry.lifecycle) {
+            continue;
+        }
+        if let Some(granularity) = params.granularity
+            && record.granularity != granularity
+        {
+            continue;
+        }
+        if let Some(app) = &app_filter
+            && !record.steps.iter().any(|step| &step.app == app)
+        {
+            continue;
+        }
+        if let Some(min_confidence) = params.min_confidence
+            && record.confidence < min_confidence
+        {
+            continue;
+        }
+        entries.push(entry);
+    }
+    if params.include_unmined {
+        for (routine_id, state) in &states {
+            if records.contains_key(routine_id) {
+                continue;
+            }
+            let entry = list_entry_unmined(state);
+            if !lifecycle_allowed(entry.lifecycle) {
+                continue;
+            }
+            // Unmined entries carry no template, so app/granularity filters
+            // exclude them; min_confidence applies to the last known value.
+            if params.granularity.is_some() || app_filter.is_some() {
+                continue;
+            }
+            if let Some(min_confidence) = params.min_confidence
+                && entry.confidence.is_none_or(|value| value < min_confidence)
+            {
+                continue;
+            }
+            entries.push(entry);
+        }
+    }
+    // Mined first, strongest first; unmined afterwards, newest first; id as
+    // the deterministic tiebreaker.
+    entries.sort_by(|a, b| {
+        b.mined.cmp(&a.mined).then_with(|| {
+            if a.mined {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.routine_id.cmp(&b.routine_id))
+            } else {
+                b.updated_ts_ns
+                    .cmp(&a.updated_ts_ns)
+                    .then_with(|| a.routine_id.cmp(&b.routine_id))
+            }
+        })
+    });
+    let matched = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    entries.truncate(limit as usize);
+    let returned = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    Ok(RoutineListResponse {
+        total_mined,
+        total_state_rows,
+        matched,
+        returned,
+        truncated: matched > returned,
+        entries,
+    })
+}
+
+/// Fetches one routine: full mined record plus lifecycle state.
+pub fn inspect_routine(
+    db: &Arc<Db>,
+    params: &RoutineInspectParams,
+) -> Result<RoutineInspectResponse, ErrorData> {
+    validate_routine_id_param("routine_inspect", &params.routine_id)?;
+    let record = load_routine_record(db, &params.routine_id)?;
+    let state = load_state_row(db, &params.routine_id)?;
+    let state_row_exists = state.is_some();
+    let state = match (state, &record) {
+        (Some(state), _) => state,
+        (None, Some(record)) => synthesized_default_state(record),
+        (None, None) => {
+            return Err(invalid(format!(
+                "ROUTINE_NOT_FOUND: routine_id {} exists in neither CF_ROUTINES nor \
+                 CF_ROUTINE_STATE; run routine_list to see what exists",
+                params.routine_id
+            )));
+        }
+    };
+    Ok(RoutineInspectResponse {
+        routine_id: params.routine_id.clone(),
+        mined: record.is_some(),
+        state_row_exists,
+        record,
+        state,
+    })
+}
+
+const fn action_kind(action: RoutineUpdateAction) -> RoutineStateAction {
+    match action {
+        RoutineUpdateAction::Confirm => RoutineStateAction::Confirm,
+        RoutineUpdateAction::Disable => RoutineStateAction::Disable,
+        RoutineUpdateAction::Enable => RoutineStateAction::Enable,
+        RoutineUpdateAction::Archive => RoutineStateAction::Archive,
+        RoutineUpdateAction::Rename => RoutineStateAction::Rename,
+    }
+}
+
+/// The lifecycle a legal transition lands in, or a structured refusal.
+fn transition_target(
+    action: RoutineUpdateAction,
+    current: RoutineLifecycle,
+) -> Result<RoutineLifecycle, ErrorData> {
+    use RoutineLifecycle::{Archived, Candidate, Confirmed, Disabled};
+    let target = match (action, current) {
+        (RoutineUpdateAction::Confirm, Candidate) => Confirmed,
+        (RoutineUpdateAction::Disable, Candidate | Confirmed) => Disabled,
+        (RoutineUpdateAction::Enable, Disabled | Archived) => Candidate,
+        (RoutineUpdateAction::Archive, Candidate | Confirmed | Disabled) => Archived,
+        (RoutineUpdateAction::Rename, current) => current,
+        (action, current) => {
+            return Err(invalid(format!(
+                "ROUTINE_TRANSITION_INVALID: action {action:?} is not legal from lifecycle \
+                 {current:?} (confirm: candidate→confirmed; disable: candidate|confirmed→\
+                 disabled; enable: disabled|archived→candidate; archive: candidate|confirmed|\
+                 disabled→archived)"
+            )));
+        }
+    };
+    Ok(target)
+}
+
+fn validate_update_fields(params: &RoutineUpdateParams) -> Result<(), ErrorData> {
+    match params.action {
+        RoutineUpdateAction::Rename => {
+            let Some(label) = params.label.as_deref().map(str::trim) else {
+                return Err(invalid("routine_update rename requires a label"));
+            };
+            if label.is_empty() {
+                return Err(invalid("routine_update label must not be blank"));
+            }
+            if label.chars().count() > MAX_LABEL_CHARS {
+                return Err(invalid(format!(
+                    "routine_update label must be at most {MAX_LABEL_CHARS} characters; got {}",
+                    label.chars().count()
+                )));
+            }
+            if label.chars().any(char::is_control) {
+                return Err(invalid(
+                    "routine_update label must not contain control characters",
+                ));
+            }
+        }
+        _ if params.label.is_some() => {
+            return Err(invalid(format!(
+                "routine_update label is only valid for action=rename; got action={:?}",
+                params.action
+            )));
+        }
+        _ => {}
+    }
+    if let Some(note) = &params.note {
+        if note.trim().is_empty() {
+            return Err(invalid("routine_update note must not be blank when set"));
+        }
+        if note.chars().count() > MAX_NOTE_CHARS {
+            return Err(invalid(format!(
+                "routine_update note must be at most {MAX_NOTE_CHARS} characters; got {}",
+                note.chars().count()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Applies one lifecycle mutation: legality check, audit-trail append,
+/// synchronous flushed write, and a physical read-back verification.
+pub fn update_routine(
+    db: &Arc<Db>,
+    params: &RoutineUpdateParams,
+    by_session: &str,
+) -> Result<RoutineUpdateResponse, ErrorData> {
+    validate_routine_id_param("routine_update", &params.routine_id)?;
+    validate_update_fields(params)?;
+
+    if !db.pressure_permits_write(cf::CF_ROUTINE_STATE) {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "routine_update refused under disk pressure: cf_name={} pressure_level={:?}; \
+                 the lifecycle is unchanged",
+                cf::CF_ROUTINE_STATE,
+                db.pressure_level()
+            ),
+        ));
+    }
+
+    let existing_state = load_state_row(db, &params.routine_id)?;
+    let state_row_created = existing_state.is_none();
+    let mut state = match existing_state {
+        Some(state) => state,
+        None => {
+            let Some(record) = load_routine_record(db, &params.routine_id)? else {
+                return Err(invalid(format!(
+                    "ROUTINE_NOT_FOUND: routine_id {} exists in neither CF_ROUTINES nor \
+                     CF_ROUTINE_STATE; run routine_list to see what exists",
+                    params.routine_id
+                )));
+            };
+            synthesized_default_state(&record)
+        }
+    };
+
+    let lifecycle_before = state.lifecycle;
+    let label_before = state.label.clone();
+    let lifecycle_after = transition_target(params.action, lifecycle_before)?;
+    let label_after = match params.action {
+        RoutineUpdateAction::Rename => params.label.as_deref().map(str::trim).map(str::to_owned),
+        _ => label_before.clone(),
+    };
+
+    let now = now_ts_ns();
+    state.lifecycle = lifecycle_after;
+    state.label.clone_from(&label_after);
+    state.updated_ts_ns = now;
+    push_transition(
+        &mut state,
+        RoutineTransition {
+            ts_ns: now,
+            action: action_kind(params.action),
+            from: Some(lifecycle_before),
+            to: lifecycle_after,
+            by: by_session.to_owned(),
+            label_before: if params.action == RoutineUpdateAction::Rename {
+                label_before.clone()
+            } else {
+                None
+            },
+            label_after: if params.action == RoutineUpdateAction::Rename {
+                label_after.clone()
+            } else {
+                None
+            },
+            note: params.note.clone(),
+        },
+    );
+
+    put_state_rows(db, std::slice::from_ref(&state))?;
+
+    // Read-your-write against the physical row: the response carries what
+    // storage actually holds, never just the in-memory value.
+    let readback = load_state_row(db, &params.routine_id)?.ok_or_else(|| {
+        internal(format!(
+            "ROUTINE_STATE_READBACK_MISSING: CF_ROUTINE_STATE row for {} vanished immediately \
+             after a flushed write",
+            params.routine_id
+        ))
+    })?;
+    if readback != state {
+        return Err(internal(format!(
+            "ROUTINE_STATE_READBACK_MISMATCH: CF_ROUTINE_STATE row for {} does not match the \
+             value just written; expected lifecycle {:?}, found {:?}",
+            params.routine_id, state.lifecycle, readback.lifecycle
+        )));
+    }
+
+    tracing::info!(
+        code = "ROUTINE_LIFECYCLE_TRANSITION",
+        routine_id = %params.routine_id,
+        action = ?params.action,
+        lifecycle_before = ?lifecycle_before,
+        lifecycle_after = ?lifecycle_after,
+        label_before = label_before.as_deref(),
+        label_after = label_after.as_deref(),
+        by = by_session,
+        state_row_created,
+        "routine lifecycle transition persisted and read back"
+    );
+
+    Ok(RoutineUpdateResponse {
+        routine_id: params.routine_id.clone(),
+        action: params.action,
+        lifecycle_before,
+        lifecycle_after,
+        label_before,
+        label_after,
+        state_row_created,
+        state: readback,
     })
 }
 
@@ -532,6 +1521,170 @@ mod tests {
         assert!(config.include_agent_activity);
         let defaults = build_config(&RoutineMineParams::default()).expect("defaults");
         assert_eq!(defaults, RoutineMiningConfig::default());
+    }
+
+    fn state_fixture(lifecycle: RoutineLifecycle) -> RoutineStateRecord {
+        RoutineStateRecord {
+            record_version: ROUTINE_STATE_RECORD_VERSION,
+            routine_id: "rt1-0123456789abcdef".to_owned(),
+            lifecycle,
+            label: None,
+            created_ts_ns: 1,
+            updated_ts_ns: 1,
+            last_mined_ts_ns: Some(1),
+            present_in_last_mine: true,
+            transitions: Vec::new(),
+            transitions_truncated: 0,
+            confidence_history: Vec::new(),
+            confidence_history_truncated: 0,
+        }
+    }
+
+    #[test]
+    fn transition_targets_enforce_the_lifecycle_state_machine() {
+        use RoutineLifecycle::{Archived, Candidate, Confirmed, Disabled};
+        use RoutineUpdateAction::{Archive, Confirm, Disable, Enable, Rename};
+        let legal = [
+            (Confirm, Candidate, Confirmed),
+            (Disable, Candidate, Disabled),
+            (Disable, Confirmed, Disabled),
+            (Enable, Disabled, Candidate),
+            (Enable, Archived, Candidate),
+            (Archive, Candidate, Archived),
+            (Archive, Confirmed, Archived),
+            (Archive, Disabled, Archived),
+            (Rename, Candidate, Candidate),
+            (Rename, Archived, Archived),
+        ];
+        for (action, from, to) in legal {
+            let target = transition_target(action, from).expect("legal transition");
+            println!("transition action={action:?} from={from:?} to={target:?}");
+            assert_eq!(target, to);
+        }
+        let illegal = [
+            (Confirm, Confirmed),
+            (Confirm, Disabled),
+            (Confirm, Archived),
+            (Disable, Disabled),
+            (Disable, Archived),
+            (Enable, Candidate),
+            (Enable, Confirmed),
+            (Archive, Archived),
+        ];
+        for (action, from) in illegal {
+            let error = transition_target(action, from).expect_err("illegal transition");
+            assert!(
+                error.message.contains("ROUTINE_TRANSITION_INVALID"),
+                "{action:?} from {from:?}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn update_field_validation_enforces_label_and_note_rules() {
+        let base = |action| RoutineUpdateParams {
+            routine_id: "rt1-0123456789abcdef".to_owned(),
+            action,
+            label: None,
+            note: None,
+        };
+        let mut rename_missing_label = base(RoutineUpdateAction::Rename);
+        let error = validate_update_fields(&rename_missing_label).expect_err("label required");
+        assert!(error.message.contains("requires a label"), "{}", error.message);
+        rename_missing_label.label = Some("  ".to_owned());
+        let error = validate_update_fields(&rename_missing_label).expect_err("blank label");
+        assert!(error.message.contains("not be blank"), "{}", error.message);
+        rename_missing_label.label = Some("a".repeat(MAX_LABEL_CHARS + 1));
+        let error = validate_update_fields(&rename_missing_label).expect_err("label too long");
+        assert!(error.message.contains("at most"), "{}", error.message);
+        rename_missing_label.label = Some("tab\tname".to_owned());
+        let error = validate_update_fields(&rename_missing_label).expect_err("control chars");
+        assert!(error.message.contains("control"), "{}", error.message);
+
+        let mut confirm_with_label = base(RoutineUpdateAction::Confirm);
+        confirm_with_label.label = Some("nope".to_owned());
+        let error = validate_update_fields(&confirm_with_label).expect_err("label rejected");
+        assert!(
+            error.message.contains("only valid for action=rename"),
+            "{}",
+            error.message
+        );
+
+        let mut long_note = base(RoutineUpdateAction::Disable);
+        long_note.note = Some("n".repeat(MAX_NOTE_CHARS + 1));
+        let error = validate_update_fields(&long_note).expect_err("note too long");
+        assert!(error.message.contains("at most"), "{}", error.message);
+
+        let mut valid_rename = base(RoutineUpdateAction::Rename);
+        valid_rename.label = Some("Morning report".to_owned());
+        valid_rename.note = Some("named after review".to_owned());
+        validate_update_fields(&valid_rename).expect("valid rename");
+    }
+
+    #[test]
+    fn transition_and_confidence_caps_are_loud() {
+        let mut state = state_fixture(RoutineLifecycle::Candidate);
+        for index in 0..(ROUTINE_STATE_MAX_TRANSITIONS as u64 + 5) {
+            push_transition(
+                &mut state,
+                RoutineTransition {
+                    ts_ns: index,
+                    action: RoutineStateAction::Rename,
+                    from: Some(RoutineLifecycle::Candidate),
+                    to: RoutineLifecycle::Candidate,
+                    by: "test".to_owned(),
+                    label_before: None,
+                    label_after: None,
+                    note: None,
+                },
+            );
+        }
+        println!(
+            "transitions len={} truncated={} oldest_ts={}",
+            state.transitions.len(),
+            state.transitions_truncated,
+            state.transitions[0].ts_ns
+        );
+        assert_eq!(state.transitions.len(), ROUTINE_STATE_MAX_TRANSITIONS);
+        assert_eq!(state.transitions_truncated, 5);
+        assert_eq!(state.transitions[0].ts_ns, 5);
+
+        let mut state = state_fixture(RoutineLifecycle::Candidate);
+        for index in 0..(ROUTINE_STATE_MAX_CONFIDENCE_POINTS as u64 + 3) {
+            #[allow(clippy::cast_precision_loss)]
+            let appended = push_confidence_point(
+                &mut state,
+                RoutineConfidencePoint {
+                    ts_ns: index,
+                    confidence: index as f64 / 1_000.0,
+                    support_days: 3,
+                    opportunity_days: 10,
+                },
+            );
+            assert!(appended, "distinct points must append");
+        }
+        assert_eq!(
+            state.confidence_history.len(),
+            ROUTINE_STATE_MAX_CONFIDENCE_POINTS
+        );
+        assert_eq!(state.confidence_history_truncated, 3);
+        // An identical observation is a heartbeat, not a change-point.
+        let last = state.confidence_history.last().expect("non-empty").clone();
+        let appended = push_confidence_point(
+            &mut state,
+            RoutineConfidencePoint {
+                ts_ns: last.ts_ns + 1,
+                confidence: last.confidence,
+                support_days: last.support_days,
+                opportunity_days: last.opportunity_days,
+            },
+        );
+        assert!(!appended, "identical observation must not append");
+        assert_eq!(
+            state.confidence_history.len(),
+            ROUTINE_STATE_MAX_CONFIDENCE_POINTS
+        );
     }
 
     #[test]
