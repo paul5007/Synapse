@@ -22,7 +22,8 @@ pub use snapshot::{
 pub use window::{
     close_window, current_foreground_context, element_from_point, focus_window_with_intent,
     focused_element, focused_window, foreground_context, is_top_level_window, is_window_minimized,
-    is_window_visible, snapshot_focused_window, snapshot_window_for_process, top_level_root_hwnd,
+    is_window_visible, millis_since_last_input, snapshot_focused_window,
+    snapshot_window_for_process, top_level_root_hwnd,
     top_level_window_hwnd_by_name, visible_top_level_window_contexts, window_for_process,
     window_from_hwnd,
 };

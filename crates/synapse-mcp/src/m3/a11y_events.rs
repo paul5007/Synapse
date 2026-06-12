@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use chrono::Utc;
 use serde_json::json;
@@ -6,6 +6,8 @@ use synapse_a11y::{AccessibleEvent, AccessibleEventKind, WinEventSubscription};
 use synapse_core::{Event, EventFilter, EventSource, ForegroundContext};
 use synapse_reflex::EventBus;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
+
+use super::activity_recorder::ActivityRecorder;
 
 pub struct A11yEventBridge {
     _subscription: WinEventSubscription,
@@ -52,15 +54,20 @@ pub fn is_a11y_event_kind(kind: &str) -> bool {
 }
 
 impl A11yEventBridge {
-    pub(crate) fn start(event_bus: EventBus) -> synapse_a11y::A11yResult<Self> {
+    pub(crate) fn start(
+        event_bus: EventBus,
+        activity_recorder: Option<Arc<ActivityRecorder>>,
+    ) -> synapse_a11y::A11yResult<Self> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let subscription = synapse_a11y::subscribe_win_events(sender)?;
-        let task = tokio::spawn(run_bridge(event_bus, receiver));
+        let recorder_attached = activity_recorder.is_some();
+        let task = tokio::spawn(run_bridge(event_bus, receiver, activity_recorder));
         tracing::info!(
             code = "M3_A11Y_EVENT_BRIDGE_STARTED",
             thread_id = subscription.readback().thread_id,
             hook_count = subscription.readback().hook_count,
             event_ids = ?subscription.readback().event_ids,
+            recorder_attached,
             "M3 a11y WinEvent bridge started"
         );
         Ok(Self {
@@ -85,9 +92,16 @@ impl Drop for A11yEventBridge {
     }
 }
 
-async fn run_bridge(event_bus: EventBus, mut receiver: UnboundedReceiver<AccessibleEvent>) {
+async fn run_bridge(
+    event_bus: EventBus,
+    mut receiver: UnboundedReceiver<AccessibleEvent>,
+    activity_recorder: Option<Arc<ActivityRecorder>>,
+) {
     let mut next_seq = 1_u64;
     while let Some(accessible_event) = receiver.recv().await {
+        if let Some(recorder) = &activity_recorder {
+            recorder.record_accessible_event(&accessible_event);
+        }
         let event = event_from_accessible(&accessible_event, next_seq);
         next_seq = next_seq.saturating_add(1);
         let report = event_bus.publish(event.clone());

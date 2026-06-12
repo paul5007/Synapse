@@ -228,6 +228,42 @@ pub(super) async fn serve(
         );
     }
 
+    // Always-on activity recorder (#837): started eagerly so the operator
+    // timeline records whenever the daemon runs, before any tool call can
+    // lazily start a recorder-less WinEvent bridge. A recorder that cannot
+    // record is a startup failure, not a degraded mode.
+    let m3_state_for_recorder = service.m3_state_handle();
+    {
+        let recorder_result = {
+            let mut state = m3_state_for_recorder.lock().map_err(|_poisoned| {
+                anyhow::anyhow!("m3 service state lock poisoned during activity recorder startup")
+            })?;
+            state.ensure_activity_recorder(sse_state.event_bus())
+        };
+        if let Err(error) = recorder_result {
+            let detail = format!("{error:#}");
+            tracing::error!(
+                code = "TIMELINE_RECORDER_START_FAILED",
+                db_path = %db_path.display(),
+                detail = %detail,
+                "refusing to start: activity recorder failed at daemon startup"
+            );
+            crate::daemon_lifecycle::record_startup_exit(
+                "startup_activity_recorder_failed",
+                serde_json::json!({
+                    "db_path": db_path.display().to_string(),
+                    "detail": detail,
+                }),
+            )
+            .context("record daemon lifecycle startup activity-recorder failure")?;
+            return Ok(ExitCode::from(4));
+        }
+        tracing::info!(
+            code = "MCP_DAEMON_ACTIVITY_RECORDER_STARTED",
+            "activity recorder started eagerly at startup"
+        );
+    }
+
     let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.m3_state_handle())
         .context("install operator panic hotkey")?;
     let m2_emitter_done = service.m2_emitter_done_receiver();
@@ -286,6 +322,22 @@ pub(super) async fn serve(
             ExitCode::SUCCESS
         }
     };
+    // Stop the activity recorder last so the timeline closes with a
+    // session_end row covering the whole daemon lifetime (#837).
+    let recorder = m3_state_for_recorder
+        .lock()
+        .ok()
+        .and_then(|mut state| state.activity_recorder.take());
+    if let Some(recorder) = recorder {
+        recorder.shutdown().await;
+        let (rows_written, write_failures) = recorder.readback();
+        tracing::info!(
+            code = "MCP_DAEMON_ACTIVITY_RECORDER_STOPPED",
+            rows_written,
+            write_failures,
+            "activity recorder stopped at daemon shutdown"
+        );
+    }
     crate::daemon_lifecycle::record_graceful_exit("http_service_completed")
         .context("record daemon lifecycle graceful HTTP service completion")?;
     Ok(code)

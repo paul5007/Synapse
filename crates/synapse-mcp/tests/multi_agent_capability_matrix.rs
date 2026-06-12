@@ -196,7 +196,7 @@ fn parse_matrix(markdown: &str) -> anyhow::Result<Vec<MatrixRow>> {
     Ok(rows)
 }
 
-fn rows_by_tool<'a>(rows: &'a [MatrixRow]) -> anyhow::Result<BTreeMap<String, &'a MatrixRow>> {
+fn rows_by_tool(rows: &[MatrixRow]) -> anyhow::Result<BTreeMap<String, &MatrixRow>> {
     let mut by_tool = BTreeMap::new();
     for row in rows {
         ensure!(

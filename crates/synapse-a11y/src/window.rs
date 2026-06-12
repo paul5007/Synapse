@@ -53,6 +53,21 @@ pub fn window_from_hwnd(hwnd: i64) -> A11yResult<UIElement> {
     platform::window_from_hwnd(hwnd)
 }
 
+/// Returns milliseconds since the interactive session last saw keyboard,
+/// mouse, or other input (`GetLastInputInfo`).
+///
+/// Synthetic input injected with `SendInput` (agent actions) also resets the
+/// counter, so this measures "the session is receiving input", not "the human
+/// is present"; cadence capture (#838) separates the two.
+///
+/// # Errors
+///
+/// Returns a structured internal error when `GetLastInputInfo` fails, or
+/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn millis_since_last_input() -> A11yResult<u64> {
+    platform::millis_since_last_input()
+}
+
 /// Requests foreground focus for a top-level native HWND.
 ///
 /// # Errors

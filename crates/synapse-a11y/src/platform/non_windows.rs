@@ -55,6 +55,12 @@ pub fn is_window_visible(_hwnd: i64) -> A11yResult<bool> {
     ))
 }
 
+pub fn millis_since_last_input() -> A11yResult<u64> {
+    Err(A11yError::not_available(
+        "last-input idle readback requires Windows",
+    ))
+}
+
 pub fn is_top_level_window(_hwnd: i64) -> A11yResult<bool> {
     Err(A11yError::not_available(
         "top-level window readback requires Windows",

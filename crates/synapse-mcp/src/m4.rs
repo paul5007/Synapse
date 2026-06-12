@@ -8390,18 +8390,21 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn launch_wait_fails_when_window_does_not_match() {
+    async fn launch_wait_refuses_console_window_title_wait() {
+        // Console launches are hidden/no-window by policy, so a window-title
+        // wait on a console target is unsatisfiable and must fail closed
+        // before spawning anything (validate_console_launch_visibility).
         let mut params = launch_params("cmd.exe", vec!["/c", "exit 0"], 50);
         params.wait_for_window_title_regex = Some("^SynapseLaunchNoSuchWindow$".to_owned());
         let config = launch_config_for(&params);
 
         let error = match launch(&config, params).await {
-            Ok(response) => panic!("window verification should fail closed: {response:?}"),
+            Ok(response) => panic!("console window wait should fail closed: {response:?}"),
             Err(error) => error,
         };
 
         println!(
-            "readback=act_launch_window_wait edge=no_match before=regex:^SynapseLaunchNoSuchWindow$ after=error:{error}"
+            "readback=act_launch_window_wait edge=console_no_window before=regex:^SynapseLaunchNoSuchWindow$ after=error:{error}"
         );
         assert_eq!(
             error
@@ -8409,7 +8412,7 @@ mod tests {
                 .as_ref()
                 .and_then(|data| data.get("code"))
                 .and_then(|code| code.as_str()),
-            Some(error_codes::ACTION_LAUNCH_WINDOW_NOT_FOUND)
+            Some(error_codes::TOOL_PARAMS_INVALID)
         );
         assert_eq!(
             error
@@ -8417,7 +8420,7 @@ mod tests {
                 .as_ref()
                 .and_then(|data| data.get("reason"))
                 .and_then(|reason| reason.as_str()),
-            Some("no_match_within_timeout")
+            Some("hidden_console_has_no_window_to_wait_for")
         );
     }
 

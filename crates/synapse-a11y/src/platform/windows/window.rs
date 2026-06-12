@@ -12,9 +12,10 @@ use windows::{
             AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
             PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         },
+        System::SystemInformation::GetTickCount,
         UI::Input::KeyboardAndMouse::{
-            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-            SendInput, VIRTUAL_KEY, VK_MENU,
+            GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+            KEYEVENTF_KEYUP, LASTINPUTINFO, SendInput, VIRTUAL_KEY, VK_MENU,
         },
         UI::WindowsAndMessaging::{
             BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetForegroundWindow,
@@ -188,6 +189,24 @@ pub fn is_window_minimized(hwnd: i64) -> A11yResult<bool> {
 pub fn is_window_visible(hwnd: i64) -> A11yResult<bool> {
     let hwnd = valid_hwnd(hwnd)?;
     Ok(unsafe { IsWindowVisible(hwnd) }.as_bool())
+}
+
+pub fn millis_since_last_input() -> A11yResult<u64> {
+    let mut info = LASTINPUTINFO {
+        cbSize: u32::try_from(mem::size_of::<LASTINPUTINFO>())
+            .map_err(|err| A11yError::internal(err.to_string()))?,
+        dwTime: 0,
+    };
+    if !unsafe { GetLastInputInfo(&raw mut info) }.as_bool() {
+        return Err(A11yError::internal(format!(
+            "GetLastInputInfo failed: {:?}",
+            windows::core::Error::from_thread()
+        )));
+    }
+    // Both values are 32-bit session ticks that wrap every ~49.7 days;
+    // wrapping subtraction yields the correct elapsed span across the wrap.
+    let now_tick = unsafe { GetTickCount() };
+    Ok(u64::from(now_tick.wrapping_sub(info.dwTime)))
 }
 
 pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {

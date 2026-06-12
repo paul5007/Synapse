@@ -1,4 +1,5 @@
 mod a11y_events;
+pub mod activity_recorder;
 pub mod audio;
 pub mod audit_export;
 pub mod audit_retention;
@@ -33,6 +34,7 @@ use synapse_storage::Db;
 use tokio_util::sync::CancellationToken;
 
 use self::a11y_events::A11yEventBridge;
+use self::activity_recorder::{ActivityRecorder, RecorderConfig};
 use self::permissions::{PermissionGrants, configured_grants_from_parts};
 use crate::http::sse::SseState;
 
@@ -174,6 +176,7 @@ pub struct M3State {
     pub sse_state: SseState,
     pub reflex_runtime: Option<Arc<Mutex<ReflexRuntime>>>,
     pub a11y_event_bridge: Option<A11yEventBridge>,
+    pub activity_recorder: Option<Arc<ActivityRecorder>>,
     pub audio_runtime: Option<Arc<AudioRuntime>>,
     pub audit_session: Option<AuditSessionState>,
     pub mcp_audit_sessions: BTreeMap<SessionId, AuditSessionState>,
@@ -295,6 +298,7 @@ impl M3State {
             sse_state,
             reflex_runtime: None,
             a11y_event_bridge: None,
+            activity_recorder: None,
             audio_runtime: None,
             audit_session: None,
             mcp_audit_sessions: BTreeMap::new(),
@@ -411,8 +415,42 @@ impl M3State {
         if self.a11y_event_bridge.is_some() {
             return Ok(());
         }
-        let bridge = A11yEventBridge::start(event_bus)?;
+        let bridge = A11yEventBridge::start(event_bus, self.activity_recorder.clone())?;
         self.a11y_event_bridge = Some(bridge);
+        Ok(())
+    }
+
+    /// Starts the always-on operator-activity recorder (#837) and the WinEvent
+    /// bridge that feeds it. Called eagerly at daemon startup, before any tool
+    /// call can lazily start a recorder-less bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage cannot open, when the recorder cannot
+    /// probe its idle source or write its `session_start` row, when the
+    /// WinEvent bridge cannot start, or when a bridge already exists without
+    /// the recorder attached (a startup-ordering bug that would silently drop
+    /// every timeline row).
+    pub fn ensure_activity_recorder(&mut self, event_bus: EventBus) -> Result<()> {
+        if self.activity_recorder.is_some() {
+            return Ok(());
+        }
+        if self.a11y_event_bridge.is_some() {
+            bail!(
+                "a11y event bridge started before the activity recorder; \
+                 timeline rows would be silently dropped (startup-ordering bug)"
+            );
+        }
+        let db = self
+            .ensure_storage()
+            .context("open storage for the activity recorder")?;
+        let config = RecorderConfig::from_env()?;
+        let recorder = Arc::new(ActivityRecorder::spawn(db, config)?);
+        self.activity_recorder = Some(Arc::clone(&recorder));
+        if let Err(error) = self.ensure_a11y_event_bridge(event_bus) {
+            self.activity_recorder = None;
+            return Err(error).context("start WinEvent bridge for the activity recorder");
+        }
         Ok(())
     }
 

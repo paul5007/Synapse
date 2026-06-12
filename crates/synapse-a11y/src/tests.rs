@@ -367,3 +367,20 @@ fn windows_foreground_snapshot_round_trips_element_id() -> Result<(), Box<dyn st
     assert_eq!(round_trip.root, tree.root);
     Ok(())
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_millis_since_last_input_reads_real_session_idle() -> Result<(), Box<dyn std::error::Error>> {
+    println!("readback=last_input edge=real_session before=GetLastInputInfo");
+    let first = millis_since_last_input()?;
+    let second = millis_since_last_input()?;
+    println!("readback=last_input edge=real_session after=first:{first}ms second:{second}ms");
+    // Two consecutive reads without injected input: the second read is the
+    // same instant or later on the session tick clock (modulo an input event
+    // landing between them, which resets both toward zero).
+    assert!(
+        second >= first || second < 1_000,
+        "second read ({second}ms) must advance from first ({first}ms) unless real input reset it"
+    );
+    Ok(())
+}
