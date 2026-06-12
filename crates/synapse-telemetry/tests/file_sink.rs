@@ -65,7 +65,7 @@ fn synthetic_file_path_log_dir_returns_error() -> Result<(), Box<dyn std::error:
 
     let cfg = TelemetryConfig::default_with_log_dir(file_path);
     let res = init_tracing(cfg);
-    assert!(matches!(res, Err(TelemetryError::LogDirNotWritable(_))));
+    assert!(matches!(res, Err(TelemetryError::LogDirNotWritable(_, _))));
     Ok(())
 }
 

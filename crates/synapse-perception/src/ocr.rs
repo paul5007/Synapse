@@ -349,14 +349,14 @@ mod platform {
     ) -> PerceptionResult<Vec<TextRegion>> {
         let engine = ocr_engine()?;
         let max_dimension = ocr_max_image_dimension()?;
-        let primary = recognize_bgra_region(&engine, region, width, height, bytes, max_dimension);
+        let primary = recognize_bgra_region(engine, region, width, height, bytes, max_dimension);
         let fallback = if should_try_sparse_ocr(width, height, max_dimension)
             || matches!(
                 &primary,
                 Err(PerceptionError::OcrNoText { .. }
                     | PerceptionError::OcrBackendUnavailable { .. })
             ) {
-            sparse_bgra_alternative(&engine, region, width, height, bytes, max_dimension)
+            sparse_bgra_alternative(engine, region, width, height, bytes, max_dimension)
         } else {
             None
         };
@@ -467,8 +467,8 @@ mod platform {
     ) -> Option<Vec<TextRegion>> {
         validate_bgra_len(width, height, bytes).ok()?;
         let mut best = None;
-        if let Some(bounds) = content_bounds_for_bgra(width, height, bytes) {
-            if let Some(candidate) = recognize_bgra_subregion(
+        if let Some(bounds) = content_bounds_for_bgra(width, height, bytes)
+            && let Some(candidate) = recognize_bgra_subregion(
                 engine,
                 region,
                 width,
@@ -476,9 +476,9 @@ mod platform {
                 bytes,
                 bounds,
                 max_dimension,
-            ) {
-                best = Some(candidate);
-            }
+            )
+        {
+            best = Some(candidate);
         }
         if should_try_sparse_tiling(width, height, max_dimension) {
             let mut tiled = Vec::new();

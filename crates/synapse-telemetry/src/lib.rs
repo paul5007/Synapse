@@ -64,8 +64,8 @@ impl TelemetryConfig {
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
-    #[error("TELEMETRY_LOG_DIR_NOT_WRITABLE: {0}")]
-    LogDirNotWritable(PathBuf),
+    #[error("TELEMETRY_LOG_DIR_NOT_WRITABLE: {0} ({1})")]
+    LogDirNotWritable(PathBuf, String),
     #[error("TELEMETRY_SUBSCRIBER_INIT_FAILED: {0}")]
     SubscriberInit(String),
     #[error("TELEMETRY_GC_FAILED: {0}")]
@@ -76,7 +76,7 @@ impl TelemetryError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::LogDirNotWritable(_) => "TELEMETRY_LOG_DIR_NOT_WRITABLE",
+            Self::LogDirNotWritable(_, _) => "TELEMETRY_LOG_DIR_NOT_WRITABLE",
             Self::SubscriberInit(_) => "TELEMETRY_SUBSCRIBER_INIT_FAILED",
             Self::Gc(_) => "TELEMETRY_GC_FAILED",
         }
@@ -356,11 +356,19 @@ pub fn default_log_dir() -> PathBuf {
 }
 
 fn prepare_log_dir(log_dir: &Path) -> Result<(), TelemetryError> {
-    fs::create_dir_all(log_dir)
-        .map_err(|_| TelemetryError::LogDirNotWritable(log_dir.to_path_buf()))?;
-    let probe = log_dir.join(".synapse-write-probe");
-    File::create(&probe).map_err(|_| TelemetryError::LogDirNotWritable(log_dir.to_path_buf()))?;
-    fs::remove_file(probe).map_err(|_| TelemetryError::LogDirNotWritable(log_dir.to_path_buf()))
+    fs::create_dir_all(log_dir).map_err(|error| {
+        TelemetryError::LogDirNotWritable(log_dir.to_path_buf(), format!("create_dir_all: {error}"))
+    })?;
+    // Probe filename must be unique per process: concurrent daemons share
+    // this directory, and a fixed name makes one daemon's create/remove race
+    // another's, killing it at startup with a phantom "not writable".
+    let probe = log_dir.join(format!(".synapse-write-probe-{}", std::process::id()));
+    File::create(&probe).map_err(|error| {
+        TelemetryError::LogDirNotWritable(log_dir.to_path_buf(), format!("probe create: {error}"))
+    })?;
+    fs::remove_file(probe).map_err(|error| {
+        TelemetryError::LogDirNotWritable(log_dir.to_path_buf(), format!("probe remove: {error}"))
+    })
 }
 
 fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), String> {

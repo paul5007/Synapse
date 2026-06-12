@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -19,6 +20,7 @@ pub struct StdioMcpClient {
     stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
     stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    stderr_buffer: Arc<Mutex<Vec<u8>>>,
     _temp_db_dir: Option<tempfile::TempDir>,
     next_id: u64,
     raw_rx: Vec<String>,
@@ -103,16 +105,34 @@ impl StdioMcpClient {
         let stdin = child.stdin.take().context("child stdin missing")?;
         let stdout = child.stdout.take().context("child stdout missing")?;
         let stderr = child.stderr.take().context("child stderr missing")?;
+        let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
-            stderr_task: Some(tokio::spawn(read_stderr(stderr))),
+            stderr_task: Some(tokio::spawn(read_stderr(
+                stderr,
+                Arc::clone(&stderr_buffer),
+            ))),
+            stderr_buffer,
             _temp_db_dir: temp_db_dir,
             next_id: 0,
             raw_rx: Vec::new(),
             raw_tx: Vec::new(),
         })
+    }
+
+    /// Tail of the daemon's stderr captured so far — the only diagnostics
+    /// available when the child dies before answering a request.
+    #[must_use]
+    pub fn stderr_tail(&self, max_bytes: usize) -> String {
+        let buffer = self
+            .stderr_buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default();
+        let start = buffer.len().saturating_sub(max_bytes);
+        String::from_utf8_lossy(&buffer[start..]).into_owned()
     }
 
     pub async fn tools_list(&mut self) -> anyhow::Result<Value> {
@@ -264,7 +284,12 @@ impl StdioMcpClient {
                 return Ok(value);
             }
         }
-        bail!("MCP_TRANSPORT_CLOSED before response id {id}");
+        // Give the stderr reader a beat to drain the pipe before reporting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        bail!(
+            "MCP_TRANSPORT_CLOSED before response id {id}; daemon stderr tail:\n{}",
+            self.stderr_tail(8 * 1024)
+        );
     }
 }
 
@@ -282,10 +307,22 @@ impl Drop for StdioMcpClient {
     }
 }
 
-async fn read_stderr(mut stderr: ChildStderr) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let _ = stderr.read_to_end(&mut buf).await;
-    buf
+async fn read_stderr(mut stderr: ChildStderr, shared: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if let Ok(mut shared) = shared.lock() {
+                    shared.extend_from_slice(&buf[..read]);
+                }
+            }
+        }
+    }
+    shared
+        .lock()
+        .map(|shared| shared.clone())
+        .unwrap_or_default()
 }
 
 fn mcp_binary_path() -> anyhow::Result<PathBuf> {
