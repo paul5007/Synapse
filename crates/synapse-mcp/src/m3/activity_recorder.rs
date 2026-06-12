@@ -31,7 +31,7 @@
 
 use std::time::{Duration, Instant};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -43,9 +43,14 @@ use chrono::Utc;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use synapse_a11y::{AccessibleEvent, AccessibleEventKind};
-use synapse_core::types::{
-    FsEventKind, Observation, TIMELINE_RECORD_VERSION, TimelineActor, TimelineKind, TimelineRecord,
+use synapse_core::{
+    Event, EventSource, SCHEMA_VERSION, StoredEvent,
+    types::{
+        AccessibleNode, FsEventKind, Observation, TIMELINE_RECORD_VERSION, TimelineActor,
+        TimelineKind, TimelineRecord,
+    },
 };
+use synapse_reflex::EventBus;
 use synapse_storage::{Db, cf, timeline::timeline_key};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -53,7 +58,9 @@ use tokio::{
 };
 
 use super::{
-    interaction_cadence::{InteractionEvent, InteractionEventKind, InteractionHook},
+    interaction_cadence::{
+        InteractionEvent, InteractionEventKind, InteractionHook, InteractionKeySignal,
+    },
     timeline_control::{RecorderControl, SuppressReason},
 };
 use crate::m1::{
@@ -67,12 +74,14 @@ const DEFAULT_IDLE_TIMEOUT_MS: u64 = 180_000;
 const MIN_IDLE_POLL_INTERVAL_MS: u64 = 250;
 const MAX_IDLE_POLL_INTERVAL_MS: u64 = 5_000;
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const ASSIST_EVENT_KIND: &str = "assist.opportunity";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecorderConfig {
     pub idle_timeout_ms: u64,
     pub idle_poll_interval_ms: u64,
     interaction_hook_enabled: bool,
+    assist: AssistDetectorConfig,
 }
 
 impl RecorderConfig {
@@ -106,6 +115,7 @@ impl RecorderConfig {
             idle_timeout_ms,
             idle_poll_interval_ms,
             interaction_hook_enabled: true,
+            assist: AssistDetectorConfig::from_env()?,
         })
     }
 
@@ -507,6 +517,513 @@ impl InteractionAccumulator {
     }
 }
 
+const ASSIST_UNDO_BURST_COUNT_ENV: &str = "SYNAPSE_ASSIST_UNDO_BURST_COUNT";
+const ASSIST_UNDO_BURST_WINDOW_MS_ENV: &str = "SYNAPSE_ASSIST_UNDO_BURST_WINDOW_MS";
+const ASSIST_RETYPE_DELETE_COUNT_ENV: &str = "SYNAPSE_ASSIST_RETYPE_DELETE_COUNT";
+const ASSIST_RETYPE_TEXT_COUNT_ENV: &str = "SYNAPSE_ASSIST_RETYPE_TEXT_COUNT";
+const ASSIST_RETYPE_WINDOW_MS_ENV: &str = "SYNAPSE_ASSIST_RETYPE_WINDOW_MS";
+const ASSIST_REPEATED_CLICK_COUNT_ENV: &str = "SYNAPSE_ASSIST_REPEATED_CLICK_COUNT";
+const ASSIST_REPEATED_CLICK_WINDOW_MS_ENV: &str = "SYNAPSE_ASSIST_REPEATED_CLICK_WINDOW_MS";
+const ASSIST_DIALOG_REOPEN_COUNT_ENV: &str = "SYNAPSE_ASSIST_DIALOG_REOPEN_COUNT";
+const ASSIST_DIALOG_REOPEN_WINDOW_MS_ENV: &str = "SYNAPSE_ASSIST_DIALOG_REOPEN_WINDOW_MS";
+const ASSIST_COOLDOWN_MS_ENV: &str = "SYNAPSE_ASSIST_COOLDOWN_MS";
+const ASSIST_HISTORY_CAP: usize = 256;
+const ASSIST_INJECTED_VALUE_SUPPRESSION_NS: u64 = 2_000_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AssistDetectorConfig {
+    undo_burst_count: u64,
+    undo_burst_window_ns: u64,
+    retype_delete_count: u64,
+    retype_text_count: u64,
+    retype_window_ns: u64,
+    repeated_click_count: u64,
+    repeated_click_window_ns: u64,
+    dialog_reopen_count: u64,
+    dialog_reopen_window_ns: u64,
+    cooldown_ns: u64,
+}
+
+impl AssistDetectorConfig {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            undo_burst_count: env_u64(ASSIST_UNDO_BURST_COUNT_ENV, 3)?,
+            undo_burst_window_ns: env_ms_as_ns(ASSIST_UNDO_BURST_WINDOW_MS_ENV, 10_000)?,
+            retype_delete_count: env_u64(ASSIST_RETYPE_DELETE_COUNT_ENV, 3)?,
+            retype_text_count: env_u64(ASSIST_RETYPE_TEXT_COUNT_ENV, 12)?,
+            retype_window_ns: env_ms_as_ns(ASSIST_RETYPE_WINDOW_MS_ENV, 20_000)?,
+            repeated_click_count: env_u64(ASSIST_REPEATED_CLICK_COUNT_ENV, 5)?,
+            repeated_click_window_ns: env_ms_as_ns(ASSIST_REPEATED_CLICK_WINDOW_MS_ENV, 8_000)?,
+            dialog_reopen_count: env_u64(ASSIST_DIALOG_REOPEN_COUNT_ENV, 3)?,
+            dialog_reopen_window_ns: env_ms_as_ns(ASSIST_DIALOG_REOPEN_WINDOW_MS_ENV, 60_000)?,
+            cooldown_ns: env_ms_as_ns(ASSIST_COOLDOWN_MS_ENV, 60_000)?,
+        })
+    }
+
+    #[cfg(test)]
+    const fn test() -> Self {
+        Self {
+            undo_burst_count: 3,
+            undo_burst_window_ns: 10_000_000_000,
+            retype_delete_count: 2,
+            retype_text_count: 4,
+            retype_window_ns: 20_000_000_000,
+            repeated_click_count: 3,
+            repeated_click_window_ns: 8_000_000_000,
+            dialog_reopen_count: 3,
+            dialog_reopen_window_ns: 60_000_000_000,
+            cooldown_ns: 60_000_000_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AssistContext {
+    hwnd: i64,
+    pid: u32,
+    process_name: String,
+    window_title_sha256: String,
+    focused_element_sha256: Option<String>,
+    focused_role: Option<String>,
+}
+
+impl AssistContext {
+    fn from_foreground(
+        context: &synapse_core::ForegroundContext,
+        focused: Option<&AccessibleNode>,
+    ) -> Self {
+        Self {
+            hwnd: context.hwnd,
+            pid: context.pid,
+            process_name: context.process_name.clone(),
+            window_title_sha256: sha256_hex(&context.window_title),
+            focused_element_sha256: focused.map(focused_element_signature),
+            focused_role: focused.map(|node| node.role.clone()),
+        }
+    }
+
+    fn window_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.hwnd,
+            self.pid,
+            self.process_name,
+            self.focused_element_sha256.as_deref().unwrap_or("window")
+        )
+    }
+
+    fn evidence_json(&self) -> serde_json::Value {
+        json!({
+            "hwnd": self.hwnd,
+            "pid": self.pid,
+            "process_name": self.process_name,
+            "window_title_sha256": self.window_title_sha256,
+            "focused_element_sha256": self.focused_element_sha256,
+            "focused_role": self.focused_role,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssistSignalKind {
+    UndoCommand,
+    DeleteCommand,
+    TextLikeKey,
+    Click,
+}
+
+#[derive(Clone, Debug)]
+struct AssistSignal {
+    ts_ns: u64,
+    window_key: String,
+    state_version: u64,
+    kind: AssistSignalKind,
+}
+
+#[derive(Clone, Debug)]
+struct DialogSeen {
+    ts_ns: u64,
+    process_name: String,
+    title_sha256: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AssistDetector {
+    interactions: VecDeque<AssistSignal>,
+    dialogs: VecDeque<DialogSeen>,
+    last_emitted: VecDeque<(String, u64)>,
+    value_lengths: HashMap<String, usize>,
+    last_injected_keyboard_ns: Option<u64>,
+    state_version: u64,
+}
+
+impl AssistDetector {
+    fn note_state_change(&mut self) {
+        self.state_version = self.state_version.saturating_add(1);
+    }
+
+    fn record_interaction(
+        &mut self,
+        event: &InteractionEvent,
+        context: &AssistContext,
+        actor: &TimelineActor,
+        input_origin: &'static str,
+        config: AssistDetectorConfig,
+        sink: &AssistEventSink,
+    ) {
+        let Some(kind) = signal_kind(event) else {
+            return;
+        };
+        if input_origin == "injected"
+            && matches!(
+                kind,
+                AssistSignalKind::UndoCommand
+                    | AssistSignalKind::DeleteCommand
+                    | AssistSignalKind::TextLikeKey
+            )
+        {
+            self.last_injected_keyboard_ns = Some(event.ts_ns);
+        }
+        self.interactions.push_back(AssistSignal {
+            ts_ns: event.ts_ns,
+            window_key: context.window_key(),
+            state_version: self.state_version,
+            kind,
+        });
+        trim_interactions(&mut self.interactions, event.ts_ns, config);
+        self.detect_interaction_loops(
+            event.ts_ns,
+            context,
+            Some(actor),
+            input_origin,
+            config,
+            sink,
+        );
+    }
+
+    fn record_value_change(
+        &mut self,
+        ts_ns: u64,
+        context: &AssistContext,
+        value_len: usize,
+        config: AssistDetectorConfig,
+        sink: &AssistEventSink,
+    ) {
+        self.note_state_change();
+        let window_key = context.window_key();
+        let Some(previous_len) = self.value_lengths.insert(window_key.clone(), value_len) else {
+            return;
+        };
+        if self.recent_injected_keyboard(ts_ns) {
+            return;
+        }
+        let kind = match value_len.cmp(&previous_len) {
+            std::cmp::Ordering::Greater => AssistSignalKind::TextLikeKey,
+            std::cmp::Ordering::Less => AssistSignalKind::DeleteCommand,
+            std::cmp::Ordering::Equal => return,
+        };
+        self.interactions.push_back(AssistSignal {
+            ts_ns,
+            window_key,
+            state_version: self.state_version,
+            kind,
+        });
+        trim_interactions(&mut self.interactions, ts_ns, config);
+        self.detect_interaction_loops(ts_ns, context, None, "uia_value_change", config, sink);
+    }
+
+    fn recent_injected_keyboard(&self, ts_ns: u64) -> bool {
+        self.last_injected_keyboard_ns.is_some_and(|last| {
+            ts_ns >= last && ts_ns.saturating_sub(last) <= ASSIST_INJECTED_VALUE_SUPPRESSION_NS
+        })
+    }
+
+    fn record_dialog_title(
+        &mut self,
+        ts_ns: u64,
+        snapshot: &ForegroundSnapshot,
+        config: AssistDetectorConfig,
+        sink: &AssistEventSink,
+    ) {
+        if !dialog_like_title(&snapshot.title) {
+            return;
+        }
+        let title_sha256 = sha256_hex(&snapshot.title);
+        self.dialogs.push_back(DialogSeen {
+            ts_ns,
+            process_name: snapshot.process_name.clone(),
+            title_sha256: title_sha256.clone(),
+        });
+        trim_dialogs(&mut self.dialogs, ts_ns, config.dialog_reopen_window_ns);
+        let count = self
+            .dialogs
+            .iter()
+            .filter(|seen| {
+                seen.process_name == snapshot.process_name && seen.title_sha256 == title_sha256
+            })
+            .count() as u64;
+        if count >= config.dialog_reopen_count {
+            let context = AssistContext {
+                hwnd: snapshot.hwnd,
+                pid: snapshot.pid,
+                process_name: snapshot.process_name.clone(),
+                window_title_sha256: title_sha256,
+                focused_element_sha256: None,
+                focused_role: None,
+            };
+            self.emit(
+                "dialog_reopen_loop",
+                ts_ns,
+                &context,
+                None,
+                "foreground_dialog_title",
+                config.cooldown_ns,
+                json!({
+                    "dialog_reopen_count": count,
+                    "window_ns": config.dialog_reopen_window_ns,
+                    "threshold_count": config.dialog_reopen_count,
+                }),
+                sink,
+            );
+        }
+    }
+
+    fn detect_interaction_loops(
+        &mut self,
+        ts_ns: u64,
+        context: &AssistContext,
+        actor: Option<&TimelineActor>,
+        input_origin: &'static str,
+        config: AssistDetectorConfig,
+        sink: &AssistEventSink,
+    ) {
+        let window_key = context.window_key();
+        let undo_count = self.count_recent(
+            ts_ns,
+            config.undo_burst_window_ns,
+            &window_key,
+            None,
+            AssistSignalKind::UndoCommand,
+        );
+        if undo_count >= config.undo_burst_count {
+            self.emit(
+                "undo_burst",
+                ts_ns,
+                context,
+                actor,
+                input_origin,
+                config.cooldown_ns,
+                json!({
+                    "undo_command_count": undo_count,
+                    "window_ns": config.undo_burst_window_ns,
+                    "threshold_count": config.undo_burst_count,
+                }),
+                sink,
+            );
+        }
+
+        let text_count = self.count_recent(
+            ts_ns,
+            config.retype_window_ns,
+            &window_key,
+            None,
+            AssistSignalKind::TextLikeKey,
+        );
+        let delete_count = self.count_recent(
+            ts_ns,
+            config.retype_window_ns,
+            &window_key,
+            None,
+            AssistSignalKind::DeleteCommand,
+        );
+        if text_count >= config.retype_text_count && delete_count >= config.retype_delete_count {
+            self.emit(
+                "retype_loop",
+                ts_ns,
+                context,
+                actor,
+                input_origin,
+                config.cooldown_ns,
+                json!({
+                    "text_like_key_count": text_count,
+                    "delete_command_count": delete_count,
+                    "window_ns": config.retype_window_ns,
+                    "text_threshold": config.retype_text_count,
+                    "delete_threshold": config.retype_delete_count,
+                }),
+                sink,
+            );
+        }
+
+        let click_count = self.count_recent(
+            ts_ns,
+            config.repeated_click_window_ns,
+            &window_key,
+            Some(self.state_version),
+            AssistSignalKind::Click,
+        );
+        if click_count >= config.repeated_click_count {
+            self.emit(
+                "repeated_click_without_state_change",
+                ts_ns,
+                context,
+                actor,
+                input_origin,
+                config.cooldown_ns,
+                json!({
+                    "click_count": click_count,
+                    "window_ns": config.repeated_click_window_ns,
+                    "threshold_count": config.repeated_click_count,
+                    "state_version": self.state_version,
+                }),
+                sink,
+            );
+        }
+    }
+
+    fn count_recent(
+        &self,
+        ts_ns: u64,
+        window_ns: u64,
+        window_key: &str,
+        state_version: Option<u64>,
+        kind: AssistSignalKind,
+    ) -> u64 {
+        let start = ts_ns.saturating_sub(window_ns);
+        self.interactions
+            .iter()
+            .filter(|signal| {
+                signal.ts_ns >= start
+                    && signal.window_key == window_key
+                    && signal.kind == kind
+                    && state_version.is_none_or(|version| signal.state_version == version)
+            })
+            .count() as u64
+    }
+
+    fn emit(
+        &mut self,
+        detector: &'static str,
+        ts_ns: u64,
+        context: &AssistContext,
+        actor: Option<&TimelineActor>,
+        input_origin: &'static str,
+        cooldown_ns: u64,
+        counts: serde_json::Value,
+        sink: &AssistEventSink,
+    ) {
+        let cooldown_key = format!("{detector}:{}", context.window_key());
+        trim_cooldowns(&mut self.last_emitted, ts_ns, cooldown_ns);
+        if self.last_emitted.iter().any(|(key, last_ts)| {
+            key == &cooldown_key && last_ts.saturating_add(cooldown_ns) > ts_ns
+        }) {
+            return;
+        }
+        self.last_emitted.push_back((cooldown_key, ts_ns));
+        sink.emit(ts_ns, detector, context, actor, input_origin, counts);
+    }
+}
+
+#[derive(Clone)]
+struct AssistEventSink {
+    db: Arc<Db>,
+    event_bus: EventBus,
+    event_seq: Arc<AtomicU64>,
+    storage_seq: Arc<AtomicU32>,
+}
+
+impl AssistEventSink {
+    fn emit(
+        &self,
+        ts_ns: u64,
+        detector: &'static str,
+        context: &AssistContext,
+        actor: Option<&TimelineActor>,
+        input_origin: &'static str,
+        counts: serde_json::Value,
+    ) {
+        let seq = self.event_seq.fetch_add(1, Ordering::Relaxed);
+        let data = json!({
+            "opportunity_id": format!("assist-{ts_ns}-{seq}"),
+            "detector": detector,
+            "confidence": confidence_for_detector(detector),
+            "trigger": {
+                "actor": actor_evidence(actor),
+                "input_origin": input_origin
+            },
+            "window": context.evidence_json(),
+            "counts": counts,
+            "privacy": {
+                "raw_typed_text": false,
+                "raw_key_names": false,
+                "mouse_coordinates": false,
+                "raw_window_title": false,
+                "raw_element_value": false
+            }
+        });
+        let at = chrono::DateTime::<Utc>::from_timestamp(
+            i64::try_from(ts_ns / 1_000_000_000).unwrap_or(i64::MAX),
+            u32::try_from(ts_ns % 1_000_000_000).unwrap_or(999_999_999),
+        )
+        .unwrap_or_else(Utc::now);
+        let event = Event {
+            seq,
+            at,
+            source: EventSource::System,
+            kind: ASSIST_EVENT_KIND.to_owned(),
+            data: data.clone(),
+            correlations: Vec::new(),
+        };
+        let report = self.event_bus.publish(event);
+        let stored = StoredEvent {
+            schema_version: SCHEMA_VERSION,
+            event_id: format!("assist-opportunity-{ts_ns}-{seq}"),
+            ts_ns,
+            session_id: None,
+            audit_context: None,
+            source: EventSource::System,
+            kind: ASSIST_EVENT_KIND.to_owned(),
+            data,
+            window_id: Some(context.hwnd),
+            element_id: None,
+            redacted: false,
+            redactions: Vec::new(),
+        };
+        if let Err(error) = self.write_stored_event(&stored) {
+            tracing::error!(
+                code = "ASSIST_OPPORTUNITY_EVENT_WRITE_FAILED",
+                detector,
+                detail = %format!("{error:#}"),
+                "failed to persist assist opportunity event"
+            );
+            return;
+        }
+        tracing::info!(
+            code = "ASSIST_OPPORTUNITY_EMITTED",
+            detector,
+            event_seq = seq,
+            matched = report.matched,
+            queued = report.queued,
+            dropped = report.dropped,
+            "assist opportunity emitted"
+        );
+    }
+
+    fn write_stored_event(&self, event: &StoredEvent) -> Result<()> {
+        let encoded = synapse_storage::encode_json(event)
+            .context("encode assist opportunity CF_EVENTS row")?;
+        self.db
+            .put_batch(
+                cf::CF_EVENTS,
+                [(event_key(event.ts_ns, &self.storage_seq), encoded)],
+            )
+            .context("write assist opportunity CF_EVENTS row")?;
+        self.db
+            .flush()
+            .context("flush assist opportunity CF_EVENTS row")
+    }
+}
+
 fn bucket_start(ts_ns: u64) -> u64 {
     (ts_ns / INTERACTION_BUCKET_NS).saturating_mul(INTERACTION_BUCKET_NS)
 }
@@ -514,6 +1031,144 @@ fn bucket_start(ts_ns: u64) -> u64 {
 fn sha256_hex(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn focused_element_signature(node: &AccessibleNode) -> String {
+    sha256_hex(&format!(
+        "{}\n{}\n{}",
+        node.element_id,
+        node.role,
+        node.automation_id.as_deref().unwrap_or_default()
+    ))
+}
+
+fn focused_element_for_context(hwnd: i64) -> Option<AccessibleNode> {
+    match synapse_a11y::focused_element_node_in_window(hwnd) {
+        Ok(focused) => focused,
+        Err(error) => {
+            tracing::debug!(
+                code = "ASSIST_FOCUSED_ELEMENT_UNAVAILABLE",
+                hwnd,
+                detail = %error,
+                "assist detector could not resolve focused element; using window identity only"
+            );
+            None
+        }
+    }
+}
+
+fn value_len_for_event(event: &AccessibleEvent, focused: Option<&AccessibleNode>) -> Option<usize> {
+    event
+        .value
+        .as_ref()
+        .or_else(|| focused.and_then(|node| node.value.as_ref()))
+        .map(|value| value.chars().count())
+}
+
+fn signal_kind(event: &InteractionEvent) -> Option<AssistSignalKind> {
+    match event.kind {
+        InteractionEventKind::Keystroke => match event.key_signal {
+            Some(InteractionKeySignal::UndoCommand) => Some(AssistSignalKind::UndoCommand),
+            Some(InteractionKeySignal::DeleteCommand) => Some(AssistSignalKind::DeleteCommand),
+            Some(InteractionKeySignal::TextLikeKey) => Some(AssistSignalKind::TextLikeKey),
+            Some(InteractionKeySignal::OtherKey) | None => None,
+        },
+        InteractionEventKind::Click => Some(AssistSignalKind::Click),
+        InteractionEventKind::VerticalScroll { .. }
+        | InteractionEventKind::HorizontalScroll { .. } => None,
+    }
+}
+
+fn actor_evidence(actor: Option<&TimelineActor>) -> serde_json::Value {
+    match actor {
+        Some(TimelineActor::Human) => json!({ "kind": "human" }),
+        Some(TimelineActor::Agent { session_id }) => {
+            json!({ "kind": "agent", "session_id": session_id })
+        }
+        None => json!({ "kind": "unknown" }),
+    }
+}
+
+fn trim_interactions(
+    interactions: &mut VecDeque<AssistSignal>,
+    now_ns: u64,
+    config: AssistDetectorConfig,
+) {
+    let max_window = config
+        .undo_burst_window_ns
+        .max(config.retype_window_ns)
+        .max(config.repeated_click_window_ns);
+    let cutoff = now_ns.saturating_sub(max_window);
+    while interactions
+        .front()
+        .is_some_and(|signal| signal.ts_ns < cutoff || interactions.len() > ASSIST_HISTORY_CAP)
+    {
+        interactions.pop_front();
+    }
+}
+
+fn trim_dialogs(dialogs: &mut VecDeque<DialogSeen>, now_ns: u64, window_ns: u64) {
+    let cutoff = now_ns.saturating_sub(window_ns);
+    while dialogs
+        .front()
+        .is_some_and(|seen| seen.ts_ns < cutoff || dialogs.len() > ASSIST_HISTORY_CAP)
+    {
+        dialogs.pop_front();
+    }
+}
+
+fn trim_cooldowns(cooldowns: &mut VecDeque<(String, u64)>, now_ns: u64, cooldown_ns: u64) {
+    let cutoff = now_ns.saturating_sub(cooldown_ns);
+    while cooldowns
+        .front()
+        .is_some_and(|(_key, ts_ns)| *ts_ns < cutoff || cooldowns.len() > ASSIST_HISTORY_CAP)
+    {
+        cooldowns.pop_front();
+    }
+}
+
+fn dialog_like_title(title: &str) -> bool {
+    let lowered = title.to_ascii_lowercase();
+    ["error", "warning", "save", "open", "confirm", "dialog"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+}
+
+fn confidence_for_detector(detector: &str) -> f64 {
+    match detector {
+        "undo_burst" => 0.82,
+        "retype_loop" => 0.78,
+        "repeated_click_without_state_change" => 0.72,
+        "dialog_reopen_loop" => 0.8,
+        _ => 0.5,
+    }
+}
+
+fn event_key(ts_ns: u64, seq: &AtomicU32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(12);
+    key.extend_from_slice(&ts_ns.to_be_bytes());
+    key.extend_from_slice(&seq.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    key
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a positive integer, got {raw:?}"))?;
+    if value == 0 {
+        bail!("{name} must be at least 1, got 0");
+    }
+    Ok(value)
+}
+
+fn env_ms_as_ns(name: &str, default_ms: u64) -> Result<u64> {
+    let ms = env_u64(name, default_ms)?;
+    ms.checked_mul(1_000_000)
+        .ok_or_else(|| anyhow::anyhow!("{name} is too large to convert from ms to ns: {ms}"))
 }
 
 fn browser_nav_dedupe_key(event: &BrowserNavigationEvent) -> String {
@@ -586,6 +1241,8 @@ struct WorkerState {
     foreground: Option<ForegroundSnapshot>,
     idle: bool,
     interactions: InteractionAccumulator,
+    assist: AssistDetector,
+    assist_sink: AssistEventSink,
 }
 
 impl WorkerState {
@@ -603,6 +1260,7 @@ impl WorkerState {
         match event.kind {
             AccessibleEventKind::ForegroundChanged => self.handle_foreground(event.window_id),
             AccessibleEventKind::NameChanged => self.handle_name_change(event.window_id),
+            AccessibleEventKind::ValueChanged => self.handle_value_change(event),
             _ => {}
         }
     }
@@ -633,7 +1291,50 @@ impl WorkerState {
         }
         let (actor, input_origin) = interaction_actor(event.injected);
         self.interactions
-            .record_input(event, &context, actor, input_origin, &self.writer);
+            .record_input(event, &context, actor.clone(), input_origin, &self.writer);
+        let focused = focused_element_for_context(context.hwnd);
+        let assist_context = AssistContext::from_foreground(&context, focused.as_ref());
+        self.assist.record_interaction(
+            event,
+            &assist_context,
+            &actor,
+            input_origin,
+            self.config.assist,
+            &self.assist_sink,
+        );
+    }
+
+    fn handle_value_change(&mut self, event: &AccessibleEvent) {
+        let context = match synapse_a11y::current_foreground_context() {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::debug!(
+                    code = "ASSIST_VALUE_CHANGE_FOREGROUND_NONE",
+                    event_hwnd = event.window_id,
+                    detail = %error,
+                    "value-change event had no foreground context"
+                );
+                return;
+            }
+        };
+        if self.writer.suppressed(
+            TimelineKind::InteractionSummary,
+            Some(&context.process_name),
+        ) {
+            return;
+        }
+        let focused = focused_element_for_context(context.hwnd);
+        let Some(value_len) = value_len_for_event(event, focused.as_ref()) else {
+            return;
+        };
+        let assist_context = AssistContext::from_foreground(&context, focused.as_ref());
+        self.assist.record_value_change(
+            event.at_ms.saturating_mul(1_000_000),
+            &assist_context,
+            value_len,
+            self.config.assist,
+            &self.assist_sink,
+        );
     }
 
     /// A `ForegroundChanged` WinEvent is a *trigger*, not the truth: it is
@@ -732,7 +1433,17 @@ impl WorkerState {
         }
         match classify_foreground_transition(self.foreground.as_ref(), &next) {
             ForegroundTransition::Duplicate => {}
-            ForegroundTransition::TitleChanged => self.write_title_change(&next),
+            ForegroundTransition::TitleChanged => {
+                let ts_ns = now_ts_ns();
+                self.write_title_change(&next, ts_ns);
+                self.assist.note_state_change();
+                self.assist.record_dialog_title(
+                    ts_ns,
+                    &next,
+                    self.config.assist,
+                    &self.assist_sink,
+                );
+            }
             ForegroundTransition::Switched => {
                 let ts_ns = now_ts_ns();
                 let actor = current_actor();
@@ -751,6 +1462,13 @@ impl WorkerState {
                 );
                 self.interactions
                     .record_app_switch(ts_ns, context, actor, &self.writer);
+                self.assist.note_state_change();
+                self.assist.record_dialog_title(
+                    ts_ns,
+                    &next,
+                    self.config.assist,
+                    &self.assist_sink,
+                );
             }
         }
         self.foreground = Some(next);
@@ -787,17 +1505,21 @@ impl WorkerState {
             process_path: context.process_path,
             title: context.window_title,
         };
-        self.write_title_change(&next);
+        let ts_ns = now_ts_ns();
+        self.write_title_change(&next, ts_ns);
+        self.assist.note_state_change();
+        self.assist
+            .record_dialog_title(ts_ns, &next, self.config.assist, &self.assist_sink);
         self.foreground = Some(next);
     }
 
-    fn write_title_change(&self, next: &ForegroundSnapshot) {
+    fn write_title_change(&self, next: &ForegroundSnapshot, ts_ns: u64) {
         let previous_title = self
             .foreground
             .as_ref()
             .map(|snapshot| snapshot.title.clone());
         self.writer.write_logged(
-            now_ts_ns(),
+            ts_ns,
             TimelineKind::TitleChange,
             current_actor(),
             Some(next.process_name.clone()),
@@ -1153,6 +1875,7 @@ impl ActivityRecorder {
         db: Arc<Db>,
         config: RecorderConfig,
         control: Arc<RecorderControl>,
+        event_bus: EventBus,
     ) -> Result<Self> {
         let initial_idle_ms = synapse_a11y::millis_since_last_input()
             .context("probe GetLastInputInfo for the activity recorder idle source")?;
@@ -1205,12 +1928,20 @@ impl ActivityRecorder {
         }
 
         let (sender, receiver) = mpsc::unbounded_channel();
+        let assist_sink = AssistEventSink {
+            db: Arc::clone(&writer.db),
+            event_bus,
+            event_seq: Arc::new(AtomicU64::new(1)),
+            storage_seq: Arc::new(AtomicU32::new(0)),
+        };
         let state = WorkerState {
             writer: writer.clone(),
             config,
             foreground: None,
             idle: false,
             interactions: InteractionAccumulator::default(),
+            assist: AssistDetector::default(),
+            assist_sink,
         };
         let worker = tokio::spawn(run_worker(receiver, state));
         let idle_probe = tokio::spawn(run_idle_probe(sender.clone(), config.idle_poll_interval_ms));
@@ -1801,6 +2532,42 @@ mod tests {
             .collect()
     }
 
+    fn stored_events(writer: &TimelineWriter) -> Vec<StoredEvent> {
+        writer
+            .db
+            .flush()
+            .unwrap_or_else(|error| panic!("flush: {error}"));
+        writer
+            .db
+            .scan_cf(cf::CF_EVENTS)
+            .unwrap_or_else(|error| panic!("scan events: {error}"))
+            .into_iter()
+            .map(|(_key, value)| {
+                serde_json::from_slice(&value).unwrap_or_else(|error| panic!("decode: {error}"))
+            })
+            .collect()
+    }
+
+    fn assist_sink(writer: &TimelineWriter, event_bus: EventBus) -> AssistEventSink {
+        AssistEventSink {
+            db: Arc::clone(&writer.db),
+            event_bus,
+            event_seq: Arc::new(AtomicU64::new(1)),
+            storage_seq: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn assist_context(hwnd: i64, pid: u32, process_name: &str, title: &str) -> AssistContext {
+        AssistContext {
+            hwnd,
+            pid,
+            process_name: process_name.to_owned(),
+            window_title_sha256: sha256_hex(title),
+            focused_element_sha256: Some(sha256_hex("focused.synthetic")),
+            focused_role: Some("edit".to_owned()),
+        }
+    }
+
     fn recorder_for_writer(writer: TimelineWriter) -> ActivityRecorder {
         let (sender, _receiver) = mpsc::unbounded_channel();
         ActivityRecorder {
@@ -1810,6 +2577,7 @@ mod tests {
                 idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
                 idle_poll_interval_ms: MAX_IDLE_POLL_INTERVAL_MS,
                 interaction_hook_enabled: false,
+                assist: AssistDetectorConfig::test(),
             },
             last_clipboard_sha256: Mutex::new(None),
             browser_nav_dedupe_keys: Mutex::new(VecDeque::new()),
@@ -2084,6 +2852,7 @@ mod tests {
                 ts_ns: 30_000_000_001,
                 kind: InteractionEventKind::Keystroke,
                 injected: false,
+                key_signal: Some(InteractionKeySignal::TextLikeKey),
             },
             &context,
             TimelineActor::Human,
@@ -2095,6 +2864,7 @@ mod tests {
                 ts_ns: 30_000_000_002,
                 kind: InteractionEventKind::Click,
                 injected: false,
+                key_signal: None,
             },
             &context,
             TimelineActor::Human,
@@ -2106,6 +2876,7 @@ mod tests {
                 ts_ns: 30_000_000_003,
                 kind: InteractionEventKind::VerticalScroll { delta: -120 },
                 injected: false,
+                key_signal: None,
             },
             &context,
             TimelineActor::Human,
@@ -2155,6 +2926,7 @@ mod tests {
                 ts_ns: 60_000_000_001,
                 kind: InteractionEventKind::Keystroke,
                 injected: true,
+                key_signal: Some(InteractionKeySignal::TextLikeKey),
             },
             &context,
             actor.clone(),
@@ -2201,6 +2973,227 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assist_detector_retype_loop_emits_one_bounded_event() {
+        let (_dir, writer) = temp_writer();
+        let event_bus = EventBus::default();
+        let subscriber = event_bus
+            .subscribe(
+                synapse_core::EventFilter::Kind {
+                    kind: ASSIST_EVENT_KIND.to_owned(),
+                },
+                Vec::new(),
+                false,
+            )
+            .unwrap_or_else(|error| panic!("subscribe: {error}"));
+        let sink = assist_sink(&writer, event_bus);
+        let mut detector = AssistDetector::default();
+        let context = assist_context(86301, 863, "notepad.exe", "Private Draft - Notepad");
+        let config = AssistDetectorConfig::test();
+        let actor = TimelineActor::Agent {
+            session_id: "fsv-agent-session".to_owned(),
+        };
+
+        println!(
+            "readback=assist_detector edge=retype before_events={}",
+            stored_events(&writer).len()
+        );
+        for index in 0_u64..4 {
+            detector.record_interaction(
+                &InteractionEvent {
+                    ts_ns: 1_000_000_000 + index,
+                    kind: InteractionEventKind::Keystroke,
+                    injected: true,
+                    key_signal: Some(InteractionKeySignal::TextLikeKey),
+                },
+                &context,
+                &actor,
+                "injected",
+                config,
+                &sink,
+            );
+        }
+        for index in 0_u64..2 {
+            detector.record_interaction(
+                &InteractionEvent {
+                    ts_ns: 1_000_000_100 + index,
+                    kind: InteractionEventKind::Keystroke,
+                    injected: true,
+                    key_signal: Some(InteractionKeySignal::DeleteCommand),
+                },
+                &context,
+                &actor,
+                "injected",
+                config,
+                &sink,
+            );
+        }
+        detector.record_interaction(
+            &InteractionEvent {
+                ts_ns: 1_000_000_200,
+                kind: InteractionEventKind::Keystroke,
+                injected: true,
+                key_signal: Some(InteractionKeySignal::TextLikeKey),
+            },
+            &context,
+            &actor,
+            "injected",
+            config,
+            &sink,
+        );
+        let events = stored_events(&writer);
+        println!("readback=assist_detector edge=retype after_events={events:?}");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ASSIST_EVENT_KIND);
+        assert_eq!(events[0].data["detector"], "retype_loop");
+        assert_eq!(events[0].data["trigger"]["actor"]["kind"], "agent");
+        assert_eq!(events[0].data["trigger"]["input_origin"], "injected");
+        assert_eq!(events[0].data["window"]["process_name"], "notepad.exe");
+        assert_eq!(events[0].data["privacy"]["raw_typed_text"], false);
+        assert_eq!(events[0].data["privacy"]["raw_key_names"], false);
+        assert!(events[0].data.get("typed_text").is_none());
+        assert!(events[0].data["window"].get("raw_title").is_none());
+        let bus_events = subscriber.drain();
+        assert_eq!(bus_events.len(), 1);
+        assert_eq!(bus_events[0].kind, ASSIST_EVENT_KIND);
+    }
+
+    #[test]
+    fn assist_detector_value_changes_emit_retype_without_raw_value() {
+        let (_dir, writer) = temp_writer();
+        let sink = assist_sink(&writer, EventBus::default());
+        let mut detector = AssistDetector::default();
+        let context = assist_context(86311, 863, "notepad.exe", "Private Draft - Notepad");
+        let config = AssistDetectorConfig::test();
+
+        println!(
+            "readback=assist_detector edge=value_retype before_events={}",
+            stored_events(&writer).len()
+        );
+        detector.record_value_change(1_000_000_000, &context, 0, config, &sink);
+        for len in 1_usize..=4 {
+            detector.record_value_change(
+                1_000_000_000 + u64::try_from(len).unwrap(),
+                &context,
+                len,
+                config,
+                &sink,
+            );
+        }
+        detector.record_value_change(1_000_000_100, &context, 3, config, &sink);
+        detector.record_value_change(1_000_000_200, &context, 2, config, &sink);
+
+        let events = stored_events(&writer);
+        println!("readback=assist_detector edge=value_retype after_events={events:?}");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ASSIST_EVENT_KIND);
+        assert_eq!(events[0].data["detector"], "retype_loop");
+        assert_eq!(events[0].data["counts"]["text_like_key_count"], 4);
+        assert_eq!(events[0].data["counts"]["delete_command_count"], 2);
+        assert_eq!(events[0].data["privacy"]["raw_element_value"], false);
+        assert!(events[0].data.get("value").is_none());
+        assert!(events[0].data.get("raw_value").is_none());
+    }
+
+    #[test]
+    fn assist_detector_edges_agent_human_click_dialog_and_value_dedup() {
+        let (_dir, writer) = temp_writer();
+        let sink = assist_sink(&writer, EventBus::default());
+        let mut detector = AssistDetector::default();
+        let context = assist_context(86302, 864, "editor.exe", "Secret Title - Editor");
+        let config = AssistDetectorConfig::test();
+        let human = TimelineActor::Human;
+        let agent = TimelineActor::Agent {
+            session_id: "agent-session".to_owned(),
+        };
+
+        for index in 0_u64..5 {
+            detector.record_interaction(
+                &InteractionEvent {
+                    ts_ns: 2_000_000_000 + index,
+                    kind: InteractionEventKind::Keystroke,
+                    injected: true,
+                    key_signal: Some(InteractionKeySignal::UndoCommand),
+                },
+                &context,
+                &agent,
+                "injected",
+                config,
+                &sink,
+            );
+        }
+        let after_agent = stored_events(&writer);
+        assert_eq!(after_agent.len(), 1);
+        assert_eq!(after_agent[0].data["detector"], "undo_burst");
+        assert_eq!(after_agent[0].data["trigger"]["actor"]["kind"], "agent");
+        assert_eq!(after_agent[0].data["trigger"]["input_origin"], "injected");
+        detector.record_value_change(2_000_000_100, &context, 0, config, &sink);
+        detector.record_value_change(2_000_000_200, &context, 8, config, &sink);
+        assert_eq!(
+            stored_events(&writer).len(),
+            1,
+            "value changes immediately after injected keyboard input must not duplicate the event"
+        );
+
+        for index in 0_u64..3 {
+            detector.record_interaction(
+                &InteractionEvent {
+                    ts_ns: 63_000_000_000 + index,
+                    kind: InteractionEventKind::Keystroke,
+                    injected: false,
+                    key_signal: Some(InteractionKeySignal::UndoCommand),
+                },
+                &context,
+                &human,
+                "physical",
+                config,
+                &sink,
+            );
+        }
+        let after_undo = stored_events(&writer);
+        assert_eq!(after_undo.len(), 2);
+        assert_eq!(after_undo[1].data["detector"], "undo_burst");
+        assert_eq!(after_undo[1].data["trigger"]["actor"]["kind"], "human");
+
+        for index in 0_u64..3 {
+            detector.record_interaction(
+                &InteractionEvent {
+                    ts_ns: 64_000_000_000 + index,
+                    kind: InteractionEventKind::Click,
+                    injected: false,
+                    key_signal: None,
+                },
+                &context,
+                &human,
+                "physical",
+                config,
+                &sink,
+            );
+        }
+        let after_clicks = stored_events(&writer);
+        assert_eq!(after_clicks.len(), 3);
+        assert_eq!(
+            after_clicks[2].data["detector"],
+            "repeated_click_without_state_change"
+        );
+
+        let dialog = ForegroundSnapshot {
+            hwnd: 86303,
+            pid: 865,
+            process_name: "editor.exe".to_owned(),
+            process_path: r"C:\editor.exe".to_owned(),
+            title: "Save Error".to_owned(),
+        };
+        for index in 0_u64..3 {
+            detector.record_dialog_title(65_000_000_000 + index, &dialog, config, &sink);
+        }
+        let after_dialog = stored_events(&writer);
+        println!("readback=assist_detector edge=multi after_events={after_dialog:?}");
+        assert_eq!(after_dialog.len(), 4);
+        assert_eq!(after_dialog[3].data["detector"], "dialog_reopen_loop");
+        assert_eq!(after_dialog[3].data["privacy"]["raw_window_title"], false);
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn recorder_writes_real_foreground_rows_into_cf_timeline() {
@@ -2220,8 +3213,9 @@ mod tests {
             crate::m3::timeline_control::RecorderControl::hydrate(&db)
                 .unwrap_or_else(|error| panic!("hydrate control: {error:#}")),
         );
-        let recorder = ActivityRecorder::spawn(Arc::clone(&db), config, control)
-            .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
+        let recorder =
+            ActivityRecorder::spawn(Arc::clone(&db), config, control, EventBus::default())
+                .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
         let (after_start, _failures) = recorder.readback();
         assert_eq!(
             after_start, 1,
@@ -2387,8 +3381,13 @@ mod tests {
         let control = Arc::new(
             RecorderControl::hydrate(&db).unwrap_or_else(|error| panic!("hydrate: {error:#}")),
         );
-        let recorder = ActivityRecorder::spawn(Arc::clone(&db), config, Arc::clone(&control))
-            .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
+        let recorder = ActivityRecorder::spawn(
+            Arc::clone(&db),
+            config,
+            Arc::clone(&control),
+            EventBus::default(),
+        )
+        .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
         assert_eq!(recorder.readback().0, 1, "session_start");
 
         let context = synapse_a11y::current_foreground_context()

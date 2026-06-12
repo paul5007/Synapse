@@ -458,7 +458,12 @@ impl M3State {
         let control = self
             .ensure_recorder_control()
             .context("hydrate recorder control state for the activity recorder")?;
-        let recorder = Arc::new(ActivityRecorder::spawn(db, config, control)?);
+        let recorder = Arc::new(ActivityRecorder::spawn(
+            db,
+            config,
+            control,
+            event_bus.clone(),
+        )?);
         self.activity_recorder = Some(Arc::clone(&recorder));
         if let Err(error) = self.ensure_a11y_event_bridge(event_bus) {
             self.activity_recorder = None;

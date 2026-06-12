@@ -13,6 +13,7 @@ pub struct InteractionEvent {
     pub ts_ns: u64,
     pub kind: InteractionEventKind,
     pub injected: bool,
+    pub key_signal: Option<InteractionKeySignal>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +22,14 @@ pub enum InteractionEventKind {
     Click,
     VerticalScroll { delta: i32 },
     HorizontalScroll { delta: i32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractionKeySignal {
+    UndoCommand,
+    DeleteCommand,
+    TextLikeKey,
+    OtherKey,
 }
 
 pub struct InteractionHook {
@@ -65,6 +74,7 @@ mod platform {
     use windows::Win32::{
         Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+        UI::Input::KeyboardAndMouse::GetAsyncKeyState,
         UI::WindowsAndMessaging::{
             CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
             PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
@@ -73,10 +83,21 @@ mod platform {
         },
     };
 
-    use super::{InteractionEvent, InteractionEventKind, InteractionHookReadback};
+    use super::{
+        InteractionEvent, InteractionEventKind, InteractionHookReadback, InteractionKeySignal,
+    };
 
     const LLKHF_INJECTED_MASK: u32 = 0x12;
     const LLMHF_INJECTED_MASK: u32 = 0x03;
+    const KEY_DOWN_MASK: u16 = 0x8000;
+    const VK_BACK_CODE: u32 = 0x08;
+    const VK_SPACE_CODE: u32 = 0x20;
+    const VK_DELETE_CODE: u32 = 0x2e;
+    const VK_CONTROL_CODE: u32 = 0x11;
+    const VK_LCONTROL_CODE: u32 = 0xa2;
+    const VK_RCONTROL_CODE: u32 = 0xa3;
+    const VK_Z_CODE: u32 = 0x5a;
+    const VK_PACKET_CODE: u32 = 0xe7;
 
     static HOOK_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<InteractionEvent>>>> =
         OnceLock::new();
@@ -225,6 +246,7 @@ mod platform {
                 emit(
                     InteractionEventKind::Keystroke,
                     data.flags.0 & LLKHF_INJECTED_MASK != 0,
+                    Some(key_signal(data.vkCode)),
                 );
             } else if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
                 // Key-up confirms release state but is not an interaction
@@ -245,7 +267,7 @@ mod platform {
             let injected = data.flags & LLMHF_INJECTED_MASK != 0;
             match message {
                 WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
-                    emit(InteractionEventKind::Click, injected);
+                    emit(InteractionEventKind::Click, injected, None);
                 }
                 WM_MOUSEWHEEL => {
                     emit(
@@ -253,6 +275,7 @@ mod platform {
                             delta: wheel_delta(data.mouseData),
                         },
                         injected,
+                        None,
                     );
                 }
                 WM_MOUSEHWHEEL => {
@@ -261,6 +284,7 @@ mod platform {
                             delta: wheel_delta(data.mouseData),
                         },
                         injected,
+                        None,
                     );
                 }
                 _ => {}
@@ -269,11 +293,12 @@ mod platform {
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 
-    fn emit(kind: InteractionEventKind, injected: bool) {
+    fn emit(kind: InteractionEventKind, injected: bool, key_signal: Option<InteractionKeySignal>) {
         let event = InteractionEvent {
             ts_ns: super::super_now_ts_ns(),
             kind,
             injected,
+            key_signal,
         };
         if let Ok(guard) = hook_sender().lock()
             && let Some(sender) = guard.as_ref()
@@ -284,6 +309,67 @@ mod platform {
 
     fn wheel_delta(mouse_data: u32) -> i32 {
         i32::from(((mouse_data >> 16) as u16) as i16)
+    }
+
+    fn key_signal(vk_code: u32) -> InteractionKeySignal {
+        key_signal_with_ctrl(vk_code, ctrl_down())
+    }
+
+    fn key_signal_with_ctrl(vk_code: u32, ctrl_down: bool) -> InteractionKeySignal {
+        if vk_code == VK_Z_CODE && ctrl_down {
+            return InteractionKeySignal::UndoCommand;
+        }
+        if matches!(vk_code, VK_BACK_CODE | VK_DELETE_CODE) {
+            return InteractionKeySignal::DeleteCommand;
+        }
+        if text_like_key(vk_code) {
+            InteractionKeySignal::TextLikeKey
+        } else {
+            InteractionKeySignal::OtherKey
+        }
+    }
+
+    fn ctrl_down() -> bool {
+        key_down(VK_CONTROL_CODE) || key_down(VK_LCONTROL_CODE) || key_down(VK_RCONTROL_CODE)
+    }
+
+    fn key_down(vk_code: u32) -> bool {
+        let state = unsafe { GetAsyncKeyState(i32::try_from(vk_code).unwrap_or(0)) };
+        (state as u16 & KEY_DOWN_MASK) != 0
+    }
+
+    const fn text_like_key(vk_code: u32) -> bool {
+        matches!(
+            vk_code,
+            VK_SPACE_CODE
+                | VK_PACKET_CODE
+                | 0x30..=0x39
+                | 0x41..=0x5a
+                | 0x60..=0x6f
+                | 0xba..=0xc0
+                | 0xdb..=0xdf
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn unicode_sendinput_packet_is_text_like_without_raw_character() {
+            assert_eq!(
+                key_signal_with_ctrl(VK_PACKET_CODE, false),
+                InteractionKeySignal::TextLikeKey
+            );
+            assert_eq!(
+                key_signal_with_ctrl(VK_BACK_CODE, false),
+                InteractionKeySignal::DeleteCommand
+            );
+            assert_eq!(
+                key_signal_with_ctrl(VK_Z_CODE, true),
+                InteractionKeySignal::UndoCommand
+            );
+        }
     }
 }
 
