@@ -150,6 +150,9 @@ pub const STORAGE_DISK_PRESSURE_LEVEL_3: &str = "STORAGE_DISK_PRESSURE_LEVEL_3";
 pub const STORAGE_DISK_PRESSURE_LEVEL_4: &str = "STORAGE_DISK_PRESSURE_LEVEL_4";
 pub const STORAGE_CF_HARD_CAP_REACHED: &str = "STORAGE_CF_HARD_CAP_REACHED";
 
+// === Episodes (derived activity spans, issues #846/#847) ===
+pub const EPISODE_NOT_FOUND: &str = "EPISODE_NOT_FOUND";
+
 // === Models (06 section 8.7) ===
 pub const MODEL_DOWNLOAD_FAILED: &str = "MODEL_DOWNLOAD_FAILED";
 pub const MODEL_HASH_MISMATCH: &str = "MODEL_HASH_MISMATCH";

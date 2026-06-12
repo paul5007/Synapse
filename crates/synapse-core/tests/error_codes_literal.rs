@@ -115,6 +115,8 @@ fn error_codes_match_literal_names() {
     assert_literal!(STORAGE_DISK_PRESSURE_LEVEL_4);
     assert_literal!(STORAGE_CF_HARD_CAP_REACHED);
 
+    assert_literal!(EPISODE_NOT_FOUND);
+
     assert_literal!(MODEL_DOWNLOAD_FAILED);
     assert_literal!(MODEL_HASH_MISMATCH);
     assert_literal!(MODEL_LOAD_FAILED);

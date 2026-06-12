@@ -1,7 +1,8 @@
 use super::{
     AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse,
     AuditExportBundleParams, AuditExportBundleResponse, AuditIntelligenceQueryParams,
-    AuditIntelligenceQueryResponse, EpisodeSegmentParams, EpisodeSegmentResponse, ErrorData,
+    AuditIntelligenceQueryResponse, EpisodeGetParams, EpisodeGetResponse, EpisodeListParams,
+    EpisodeListResponse, EpisodeSegmentParams, EpisodeSegmentResponse, ErrorData,
     HygieneFlagsParams, HygieneFlagsResponse, HygieneScanStorageParams, HygieneScanStorageResponse,
     HygieneScanTextParams, HygieneScanTextResponse, Json, Parameters, ProfileActivateParams,
     ProfileActivateResponse, ProfileAuthoringDecideParams, ProfileAuthoringDecideResponse,
@@ -25,13 +26,13 @@ use super::{
     apply_storage_pressure_sample, cancel_reflex, cancel_subscription,
     decide_profile_authoring_candidate, disable_registry_profile, export_audit_bundle,
     export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
-    history_reflexes, import_registry, inspect_profile_authoring_candidate, inspect_storage,
-    install_registry_package, list_profile_authoring_candidates, list_profiles, list_reflexes,
-    pause_timeline, purge_timeline, put_probe_rows, query_audit_intelligence, query_flags,
-    query_registry, record_replay, refresh_profile_quality, register_reflex, resume_timeline,
-    rollback_registry_profile, run_storage_gc_once, scan_storage, scan_text_tool, search_timeline,
-    segment_episodes, subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
-    update_timeline_exclusions,
+    get_episode, history_reflexes, import_registry, inspect_profile_authoring_candidate,
+    inspect_storage, install_registry_package, list_episodes, list_profile_authoring_candidates,
+    list_profiles, list_reflexes, pause_timeline, purge_timeline, put_probe_rows,
+    query_audit_intelligence, query_flags, query_registry, record_replay, refresh_profile_quality,
+    register_reflex, resume_timeline, rollback_registry_profile, run_storage_gc_once, scan_storage,
+    scan_text_tool, search_timeline, segment_episodes, subscribe_to_events, tail_audio, tool,
+    tool_router, transcribe_audio, update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 
@@ -800,6 +801,57 @@ impl SynapseService {
         )?;
         let runtime = self.reflex_runtime()?;
         segment_episodes(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "List derived episodes (CF_EPISODES) overlapping a time range, ordered chronologically with stable ids, durations, app/document identity, and interaction summaries; filters by app, actor, and minimum duration; pages via cursor. Run episode_segment first to materialize episodes"
+    )]
+    pub async fn episode_list(
+        &self,
+        params: Parameters<EpisodeListParams>,
+    ) -> Result<Json<EpisodeListResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "episode_list",
+            start_ts_ns = params.0.start_ts_ns,
+            end_ts_ns = params.0.end_ts_ns,
+            apps_count = params.0.apps.as_deref().unwrap_or_default().len(),
+            actor = ?params.0.actor,
+            min_duration_ms = params.0.min_duration_ms,
+            limit = params.0.limit,
+            has_cursor = params.0.cursor.is_some(),
+            "tool.invocation kind=episode_list"
+        );
+        self.require_m3_permissions(
+            "episode_list",
+            &crate::m3::episodes::required_permissions_list(&params.0),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        list_episodes(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Fetch one derived episode by its stable id, with the underlying CF_TIMELINE evidence row references inside its span (paged via refs_cursor). Optional start_ts_ns seeks the id lookup; refs include the closing boundary row and agent rows"
+    )]
+    pub async fn episode_get(
+        &self,
+        params: Parameters<EpisodeGetParams>,
+    ) -> Result<Json<EpisodeGetResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "episode_get",
+            episode_id = %params.0.episode_id,
+            start_ts_ns = params.0.start_ts_ns,
+            refs_limit = params.0.refs_limit,
+            has_refs_cursor = params.0.refs_cursor.is_some(),
+            "tool.invocation kind=episode_get"
+        );
+        self.require_m3_permissions(
+            "episode_get",
+            &crate::m3::episodes::required_permissions_get(&params.0),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        get_episode(&runtime, &params.0).map(Json)
     }
 
     #[tool(description = "Write bounded synthetic probe rows to a storage column family")]

@@ -59,7 +59,11 @@ use crate::{
             populate_audio_summary, tail_audio, transcribe_audio,
         },
         audit_export::{AuditExportBundleParams, AuditExportBundleResponse, export_audit_bundle},
-        episodes::{EpisodeSegmentParams, EpisodeSegmentResponse, segment_episodes},
+        episodes::{
+            EpisodeGetParams, EpisodeGetResponse, EpisodeListParams, EpisodeListResponse,
+            EpisodeSegmentParams, EpisodeSegmentResponse, get_episode, list_episodes,
+            segment_episodes,
+        },
         hygiene::{
             HygieneFlagsParams, HygieneFlagsResponse, HygieneScanStorageParams,
             HygieneScanStorageResponse, HygieneScanTextParams, HygieneScanTextResponse,
