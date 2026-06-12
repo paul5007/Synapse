@@ -104,7 +104,15 @@ use crate::{
             SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams, SubscribeResponse,
             cancel_subscription, subscribe_to_events,
         },
-        timeline::{TimelineSearchParams, TimelineSearchResponse, search_timeline},
+        timeline::{
+            TimelinePurgeParams, TimelinePurgeResponse, TimelineSearchParams,
+            TimelineSearchResponse, purge_timeline, search_timeline,
+        },
+        timeline_control::{
+            TimelineExclusionsParams, TimelineExclusionsResponse, TimelinePauseParams,
+            TimelinePauseResponse, TimelineResumeParams, TimelineResumeResponse, pause_timeline,
+            resume_timeline, update_timeline_exclusions,
+        },
     },
     m4::{
         ActComboParams, ActComboResponse, ActLaunchParams, ActLaunchResponse,

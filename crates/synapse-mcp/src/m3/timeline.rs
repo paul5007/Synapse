@@ -1,4 +1,5 @@
-//! `timeline_search` MCP tool (#841, ADR 2026-06-11-timeline-data-model).
+//! `timeline_search` (#841) and `timeline_purge` (#843) MCP tools
+//! (ADR 2026-06-11-timeline-data-model).
 //!
 //! Searches `CF_TIMELINE` rows by time range, app, record kind, actor, and
 //! case-insensitive text over the record's app and payload string values
@@ -6,12 +7,23 @@
 //! cursor; per-call scan work is budgeted so one query can never pin the
 //! runtime lock on an arbitrarily large timeline. Undecodable rows are
 //! counted and logged, never silently skipped.
+//!
+//! Purge shares the same filter machinery (what you can find is exactly what
+//! you can delete), hard-deletes via `delete_batch`, compacts the purged key
+//! range (tombstone reclamation per the ADR §6 / RocksDB guidance), and
+//! writes a `kind = purge` audit row carrying counts and the filters — never
+//! deleted content. Blanket purges skip `purge` audit rows so a purge can
+//! never consume its own audit trail; deleting audit rows requires naming
+//! `kinds: ["purge"]` explicitly.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicU32, Ordering},
+};
 
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use synapse_core::error_codes;
 use synapse_core::types::{TimelineActor, TimelineKind, TimelineRecord};
 use synapse_reflex::ReflexRuntime;
@@ -101,6 +113,11 @@ pub struct TimelineSearchMatch {
 #[must_use]
 pub const fn timeline_search() -> M3ToolStub {
     M3ToolStub::new("timeline_search")
+}
+
+#[must_use]
+pub const fn timeline_purge() -> M3ToolStub {
+    M3ToolStub::new("timeline_purge")
 }
 
 #[must_use]
@@ -211,6 +228,317 @@ pub fn search_timeline(
         next_cursor,
         stopped_because: stopped_because.to_owned(),
     })
+}
+
+/// Monotonic per-process sequence for purge-audit keys, offset away from the
+/// recorder's own sequence space so a same-nanosecond collision is
+/// unrepresentable in practice.
+static PURGE_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0xFFFF_0000);
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TimelinePurgeParams {
+    /// Inclusive lower bound on the record `ts_ns`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ts_ns: Option<u64>,
+    /// Inclusive upper bound on the record `ts_ns`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ts_ns: Option<u64>,
+    /// Case-insensitive exact matches on the record `app` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps: Option<Vec<String>>,
+    /// Case-insensitive substring over app + payload string values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Snake-case record kinds. `purge` audit rows are only deleted when
+    /// this explicitly contains `"purge"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+    /// `human` or `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Explicit full-timeline purge. Mutually exclusive with every filter;
+    /// without it, at least one filter is required.
+    #[serde(default)]
+    pub all: bool,
+    /// Count matches without deleting anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Opaque continuation cursor from a previous purge response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TimelinePurgeResponse {
+    /// Rows that matched the filters this call.
+    pub matched_rows: u64,
+    /// Rows physically deleted (0 on `dry_run`).
+    pub deleted_rows: u64,
+    /// Rows examined this call (matching or not).
+    pub scanned_rows: u64,
+    /// Undecodable rows: counted, logged, and never deleted (a row that
+    /// cannot be decoded cannot be proven to match the filters).
+    pub invalid_rows: u64,
+    /// Matching `purge` audit rows protected because `kinds` did not
+    /// explicitly include `"purge"`.
+    pub protected_audit_rows: u64,
+    pub dry_run: bool,
+    /// Hex storage key of the audit row written for this purge; absent on
+    /// `dry_run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_key_hex: Option<String>,
+    /// Whether the purged key range was compacted (tombstone reclamation).
+    pub compacted: bool,
+    /// Present when the scan budget paused the purge; pass back as `cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// `scan_budget_exhausted`, `end_ts_reached`, or `end_of_timeline`.
+    pub stopped_because: String,
+}
+
+#[must_use]
+pub fn required_permissions_purge(_params: &TimelinePurgeParams) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+pub fn purge_timeline(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &TimelinePurgeParams,
+    by_session: &str,
+) -> Result<TimelinePurgeResponse, ErrorData> {
+    let has_filter = params.start_ts_ns.is_some()
+        || params.end_ts_ns.is_some()
+        || params.apps.is_some()
+        || params.text.is_some()
+        || params.kinds.is_some()
+        || params.actor.is_some();
+    if params.all && has_filter {
+        return Err(invalid(
+            "timeline_purge all=true is mutually exclusive with filters; drop the filters or drop all",
+        ));
+    }
+    if !params.all && !has_filter {
+        return Err(invalid(
+            "timeline_purge requires at least one filter (start_ts_ns/end_ts_ns/apps/text/kinds/actor) or an explicit all=true",
+        ));
+    }
+    let search_equivalent = TimelineSearchParams {
+        start_ts_ns: params.start_ts_ns,
+        end_ts_ns: params.end_ts_ns,
+        apps: params.apps.clone(),
+        text: params.text.clone(),
+        kinds: params.kinds.clone(),
+        actor: params.actor.clone(),
+        limit: None,
+        cursor: params.cursor.clone(),
+    };
+    let mut filters = validate(&search_equivalent)?;
+    // Purge has no match cap: everything matched inside the scan budget is
+    // deleted; the budget plus cursor bound one call's work.
+    filters.limit = usize::MAX;
+    let purge_kind_explicit = filters.kinds.contains(&TimelineKind::Purge);
+
+    let runtime_guard = lock_runtime(runtime)?;
+    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+    let mut scanned_rows = 0_u64;
+    let mut invalid_rows = 0_u64;
+    let mut protected_audit_rows = 0_u64;
+    let mut next_start = filters.start_key.clone();
+    let mut last_key: Option<Vec<u8>> = None;
+    let mut stopped_because = "end_of_timeline";
+    let mut storage_has_more = false;
+
+    'scan: loop {
+        let remaining_budget = MAX_SCAN_ROWS_PER_CALL - usize::try_from(scanned_rows).unwrap_or(0);
+        if remaining_budget == 0 {
+            stopped_because = "scan_budget_exhausted";
+            break;
+        }
+        let chunk_rows = SCAN_CHUNK_ROWS.min(remaining_budget);
+        let (rows, more) = runtime_guard
+            .storage_cf_rows_from(cf::CF_TIMELINE, &next_start, chunk_rows)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        storage_has_more = more;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in rows {
+            scanned_rows += 1;
+            last_key = Some(key.clone());
+            let codec_ts = timeline_codec::decode_timeline_key(&key).ok();
+            if let Some((key_ts, _seq)) = codec_ts
+                && key_ts > filters.end_ts_ns
+            {
+                stopped_because = "end_ts_reached";
+                storage_has_more = false;
+                break 'scan;
+            }
+            match decode_json::<TimelineRecord>(&value) {
+                Ok(record) => {
+                    if record_matches(&record, &filters) {
+                        if record.kind == TimelineKind::Purge && !purge_kind_explicit {
+                            // A purge must never consume its own audit trail:
+                            // audit rows are deleted only by naming the kind.
+                            protected_audit_rows += 1;
+                        } else {
+                            keys_to_delete.push(key);
+                        }
+                    }
+                }
+                Err(error) => {
+                    invalid_rows += 1;
+                    tracing::warn!(
+                        code = "TIMELINE_ROW_DECODE_FAILED",
+                        key_hex = %hex_encode(&key),
+                        %error,
+                        "timeline_purge left undecodable CF_TIMELINE row in place"
+                    );
+                }
+            }
+        }
+        if !more {
+            break;
+        }
+        let Some(last) = last_key.as_ref() else { break };
+        next_start = key_after(last);
+    }
+
+    let matched_rows = u64::try_from(keys_to_delete.len()).unwrap_or(u64::MAX);
+    let mut deleted_rows = 0_u64;
+    let mut compacted = false;
+    let mut audit_key_hex = None;
+    if !params.dry_run {
+        if let (Some(first), Some(last)) = (keys_to_delete.first(), keys_to_delete.last()) {
+            let compact_start = first.clone();
+            let compact_end = key_after(last);
+            deleted_rows = matched_rows;
+            runtime_guard
+                .storage_delete_rows(cf::CF_TIMELINE, keys_to_delete)
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "timeline_purge delete_batch failed; no audit row was written: {error}"
+                        ),
+                    )
+                })?;
+            runtime_guard
+                .storage_compact_cf_range(cf::CF_TIMELINE, &compact_start, &compact_end)
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "timeline_purge deleted {deleted_rows} rows but compacting the purged range failed: {error}"
+                        ),
+                    )
+                })?;
+            compacted = true;
+        }
+        let resume_cursor_pending = matches!(stopped_because, "scan_budget_exhausted");
+        let audit_payload = json!({
+            "deleted_rows": deleted_rows,
+            "matched_rows": matched_rows,
+            "scanned_rows": scanned_rows,
+            "invalid_rows": invalid_rows,
+            "protected_audit_rows": protected_audit_rows,
+            "by_session": by_session,
+            "continued_from_cursor": params.cursor.is_some(),
+            "more_pending": resume_cursor_pending,
+            "filters": {
+                "start_ts_ns": params.start_ts_ns,
+                "end_ts_ns": params.end_ts_ns,
+                "apps": params.apps,
+                "text": params.text,
+                "kinds": params.kinds,
+                "actor": params.actor,
+                "all": params.all,
+            },
+        });
+        audit_key_hex = Some(write_purge_audit_row(&runtime_guard, audit_payload)?);
+    }
+    drop(runtime_guard);
+
+    let next_cursor = if stopped_because == "scan_budget_exhausted" && storage_has_more {
+        last_key.as_deref().map(hex_encode)
+    } else {
+        None
+    };
+    tracing::info!(
+        code = "TIMELINE_PURGE_COMPLETED",
+        deleted_rows,
+        matched_rows,
+        scanned_rows,
+        invalid_rows,
+        protected_audit_rows,
+        dry_run = params.dry_run,
+        by_session,
+        stopped_because,
+        "timeline purge completed"
+    );
+    Ok(TimelinePurgeResponse {
+        matched_rows,
+        deleted_rows,
+        scanned_rows,
+        invalid_rows,
+        protected_audit_rows,
+        dry_run: params.dry_run,
+        audit_key_hex,
+        compacted,
+        next_cursor,
+        stopped_because: stopped_because.to_owned(),
+    })
+}
+
+/// Writes the purge audit row with the pressure bypass (an audit obligation
+/// must not shed), flushes it, and proves it by reading the exact key back.
+fn write_purge_audit_row(
+    runtime: &MutexGuard<'_, ReflexRuntime>,
+    payload: Value,
+) -> Result<String, ErrorData> {
+    let ts_ns = now_ts_ns();
+    let seq = PURGE_AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let key = timeline_codec::timeline_key(ts_ns, seq);
+    let mut record = TimelineRecord::new(ts_ns, TimelineKind::Purge, TimelineActor::Human);
+    record.payload = payload;
+    let value = serde_json::to_vec(&record).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("encode timeline purge audit row: {error}"),
+        )
+    })?;
+    runtime
+        .storage_put_rows_pressure_bypass(cf::CF_TIMELINE, vec![(key.clone(), value)])
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("rows were purged but writing the purge audit row failed: {error}"),
+            )
+        })?;
+    runtime.storage_flush().map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("rows were purged but flushing the purge audit row failed: {error}"),
+        )
+    })?;
+    // Full-state verification inside the tool: the audit row must be
+    // physically present, not just acked.
+    let (rows, _more) = runtime
+        .storage_cf_rows_from(cf::CF_TIMELINE, &key, 1)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    if rows.first().map(|(row_key, _value)| row_key.as_slice()) != Some(key.as_slice()) {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "rows were purged but the purge audit row is absent on readback",
+        ));
+    }
+    Ok(hex_encode(&key))
+}
+
+fn now_ts_ns() -> u64 {
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    u64::try_from(nanos).unwrap_or(0)
 }
 
 fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {

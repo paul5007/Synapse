@@ -104,6 +104,10 @@ fn m3_tool_stub_names_are_stable() {
         "storage_gc_once",
         "storage_pressure_sample",
         "timeline_search",
+        "timeline_purge",
+        "timeline_pause",
+        "timeline_resume",
+        "timeline_exclusions",
     ];
     println!("readback=m3_tool_stubs before=expected:{expected:?}");
     let actual = m3_tool_stubs().map(|stub| stub.name);

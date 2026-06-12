@@ -123,7 +123,7 @@ impl ReflexRuntime {
         cf_name: &str,
         start_key: &[u8],
         max_rows: usize,
-    ) -> StorageResult<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+    ) -> StorageResult<synapse_storage::ScanWindow> {
         self.db.scan_cf_from(cf_name, start_key, max_rows)
     }
 
@@ -178,6 +178,32 @@ impl ReflexRuntime {
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, row_count = keys.len()))]
     pub fn storage_delete_rows(&self, cf_name: &str, keys: Vec<Vec<u8>>) -> StorageResult<()> {
         self.db.delete_batch(cf_name, keys)
+    }
+
+    /// Flushes pending batched storage writes to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the flush fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn storage_flush(&self) -> StorageResult<()> {
+        self.db.flush()
+    }
+
+    /// Compacts one key range of a column family (tombstone reclamation after
+    /// a bulk delete, per the timeline ADR purge mechanics).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the column family is missing.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name))]
+    pub fn storage_compact_cf_range(
+        &self,
+        cf_name: &str,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<()> {
+        self.db.compact_cf_range(cf_name, start, end)
     }
 
     /// Writes action audit rows and flushes them immediately.

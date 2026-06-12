@@ -84,7 +84,10 @@ must remain inspectable). The envelope is defined in
   The typed envelope makes omission unrepresentable.
 - `kind: TimelineKind` — `focus_change`, `title_change`, `idle_start`,
   `idle_end`, `session_start`, `session_end`, `interaction_summary`,
-  `clipboard`, `file_activity`, `browser_nav`, `demo_marker`. Extensible
+  `clipboard`, `file_activity`, `browser_nav`, `demo_marker`, and `purge`
+  (added with #843: the counts-only audit record a `timeline_purge` leaves
+  behind; blanket purges never delete `purge` rows unless the kind is named
+  explicitly, so a purge cannot consume its own audit trail). Extensible
   enum; unknown kinds are a decode error, not a silent skip.
 - `actor: TimelineActor` — `human` or `agent { session_id }`. Recorded so
   mining can separate human activity from agent-driven activity (#837
@@ -136,6 +139,16 @@ Purge is `delete_batch` over a scanned time/key range followed by
 `compact_range_cf` (tombstone reclamation), audit-logged with counts, not
 content. Exclusion lists are enforced at the recorder (#837): excluded
 processes never produce rows, so storage needs no notion of exclusion.
+
+Implemented with #843: `timeline_purge` shares `timeline_search`'s filter
+machinery (what you can find is exactly what you can delete), requires an
+explicit filter or `all = true`, supports `dry_run`, compacts exactly the
+purged key range (`Db::compact_cf_range`), and writes its `purge` audit row
+with the pressure bypass plus an exact-key readback so the audit obligation
+can never silently shed. Pause/exclusion state is one durable `CF_KV` row
+(`timeline/control/v1`) hydrated at recorder startup; the recorder's single
+write choke point enforces both gates, with suppression counters instead of
+silent drops, and pause supports a Recall-style auto-resume deadline.
 
 ## Consequences
 

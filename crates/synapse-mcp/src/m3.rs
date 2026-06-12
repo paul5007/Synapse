@@ -15,6 +15,7 @@ pub mod subscribe;
 #[cfg(test)]
 mod tests;
 pub mod timeline;
+pub mod timeline_control;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use std::{
@@ -37,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 use self::a11y_events::A11yEventBridge;
 use self::activity_recorder::{ActivityRecorder, RecorderConfig};
 use self::permissions::{PermissionGrants, configured_grants_from_parts};
+use self::timeline_control::RecorderControl;
 use crate::http::sse::SseState;
 
 const DB_ENV: &str = "SYNAPSE_DB";
@@ -178,6 +180,7 @@ pub struct M3State {
     pub reflex_runtime: Option<Arc<Mutex<ReflexRuntime>>>,
     pub a11y_event_bridge: Option<A11yEventBridge>,
     pub activity_recorder: Option<Arc<ActivityRecorder>>,
+    pub recorder_control: Option<Arc<RecorderControl>>,
     pub audio_runtime: Option<Arc<AudioRuntime>>,
     pub audit_session: Option<AuditSessionState>,
     pub mcp_audit_sessions: BTreeMap<SessionId, AuditSessionState>,
@@ -300,6 +303,7 @@ impl M3State {
             reflex_runtime: None,
             a11y_event_bridge: None,
             activity_recorder: None,
+            recorder_control: None,
             audio_runtime: None,
             audit_session: None,
             mcp_audit_sessions: BTreeMap::new(),
@@ -446,13 +450,37 @@ impl M3State {
             .ensure_storage()
             .context("open storage for the activity recorder")?;
         let config = RecorderConfig::from_env()?;
-        let recorder = Arc::new(ActivityRecorder::spawn(db, config)?);
+        let control = self
+            .ensure_recorder_control()
+            .context("hydrate recorder control state for the activity recorder")?;
+        let recorder = Arc::new(ActivityRecorder::spawn(db, config, control)?);
         self.activity_recorder = Some(Arc::clone(&recorder));
         if let Err(error) = self.ensure_a11y_event_bridge(event_bus) {
             self.activity_recorder = None;
             return Err(error).context("start WinEvent bridge for the activity recorder");
         }
         Ok(())
+    }
+
+    /// Hydrates (once) the shared pause/exclusion gate for the timeline
+    /// recorder and the `timeline_pause`/`timeline_resume`/
+    /// `timeline_exclusions` tools (#843). The persisted `CF_KV` control row
+    /// is the durable source of truth; this is its in-process cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage cannot open, when the env exclusion
+    /// baseline is malformed, or when the persisted control row is corrupt.
+    pub fn ensure_recorder_control(&mut self) -> Result<Arc<RecorderControl>> {
+        if let Some(control) = &self.recorder_control {
+            return Ok(Arc::clone(control));
+        }
+        let db = self
+            .ensure_storage()
+            .context("open storage for timeline recorder control state")?;
+        let control = Arc::new(RecorderControl::hydrate(&db)?);
+        self.recorder_control = Some(Arc::clone(&control));
+        Ok(control)
     }
 
     pub fn ensure_audio_runtime(&mut self) -> std::result::Result<Arc<AudioRuntime>, AudioError> {
@@ -522,7 +550,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 30] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 34] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -554,6 +582,10 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 30] {
         storage::storage_gc_once(),
         storage::storage_pressure_sample(),
         timeline::timeline_search(),
+        timeline::timeline_purge(),
+        timeline_control::timeline_pause(),
+        timeline_control::timeline_resume(),
+        timeline_control::timeline_exclusions(),
     ]
 }
 

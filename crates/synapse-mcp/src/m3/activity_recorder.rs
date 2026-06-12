@@ -46,6 +46,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+use super::timeline_control::{RecorderControl, SuppressReason};
+
 /// Idle threshold override, in milliseconds. Default mirrors ActivityWatch.
 pub const IDLE_TIMEOUT_ENV: &str = "SYNAPSE_TIMELINE_IDLE_TIMEOUT_MS";
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 180_000;
@@ -101,13 +103,17 @@ enum RecorderMessage {
 
 /// Shared write path: every producer (worker, spawn, drop backstop) goes
 /// through one row encoder so key allocation and failure accounting are
-/// uniform.
+/// uniform — and one gate, so pause/exclusion (#843) can never be bypassed
+/// by a feed that forgot to check.
 #[derive(Clone)]
 struct TimelineWriter {
     db: Arc<Db>,
+    control: Arc<RecorderControl>,
     seq: Arc<AtomicU32>,
     rows_written: Arc<AtomicU64>,
     write_failures: Arc<AtomicU64>,
+    rows_suppressed_paused: Arc<AtomicU64>,
+    rows_suppressed_excluded: Arc<AtomicU64>,
 }
 
 impl TimelineWriter {
@@ -159,6 +165,34 @@ impl TimelineWriter {
         }
     }
 
+    /// The pause/exclusion gate (#843). Checked by every steady-state write;
+    /// suppression is counted and debug-logged, never silent.
+    fn suppressed(&self, kind: TimelineKind, app: Option<&str>) -> bool {
+        match self.control.suppress_reason(app) {
+            None => false,
+            Some(SuppressReason::Paused) => {
+                self.rows_suppressed_paused.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    code = "TIMELINE_ROW_SUPPRESSED_PAUSED",
+                    kind = ?kind,
+                    "timeline row suppressed: recorder is paused"
+                );
+                true
+            }
+            Some(SuppressReason::ExcludedApp) => {
+                self.rows_suppressed_excluded
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    code = "TIMELINE_ROW_SUPPRESSED_EXCLUDED",
+                    kind = ?kind,
+                    app = app.unwrap_or_default(),
+                    "timeline row suppressed: process is excluded"
+                );
+                true
+            }
+        }
+    }
+
     /// Write path for the steady-state worker: a failed row is a loud
     /// structured error plus a failure count (surfaced by `timeline_stats`,
     /// #842), never a panic that kills the recorder.
@@ -170,6 +204,9 @@ impl TimelineWriter {
         app: Option<String>,
         payload: serde_json::Value,
     ) {
+        if self.suppressed(kind, app.as_deref()) {
+            return;
+        }
         if let Err(error) = self.try_write(ts_ns, kind, actor, app, payload) {
             self.write_failures.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
@@ -260,6 +297,16 @@ struct WorkerState {
 
 impl WorkerState {
     fn handle_accessible(&mut self, event: &AccessibleEvent) {
+        // Paused means *perceive nothing*: skip even the foreground/title
+        // readbacks, not just the row writes. The snapshot is dropped so the
+        // first post-resume trigger re-records reality from scratch.
+        if self.writer.control.is_paused() {
+            self.foreground = None;
+            self.writer
+                .rows_suppressed_paused
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         match event.kind {
             AccessibleEventKind::ForegroundChanged => self.handle_foreground(event.window_id),
             AccessibleEventKind::NameChanged => self.handle_name_change(event.window_id),
@@ -351,6 +398,16 @@ impl WorkerState {
             process_path: context.process_path.clone(),
             title: context.window_title.clone(),
         };
+        // Excluded processes leave the dedup snapshot untouched: the moment
+        // the exclusion lifts (or focus moves to a recordable app), the next
+        // trigger classifies as a switch and records reality instead of
+        // deduplicating against a window that was never written.
+        if self
+            .writer
+            .suppressed(TimelineKind::FocusChange, Some(&next.process_name))
+        {
+            return;
+        }
         match classify_foreground_transition(self.foreground.as_ref(), &next) {
             ForegroundTransition::Duplicate => {}
             ForegroundTransition::TitleChanged => self.write_title_change(&next),
@@ -428,6 +485,31 @@ impl WorkerState {
     }
 
     fn handle_idle_probe(&mut self, idle_ms: u64) {
+        if self.writer.control.is_paused() {
+            self.foreground = None;
+            // The idle tick doubles as the auto-resume clock: a pause armed
+            // with `duration_ms` reopens the gate within one poll interval.
+            if self.writer.control.auto_resume_due(now_ts_ns()) {
+                match resume_recording(&self.writer, "auto_resume") {
+                    Ok(_state) => {
+                        tracing::info!(
+                            code = "TIMELINE_RECORDER_AUTO_RESUMED",
+                            "timeline recorder auto-resumed: pause deadline passed"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            code = "TIMELINE_RECORDER_AUTO_RESUME_FAILED",
+                            detail = %format!("{error:#}"),
+                            "timeline auto-resume failed; retrying next idle tick"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                return;
+            }
+        }
         self.reconcile_foreground();
         let Some(edge) = idle_transition(self.idle, idle_ms, self.config.idle_timeout_ms) else {
             return;
@@ -501,6 +583,113 @@ fn session_end_payload(writer: &TimelineWriter, edge: &str) -> serde_json::Value
         "rows_written": writer.rows_written.load(Ordering::Relaxed),
         "write_failures": writer.write_failures.load(Ordering::Relaxed),
         "edge": edge,
+    })
+}
+
+/// Outcome of a pause/resume control action, for tool readback (#843).
+#[derive(Clone, Debug)]
+pub struct RecorderControlOutcome {
+    pub was_paused: bool,
+    /// Whether a session boundary row was written (and flushed) for this
+    /// transition. Re-pausing while paused / re-resuming while recording
+    /// writes no row.
+    pub boundary_row_written: bool,
+    pub state: super::timeline_control::PersistedControlState,
+}
+
+/// Pause sequencing: boundary row while still recording, durable control row,
+/// then the gate flips. A failure at any step propagates with the system left
+/// in the last consistent state it reached.
+fn pause_recording(
+    writer: &TimelineWriter,
+    paused_until_ns: Option<u64>,
+    changed_by: &str,
+) -> Result<RecorderControlOutcome> {
+    let was_paused = writer.control.is_paused();
+    let mut boundary_row_written = false;
+    if !was_paused {
+        writer
+            .try_write(
+                now_ts_ns(),
+                TimelineKind::SessionEnd,
+                TimelineActor::Human,
+                None,
+                json!({
+                    "edge": "pause",
+                    "by_session": changed_by,
+                    "paused_until_ns": paused_until_ns,
+                    "pid": std::process::id(),
+                    "rows_written": writer.rows_written.load(Ordering::Relaxed),
+                    "write_failures": writer.write_failures.load(Ordering::Relaxed),
+                }),
+            )
+            .context("write session_end pause boundary row; recording is unchanged")?;
+        writer
+            .db
+            .flush()
+            .context("flush session_end pause boundary row; recording is unchanged")?;
+        boundary_row_written = true;
+    }
+    let state =
+        writer
+            .control
+            .persist_pause(&writer.db, paused_until_ns, now_ts_ns(), changed_by)?;
+    tracing::info!(
+        code = "TIMELINE_RECORDER_PAUSED",
+        paused_until_ns,
+        by_session = changed_by,
+        "timeline recorder paused"
+    );
+    Ok(RecorderControlOutcome {
+        was_paused,
+        boundary_row_written,
+        state,
+    })
+}
+
+/// Resume sequencing: durable control row, the gate opens, then a
+/// `session_start { edge: "resume" }` boundary row is written and flushed —
+/// the resume-time proof that the write path works. A boundary failure is a
+/// hard error: recording IS resumed at that point and the caller must know
+/// the write path is broken.
+fn resume_recording(writer: &TimelineWriter, changed_by: &str) -> Result<RecorderControlOutcome> {
+    let was_paused = writer.control.is_paused();
+    let state = writer
+        .control
+        .persist_resume(&writer.db, now_ts_ns(), changed_by)?;
+    let mut boundary_row_written = false;
+    if was_paused {
+        writer
+            .try_write(
+                now_ts_ns(),
+                TimelineKind::SessionStart,
+                TimelineActor::Human,
+                None,
+                json!({
+                    "edge": "resume",
+                    "by_session": changed_by,
+                    "pid": std::process::id(),
+                }),
+            )
+            .context(
+                "write session_start resume boundary row — recording IS resumed but the \
+                 timeline write path is broken",
+            )?;
+        writer.db.flush().context(
+            "flush session_start resume boundary row — recording IS resumed but the \
+                 timeline write path is broken",
+        )?;
+        boundary_row_written = true;
+        tracing::info!(
+            code = "TIMELINE_RECORDER_RESUMED",
+            by_session = changed_by,
+            "timeline recorder resumed"
+        );
+    }
+    Ok(RecorderControlOutcome {
+        was_paused,
+        boundary_row_written,
+        state,
     })
 }
 
@@ -596,36 +785,64 @@ impl ActivityRecorder {
     ///
     /// Returns an error when the idle probe or the `session_start` write
     /// fails; the daemon must refuse to start with a recorder that cannot
-    /// record.
-    pub fn spawn(db: Arc<Db>, config: RecorderConfig) -> Result<Self> {
+    /// record. A recorder hydrated into the paused state (#843) writes no
+    /// `session_start` — paused means zero rows — unless its auto-resume
+    /// deadline already passed while the daemon was down, in which case it
+    /// resumes immediately.
+    pub fn spawn(
+        db: Arc<Db>,
+        config: RecorderConfig,
+        control: Arc<RecorderControl>,
+    ) -> Result<Self> {
         let initial_idle_ms = synapse_a11y::millis_since_last_input()
             .context("probe GetLastInputInfo for the activity recorder idle source")?;
+        if control.auto_resume_due(now_ts_ns()) {
+            control
+                .persist_resume(&db, now_ts_ns(), "startup_auto_resume")
+                .context("auto-resume expired timeline pause at recorder startup")?;
+            tracing::info!(
+                code = "TIMELINE_RECORDER_AUTO_RESUMED",
+                "timeline pause deadline passed while the daemon was down; resuming at startup"
+            );
+        }
         let writer = TimelineWriter {
             db,
+            control,
             seq: Arc::new(AtomicU32::new(0)),
             rows_written: Arc::new(AtomicU64::new(0)),
             write_failures: Arc::new(AtomicU64::new(0)),
+            rows_suppressed_paused: Arc::new(AtomicU64::new(0)),
+            rows_suppressed_excluded: Arc::new(AtomicU64::new(0)),
         };
-        writer
-            .try_write(
-                now_ts_ns(),
-                TimelineKind::SessionStart,
-                TimelineActor::Human,
-                None,
-                json!({
-                    "pid": std::process::id(),
-                    "idle_timeout_ms": config.idle_timeout_ms,
-                    "idle_poll_interval_ms": config.idle_poll_interval_ms,
-                    "initial_idle_ms": initial_idle_ms,
-                }),
-            )
-            .context("write CF_TIMELINE session_start row at recorder startup")?;
-        // The batcher acks on enqueue; flush so a broken write path fails the
-        // daemon at startup instead of surfacing 100 ms later in a log.
-        writer
-            .db
-            .flush()
-            .context("flush CF_TIMELINE session_start row at recorder startup")?;
+        if writer.control.is_paused() {
+            tracing::info!(
+                code = "TIMELINE_RECORDER_STARTED_PAUSED",
+                paused_until_ns = writer.control.paused_until_ns(),
+                "activity recorder started in the persisted paused state; no rows until resume"
+            );
+        } else {
+            writer
+                .try_write(
+                    now_ts_ns(),
+                    TimelineKind::SessionStart,
+                    TimelineActor::Human,
+                    None,
+                    json!({
+                        "edge": "startup",
+                        "pid": std::process::id(),
+                        "idle_timeout_ms": config.idle_timeout_ms,
+                        "idle_poll_interval_ms": config.idle_poll_interval_ms,
+                        "initial_idle_ms": initial_idle_ms,
+                    }),
+                )
+                .context("write CF_TIMELINE session_start row at recorder startup")?;
+            // The batcher acks on enqueue; flush so a broken write path fails
+            // the daemon at startup instead of surfacing 100 ms later in a log.
+            writer
+                .db
+                .flush()
+                .context("flush CF_TIMELINE session_start row at recorder startup")?;
+        }
 
         let (sender, receiver) = mpsc::unbounded_channel();
         let state = WorkerState {
@@ -726,6 +943,41 @@ impl ActivityRecorder {
             self.writer.rows_written.load(Ordering::Relaxed),
             self.writer.write_failures.load(Ordering::Relaxed),
         )
+    }
+
+    /// Suppressed-row counters: `(paused, excluded)` (#843 FSV readback).
+    #[must_use]
+    pub fn suppressed_counters(&self) -> (u64, u64) {
+        (
+            self.writer.rows_suppressed_paused.load(Ordering::Relaxed),
+            self.writer.rows_suppressed_excluded.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Pauses recording: boundary row, durable control state, gate closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the boundary row or the durable control write
+    /// fails; the error states exactly which step failed and what state the
+    /// recorder was left in.
+    pub fn pause(
+        &self,
+        paused_until_ns: Option<u64>,
+        changed_by: &str,
+    ) -> Result<RecorderControlOutcome> {
+        pause_recording(&self.writer, paused_until_ns, changed_by)
+    }
+
+    /// Resumes recording: durable control state, gate open, boundary row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable control write fails (still paused)
+    /// or when the boundary row fails (resumed, write path broken — the
+    /// error says so explicitly).
+    pub fn resume(&self, changed_by: &str) -> Result<RecorderControlOutcome> {
+        resume_recording(&self.writer, changed_by)
     }
 
     fn take_task(&self, slot: &Mutex<Option<JoinHandle<()>>>) -> Option<JoinHandle<()>> {
@@ -860,7 +1112,11 @@ mod tests {
         );
         let config = RecorderConfig::from_raw(Some("600000"))
             .unwrap_or_else(|error| panic!("config: {error}"));
-        let recorder = ActivityRecorder::spawn(Arc::clone(&db), config)
+        let control = Arc::new(
+            crate::m3::timeline_control::RecorderControl::hydrate(&db)
+                .unwrap_or_else(|error| panic!("hydrate control: {error:#}")),
+        );
+        let recorder = ActivityRecorder::spawn(Arc::clone(&db), config, control)
             .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
         let (after_start, _failures) = recorder.readback();
         assert_eq!(
@@ -1002,6 +1258,191 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].ts_ns <= pair[1].ts_ns),
             "rows must iterate in chronological order"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pause_and_exclusion_gates_suppress_real_rows() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+        let temp = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let db = Arc::new(
+            Db::open(temp.path(), synapse_core::SCHEMA_VERSION)
+                .unwrap_or_else(|error| panic!("open temp db: {error}")),
+        );
+        let config = RecorderConfig::from_raw(Some("600000"))
+            .unwrap_or_else(|error| panic!("config: {error}"));
+        let control = Arc::new(
+            RecorderControl::hydrate(&db).unwrap_or_else(|error| panic!("hydrate: {error:#}")),
+        );
+        let recorder = ActivityRecorder::spawn(Arc::clone(&db), config, Arc::clone(&control))
+            .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
+        assert_eq!(recorder.readback().0, 1, "session_start");
+
+        let context = synapse_a11y::current_foreground_context()
+            .unwrap_or_else(|error| panic!("real foreground context: {error}"));
+        let event = AccessibleEvent {
+            seq: 1,
+            at_ms: 1,
+            window_id: context.hwnd,
+            element_id: None,
+            kind: AccessibleEventKind::ForegroundChanged,
+            name: None,
+            value: None,
+        };
+
+        // Pause: boundary row written while still recording, then silence.
+        println!(
+            "readback=cf_timeline edge=pause before=rows:{}",
+            recorder.readback().0
+        );
+        let outcome = recorder
+            .pause(None, "fsv-pause")
+            .unwrap_or_else(|error| panic!("pause: {error:#}"));
+        assert!(!outcome.was_paused);
+        assert!(outcome.boundary_row_written);
+        assert_eq!(recorder.readback().0, 2, "session_end{{edge=pause}}");
+        recorder.record_accessible_event(&event);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            recorder.readback().0,
+            2,
+            "paused recorder must write zero rows for real events"
+        );
+        assert!(
+            recorder.suppressed_counters().0 >= 1,
+            "paused suppression must be counted: {:?}",
+            recorder.suppressed_counters()
+        );
+        // Re-pause is honest about being a no-op.
+        let again = recorder
+            .pause(None, "fsv-pause")
+            .unwrap_or_else(|error| panic!("re-pause: {error:#}"));
+        assert!(again.was_paused);
+        assert!(!again.boundary_row_written);
+
+        // Resume: boundary row proves the write path, recording restarts.
+        let resumed = recorder
+            .resume("fsv-pause")
+            .unwrap_or_else(|error| panic!("resume: {error:#}"));
+        assert!(resumed.was_paused);
+        assert!(resumed.boundary_row_written);
+        assert_eq!(recorder.readback().0, 3, "session_start{{edge=resume}}");
+        recorder.record_accessible_event(&event);
+        wait_for_rows(&recorder, 4).await;
+
+        // Exclusion: the current foreground exe stops producing rows.
+        control
+            .persist_exclusion_update(
+                &db,
+                std::slice::from_ref(&context.process_name),
+                &[],
+                now_ts_ns(),
+                "fsv-exclude",
+            )
+            .unwrap_or_else(|error| panic!("exclude: {error:#}"));
+        println!(
+            "readback=cf_timeline edge=excluded before=rows:{} app:{}",
+            recorder.readback().0,
+            context.process_name
+        );
+        let title_changed = AccessibleEvent {
+            kind: AccessibleEventKind::NameChanged,
+            ..event.clone()
+        };
+        recorder.record_accessible_event(&event);
+        recorder.record_accessible_event(&title_changed);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            recorder.readback().0,
+            4,
+            "excluded process must write zero rows even while focused"
+        );
+        assert!(
+            recorder.suppressed_counters().1 >= 1,
+            "exclusion suppression must be counted: {:?}",
+            recorder.suppressed_counters()
+        );
+
+        // Removing the exclusion restores recording for a different window.
+        control
+            .persist_exclusion_update(
+                &db,
+                &[],
+                std::slice::from_ref(&context.process_name),
+                now_ts_ns(),
+                "fsv-exclude",
+            )
+            .unwrap_or_else(|error| panic!("un-exclude: {error:#}"));
+        let other_window = synapse_a11y::visible_top_level_window_contexts()
+            .unwrap_or_else(|error| panic!("enumerate windows: {error}"))
+            .into_iter()
+            .find(|candidate| {
+                candidate.hwnd != context.hwnd && candidate.process_name != context.process_name
+            });
+        if let Some(other) = other_window {
+            let other_event = AccessibleEvent {
+                window_id: other.hwnd,
+                ..event.clone()
+            };
+            recorder.record_accessible_event(&other_event);
+            wait_for_rows(&recorder, 5).await;
+        } else {
+            println!("readback=cf_timeline edge=unexclude skipped=no_second_window");
+        }
+
+        recorder.shutdown().await;
+        let rows = db
+            .scan_cf(cf::CF_TIMELINE)
+            .unwrap_or_else(|error| panic!("scan CF_TIMELINE: {error}"));
+        let records: Vec<TimelineRecord> = rows
+            .iter()
+            .map(|(_key, value)| {
+                serde_json::from_slice(value).unwrap_or_else(|error| panic!("decode: {error}"))
+            })
+            .collect();
+        let kinds: Vec<TimelineKind> = records.iter().map(|record| record.kind).collect();
+        println!("readback=cf_timeline edge=physical_sot kinds={kinds:?}");
+        assert_eq!(records[0].kind, TimelineKind::SessionStart);
+        assert_eq!(records[1].kind, TimelineKind::SessionEnd);
+        assert_eq!(
+            records[1].payload["edge"], "pause",
+            "pause boundary row must carry edge=pause: {:?}",
+            records[1].payload
+        );
+        assert_eq!(records[2].kind, TimelineKind::SessionStart);
+        assert_eq!(
+            records[2].payload["edge"], "resume",
+            "resume boundary row must carry edge=resume: {:?}",
+            records[2].payload
+        );
+        assert_eq!(records[3].kind, TimelineKind::FocusChange);
+        assert_eq!(
+            records.last().map(|record| record.kind),
+            Some(TimelineKind::SessionEnd),
+            "shutdown must close the session"
+        );
+        // The only NameChanged event ever sent arrived while the process was
+        // excluded, so no title row may exist; and the excluded-window focus
+        // events must not have added a second focus row for that process.
+        assert!(
+            !kinds.contains(&TimelineKind::TitleChange),
+            "excluded-window title event must not produce a row: {records:?}"
+        );
+        let focus_rows_for_excluded = records
+            .iter()
+            .filter(|record| {
+                record.kind == TimelineKind::FocusChange
+                    && record.app.as_deref() == Some(context.process_name.as_str())
+            })
+            .count();
+        assert_eq!(
+            focus_rows_for_excluded, 1,
+            "only the pre-exclusion focus row may exist for {}: {records:?}",
+            context.process_name
         );
     }
 

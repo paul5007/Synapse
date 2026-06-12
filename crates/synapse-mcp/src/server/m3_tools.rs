@@ -17,15 +17,18 @@ use super::{
     StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
     StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
     StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
-    SubscribeResponse, SynapseService, TimelineSearchParams, TimelineSearchResponse,
+    SubscribeResponse, SynapseService, TimelineExclusionsParams, TimelineExclusionsResponse,
+    TimelinePauseParams, TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse,
+    TimelineResumeParams, TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
     apply_storage_pressure_sample, cancel_reflex, cancel_subscription,
     decide_profile_authoring_candidate, disable_registry_profile, export_audit_bundle,
     export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
     history_reflexes, import_registry, inspect_profile_authoring_candidate, inspect_storage,
     install_registry_package, list_profile_authoring_candidates, list_profiles, list_reflexes,
-    put_probe_rows, query_audit_intelligence, query_registry, record_replay,
-    refresh_profile_quality, register_reflex, rollback_registry_profile, run_storage_gc_once,
-    search_timeline, subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    pause_timeline, purge_timeline, put_probe_rows, query_audit_intelligence, query_registry,
+    record_replay, refresh_profile_quality, register_reflex, resume_timeline,
+    rollback_registry_profile, run_storage_gc_once, search_timeline, subscribe_to_events,
+    tail_audio, tool, tool_router, transcribe_audio, update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 
@@ -607,6 +610,102 @@ impl SynapseService {
         )?;
         let runtime = self.reflex_runtime()?;
         search_timeline(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Pause the operator activity timeline recorder: zero new rows across all feeds until timeline_resume. State survives daemon restart; optional duration_ms arms an auto-resume deadline"
+    )]
+    pub async fn timeline_pause(
+        &self,
+        params: Parameters<TimelinePauseParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TimelinePauseResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "timeline_pause",
+            duration_ms = params.0.duration_ms,
+            "tool.invocation kind=timeline_pause"
+        );
+        self.require_m3_permissions(
+            "timeline_pause",
+            &crate::m3::timeline_control::required_permissions_pause(&params.0),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        pause_timeline(&self.m3_state, &params.0, &by_session).map(Json)
+    }
+
+    #[tool(
+        description = "Resume the operator activity timeline recorder after timeline_pause; writes and verifies a session_start boundary row"
+    )]
+    pub async fn timeline_resume(
+        &self,
+        params: Parameters<TimelineResumeParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TimelineResumeResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "timeline_resume",
+            "tool.invocation kind=timeline_resume"
+        );
+        self.require_m3_permissions(
+            "timeline_resume",
+            &crate::m3::timeline_control::required_permissions_resume(&params.0),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        resume_timeline(&self.m3_state, &params.0, &by_session).map(Json)
+    }
+
+    #[tool(
+        description = "List or mutate the timeline recorder's per-process exclusion list; excluded executables (e.g. keepass.exe) never produce timeline rows. Env baseline (SYNAPSE_TIMELINE_EXCLUDE) is immutable at runtime"
+    )]
+    pub async fn timeline_exclusions(
+        &self,
+        params: Parameters<TimelineExclusionsParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TimelineExclusionsResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "timeline_exclusions",
+            add_count = params.0.add.as_deref().unwrap_or_default().len(),
+            remove_count = params.0.remove.as_deref().unwrap_or_default().len(),
+            "tool.invocation kind=timeline_exclusions"
+        );
+        self.require_m3_permissions(
+            "timeline_exclusions",
+            &crate::m3::timeline_control::required_permissions_exclusions(&params.0),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        update_timeline_exclusions(&self.m3_state, &params.0, &by_session).map(Json)
+    }
+
+    #[tool(
+        description = "Hard-delete operator timeline rows matching the filters (same semantics as timeline_search) and write a counts-only audit row. Requires at least one filter or all=true; supports dry_run; purge audit rows are only deleted when kinds explicitly includes \"purge\""
+    )]
+    pub async fn timeline_purge(
+        &self,
+        params: Parameters<TimelinePurgeParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TimelinePurgeResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "timeline_purge",
+            all = params.0.all,
+            dry_run = params.0.dry_run,
+            has_text = params.0.text.is_some(),
+            has_cursor = params.0.cursor.is_some(),
+            "tool.invocation kind=timeline_purge"
+        );
+        self.require_m3_permissions(
+            "timeline_purge",
+            &crate::m3::timeline::required_permissions_purge(&params.0),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let runtime = self.reflex_runtime()?;
+        purge_timeline(&runtime, &params.0, &by_session).map(Json)
     }
 
     #[tool(description = "Write bounded synthetic probe rows to a storage column family")]

@@ -32,6 +32,11 @@ const SCHEMA_VERSION_KEY: &[u8] = b"__schema_version";
 const TIMELINE_PERIODIC_COMPACTION_SECONDS: u64 = 86_400;
 const STORAGE_WRITES_SHED_TOTAL: &str = "storage_writes_shed_total";
 
+/// One raw storage row: key bytes and value bytes.
+pub type RawRow = (Vec<u8>, Vec<u8>);
+/// A bounded scan window plus whether more rows remain past it.
+pub type ScanWindow = (Vec<RawRow>, bool);
+
 /// Opened storage handle.
 pub struct Db {
     pub path: PathBuf,
@@ -553,7 +558,7 @@ impl Db {
         cf_name: &str,
         start_key: &[u8],
         max_rows: usize,
-    ) -> StorageResult<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+    ) -> StorageResult<ScanWindow> {
         let handle = self.cf_handle(cf_name)?;
         let mut rows = Vec::new();
         let mut more = false;
@@ -584,6 +589,23 @@ impl Db {
         let handle = self.cf_handle(cf_name)?;
         self.inner
             .compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
+        Ok(())
+    }
+
+    /// Compacts one key range of a column family.
+    ///
+    /// `RocksDB`'s documented remedy for tombstone buildup after a bulk
+    /// scan-and-delete is `CompactRange` over exactly the deleted range, so
+    /// space is reclaimed and iterators do not slow down on tombstone runs
+    /// (ADR 2026-06-11-timeline-data-model §6, purge mechanics).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when the column family is missing.
+    #[tracing::instrument(skip_all, fields(cf_name, start_len = start.len(), end_len = end.len()))]
+    pub fn compact_cf_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        let handle = self.cf_handle(cf_name)?;
+        self.inner.compact_range_cf(&handle, Some(start), Some(end));
         Ok(())
     }
 

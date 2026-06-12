@@ -43,6 +43,10 @@ pub enum TimelineKind {
     FileActivity,
     BrowserNav,
     DemoMarker,
+    /// Audit record for a `timeline_purge` invocation (#843): counts and the
+    /// purge filters, never deleted-row content. Blanket purges skip rows of
+    /// this kind so a purge can never silently consume its own audit trail.
+    Purge,
 }
 
 /// Who produced the activity behind a timeline row.

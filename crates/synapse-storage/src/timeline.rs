@@ -47,10 +47,14 @@ pub fn decode_timeline_key(key: &[u8]) -> StorageResult<(u64, u32)> {
         cf_name: cf::CF_TIMELINE.to_owned(),
         detail: "TIMELINE_KEY_INVALID: timestamp bytes unreadable".to_owned(),
     })?);
-    let seq = u32::from_be_bytes(seq_bytes.try_into().map_err(|_e| StorageError::ReadFailed {
-        cf_name: cf::CF_TIMELINE.to_owned(),
-        detail: "TIMELINE_KEY_INVALID: sequence bytes unreadable".to_owned(),
-    })?);
+    let seq = u32::from_be_bytes(
+        seq_bytes
+            .try_into()
+            .map_err(|_e| StorageError::ReadFailed {
+                cf_name: cf::CF_TIMELINE.to_owned(),
+                detail: "TIMELINE_KEY_INVALID: sequence bytes unreadable".to_owned(),
+            })?,
+    );
     Ok((ts_ns, seq))
 }
 
