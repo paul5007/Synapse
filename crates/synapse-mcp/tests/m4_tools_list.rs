@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 115] = [
+const EXPECTED_TOOLS: [&str; 114] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -70,6 +70,9 @@ const EXPECTED_TOOLS: [&str; 115] = [
     "get_target",
     "health",
     "hidden_desktop_pip_frame",
+    "hygiene_flags",
+    "hygiene_scan_storage",
+    "hygiene_scan_text",
     "observe",
     "observe_delta",
     "profile_activate",
@@ -111,10 +114,6 @@ const EXPECTED_TOOLS: [&str; 115] = [
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
-    "timeline_exclusions",
-    "timeline_pause",
-    "timeline_purge",
-    "timeline_resume",
     "timeline_search",
     "workspace_get",
     "workspace_list",

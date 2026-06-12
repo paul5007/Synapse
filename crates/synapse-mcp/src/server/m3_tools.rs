@@ -1,9 +1,11 @@
 use super::{
     AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse,
     AuditExportBundleParams, AuditExportBundleResponse, AuditIntelligenceQueryParams,
-    AuditIntelligenceQueryResponse, ErrorData, Json, Parameters, ProfileActivateParams,
-    ProfileActivateResponse, ProfileAuthoringDecideParams, ProfileAuthoringDecideResponse,
-    ProfileAuthoringExportParams, ProfileAuthoringExportResponse, ProfileAuthoringGenerateParams,
+    AuditIntelligenceQueryResponse, ErrorData, HygieneFlagsParams, HygieneFlagsResponse,
+    HygieneScanStorageParams, HygieneScanStorageResponse, HygieneScanTextParams,
+    HygieneScanTextResponse, Json, Parameters, ProfileActivateParams, ProfileActivateResponse,
+    ProfileAuthoringDecideParams, ProfileAuthoringDecideResponse, ProfileAuthoringExportParams,
+    ProfileAuthoringExportResponse, ProfileAuthoringGenerateParams,
     ProfileAuthoringGenerateResponse, ProfileAuthoringInspectParams,
     ProfileAuthoringInspectResponse, ProfileAuthoringListParams, ProfileAuthoringListResponse,
     ProfileListParams, ProfileListResponse, ProfileQualityRefreshParams,
@@ -25,10 +27,11 @@ use super::{
     export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
     history_reflexes, import_registry, inspect_profile_authoring_candidate, inspect_storage,
     install_registry_package, list_profile_authoring_candidates, list_profiles, list_reflexes,
-    pause_timeline, purge_timeline, put_probe_rows, query_audit_intelligence, query_registry,
-    record_replay, refresh_profile_quality, register_reflex, resume_timeline,
-    rollback_registry_profile, run_storage_gc_once, search_timeline, subscribe_to_events,
-    tail_audio, tool, tool_router, transcribe_audio, update_timeline_exclusions,
+    pause_timeline, purge_timeline, put_probe_rows, query_audit_intelligence, query_flags,
+    query_registry, record_replay, refresh_profile_quality, register_reflex, resume_timeline,
+    rollback_registry_profile, run_storage_gc_once, scan_storage, scan_text_tool, search_timeline,
+    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 
@@ -567,6 +570,73 @@ impl SynapseService {
             &crate::m3::audio::required_permissions_transcribe(&params.0),
         )?;
         transcribe_audio(&self.m3_state, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Score one text blob for prompt-injection/adversarial instruction heuristics; optionally persist source-linked flag rows"
+    )]
+    pub async fn hygiene_scan_text(
+        &self,
+        params: Parameters<HygieneScanTextParams>,
+    ) -> Result<Json<HygieneScanTextResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "hygiene_scan_text",
+            text_bytes = params.0.text.len(),
+            persist = params.0.persist,
+            "tool.invocation kind=hygiene_scan_text"
+        );
+        self.require_m3_permissions(
+            "hygiene_scan_text",
+            &crate::m3::hygiene::required_permissions_scan_text(&params.0),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        scan_text_tool(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Batch-scan CF_OBSERVATIONS/CF_TIMELINE text fields for prompt-injection heuristics and persist source-linked flag rows"
+    )]
+    pub async fn hygiene_scan_storage(
+        &self,
+        params: Parameters<HygieneScanStorageParams>,
+    ) -> Result<Json<HygieneScanStorageResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "hygiene_scan_storage",
+            limit_rows = params.0.limit_rows,
+            flag_limit = params.0.flag_limit,
+            has_cursor = params.0.cursor.is_some(),
+            "tool.invocation kind=hygiene_scan_storage"
+        );
+        self.require_m3_permissions(
+            "hygiene_scan_storage",
+            &crate::m3::hygiene::required_permissions_scan_storage(&params.0),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        scan_storage(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Query prompt-injection hygiene flag rows persisted in CF_KV")]
+    pub async fn hygiene_flags(
+        &self,
+        params: Parameters<HygieneFlagsParams>,
+    ) -> Result<Json<HygieneFlagsResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "hygiene_flags",
+            source_cf = ?params.0.source_cf,
+            source_key_hex = ?params.0.source_key_hex,
+            limit = params.0.limit,
+            has_cursor = params.0.cursor.is_some(),
+            "tool.invocation kind=hygiene_flags"
+        );
+        self.require_m3_permissions(
+            "hygiene_flags",
+            &crate::m3::hygiene::required_permissions_flags(&params.0),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        query_flags(&runtime, &params.0).map(Json)
     }
 
     #[tool(description = "Inspect storage sizes, row counts, and pressure state")]

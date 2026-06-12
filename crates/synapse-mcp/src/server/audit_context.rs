@@ -215,6 +215,17 @@ impl SynapseService {
 
         let stored = stored_observation(observation, &observation_id, ts_ns, &session_id, reason);
         self.write_observation_row(ts_ns, seq, &stored)?;
+        let source_key = observation_key(ts_ns, seq);
+        {
+            let runtime = self.reflex_runtime()?;
+            let runtime = runtime.lock().map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "reflex runtime lock poisoned while scanning observation hygiene",
+                )
+            })?;
+            crate::m3::hygiene::scan_and_persist_observation(&runtime, &stored, &source_key)?;
+        }
 
         let event = observation_recorded_event(
             observation,

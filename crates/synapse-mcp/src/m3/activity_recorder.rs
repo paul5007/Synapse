@@ -33,11 +33,12 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use synapse_a11y::{AccessibleEvent, AccessibleEventKind};
 use synapse_core::types::{
     FsEventKind, Observation, TIMELINE_RECORD_VERSION, TimelineActor, TimelineKind, TimelineRecord,
@@ -48,7 +49,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::timeline_control::{RecorderControl, SuppressReason};
+use super::{
+    interaction_cadence::{InteractionEvent, InteractionEventKind, InteractionHook},
+    timeline_control::{RecorderControl, SuppressReason},
+};
 use crate::m1::{
     ClipboardTimelineSample, FsTimelineEvent, timeline_clipboard_enabled,
     timeline_file_activity_enabled,
@@ -103,7 +107,9 @@ impl RecorderConfig {
 
 enum RecorderMessage {
     Accessible(AccessibleEvent),
+    Interaction(InteractionEvent),
     IdleProbe { idle_ms: u64 },
+    FlushInteractions { done: oneshot::Sender<()> },
     Shutdown { done: oneshot::Sender<()> },
 }
 
@@ -294,11 +300,242 @@ fn current_actor() -> TimelineActor {
     }
 }
 
+const INTERACTION_BUCKET_NS: u64 = 30_000_000_000;
+const INJECTED_UNATTRIBUTED_SESSION_ID: &str = "injected-input";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InteractionBucket {
+    bucket_start_ns: u64,
+    bucket_end_ns: u64,
+    first_event_ns: u64,
+    last_event_ns: u64,
+    hwnd: i64,
+    pid: u32,
+    process_name: String,
+    process_path: String,
+    title_sha256: String,
+    actor: TimelineActor,
+    input_origin: &'static str,
+    keystroke_count: u64,
+    click_count: u64,
+    vertical_scroll_delta: i64,
+    horizontal_scroll_delta: i64,
+    app_switch_count: u64,
+}
+
+impl InteractionBucket {
+    fn new(
+        ts_ns: u64,
+        context: &synapse_core::ForegroundContext,
+        actor: TimelineActor,
+        input_origin: &'static str,
+    ) -> Self {
+        let bucket_start_ns = bucket_start(ts_ns);
+        Self {
+            bucket_start_ns,
+            bucket_end_ns: bucket_start_ns.saturating_add(INTERACTION_BUCKET_NS),
+            first_event_ns: ts_ns,
+            last_event_ns: ts_ns,
+            hwnd: context.hwnd,
+            pid: context.pid,
+            process_name: context.process_name.clone(),
+            process_path: context.process_path.clone(),
+            title_sha256: sha256_hex(&context.window_title),
+            actor,
+            input_origin,
+            keystroke_count: 0,
+            click_count: 0,
+            vertical_scroll_delta: 0,
+            horizontal_scroll_delta: 0,
+            app_switch_count: 0,
+        }
+    }
+
+    fn accepts(
+        &self,
+        ts_ns: u64,
+        context: &synapse_core::ForegroundContext,
+        actor: &TimelineActor,
+        input_origin: &'static str,
+    ) -> bool {
+        self.bucket_start_ns == bucket_start(ts_ns)
+            && self.hwnd == context.hwnd
+            && self.pid == context.pid
+            && self.process_name == context.process_name
+            && &self.actor == actor
+            && self.input_origin == input_origin
+    }
+
+    fn note_event_time(&mut self, ts_ns: u64) {
+        self.first_event_ns = self.first_event_ns.min(ts_ns);
+        self.last_event_ns = self.last_event_ns.max(ts_ns);
+    }
+
+    fn input_event_count(&self) -> u64 {
+        self.keystroke_count
+            .saturating_add(self.click_count)
+            .saturating_add(u64::from(self.vertical_scroll_delta != 0))
+            .saturating_add(u64::from(self.horizontal_scroll_delta != 0))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keystroke_count == 0
+            && self.click_count == 0
+            && self.vertical_scroll_delta == 0
+            && self.horizontal_scroll_delta == 0
+            && self.app_switch_count == 0
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct InteractionAccumulator {
+    current: Option<InteractionBucket>,
+}
+
+impl InteractionAccumulator {
+    fn record_input(
+        &mut self,
+        event: &InteractionEvent,
+        context: &synapse_core::ForegroundContext,
+        actor: TimelineActor,
+        input_origin: &'static str,
+        writer: &TimelineWriter,
+    ) {
+        self.ensure_bucket(event.ts_ns, context, actor, input_origin, writer);
+        let Some(bucket) = self.current.as_mut() else {
+            return;
+        };
+        bucket.note_event_time(event.ts_ns);
+        match event.kind {
+            InteractionEventKind::Keystroke => {
+                bucket.keystroke_count = bucket.keystroke_count.saturating_add(1);
+            }
+            InteractionEventKind::Click => {
+                bucket.click_count = bucket.click_count.saturating_add(1);
+            }
+            InteractionEventKind::VerticalScroll { delta } => {
+                bucket.vertical_scroll_delta = bucket
+                    .vertical_scroll_delta
+                    .saturating_add(i64::from(delta));
+            }
+            InteractionEventKind::HorizontalScroll { delta } => {
+                bucket.horizontal_scroll_delta = bucket
+                    .horizontal_scroll_delta
+                    .saturating_add(i64::from(delta));
+            }
+        }
+    }
+
+    fn record_app_switch(
+        &mut self,
+        ts_ns: u64,
+        context: &synapse_core::ForegroundContext,
+        actor: TimelineActor,
+        writer: &TimelineWriter,
+    ) {
+        self.ensure_bucket(ts_ns, context, actor, "foreground", writer);
+        let Some(bucket) = self.current.as_mut() else {
+            return;
+        };
+        bucket.note_event_time(ts_ns);
+        bucket.app_switch_count = bucket.app_switch_count.saturating_add(1);
+    }
+
+    fn ensure_bucket(
+        &mut self,
+        ts_ns: u64,
+        context: &synapse_core::ForegroundContext,
+        actor: TimelineActor,
+        input_origin: &'static str,
+        writer: &TimelineWriter,
+    ) {
+        let needs_new = self.current.as_ref().map_or(true, |bucket| {
+            !bucket.accepts(ts_ns, context, &actor, input_origin)
+        });
+        if needs_new {
+            self.flush(writer);
+            self.current = Some(InteractionBucket::new(ts_ns, context, actor, input_origin));
+        }
+    }
+
+    fn flush(&mut self, writer: &TimelineWriter) {
+        let Some(bucket) = self.current.take() else {
+            return;
+        };
+        if bucket.is_empty() {
+            return;
+        }
+        write_interaction_summary(writer, bucket);
+    }
+}
+
+fn bucket_start(ts_ns: u64) -> u64 {
+    (ts_ns / INTERACTION_BUCKET_NS).saturating_mul(INTERACTION_BUCKET_NS)
+}
+
+fn sha256_hex(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn interaction_actor(injected: bool) -> (TimelineActor, &'static str) {
+    if !injected {
+        return (TimelineActor::Human, "physical");
+    }
+    match current_actor() {
+        TimelineActor::Agent { session_id } => (TimelineActor::Agent { session_id }, "injected"),
+        TimelineActor::Human => (
+            TimelineActor::Agent {
+                session_id: INJECTED_UNATTRIBUTED_SESSION_ID.to_owned(),
+            },
+            "injected",
+        ),
+    }
+}
+
+fn write_interaction_summary(writer: &TimelineWriter, bucket: InteractionBucket) {
+    let duration_ms = bucket.last_event_ns.saturating_sub(bucket.first_event_ns) / 1_000_000;
+    let payload = json!({
+        "bucket_start_ns": bucket.bucket_start_ns,
+        "bucket_end_ns": bucket.bucket_end_ns,
+        "bucket_ms": INTERACTION_BUCKET_NS / 1_000_000,
+        "first_event_ns": bucket.first_event_ns,
+        "last_event_ns": bucket.last_event_ns,
+        "duration_ms": duration_ms,
+        "pid": bucket.pid,
+        "hwnd": bucket.hwnd,
+        "process_path": bucket.process_path,
+        "window_title_sha256": bucket.title_sha256,
+        "input_origin": bucket.input_origin,
+        "keystroke_count": bucket.keystroke_count,
+        "click_count": bucket.click_count,
+        "scroll_vertical_delta": bucket.vertical_scroll_delta,
+        "scroll_horizontal_delta": bucket.horizontal_scroll_delta,
+        "app_switch_count": bucket.app_switch_count,
+        "input_event_count": bucket.input_event_count(),
+    });
+    if let Err(error) = writer.try_write(
+        bucket.last_event_ns,
+        TimelineKind::InteractionSummary,
+        bucket.actor,
+        Some(bucket.process_name),
+        payload,
+    ) {
+        writer.write_failures.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            code = "TIMELINE_INTERACTION_SUMMARY_WRITE_FAILED",
+            detail = %format!("{error:#}"),
+            "failed to persist interaction cadence summary row"
+        );
+    }
+}
+
 struct WorkerState {
     writer: TimelineWriter,
     config: RecorderConfig,
     foreground: Option<ForegroundSnapshot>,
     idle: bool,
+    interactions: InteractionAccumulator,
 }
 
 impl WorkerState {
@@ -318,6 +555,35 @@ impl WorkerState {
             AccessibleEventKind::NameChanged => self.handle_name_change(event.window_id),
             _ => {}
         }
+    }
+
+    fn handle_interaction(&mut self, event: &InteractionEvent) {
+        if self.writer.control.is_paused() {
+            self.writer
+                .rows_suppressed_paused
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let context = match synapse_a11y::current_foreground_context() {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::debug!(
+                    code = "TIMELINE_INTERACTION_FOREGROUND_NONE",
+                    detail = %error,
+                    "interaction cadence event had no foreground context"
+                );
+                return;
+            }
+        };
+        if self.writer.suppressed(
+            TimelineKind::InteractionSummary,
+            Some(&context.process_name),
+        ) {
+            return;
+        }
+        let (actor, input_origin) = interaction_actor(event.injected);
+        self.interactions
+            .record_input(event, &context, actor, input_origin, &self.writer);
     }
 
     /// A `ForegroundChanged` WinEvent is a *trigger*, not the truth: it is
@@ -418,10 +684,12 @@ impl WorkerState {
             ForegroundTransition::Duplicate => {}
             ForegroundTransition::TitleChanged => self.write_title_change(&next),
             ForegroundTransition::Switched => {
+                let ts_ns = now_ts_ns();
+                let actor = current_actor();
                 self.writer.write_logged(
-                    now_ts_ns(),
+                    ts_ns,
                     TimelineKind::FocusChange,
-                    current_actor(),
+                    actor.clone(),
                     Some(next.process_name.clone()),
                     json!({
                         "title": next.title,
@@ -431,6 +699,8 @@ impl WorkerState {
                         "source": source,
                     }),
                 );
+                self.interactions
+                    .record_app_switch(ts_ns, context, actor, &self.writer);
             }
         }
         self.foreground = Some(next);
@@ -581,6 +851,10 @@ impl WorkerState {
             session_end_payload(&self.writer, edge),
         );
     }
+
+    fn flush_interactions(&mut self) {
+        self.interactions.flush(&self.writer);
+    }
 }
 
 fn session_end_payload(writer: &TimelineWriter, edge: &str) -> serde_json::Value {
@@ -706,8 +980,15 @@ async fn run_worker(
     while let Some(message) = receiver.recv().await {
         match message {
             RecorderMessage::Accessible(event) => state.handle_accessible(&event),
+            RecorderMessage::Interaction(event) => state.handle_interaction(&event),
             RecorderMessage::IdleProbe { idle_ms } => state.handle_idle_probe(idle_ms),
+            RecorderMessage::FlushInteractions { done } => {
+                state.flush_interactions();
+                state.writer.flush_logged();
+                let _ = done.send(());
+            }
             RecorderMessage::Shutdown { done } => {
+                state.flush_interactions();
                 state.write_session_end("shutdown");
                 state.writer.flush_logged();
                 let _ = done.send(());
@@ -752,6 +1033,25 @@ async fn run_idle_probe(sender: mpsc::UnboundedSender<RecorderMessage>, poll_int
     }
 }
 
+fn start_interaction_pipeline(
+    recorder_sender: &mpsc::UnboundedSender<RecorderMessage>,
+) -> Result<(InteractionHook, JoinHandle<()>)> {
+    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let hook = InteractionHook::start(interaction_tx)?;
+    let recorder_sender = recorder_sender.clone();
+    let bridge = tokio::spawn(async move {
+        while let Some(event) = interaction_rx.recv().await {
+            if recorder_sender
+                .send(RecorderMessage::Interaction(event))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    Ok((hook, bridge))
+}
+
 /// Always-on operator-activity recorder. One per daemon; owns the timeline
 /// write path for foreground/title/idle/session rows.
 pub struct ActivityRecorder {
@@ -763,6 +1063,8 @@ pub struct ActivityRecorder {
     sink_closed_logged: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
     idle_probe: Mutex<Option<JoinHandle<()>>>,
+    interaction_hook: Mutex<Option<InteractionHook>>,
+    interaction_bridge: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for ActivityRecorder {
@@ -857,14 +1159,26 @@ impl ActivityRecorder {
             config,
             foreground: None,
             idle: false,
+            interactions: InteractionAccumulator::default(),
         };
         let worker = tokio::spawn(run_worker(receiver, state));
         let idle_probe = tokio::spawn(run_idle_probe(sender.clone(), config.idle_poll_interval_ms));
+        let (interaction_hook, interaction_bridge) = if writer.control.is_paused() {
+            (None, None)
+        } else {
+            let (hook, bridge) = start_interaction_pipeline(&sender)
+                .context("start counts-only interaction cadence hook")?;
+            (Some(hook), Some(bridge))
+        };
         tracing::info!(
             code = "TIMELINE_RECORDER_STARTED",
             idle_timeout_ms = config.idle_timeout_ms,
             idle_poll_interval_ms = config.idle_poll_interval_ms,
             initial_idle_ms,
+            interaction_hook_thread_id = interaction_hook
+                .as_ref()
+                .map(|hook| hook.readback().thread_id)
+                .unwrap_or(0),
             "activity recorder started"
         );
         Ok(Self {
@@ -876,6 +1190,8 @@ impl ActivityRecorder {
             sink_closed_logged: AtomicBool::new(false),
             worker: Mutex::new(Some(worker)),
             idle_probe: Mutex::new(Some(idle_probe)),
+            interaction_hook: Mutex::new(interaction_hook),
+            interaction_bridge: Mutex::new(interaction_bridge),
         })
     }
 
@@ -933,6 +1249,7 @@ impl ActivityRecorder {
         if let Some(probe) = self.take_task(&self.idle_probe) {
             probe.abort();
         }
+        self.stop_interaction_hook();
         let (done_tx, done_rx) = oneshot::channel();
         if self
             .sender
@@ -1096,7 +1413,12 @@ impl ActivityRecorder {
         paused_until_ns: Option<u64>,
         changed_by: &str,
     ) -> Result<RecorderControlOutcome> {
-        pause_recording(&self.writer, paused_until_ns, changed_by)
+        self.flush_interactions_blocking();
+        let outcome = pause_recording(&self.writer, paused_until_ns, changed_by)?;
+        if !outcome.was_paused {
+            self.stop_interaction_hook();
+        }
+        Ok(outcome)
     }
 
     /// Resumes recording: durable control state, gate open, boundary row.
@@ -1107,13 +1429,101 @@ impl ActivityRecorder {
     /// or when the boundary row fails (resumed, write path broken — the
     /// error says so explicitly).
     pub fn resume(&self, changed_by: &str) -> Result<RecorderControlOutcome> {
-        resume_recording(&self.writer, changed_by)
+        let outcome = resume_recording(&self.writer, changed_by)?;
+        if outcome.was_paused {
+            self.start_interaction_hook()
+                .context("timeline resumed but starting the interaction cadence hook failed")?;
+        }
+        Ok(outcome)
     }
 
     fn take_task(&self, slot: &Mutex<Option<JoinHandle<()>>>) -> Option<JoinHandle<()>> {
         match slot.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+
+    fn start_interaction_hook(&self) -> Result<()> {
+        let mut guard = match self.interaction_hook.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_some() {
+            return Ok(());
+        }
+        let (hook, bridge) = start_interaction_pipeline(&self.sender)
+            .context("start counts-only interaction cadence hook")?;
+        tracing::info!(
+            code = "TIMELINE_INTERACTION_HOOK_STARTED",
+            thread_id = hook.readback().thread_id,
+            keyboard_hook_installed = hook.readback().keyboard_hook_installed,
+            mouse_hook_installed = hook.readback().mouse_hook_installed,
+            "interaction cadence hook started"
+        );
+        *guard = Some(hook);
+        match self.interaction_bridge.lock() {
+            Ok(mut bridge_guard) => *bridge_guard = Some(bridge),
+            Err(poisoned) => *poisoned.into_inner() = Some(bridge),
+        }
+        Ok(())
+    }
+
+    fn stop_interaction_hook(&self) {
+        let mut guard = match self.interaction_hook.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.take().is_some() {
+            tracing::info!(
+                code = "TIMELINE_INTERACTION_HOOK_STOPPED",
+                "interaction cadence hook stopped"
+            );
+        }
+        let bridge = match self.interaction_bridge.lock() {
+            Ok(mut bridge_guard) => bridge_guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(bridge) = bridge {
+            bridge.abort();
+        }
+    }
+
+    fn flush_interactions_blocking(&self) {
+        let (done_tx, mut done_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RecorderMessage::FlushInteractions { done: done_tx })
+            .is_err()
+        {
+            tracing::error!(
+                code = "TIMELINE_INTERACTION_FLUSH_WORKER_GONE",
+                "activity recorder worker is gone; interaction cadence bucket cannot be flushed"
+            );
+            return;
+        }
+        let deadline = Instant::now() + SHUTDOWN_ACK_TIMEOUT;
+        loop {
+            match done_rx.try_recv() {
+                Ok(()) => return,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        tracing::error!(
+                            code = "TIMELINE_INTERACTION_FLUSH_TIMEOUT",
+                            "activity recorder did not acknowledge interaction cadence flush"
+                        );
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    tracing::error!(
+                        code = "TIMELINE_INTERACTION_FLUSH_ACK_DROPPED",
+                        "activity recorder did not acknowledge interaction cadence flush"
+                    );
+                    return;
+                }
+            }
         }
     }
 
@@ -1151,6 +1561,7 @@ impl Drop for ActivityRecorder {
         if let Some(probe) = self.take_task(&self.idle_probe) {
             probe.abort();
         }
+        self.stop_interaction_hook();
         if let Some(worker) = self.take_task(&self.worker) {
             worker.abort();
         }
@@ -1255,6 +1666,8 @@ mod tests {
             sink_closed_logged: AtomicBool::new(false),
             worker: Mutex::new(None),
             idle_probe: Mutex::new(None),
+            interaction_hook: Mutex::new(None),
+            interaction_bridge: Mutex::new(None),
         }
     }
 
@@ -1419,6 +1832,133 @@ mod tests {
         assert_eq!(records[0].payload["path"], path);
         assert_eq!(records[0].payload["event_kind"], "modified");
         assert_eq!(records[0].payload["size_bytes"], 42);
+    }
+
+    #[test]
+    fn interaction_summary_counts_only_and_hashes_title() {
+        let (_dir, writer) = temp_writer();
+        let mut accumulator = InteractionAccumulator::default();
+        let context = foreground(100, 7, "notepad.exe", "Private Draft - Notepad");
+        accumulator.record_input(
+            &InteractionEvent {
+                ts_ns: 30_000_000_001,
+                kind: InteractionEventKind::Keystroke,
+                injected: false,
+            },
+            &context,
+            TimelineActor::Human,
+            "physical",
+            &writer,
+        );
+        accumulator.record_input(
+            &InteractionEvent {
+                ts_ns: 30_000_000_002,
+                kind: InteractionEventKind::Click,
+                injected: false,
+            },
+            &context,
+            TimelineActor::Human,
+            "physical",
+            &writer,
+        );
+        accumulator.record_input(
+            &InteractionEvent {
+                ts_ns: 30_000_000_003,
+                kind: InteractionEventKind::VerticalScroll { delta: -120 },
+                injected: false,
+            },
+            &context,
+            TimelineActor::Human,
+            "physical",
+            &writer,
+        );
+        println!(
+            "readback=interaction_summary edge=counts_only before_rows={}",
+            timeline_records(&writer).len()
+        );
+        accumulator.flush(&writer);
+        let records = timeline_records(&writer);
+        println!("readback=interaction_summary edge=counts_only after={records:?}");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.kind, TimelineKind::InteractionSummary);
+        assert_eq!(record.actor, TimelineActor::Human);
+        assert_eq!(record.app.as_deref(), Some("notepad.exe"));
+        assert_eq!(record.payload["keystroke_count"], 1);
+        assert_eq!(record.payload["click_count"], 1);
+        assert_eq!(record.payload["scroll_vertical_delta"], -120);
+        assert_eq!(record.payload["input_origin"], "physical");
+        assert_eq!(
+            record.payload["window_title_sha256"],
+            sha256_hex("Private Draft - Notepad")
+        );
+        assert!(
+            record.payload.get("title").is_none(),
+            "interaction summaries must not store raw window titles"
+        );
+        assert!(
+            record.payload.get("key").is_none(),
+            "interaction summaries must not store raw key names"
+        );
+    }
+
+    #[test]
+    fn injected_interactions_are_agent_tagged_not_human() {
+        let (_dir, writer) = temp_writer();
+        let mut accumulator = InteractionAccumulator::default();
+        let context = foreground(200, 9, "chrome.exe", "Form - Chrome");
+        let actor = TimelineActor::Agent {
+            session_id: INJECTED_UNATTRIBUTED_SESSION_ID.to_owned(),
+        };
+        accumulator.record_input(
+            &InteractionEvent {
+                ts_ns: 60_000_000_001,
+                kind: InteractionEventKind::Keystroke,
+                injected: true,
+            },
+            &context,
+            actor.clone(),
+            "injected",
+            &writer,
+        );
+        accumulator.flush(&writer);
+        let records = timeline_records(&writer);
+        println!("readback=interaction_summary edge=injected after={records:?}");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, TimelineKind::InteractionSummary);
+        assert_eq!(records[0].actor, actor);
+        assert_ne!(records[0].actor, TimelineActor::Human);
+        assert_eq!(records[0].payload["input_origin"], "injected");
+        assert_eq!(records[0].payload["keystroke_count"], 1);
+    }
+
+    #[test]
+    fn app_switches_create_summary_rows_without_input_content() {
+        let (_dir, writer) = temp_writer();
+        let mut accumulator = InteractionAccumulator::default();
+        let first = foreground(100, 7, "code.exe", "Repo - Code");
+        let second = foreground(200, 8, "notepad.exe", "Notes - Notepad");
+        accumulator.record_app_switch(90_000_000_001, &first, TimelineActor::Human, &writer);
+        accumulator.record_app_switch(90_000_000_002, &second, TimelineActor::Human, &writer);
+        accumulator.flush(&writer);
+        let records = timeline_records(&writer);
+        println!("readback=interaction_summary edge=app_switch after={records:?}");
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.kind == TimelineKind::InteractionSummary)
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.payload["app_switch_count"] == 1)
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.payload.get("title").is_none())
+        );
     }
 
     #[cfg(windows)]

@@ -58,6 +58,11 @@ use crate::{
             populate_audio_summary, tail_audio, transcribe_audio,
         },
         audit_export::{AuditExportBundleParams, AuditExportBundleResponse, export_audit_bundle},
+        hygiene::{
+            HygieneFlagsParams, HygieneFlagsResponse, HygieneScanStorageParams,
+            HygieneScanStorageResponse, HygieneScanTextParams, HygieneScanTextResponse,
+            query_flags, scan_storage, scan_text_tool,
+        },
         permissions::{RequiredPermissions, authorization_error},
         profile::{
             ProfileActivateParams, ProfileActivateResponse, ProfileListParams, ProfileListResponse,

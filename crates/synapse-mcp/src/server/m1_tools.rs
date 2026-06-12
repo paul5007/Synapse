@@ -2978,6 +2978,11 @@ impl SynapseService {
                     recognition_latency_ms = row.recognition_latency_ms,
                     "OCR cache hit"
                 );
+                crate::m3::hygiene::scan_and_persist_ocr_result(
+                    &runtime,
+                    &row.result,
+                    cache_key.as_bytes(),
+                )?;
                 return Ok(row.result);
             }
         }
@@ -3054,6 +3059,11 @@ impl SynapseService {
                     format!("OCR cache readback result mismatch for key {cache_key}"),
                 ));
             }
+            crate::m3::hygiene::scan_and_persist_ocr_result(
+                &runtime,
+                &readback.result,
+                cache_key.as_bytes(),
+            )?;
         }
 
         tracing::info!(
