@@ -1,15 +1,15 @@
-//! Real-data Full-State-Verification for cross-process UWP accessibility
-//! traversal. No mocks: this launches the real Windows Calculator (a
-//! `Windows.UI.Core.CoreWindow`-hosted UWP app whose XAML content runs in a
-//! separate process) and asserts that the production
-//! `synapse_a11y::snapshot_window_from_hwnd` reaches the in-process
-//! source-of-truth display element across the cross-process boundary.
+//! Supporting regression check for cross-process UWP accessibility traversal.
+//! This is not Full State Verification and does not replace manual FSV.
+//! It launches the real Windows Calculator (a `Windows.UI.Core.CoreWindow`-
+//! hosted UWP app whose XAML content runs in a separate process) and asserts
+//! that the production `synapse_a11y::snapshot_window_from_hwnd` reaches the
+//! display element across the cross-process boundary.
 //!
 //! Ignored by default because it requires an interactive Windows desktop
 //! session. Run manually on a real host:
 //!
 //! ```text
-//! cargo test -p synapse-a11y --test uwp_snapshot_fsv -- --ignored --nocapture
+//! cargo test -p synapse-a11y --test uwp_snapshot_regression -- --ignored --nocapture
 //! ```
 //!
 //! Before this fix, `snapshot` collapsed to depth 1 (4 nodes, no content)
@@ -54,8 +54,8 @@ fn calculator_uwp_display_is_reachable_via_snapshot() -> Result<(), Box<dyn Erro
 
     let tree = synapse_a11y::snapshot_window_from_hwnd(hwnd, 12)?;
 
-    // Source of truth: the CoreWindow-hosted XAML display element, which lives
-    // in a different process than the ApplicationFrameHost window.
+    // Regression oracle: the CoreWindow-hosted XAML display element, which
+    // lives in a different process than the ApplicationFrameHost window.
     let display = tree.nodes.iter().find(|node| {
         node.automation_id.as_deref() == Some("CalculatorResults")
             || node.name.starts_with("Display is")
