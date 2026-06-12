@@ -12,9 +12,9 @@ pub mod reflex;
 pub mod replay;
 pub mod storage;
 pub mod subscribe;
-pub mod timeline;
 #[cfg(test)]
 mod tests;
+pub mod timeline;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use std::{

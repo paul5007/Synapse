@@ -370,7 +370,8 @@ fn windows_foreground_snapshot_round_trips_element_id() -> Result<(), Box<dyn st
 
 #[cfg(windows)]
 #[test]
-fn windows_millis_since_last_input_reads_real_session_idle() -> Result<(), Box<dyn std::error::Error>> {
+fn windows_millis_since_last_input_reads_real_session_idle()
+-> Result<(), Box<dyn std::error::Error>> {
     println!("readback=last_input edge=real_session before=GetLastInputInfo");
     let first = millis_since_last_input()?;
     let second = millis_since_last_input()?;

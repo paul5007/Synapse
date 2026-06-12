@@ -8,11 +8,11 @@ use uiautomation::{
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM},
+        System::SystemInformation::GetTickCount,
         System::Threading::{
             AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
             PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         },
-        System::SystemInformation::GetTickCount,
         UI::Input::KeyboardAndMouse::{
             GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
             KEYEVENTF_KEYUP, LASTINPUTINFO, SendInput, VIRTUAL_KEY, VK_MENU,

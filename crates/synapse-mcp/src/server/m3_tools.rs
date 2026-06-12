@@ -18,15 +18,14 @@ use super::{
     StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
     StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
     SubscribeResponse, SynapseService, TimelineSearchParams, TimelineSearchResponse,
-    apply_storage_pressure_sample, cancel_reflex,
-    cancel_subscription, decide_profile_authoring_candidate, disable_registry_profile,
-    export_audit_bundle, export_profile_authoring_candidate, export_registry,
-    generate_profile_authoring_candidate, history_reflexes, import_registry,
-    inspect_profile_authoring_candidate, inspect_storage, install_registry_package,
-    list_profile_authoring_candidates, list_profiles, list_reflexes, put_probe_rows,
-    query_audit_intelligence, query_registry, record_replay, refresh_profile_quality,
-    register_reflex, rollback_registry_profile, run_storage_gc_once, search_timeline,
-    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    apply_storage_pressure_sample, cancel_reflex, cancel_subscription,
+    decide_profile_authoring_candidate, disable_registry_profile, export_audit_bundle,
+    export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
+    history_reflexes, import_registry, inspect_profile_authoring_candidate, inspect_storage,
+    install_registry_package, list_profile_authoring_candidates, list_profiles, list_reflexes,
+    put_probe_rows, query_audit_intelligence, query_registry, record_replay,
+    refresh_profile_quality, register_reflex, rollback_registry_profile, run_storage_gc_once,
+    search_timeline, subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
 };
 use rmcp::{RoleServer, service::RequestContext};
 

@@ -15,6 +15,8 @@ mod window;
 pub use cdp::*;
 #[cfg(windows)]
 pub use cdp_action::*;
+#[cfg(windows)]
+pub use cdp_action::{CdpMouseStrokePoint, cdp_mouse_stroke_target};
 pub use cdp_dom::*;
 pub use error::*;
 pub use events::*;
@@ -22,6 +24,7 @@ pub use ids::*;
 pub use re_resolve::*;
 pub use snapshot::*;
 pub use ui_element::*;
+pub use window::millis_since_last_input;
 pub use window::*;
 
 #[cfg(test)]

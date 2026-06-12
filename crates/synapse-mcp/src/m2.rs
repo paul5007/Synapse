@@ -584,44 +584,53 @@ fn record_foreground_restore_context_event(
     // records normally. So suppress only this unasserted side-effect under test.
     #[cfg(test)]
     {
-        let _ = (tool, session_id, status, code, reason_code, foreground, foreground_read_error, detail);
+        let _ = (
+            tool,
+            session_id,
+            status,
+            code,
+            reason_code,
+            foreground,
+            foreground_read_error,
+            detail,
+        );
         return;
     }
     #[cfg(not(test))]
     {
-    let detail = json!({
-        "code": code,
-        "reason_code": reason_code,
-        "detail": detail,
-    });
-    match crate::daemon_lifecycle::record_context_event(crate::daemon_lifecycle::ContextEvent {
-        event_kind: "foreground_context_restore",
-        tool,
-        status,
-        mcp_session_id: Some(session_id.to_owned()),
-        foreground,
-        foreground_read_error,
-        detail,
-    }) {
-        Ok(seq) => tracing::info!(
-            code = "INPUT_LEASE_CONTEXT_RESTORE_EVENT_RECORDED",
+        let detail = json!({
+            "code": code,
+            "reason_code": reason_code,
+            "detail": detail,
+        });
+        match crate::daemon_lifecycle::record_context_event(crate::daemon_lifecycle::ContextEvent {
+            event_kind: "foreground_context_restore",
             tool,
-            session_id,
             status,
-            seq,
-            reason_code,
-            "readback=daemon_lifecycle outcome=foreground_context_restore_recorded"
-        ),
-        Err(error) => tracing::error!(
-            code = "INPUT_LEASE_CONTEXT_RESTORE_EVENT_WRITE_FAILED",
-            tool,
-            session_id,
-            status,
-            reason_code,
-            detail = %error,
-            "foreground input context restore event write failed"
-        ),
-    }
+            mcp_session_id: Some(session_id.to_owned()),
+            foreground,
+            foreground_read_error,
+            detail,
+        }) {
+            Ok(seq) => tracing::info!(
+                code = "INPUT_LEASE_CONTEXT_RESTORE_EVENT_RECORDED",
+                tool,
+                session_id,
+                status,
+                seq,
+                reason_code,
+                "readback=daemon_lifecycle outcome=foreground_context_restore_recorded"
+            ),
+            Err(error) => tracing::error!(
+                code = "INPUT_LEASE_CONTEXT_RESTORE_EVENT_WRITE_FAILED",
+                tool,
+                session_id,
+                status,
+                reason_code,
+                detail = %error,
+                "foreground input context restore event write failed"
+            ),
+        }
     }
 }
 

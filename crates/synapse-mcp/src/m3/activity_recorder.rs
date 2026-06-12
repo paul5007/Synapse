@@ -75,7 +75,9 @@ impl RecorderConfig {
         let idle_timeout_ms = match raw {
             None => DEFAULT_IDLE_TIMEOUT_MS,
             Some(value) => value.trim().parse::<u64>().with_context(|| {
-                format!("{IDLE_TIMEOUT_ENV} must be a positive integer of milliseconds, got {value:?}")
+                format!(
+                    "{IDLE_TIMEOUT_ENV} must be a positive integer of milliseconds, got {value:?}"
+                )
             })?,
         };
         if idle_timeout_ms == 0 {
@@ -242,9 +244,7 @@ fn now_ts_ns() -> u64 {
 fn current_actor() -> TimelineActor {
     let status = synapse_action::lease::status();
     match status.owner_session_id {
-        Some(owner)
-            if status.held && owner != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID =>
-        {
+        Some(owner) if status.held && owner != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID => {
             TimelineActor::Agent { session_id: owner }
         }
         _ => TimelineActor::Human,
@@ -504,7 +504,10 @@ fn session_end_payload(writer: &TimelineWriter, edge: &str) -> serde_json::Value
     })
 }
 
-async fn run_worker(mut receiver: mpsc::UnboundedReceiver<RecorderMessage>, mut state: WorkerState) {
+async fn run_worker(
+    mut receiver: mpsc::UnboundedReceiver<RecorderMessage>,
+    mut state: WorkerState,
+) {
     while let Some(message) = receiver.recv().await {
         match message {
             RecorderMessage::Accessible(event) => state.handle_accessible(&event),
@@ -539,10 +542,7 @@ async fn run_idle_probe(sender: mpsc::UnboundedSender<RecorderMessage>, poll_int
         interval.tick().await;
         match synapse_a11y::millis_since_last_input() {
             Ok(idle_ms) => {
-                if sender
-                    .send(RecorderMessage::IdleProbe { idle_ms })
-                    .is_err()
-                {
+                if sender.send(RecorderMessage::IdleProbe { idle_ms }).is_err() {
                     return;
                 }
             }
@@ -707,7 +707,8 @@ impl ActivityRecorder {
             _ => {
                 tracing::error!(
                     code = "TIMELINE_RECORDER_SHUTDOWN_TIMEOUT",
-                    timeout_ms = u64::try_from(SHUTDOWN_ACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    timeout_ms =
+                        u64::try_from(SHUTDOWN_ACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
                     "activity recorder worker did not acknowledge shutdown; aborting it"
                 );
                 if let Some(worker) = self.take_task(&self.worker) {
@@ -801,7 +802,10 @@ mod tests {
 
     #[test]
     fn config_rejects_zero_and_garbage() {
-        assert!(RecorderConfig::from_raw(Some("0")).is_err(), "0 must be rejected");
+        assert!(
+            RecorderConfig::from_raw(Some("0")).is_err(),
+            "0 must be rejected"
+        );
         assert!(
             RecorderConfig::from_raw(Some("fast")).is_err(),
             "non-numeric must be rejected"
@@ -859,7 +863,10 @@ mod tests {
         let recorder = ActivityRecorder::spawn(Arc::clone(&db), config)
             .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
         let (after_start, _failures) = recorder.readback();
-        assert_eq!(after_start, 1, "session_start must be written synchronously");
+        assert_eq!(
+            after_start, 1,
+            "session_start must be written synchronously"
+        );
 
         // Real foreground window: the event the WinEvent hook would deliver.
         let context = synapse_a11y::current_foreground_context()
@@ -1016,7 +1023,11 @@ mod tests {
 
     #[test]
     fn idle_transitions_fire_exactly_on_edges() {
-        assert_eq!(idle_transition(false, 179_999, 180_000), None, "below threshold");
+        assert_eq!(
+            idle_transition(false, 179_999, 180_000),
+            None,
+            "below threshold"
+        );
         assert_eq!(
             idle_transition(false, 180_000, 180_000),
             Some(IdleEdge::Start),
@@ -1028,6 +1039,10 @@ mod tests {
             Some(IdleEdge::End),
             "input resumption ends idle"
         );
-        assert_eq!(idle_transition(false, 0, 180_000), None, "active stays active");
+        assert_eq!(
+            idle_transition(false, 0, 180_000),
+            None,
+            "active stays active"
+        );
     }
 }

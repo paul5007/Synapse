@@ -297,13 +297,11 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
 }
 
 fn parse_kind(raw: &str) -> Result<TimelineKind, ErrorData> {
-    serde_json::from_value::<TimelineKind>(Value::String(raw.trim().to_owned())).map_err(
-        |_error| {
-            invalid(format!(
-                "timeline_search kinds entry {raw:?} is not a known timeline kind"
-            ))
-        },
-    )
+    serde_json::from_value::<TimelineKind>(Value::String(raw.trim().to_owned())).map_err(|_error| {
+        invalid(format!(
+            "timeline_search kinds entry {raw:?} is not a known timeline kind"
+        ))
+    })
 }
 
 fn record_matches(record: &TimelineRecord, filters: &Filters) -> bool {

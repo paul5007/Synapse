@@ -10,11 +10,7 @@ use tempfile::TempDir;
 const STEP_NS: u64 = 1_000_000_000;
 
 fn base_ts_ns() -> anyhow::Result<u64> {
-    let now_ns = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_nanos(),
-    )?;
+    let now_ns = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
     // Recent timestamps so the 90-day TTL compaction filter cannot expire
     // rows mid-test; offset leaves room for 1000 forward steps.
     Ok(now_ns - 2_000 * STEP_NS)
@@ -154,7 +150,10 @@ async fn timeline_search_filters_pages_and_persists() -> anyhow::Result<()> {
     // App filter (case-insensitive).
     let excel = structured(
         &client
-            .tools_call("timeline_search", json!({"apps": ["excel.exe"], "limit": 500}))
+            .tools_call(
+                "timeline_search",
+                json!({"apps": ["excel.exe"], "limit": 500}),
+            )
             .await?,
     )?;
     assert_eq!(excel["matches"].as_array().map_or(0, Vec::len), 20);
@@ -162,7 +161,10 @@ async fn timeline_search_filters_pages_and_persists() -> anyhow::Result<()> {
     // Text over nested payload values.
     let text = structured(
         &client
-            .tools_call("timeline_search", json!({"text": "Quarterly-Report", "limit": 500}))
+            .tools_call(
+                "timeline_search",
+                json!({"text": "Quarterly-Report", "limit": 500}),
+            )
             .await?,
     )?;
     assert_eq!(text["matches"].as_array().map_or(0, Vec::len), 10);
