@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io,
     net::SocketAddr,
     process::ExitCode,
@@ -11,9 +11,9 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use rmcp::transport::streamable_http_server::{
@@ -46,6 +46,7 @@ const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct HttpState {
+    bind_addr: SocketAddr,
     health_service: Arc<SynapseService>,
     session_manager: Arc<LocalSessionManager>,
     shutdown_cancel: CancellationToken,
@@ -385,13 +386,14 @@ fn router(
         shutdown_cancel.child_token(),
     );
     let state = HttpState {
+        bind_addr,
         health_service,
         session_manager: Arc::clone(&session_manager),
         shutdown_cancel: shutdown_cancel.clone(),
         drain_state: drain_state.clone(),
         sse_state,
     };
-    let app = Router::new()
+    let protected_routes = Router::new()
         .route("/health", get(health))
         .route("/shutdown", post(shutdown))
         .route("/events", get(events).post(publish_event))
@@ -424,7 +426,13 @@ fn router(
         .layer(middleware::from_fn_with_state(
             auth,
             auth::require_http_security,
-        ))
+        ));
+    let dashboard_routes = Router::new()
+        .route("/dashboard", get(dashboard_index))
+        .route("/dashboard/state.json", get(dashboard_state));
+    let app = Router::new()
+        .merge(dashboard_routes)
+        .merge(protected_routes)
         .with_state(state);
     Ok(HttpRouterRuntime {
         app,
@@ -1084,6 +1092,437 @@ fn http_service(
     .map_err(|error| io::Error::other(format!("{error:#}")))
 }
 
+#[derive(Serialize)]
+struct DashboardStateResponse {
+    schema_version: u32,
+    generated_at_unix_ms: u64,
+    bind_addr: String,
+    token_policy: &'static str,
+    daemon: DashboardPanel,
+    sessions: DashboardPanel,
+    lease: DashboardPanel,
+    storage: DashboardPanel,
+    approvals: DashboardPanel,
+    suggestions: DashboardPanel,
+    armed_runs: DashboardPanel,
+}
+
+#[derive(Serialize)]
+struct DashboardPanel {
+    status: &'static str,
+    source: &'static str,
+    data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl DashboardPanel {
+    fn ok(source: &'static str, data: impl Serialize) -> Self {
+        Self {
+            status: "ok",
+            source,
+            data: serde_json::to_value(data).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "serialization_error": error.to_string(),
+                })
+            }),
+            error: None,
+        }
+    }
+
+    fn unavailable(source: &'static str, data: impl Serialize) -> Self {
+        Self {
+            status: "unavailable",
+            source,
+            data: serde_json::to_value(data).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "serialization_error": error.to_string(),
+                })
+            }),
+            error: None,
+        }
+    }
+
+    fn error(source: &'static str, error: impl ToString) -> Self {
+        Self {
+            status: "error",
+            source,
+            data: serde_json::json!({}),
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DashboardStorageSummary {
+    schema_version: u32,
+    pressure_level: crate::m3::storage::StoragePressureLevel,
+    pressure_transition_codes: Vec<String>,
+    cf_sizes: BTreeMap<String, u64>,
+    cf_row_counts: BTreeMap<String, u64>,
+    audit_retention_policy_count: usize,
+}
+
+#[derive(Serialize)]
+struct DashboardDeferredSurface {
+    tool: &'static str,
+    available: bool,
+    rows: Vec<serde_json::Value>,
+}
+
+async fn dashboard_index(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return response;
+    }
+    Html(DASHBOARD_HTML).into_response()
+}
+
+async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return response;
+    }
+    let active_sessions = state.session_manager.sessions.read().await.len();
+    let health = state
+        .health_service
+        .health_payload_with_http_sessions(Some(active_sessions));
+    let sessions = match state.health_service.session_list_impl(false) {
+        Ok(sessions) => DashboardPanel::ok("session_list", sessions),
+        Err(error) => DashboardPanel::error("session_list", format!("{error:?}")),
+    };
+    let lease = DashboardPanel::ok("control_lease_status", synapse_action::lease::status());
+    let storage = match state.health_service.storage_inspect_snapshot() {
+        Ok(snapshot) => DashboardPanel::ok(
+            "storage_inspect",
+            DashboardStorageSummary {
+                schema_version: snapshot.schema_version,
+                pressure_level: snapshot.pressure_level,
+                pressure_transition_codes: snapshot.pressure_transition_codes,
+                cf_sizes: snapshot.cf_sizes,
+                cf_row_counts: snapshot.cf_row_counts,
+                audit_retention_policy_count: snapshot.audit_retention_policies.len(),
+            },
+        ),
+        Err(error) => DashboardPanel::error("storage_inspect", format!("{error:?}")),
+    };
+    let tool_names = health
+        .tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let response = DashboardStateResponse {
+        schema_version: 1,
+        generated_at_unix_ms: dashboard_unix_time_ms(),
+        bind_addr: state.bind_addr.to_string(),
+        token_policy: "dashboard responses never include bearer tokens",
+        daemon: DashboardPanel::ok("health", &health),
+        sessions,
+        lease,
+        storage,
+        approvals: deferred_panel("approval_list", &tool_names),
+        suggestions: deferred_panel("suggestion_list", &tool_names),
+        armed_runs: deferred_panel("armed_run_list", &tool_names),
+    };
+    Json(response).into_response()
+}
+
+fn deferred_panel(tool: &'static str, tool_names: &BTreeSet<&str>) -> DashboardPanel {
+    DashboardPanel::unavailable(
+        tool,
+        DashboardDeferredSurface {
+            tool,
+            available: tool_names.contains(tool),
+            rows: Vec::new(),
+        },
+    )
+}
+
+fn dashboard_local_only(state: &HttpState, headers: &HeaderMap) -> Result<(), Response> {
+    if !state.bind_addr.ip().is_loopback() {
+        return Err((StatusCode::FORBIDDEN, "DASHBOARD_LOOPBACK_BIND_REQUIRED").into_response());
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err((StatusCode::FORBIDDEN, "DASHBOARD_HOST_REQUIRED").into_response());
+    };
+    if dashboard_host_allowed(host) {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "DASHBOARD_HOST_REFUSED").into_response())
+    }
+}
+
+fn dashboard_host_allowed(raw: &str) -> bool {
+    let raw = raw.trim();
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        raw.split(':').next().unwrap_or(raw)
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+fn dashboard_unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+const DASHBOARD_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Synapse Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fa;
+      --fg: #15181d;
+      --muted: #657080;
+      --line: #d9dee7;
+      --panel: #ffffff;
+      --accent: #0b6bcb;
+      --warn: #9c5a00;
+      --ok: #17633a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --fg: #ecf1f7;
+        --muted: #a7b0be;
+        --line: #2d3542;
+        --panel: #171c22;
+        --accent: #6bb2ff;
+        --warn: #ffbe5c;
+        --ok: #71d49c;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2 {
+      margin: 0;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+    h1 { font-size: 20px; }
+    h2 { font-size: 15px; }
+    main {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 16px;
+      padding: 16px 24px 28px;
+    }
+    section {
+      min-width: 0;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 6px;
+    }
+    section > header {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: transparent;
+    }
+    .wide { grid-column: span 12; }
+    .half { grid-column: span 6; }
+    .third { grid-column: span 4; }
+    .body { padding: 12px 14px; overflow: auto; }
+    .statgrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+    .stat {
+      border-left: 3px solid var(--accent);
+      padding: 2px 0 2px 10px;
+      min-width: 0;
+    }
+    .label { color: var(--muted); font-size: 12px; }
+    .value { font-size: 17px; font-weight: 650; overflow-wrap: anywhere; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      padding: 7px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .muted { color: var(--muted); }
+    @media (max-width: 900px) {
+      header { align-items: flex-start; flex-direction: column; }
+      main { padding: 12px; }
+      .half, .third { grid-column: span 12; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Synapse Dashboard</h1>
+    <div id="updated" class="muted"></div>
+  </header>
+  <main>
+    <section class="wide">
+      <header><h2>Daemon</h2></header>
+      <div class="body statgrid" id="daemon"></div>
+    </section>
+    <section class="wide">
+      <header><h2>Sessions</h2></header>
+      <div class="body" id="sessions"></div>
+    </section>
+    <section class="half">
+      <header><h2>Lease</h2></header>
+      <div class="body statgrid" id="lease"></div>
+    </section>
+    <section class="half">
+      <header><h2>Storage</h2></header>
+      <div class="body" id="storage"></div>
+    </section>
+    <section class="third">
+      <header><h2>Approvals</h2></header>
+      <div class="body" id="approvals"></div>
+    </section>
+    <section class="third">
+      <header><h2>Suggestions</h2></header>
+      <div class="body" id="suggestions"></div>
+    </section>
+    <section class="third">
+      <header><h2>Armed Runs</h2></header>
+      <div class="body" id="armedRuns"></div>
+    </section>
+  </main>
+  <script>
+    const text = (value) => value === null || value === undefined ? "" : String(value);
+    const byId = (id) => document.getElementById(id);
+    function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+    function stat(label, value, tone) {
+      const wrap = document.createElement("div");
+      wrap.className = "stat";
+      const l = document.createElement("div");
+      l.className = "label";
+      l.textContent = label;
+      const v = document.createElement("div");
+      v.className = "value" + (tone ? " " + tone : "");
+      v.textContent = text(value);
+      wrap.append(l, v);
+      return wrap;
+    }
+    function table(headers, rows) {
+      const t = document.createElement("table");
+      const thead = document.createElement("thead");
+      const tr = document.createElement("tr");
+      headers.forEach((h) => {
+        const th = document.createElement("th");
+        th.textContent = h;
+        tr.appendChild(th);
+      });
+      thead.appendChild(tr);
+      const tbody = document.createElement("tbody");
+      rows.forEach((row) => {
+        const r = document.createElement("tr");
+        row.forEach((cell) => {
+          const td = document.createElement("td");
+          td.textContent = text(cell);
+          r.appendChild(td);
+        });
+        tbody.appendChild(r);
+      });
+      t.append(thead, tbody);
+      return t;
+    }
+    function render(data) {
+      byId("updated").textContent = new Date(data.generated_at_unix_ms).toLocaleTimeString();
+      const daemon = byId("daemon"); clear(daemon);
+      const health = data.daemon.data || {};
+      daemon.append(
+        stat("PID", health.pid),
+        stat("Build", health.build),
+        stat("Tools", health.tool_count),
+        stat("Bind", data.bind_addr),
+        stat("Storage", health.subsystems?.storage?.status || ""),
+        stat("Recorder", health.subsystems?.perception?.capture_runtime?.status || health.subsystems?.perception?.status || "")
+      );
+      const sessions = byId("sessions"); clear(sessions);
+      const sessionRows = (data.sessions.data?.sessions || []).map((s) => [
+        s.session_id,
+        s.agent_kind,
+        s.lifecycle,
+        s.transport,
+        s.last_seen_ms_ago,
+        s.last_action || "",
+        s.active_target ? JSON.stringify(s.active_target) : ""
+      ]);
+      sessions.appendChild(table(["Session", "Agent", "Life", "Transport", "Last Seen", "Last Action", "Target"], sessionRows));
+      const lease = byId("lease"); clear(lease);
+      const leaseData = data.lease.data || {};
+      lease.append(
+        stat("Held", leaseData.held, leaseData.held ? "warn" : "ok"),
+        stat("Owner", leaseData.owner_session_id || "none"),
+        stat("TTL ms", leaseData.ttl_ms || ""),
+        stat("Expires ms", leaseData.expires_in_ms || "")
+      );
+      const storage = byId("storage"); clear(storage);
+      const counts = data.storage.data?.cf_row_counts || {};
+      storage.appendChild(table(["Column Family", "Rows"], Object.entries(counts).map(([k, v]) => [k, v])));
+      renderDeferred("approvals", data.approvals);
+      renderDeferred("suggestions", data.suggestions);
+      renderDeferred("armedRuns", data.armed_runs);
+    }
+    function renderDeferred(id, panel) {
+      const node = byId(id); clear(node);
+      const data = panel.data || {};
+      node.append(
+        stat("Status", panel.status, panel.status === "ok" ? "ok" : "warn"),
+        stat("Tool", data.tool || panel.source),
+        stat("Available", data.available === true)
+      );
+    }
+    async function refresh() {
+      try {
+        const response = await fetch("/dashboard/state.json", { cache: "no-store" });
+        render(await response.json());
+      } catch (error) {
+        byId("updated").textContent = text(error);
+      }
+    }
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>"#;
+
 async fn health(State(state): State<HttpState>) -> Json<Health> {
     tracing::info!(
         code = "MCP_HTTP_HEALTH",
@@ -1285,6 +1724,23 @@ mod tests {
     use super::*;
 
     const TEST_RESET_REASON: &str = "http_transport_lease_test_reset";
+
+    #[test]
+    fn dashboard_host_gate_accepts_loopback_only() {
+        assert!(dashboard_host_allowed("127.0.0.1:7700"));
+        assert!(dashboard_host_allowed("localhost:7700"));
+        assert!(dashboard_host_allowed("[::1]:7700"));
+        assert!(!dashboard_host_allowed("192.168.1.20:7700"));
+        assert!(!dashboard_host_allowed("evil.example"));
+    }
+
+    #[test]
+    fn dashboard_html_does_not_embed_bearer_material() {
+        assert!(DASHBOARD_HTML.contains("Synapse Dashboard"));
+        assert!(!DASHBOARD_HTML.contains("Authorization"));
+        assert!(!DASHBOARD_HTML.contains("Bearer"));
+        assert!(!DASHBOARD_HTML.contains("SYNAPSE_BEARER_TOKEN"));
+    }
 
     fn test_session_state(name: &str) -> SessionState {
         SessionState::new(InitializeRequestParams::new(

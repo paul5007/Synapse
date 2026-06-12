@@ -314,6 +314,16 @@ impl SynapseService {
         Ok(runtime)
     }
 
+    pub(crate) fn storage_inspect_snapshot(
+        &self,
+    ) -> Result<crate::m3::storage::StorageInspectResponse, ErrorData> {
+        let runtime = self.reflex_runtime()?;
+        crate::m3::storage::inspect_storage(
+            &runtime,
+            &crate::m3::storage::StorageInspectParams::default(),
+        )
+    }
+
     fn install_aim_track_target_source(
         &self,
         runtime: &Arc<Mutex<synapse_reflex::ReflexRuntime>>,
