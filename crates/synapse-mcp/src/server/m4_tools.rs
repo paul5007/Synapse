@@ -757,6 +757,149 @@ fn require_shell_session_id(
 }
 
 impl SynapseService {
+    pub(crate) async fn dashboard_spawn_local_model_agent(
+        &self,
+        params: ActSpawnAgentParams,
+    ) -> Result<ActSpawnAgentResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_LOCAL_MODEL_SPAWN_REQUESTED",
+            kind = ACT_SPAWN_AGENT,
+            "dashboard.invocation kind=act_spawn_agent"
+        );
+        if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
+            self.audit_action_denied_with_details(
+                ACT_SPAWN_AGENT,
+                &error,
+                &json!({
+                    "channel": "dashboard",
+                    "source": "dashboard_local_model_spawn",
+                }),
+            );
+            return Err(error);
+        }
+        let agent_kind = params.effective_cli()?;
+        if !agent_kind.is_local_model() {
+            let error = mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "dashboard local-model spawn requires kind=local_model",
+            );
+            self.audit_action_denied_with_details(
+                ACT_SPAWN_AGENT,
+                &error,
+                &json!({
+                    "channel": "dashboard",
+                    "source": "dashboard_local_model_spawn",
+                    "requested_kind": agent_kind.as_str(),
+                }),
+            );
+            return Err(error);
+        }
+
+        let command_payload = agent_spawn_request_details(&params, None);
+        self.audit_action_started_with_details(ACT_SPAWN_AGENT, &command_payload)?;
+        let spawn_id = format!("agent-spawn-{}", new_reflex_id());
+        let command_before = json!({
+            "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+            "spawn_id": &spawn_id,
+            "before_session_ids": self.current_session_ids()?,
+            "dashboard_channel": true,
+        });
+        self.command_audit_intent(
+            super::command_audit::CommandAuditInput::mcp(
+                ACT_SPAWN_AGENT,
+                "spawn",
+                None,
+                None,
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_channel("dashboard"),
+        )?;
+        self.journal_spawn_requested(&spawn_id, &params, None)?;
+        let result = self
+            .act_spawn_agent_impl(params, None, spawn_id.clone())
+            .await;
+        match &result {
+            Ok(response) => {
+                if let Err(journal_error) = self.journal_spawn_ready(response) {
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            ACT_SPAWN_AGENT,
+                            "spawn",
+                            None,
+                            Some(response.session_id.clone()),
+                            command_payload.clone(),
+                            command_before.clone(),
+                            json!({
+                                "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+                                "spawn_id": &spawn_id,
+                                "response": response,
+                                "after_session_ids": self.current_session_ids().unwrap_or_default(),
+                            }),
+                            "error",
+                        )
+                        .with_channel("dashboard")
+                        .with_error(super::command_audit::command_audit_error_from_error_data(
+                            &journal_error,
+                        )),
+                    )?;
+                    self.audit_action_result::<ActSpawnAgentResponse>(
+                        ACT_SPAWN_AGENT,
+                        &Err(journal_error.clone()),
+                    )?;
+                    return Err(journal_error);
+                }
+            }
+            Err(error) => {
+                self.journal_spawn_failed(&spawn_id, error);
+            }
+        }
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    ACT_SPAWN_AGENT,
+                    "spawn",
+                    None,
+                    Some(response.session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+                        "spawn_id": &spawn_id,
+                        "response": response,
+                        "after_session_ids": self.current_session_ids().unwrap_or_default(),
+                    }),
+                    "ok",
+                )
+                .with_channel("dashboard"),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    ACT_SPAWN_AGENT,
+                    "spawn",
+                    None,
+                    None,
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+                        "spawn_id": &spawn_id,
+                        "after_session_ids": self.current_session_ids().unwrap_or_default(),
+                    }),
+                    "error",
+                )
+                .with_channel("dashboard")
+                .with_error(super::command_audit::command_audit_error_from_error_data(
+                    error,
+                )),
+            )?,
+        };
+        self.audit_action_result(ACT_SPAWN_AGENT, &result)?;
+        result
+    }
+
     async fn act_spawn_agent_impl(
         &self,
         params: ActSpawnAgentParams,

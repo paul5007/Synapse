@@ -557,6 +557,8 @@ impl Runner {
         };
         let is_error = result.is_error.unwrap_or(false);
         let result_value = tool_result_value(&result);
+        self.fail_if_tool_result_contains_control_shutdown(&call.name, &result_value)
+            .await?;
         let result_text = bounded_result_text(&result_value);
         self.messages.push(json!({
             "role": "tool",
@@ -587,6 +589,47 @@ impl Runner {
         }))
         .await?;
         Ok(())
+    }
+
+    async fn fail_if_tool_result_contains_control_shutdown(
+        &mut self,
+        tool_name: &str,
+        result_value: &Value,
+    ) -> anyhow::Result<()> {
+        let Some(message) = shutdown_message_from_tool_result(tool_name, result_value) else {
+            return Ok(());
+        };
+        let steering_text = steering_payload_text(&message.payload);
+        self.write_line(json!({
+            "type": "local.steering.received",
+            "session_id": self.mcp_session_id,
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "turn_index": self.turn_count,
+            "message_id": message.message_id,
+            "kind": message.kind,
+            "payload_summary": bounded_text(&steering_text, 2_000),
+            "source_tool": tool_name,
+            "delivery_path": "tool_result_control_filter",
+        }))?;
+        self.post_event(json!({
+            "event": "state_changed",
+            "session_id": self.mcp_session_id,
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "registry_name": self.registry.name,
+            "state_to": "live",
+            "reason_code": "local_steering_received",
+            "message_id": message.message_id,
+            "message_kind": message.kind,
+            "source_tool": tool_name,
+        }))
+        .await?;
+        bail!(
+            "LOCAL_AGENT_INTERRUPTED: control message {} kind={} requested shutdown",
+            message.message_id,
+            message.kind
+        )
     }
 
     async fn drain_steering_inbox(&mut self) -> anyhow::Result<()> {
@@ -1219,6 +1262,61 @@ fn bounded_result_text(value: &Value) -> String {
     bounded_text(&value.to_string(), 16_000)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ShutdownMailboxMessage {
+    message_id: String,
+    kind: String,
+    payload: Value,
+}
+
+fn shutdown_message_from_tool_result(
+    tool_name: &str,
+    result_value: &Value,
+) -> Option<ShutdownMailboxMessage> {
+    for message in mailbox_messages_from_tool_result(tool_name, result_value) {
+        let kind = message
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("message")
+            .trim()
+            .to_owned();
+        let payload = message.get("payload").cloned().unwrap_or(Value::Null);
+        if steering_requests_shutdown(&kind, &payload) {
+            let message_id = message
+                .get("message_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            return Some(ShutdownMailboxMessage {
+                message_id,
+                kind,
+                payload,
+            });
+        }
+    }
+    None
+}
+
+fn mailbox_messages_from_tool_result<'a>(
+    tool_name: &str,
+    result_value: &'a Value,
+) -> Vec<&'a Value> {
+    match tool_name {
+        "agent_inbox" => result_value
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| messages.iter().collect())
+            .unwrap_or_default(),
+        "agent_wait" => result_value
+            .get("inbox")
+            .and_then(|inbox| inbox.get("messages"))
+            .and_then(Value::as_array)
+            .map(|messages| messages.iter().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 fn bounded_text(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value.to_owned()
@@ -1335,6 +1433,50 @@ mod tests {
     use reqwest::header;
 
     use super::*;
+
+    #[test]
+    fn agent_wait_tool_result_kill_is_runner_control() {
+        let result = json!({
+            "ok": true,
+            "timed_out": false,
+            "inbox": {
+                "messages": [{
+                    "message_id": "agentmsg-1",
+                    "kind": "kill",
+                    "payload": { "reason": "operator acceptance" }
+                }]
+            }
+        });
+
+        assert_eq!(
+            shutdown_message_from_tool_result("agent_wait", &result),
+            Some(ShutdownMailboxMessage {
+                message_id: "agentmsg-1".to_owned(),
+                kind: "kill".to_owned(),
+                payload: json!({ "reason": "operator acceptance" }),
+            })
+        );
+    }
+
+    #[test]
+    fn agent_wait_tool_result_normal_steer_stays_model_visible() {
+        let result = json!({
+            "ok": true,
+            "timed_out": false,
+            "inbox": {
+                "messages": [{
+                    "message_id": "agentmsg-2",
+                    "kind": "steer",
+                    "payload": { "instruction": "write the marker row" }
+                }]
+            }
+        });
+
+        assert_eq!(
+            shutdown_message_from_tool_result("agent_wait", &result),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn local_model_endpoint_env_probe_requires_real_tool_call() -> anyhow::Result<()> {

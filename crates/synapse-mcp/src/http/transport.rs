@@ -21,7 +21,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
     session::{SessionState, SessionStore, SessionStoreError, local::LocalSessionManager},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use synapse_action::ActionHandle;
 use synapse_action::ActionStateSnapshot;
@@ -44,6 +44,7 @@ type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>
 const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
 const M2_EMITTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
+const DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 struct HttpState {
@@ -472,6 +473,12 @@ fn router(
         .route("/dashboard/assets/dashboard.css", get(dashboard_css))
         .route("/dashboard/assets/dashboard.js", get(dashboard_js))
         .route("/dashboard/state.json", get(dashboard_state))
+        .route(
+            "/dashboard/local-model-spawn",
+            post(dashboard_local_model_spawn).layer(DefaultBodyLimit::max(
+                DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
+            )),
+        )
         .route("/approval/activate", get(approval_activate));
     let app = Router::new()
         .merge(dashboard_routes)
@@ -1354,6 +1361,27 @@ struct DashboardLocalModelSurface {
     rows: Vec<crate::m3::local_models::LocalModelRegistryRow>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardLocalModelSpawnRequest {
+    model_ref: String,
+    prompt: String,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    wait_timeout_ms: Option<u64>,
+    #[serde(default)]
+    hold_open_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DashboardLocalModelSpawnResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    spawn: crate::m4::ActSpawnAgentResponse,
+}
+
 #[derive(Serialize)]
 struct DashboardTranscriptSurface {
     source_of_truth: &'static str,
@@ -1449,6 +1477,116 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         local_models: local_model_panel(&state, &tool_names),
     };
     with_dashboard_security_headers(Json(response).into_response())
+}
+
+async fn dashboard_local_model_spawn(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardLocalModelSpawnRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = match dashboard_local_model_spawn_params(request) {
+        Ok(params) => params,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    match state
+        .health_service
+        .dashboard_spawn_local_model_agent(params)
+        .await
+    {
+        Ok(spawn) => with_dashboard_security_headers(
+            Json(DashboardLocalModelSpawnResponse {
+                ok: true,
+                trigger: "dashboard.local_model_spawn",
+                source_of_truth:
+                    "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+                spawn,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+fn dashboard_local_model_spawn_params(
+    request: DashboardLocalModelSpawnRequest,
+) -> Result<crate::m4::ActSpawnAgentParams, Response> {
+    let model_ref = request.model_ref.trim();
+    if model_ref.is_empty() {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard local-model spawn requires model_ref",
+            None,
+        ));
+    }
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard local-model spawn requires prompt",
+            None,
+        ));
+    }
+    Ok(crate::m4::ActSpawnAgentParams {
+        cli: None,
+        kind: Some(crate::m4::ActSpawnAgentCli::LocalModel),
+        model: None,
+        model_ref: Some(model_ref.to_owned()),
+        prompt: Some(prompt.to_owned()),
+        target: None,
+        working_dir: request
+            .working_dir
+            .and_then(|value| trim_optional_non_empty(&value)),
+        mcp_url: crate::m4::default_agent_spawn_mcp_url(),
+        wait_timeout_ms: request
+            .wait_timeout_ms
+            .unwrap_or_else(crate::m4::default_agent_spawn_wait_timeout_ms),
+        hold_open_ms: request
+            .hold_open_ms
+            .unwrap_or_else(crate::m4::default_agent_spawn_hold_open_ms),
+    })
+}
+
+fn trim_optional_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn dashboard_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    data: Option<serde_json::Value>,
+) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "ok": false,
+            "code": code,
+            "message": message,
+            "data": data,
+        })),
+    )
+        .into_response()
+}
+
+fn dashboard_error_code(error: &rmcp::ErrorData) -> String {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{:?}", error.code))
 }
 
 async fn approval_activate(
@@ -1762,13 +1900,26 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <header><h2>Agent Transcripts</h2></header>
       <div class="body" id="agentTranscripts"></div>
     </section>
-    <section class="half" id="hygienePanel">
+    <section class="wide" id="localModelsPanel">
+      <header><h2>Local Models</h2></header>
+      <div class="body" id="localModels">
+        <div id="localModelSummary" class="statgrid"></div>
+        <div id="localModelSpawnMount">
+          <form id="localModelSpawnForm" class="spawn-control">
+            <div class="spawn-fields">
+              <label><span>Model</span><select id="localModelSpawnSelect"></select></label>
+              <label><span>Task</span><textarea id="localModelSpawnPrompt" maxlength="131072"></textarea></label>
+              <button id="localModelSpawnButton" type="submit" disabled>Spawn</button>
+            </div>
+            <div id="localModelSpawnStatus" class="spawn-status muted"></div>
+          </form>
+        </div>
+        <div id="localModelTableMount"></div>
+      </div>
+    </section>
+    <section class="wide" id="hygienePanel">
       <header><h2>Hygiene Flags</h2></header>
       <div class="body" id="hygiene"></div>
-    </section>
-    <section class="half" id="localModelsPanel">
-      <header><h2>Local Models</h2></header>
-      <div class="body" id="localModels"></div>
     </section>
   </main>
 </body>
@@ -1935,10 +2086,65 @@ th {
   color: var(--fg);
   background: var(--bg);
 }
+.spawn-control {
+  display: grid;
+  gap: 10px;
+  margin: 12px 0 14px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.spawn-fields {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(240px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+.spawn-fields label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.spawn-fields select,
+.spawn-fields textarea,
+.spawn-fields button {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--fg);
+  background: var(--bg);
+}
+.spawn-fields select,
+.spawn-fields button {
+  min-height: 34px;
+}
+.spawn-fields textarea {
+  min-height: 68px;
+  resize: vertical;
+  padding: 6px 8px;
+  font: inherit;
+}
+.spawn-fields button {
+  min-width: 96px;
+  padding: 0 12px;
+  color: white;
+  background: var(--accent);
+  cursor: pointer;
+}
+.spawn-fields button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+.spawn-status {
+  min-height: 20px;
+  overflow-wrap: anywhere;
+}
 @media (max-width: 900px) {
   .page-header { align-items: flex-start; flex-direction: column; }
   main { padding: 12px; }
   .half, .third { grid-column: span 12; }
+  .spawn-fields { grid-template-columns: 1fr; }
 }
 "#;
 
@@ -1948,6 +2154,12 @@ const MAX_TEXT_CHARS = 4096;
 const MAX_TOOL_CELL_CHARS = 4096;
 const byId = (id) => document.getElementById(id);
 const commandAuditFilters = { actor: "", verb: "", agent: "" };
+const localModelSpawnState = { model_ref: "", prompt: "", busy: false, result: "" };
+const LOCAL_MODEL_SPAWN_FORM_ID = "localModelSpawnForm";
+const LOCAL_MODEL_SPAWN_SELECT_ID = "localModelSpawnSelect";
+const LOCAL_MODEL_SPAWN_PROMPT_ID = "localModelSpawnPrompt";
+const LOCAL_MODEL_SPAWN_BUTTON_ID = "localModelSpawnButton";
+const LOCAL_MODEL_SPAWN_STATUS_ID = "localModelSpawnStatus";
 
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
@@ -2301,21 +2513,199 @@ function renderHygiene(panel) {
   })));
 }
 
+function healthyLocalModelRows(rows) {
+  return (rows || []).filter((row) => row.enabled && row.last_probe && row.last_probe.healthy);
+}
+
+function ensurePanelMount(parent, id) {
+  let node = byId(id);
+  if (!node || node.parentElement !== parent) {
+    node = document.createElement("div");
+    node.id = id;
+    parent.appendChild(node);
+  }
+  return node;
+}
+
+function syncLocalModelSpawnStateFromControls() {
+  const select = byId(LOCAL_MODEL_SPAWN_SELECT_ID);
+  if (select && select.value !== localModelSpawnState.model_ref) {
+    localModelSpawnState.model_ref = select.value;
+  }
+  const textarea = byId(LOCAL_MODEL_SPAWN_PROMPT_ID);
+  if (textarea && textarea.value !== localModelSpawnState.prompt) {
+    localModelSpawnState.prompt = textarea.value;
+  }
+}
+
+function bindLocalModelSpawnControlEvents(select, textarea) {
+  if (select && select.dataset.localModelSpawnBound !== "true") {
+    select.addEventListener("change", () => {
+      localModelSpawnState.model_ref = select.value;
+    });
+    select.dataset.localModelSpawnBound = "true";
+  }
+  if (textarea && textarea.dataset.localModelSpawnBound !== "true") {
+    textarea.addEventListener("input", () => {
+      localModelSpawnState.prompt = textarea.value;
+    });
+    textarea.dataset.localModelSpawnBound = "true";
+  }
+}
+
+async function spawnLocalModel(event) {
+  event.preventDefault();
+  syncLocalModelSpawnStateFromControls();
+  if (localModelSpawnState.busy) return;
+  const modelRef = localModelSpawnState.model_ref.trim();
+  const prompt = localModelSpawnState.prompt;
+  if (!modelRef || !prompt.trim()) {
+    localModelSpawnState.result = modelRef ? "enter a task" : "select a healthy model";
+    refresh();
+    return;
+  }
+  localModelSpawnState.busy = true;
+  localModelSpawnState.result = "spawn pending";
+  try {
+    const response = await fetch("/dashboard/local-model-spawn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model_ref: modelRef,
+        prompt
+      })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.ok === false) {
+      throw new Error([body.code, body.message || response.status].filter(Boolean).join(" "));
+    }
+    const spawn = body.spawn || {};
+    localModelSpawnState.result = [
+      "spawned",
+      spawn.spawn_id || "",
+      spawn.session_id || ""
+    ].filter(Boolean).join(" ");
+    await refresh();
+  } catch (error) {
+    localModelSpawnState.result = rawText(error.message || error);
+  } finally {
+    localModelSpawnState.busy = false;
+    refresh();
+  }
+}
+
+function renderLocalModelSpawnControl(rows) {
+  const healthy = healthyLocalModelRows(rows);
+  if (!localModelSpawnState.model_ref && healthy.length) {
+    localModelSpawnState.model_ref = healthy[0].name || "";
+  }
+  if (!healthy.some((row) => row.name === localModelSpawnState.model_ref)) {
+    localModelSpawnState.model_ref = healthy[0]?.name || "";
+  }
+  let form = byId(LOCAL_MODEL_SPAWN_FORM_ID);
+  if (form && (!byId(LOCAL_MODEL_SPAWN_SELECT_ID) || !byId(LOCAL_MODEL_SPAWN_PROMPT_ID) || !byId(LOCAL_MODEL_SPAWN_BUTTON_ID) || !byId(LOCAL_MODEL_SPAWN_STATUS_ID))) {
+    form.remove();
+    form = null;
+  }
+  if (!form) {
+    form = document.createElement("form");
+    form.id = LOCAL_MODEL_SPAWN_FORM_ID;
+    form.className = "spawn-control";
+
+    const fields = document.createElement("div");
+    fields.className = "spawn-fields";
+    const modelLabel = document.createElement("label");
+    const modelText = document.createElement("span");
+    modelText.textContent = "Model";
+    const select = document.createElement("select");
+    select.id = LOCAL_MODEL_SPAWN_SELECT_ID;
+    modelLabel.append(modelText, select);
+
+    const promptLabel = document.createElement("label");
+    const promptText = document.createElement("span");
+    promptText.textContent = "Task";
+    const textarea = document.createElement("textarea");
+    textarea.id = LOCAL_MODEL_SPAWN_PROMPT_ID;
+    textarea.maxLength = 131072;
+    promptLabel.append(promptText, textarea);
+
+    const button = document.createElement("button");
+    button.id = LOCAL_MODEL_SPAWN_BUTTON_ID;
+    button.type = "submit";
+    fields.append(modelLabel, promptLabel, button);
+
+    const status = document.createElement("div");
+    status.id = LOCAL_MODEL_SPAWN_STATUS_ID;
+    status.className = "spawn-status muted";
+    form.append(fields, status);
+  }
+  if (form.dataset.localModelSpawnBound !== "true") {
+    form.addEventListener("submit", spawnLocalModel);
+    form.dataset.localModelSpawnBound = "true";
+  }
+
+  const select = form.querySelector("#" + LOCAL_MODEL_SPAWN_SELECT_ID);
+  const textarea = form.querySelector("#" + LOCAL_MODEL_SPAWN_PROMPT_ID);
+  const button = form.querySelector("#" + LOCAL_MODEL_SPAWN_BUTTON_ID);
+  const status = form.querySelector("#" + LOCAL_MODEL_SPAWN_STATUS_ID);
+  if (!select || !textarea || !button || !status) {
+    return form;
+  }
+  bindLocalModelSpawnControlEvents(select, textarea);
+  if (textarea && textarea.value !== localModelSpawnState.prompt) {
+    localModelSpawnState.prompt = textarea.value;
+  }
+  clear(select);
+  select.disabled = localModelSpawnState.busy || healthy.length === 0;
+  for (const row of healthy) {
+    const option = document.createElement("option");
+    option.value = row.name || "";
+    option.textContent = [row.name, row.model_id].filter(Boolean).join(" / ");
+    select.appendChild(option);
+  }
+  select.value = localModelSpawnState.model_ref;
+  syncLocalModelSpawnStateFromControls();
+
+  if (document.activeElement !== textarea && textarea.value !== localModelSpawnState.prompt) {
+    textarea.value = localModelSpawnState.prompt;
+  }
+  syncLocalModelSpawnStateFromControls();
+  textarea.disabled = localModelSpawnState.busy;
+
+  button.disabled = localModelSpawnState.busy || !localModelSpawnState.model_ref || !localModelSpawnState.prompt.trim();
+  button.textContent = localModelSpawnState.busy ? "Spawning" : "Spawn";
+
+  clear(status);
+  appendDisplay(status, healthy.length ? localModelSpawnState.result : "no healthy enabled model", { maxChars: 2048 });
+  return form;
+}
+
 function renderLocalModels(panel) {
-  const node = byId("localModels"); clear(node);
+  const node = byId("localModels");
   if (!panel || panel.status !== "ok") {
+    clear(node);
     renderUnavailable(node, panel);
     return;
   }
   const data = panel.data || {};
   const rows = data.rows || [];
-  node.append(
+  const summary = ensurePanelMount(node, "localModelSummary");
+  const spawnMount = ensurePanelMount(node, "localModelSpawnMount");
+  const tableMount = ensurePanelMount(node, "localModelTableMount");
+  clear(summary);
+  summary.append(
     stat("Tool", data.tool || panel.source),
     stat("Enabled", data.enabled_count || 0),
     stat("Unhealthy", data.unhealthy_count || 0, data.unhealthy_count ? "warn" : "ok"),
     stat("Rows", rows.length)
   );
-  node.appendChild(table(["Name", "Model", "Base URL", "Enabled", "Probe", "Notes"], rows.map((row) => {
+  const form = renderLocalModelSpawnControl(rows);
+  if (form.parentElement !== spawnMount) {
+    clear(spawnMount);
+    spawnMount.appendChild(form);
+  }
+  clear(tableMount);
+  tableMount.appendChild(table(["Name", "Model", "Base URL", "Enabled", "Probe", "Notes"], rows.map((row) => {
     const probe = row.last_probe || {};
     return [
       row.name,
@@ -2674,11 +3064,33 @@ mod tests {
         assert!(DASHBOARD_JS.contains("textContent"));
         assert!(DASHBOARD_JS.contains("stripTerminalSequences"));
         assert!(DASHBOARD_JS.contains("renderCommandAudit"));
+        assert!(DASHBOARD_JS.contains("/dashboard/local-model-spawn"));
+        assert!(DASHBOARD_JS.contains("spawnLocalModel"));
         assert!(DASHBOARD_JS.contains("MAX_TEXT_CHARS"));
         assert!(!DASHBOARD_JS.contains("innerHTML"));
         assert!(!DASHBOARD_JS.contains("insertAdjacentHTML"));
         assert!(!DASHBOARD_JS.contains("new Function"));
         assert!(!DASHBOARD_JS.contains("eval("));
+    }
+
+    #[test]
+    fn dashboard_local_model_spawn_params_force_local_model_kind() {
+        let params = dashboard_local_model_spawn_params(DashboardLocalModelSpawnRequest {
+            model_ref: " ollama-gemma4-e4b ".to_owned(),
+            prompt: " write known result ".to_owned(),
+            working_dir: Some(" C:\\code\\Synapse ".to_owned()),
+            wait_timeout_ms: Some(300_000),
+            hold_open_ms: Some(0),
+        })
+        .expect("valid dashboard local model spawn params");
+
+        assert_eq!(params.cli, None);
+        assert_eq!(params.kind, Some(crate::m4::ActSpawnAgentCli::LocalModel));
+        assert_eq!(params.model_ref.as_deref(), Some("ollama-gemma4-e4b"));
+        assert_eq!(params.prompt.as_deref(), Some("write known result"));
+        assert_eq!(params.working_dir.as_deref(), Some("C:\\code\\Synapse"));
+        assert_eq!(params.wait_timeout_ms, 300_000);
+        assert_eq!(params.hold_open_ms, 0);
     }
 
     fn test_session_state(name: &str) -> SessionState {
