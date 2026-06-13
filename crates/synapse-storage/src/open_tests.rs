@@ -53,6 +53,7 @@ fn opens_database_created_with_pre_timeline_layout() -> Result<(), Box<dyn Error
                 && *name != cf::CF_ROUTINES
                 && *name != cf::CF_ROUTINE_STATE
                 && *name != cf::CF_AGENT_EVENTS
+                && *name != cf::CF_AGENT_TRANSCRIPTS
         })
         .collect();
     {
@@ -117,6 +118,7 @@ fn opens_database_created_with_pre_episodes_layout() -> Result<(), Box<dyn Error
                 && *name != cf::CF_ROUTINES
                 && *name != cf::CF_ROUTINE_STATE
                 && *name != cf::CF_AGENT_EVENTS
+                && *name != cf::CF_AGENT_TRANSCRIPTS
         })
         .collect();
     {
@@ -180,6 +182,7 @@ fn opens_database_created_with_pre_routines_layout() -> Result<(), Box<dyn Error
             *name != cf::CF_ROUTINES
                 && *name != cf::CF_ROUTINE_STATE
                 && *name != cf::CF_AGENT_EVENTS
+                && *name != cf::CF_AGENT_TRANSCRIPTS
         })
         .collect();
     {
@@ -242,7 +245,11 @@ fn opens_database_created_with_pre_routine_state_layout() -> Result<(), Box<dyn 
     // disk.
     let legacy_cfs: Vec<&str> = cf::ALL_COLUMN_FAMILIES
         .into_iter()
-        .filter(|name| *name != cf::CF_ROUTINE_STATE && *name != cf::CF_AGENT_EVENTS)
+        .filter(|name| {
+            *name != cf::CF_ROUTINE_STATE
+                && *name != cf::CF_AGENT_EVENTS
+                && *name != cf::CF_AGENT_TRANSCRIPTS
+        })
         .collect();
     {
         let mut options = Options::default();
@@ -300,11 +307,12 @@ fn opens_database_created_with_pre_agent_events_layout() -> Result<(), Box<dyn E
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("db");
 
-    // Recreate the 15-CF layout (everything except CF_AGENT_EVENTS) exactly
-    // as a pre-#897 binary would have left it on disk.
+    // Recreate the 15-CF layout (everything except CF_AGENT_EVENTS and
+    // CF_AGENT_TRANSCRIPTS) exactly as a pre-#897 binary would have left it
+    // on disk.
     let legacy_cfs: Vec<&str> = cf::ALL_COLUMN_FAMILIES
         .into_iter()
-        .filter(|name| *name != cf::CF_AGENT_EVENTS)
+        .filter(|name| *name != cf::CF_AGENT_EVENTS && *name != cf::CF_AGENT_TRANSCRIPTS)
         .collect();
     {
         let mut options = Options::default();
@@ -357,6 +365,71 @@ fn opens_database_created_with_pre_agent_events_layout() -> Result<(), Box<dyn E
     assert_eq!(preserved.as_deref(), Some(DURABILITY_VALUE));
     assert_eq!(event_rows.len(), 1);
     assert!(after.contains(&cf::CF_AGENT_EVENTS.to_owned()));
+    Ok(())
+}
+
+#[test]
+fn opens_database_created_with_pre_agent_transcripts_layout() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("db");
+
+    // Recreate the 16-CF layout (everything except CF_AGENT_TRANSCRIPTS)
+    // exactly as a pre-#900 binary would have left it on disk.
+    let legacy_cfs: Vec<&str> = cf::ALL_COLUMN_FAMILIES
+        .into_iter()
+        .filter(|name| *name != cf::CF_AGENT_TRANSCRIPTS)
+        .collect();
+    {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        let legacy = DB::open_cf(&options, &path, &legacy_cfs)?;
+        legacy.put(SCHEMA_VERSION_KEY, TEST_SCHEMA_VERSION.to_be_bytes())?;
+        let agent_events = legacy
+            .cf_handle(cf::CF_AGENT_EVENTS)
+            .ok_or("legacy CF_AGENT_EVENTS handle missing")?;
+        legacy.put_cf(&agent_events, DURABILITY_KEY, DURABILITY_VALUE)?;
+        legacy.flush_cf(&agent_events)?;
+    }
+    let before = sorted_list_cf(&path)?;
+    println!(
+        "regression_state=db.list_cf edge=pre_agent_transcripts before={before:?} before_count={}",
+        before.len()
+    );
+    assert!(
+        !before.contains(&cf::CF_AGENT_TRANSCRIPTS.to_owned()),
+        "precondition: legacy layout must not contain CF_AGENT_TRANSCRIPTS"
+    );
+
+    let db = Db::open(&path, TEST_SCHEMA_VERSION)?;
+    let handles = existing_prd_handles(&db);
+    let preserved = db
+        .inner
+        .cf_handle(cf::CF_AGENT_EVENTS)
+        .and_then(|handle| db.inner.get_cf(&handle, DURABILITY_KEY).transpose())
+        .transpose()?;
+    db.put_batch(
+        cf::CF_AGENT_TRANSCRIPTS,
+        vec![(
+            agent_transcripts::agent_transcript_key("agent-spawn-migrate", 1),
+            br#"{"ts_ns":1}"#.to_vec(),
+        )],
+    )?;
+    db.flush()?;
+    let transcript_rows = db.scan_cf(cf::CF_AGENT_TRANSCRIPTS)?;
+    drop(db);
+
+    let after = sorted_list_cf(&path)?;
+    println!(
+        "regression_state=db.list_cf edge=pre_agent_transcripts after={after:?} preserved={:?} \
+         transcript_rows={} observed=additive_open:ok",
+        preserved.as_deref(),
+        transcript_rows.len()
+    );
+    assert_eq!(handles, sorted_prd_cfs());
+    assert_eq!(preserved.as_deref(), Some(DURABILITY_VALUE));
+    assert_eq!(transcript_rows.len(), 1);
+    assert!(after.contains(&cf::CF_AGENT_TRANSCRIPTS.to_owned()));
     Ok(())
 }
 

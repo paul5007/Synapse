@@ -1219,6 +1219,22 @@ impl SessionLifecycleState {
                         }
                     }
                 }
+                // #900: the spawn's processes are gone (or force-terminated)
+                // by here, so its stdout stream is final — flush the
+                // transcript tail and mark the source complete.
+                match session_store_db(&self.m3_state) {
+                    Ok(db) => super::agent_transcripts::finalize_spawn_transcripts(
+                        &db,
+                        &cleanup.spawn_id,
+                        &cleanup.log_dir,
+                    ),
+                    Err(error) => tracing::error!(
+                        code = "TRANSCRIPT_TEARDOWN_FLUSH_FAILED",
+                        spawn_id = %cleanup.spawn_id,
+                        detail = %error,
+                        "teardown transcript flush could not access storage"
+                    ),
+                }
             }
             let desktop_close = resource
                 .desktop_lease

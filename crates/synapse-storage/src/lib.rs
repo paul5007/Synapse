@@ -1,4 +1,5 @@
 pub mod agent_events;
+pub mod agent_transcripts;
 mod batch;
 pub mod cf;
 pub mod codecs;
@@ -699,6 +700,13 @@ fn cf_options(name: &'static str) -> Options {
             // filter at least daily (ADR 2026-06-11-timeline-data-model;
             // CF_EPISODES shares the long-retention profile, #846;
             // CF_AGENT_EVENTS keys/expires the same way, #897).
+            options.set_periodic_compaction_seconds(TIMELINE_PERIODIC_COMPACTION_SECONDS);
+        }
+        cf::CF_AGENT_TRANSCRIPTS => {
+            // Same long-retention TTL profile as CF_AGENT_EVENTS (#900), but
+            // keys are spawn-id-prefixed (variable length), so no fixed
+            // 8-byte prefix extractor applies.
+            options.set_compression_type(DBCompressionType::Zstd);
             options.set_periodic_compaction_seconds(TIMELINE_PERIODIC_COMPACTION_SECONDS);
         }
         _ => {}

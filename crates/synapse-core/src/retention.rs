@@ -17,7 +17,7 @@ pub enum RetentionTtl {
 }
 
 /// PRD §4/§6 storage retention defaults.
-pub const DEFAULTS: [RetentionDefault; 16] = [
+pub const DEFAULTS: [RetentionDefault; 17] = [
     RetentionDefault {
         cf: "CF_EVENTS",
         ttl: RetentionTtl::Hours(24),
@@ -128,6 +128,16 @@ pub const DEFAULTS: [RetentionDefault; 16] = [
     // cold SST files still pass the TTL filter (see storage cf_options).
     RetentionDefault {
         cf: "CF_AGENT_EVENTS",
+        ttl: RetentionTtl::Days(30),
+        soft_cap_mb: 512,
+        hard_cap_mb: 1024,
+    },
+    // Normalized spawned-agent transcripts (#900): one row per source JSONL
+    // line, re-ingestable from the spawn log files while those exist on
+    // disk and the durable record after they are cleaned. Same 30-day
+    // dashboard horizon as the agent-event journal it reconciles with.
+    RetentionDefault {
+        cf: "CF_AGENT_TRANSCRIPTS",
         ttl: RetentionTtl::Days(30),
         soft_cap_mb: 512,
         hard_cap_mb: 1024,

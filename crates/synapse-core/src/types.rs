@@ -1,5 +1,6 @@
 mod action;
 mod agent_event;
+mod agent_transcript;
 mod episode;
 mod event;
 mod geometry;
@@ -15,6 +16,7 @@ mod web_perception;
 
 pub use action::*;
 pub use agent_event::*;
+pub use agent_transcript::*;
 pub use episode::*;
 pub use event::*;
 pub use geometry::*;

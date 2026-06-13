@@ -38,9 +38,16 @@ pub const CF_ROUTINE_STATE: &str = "CF_ROUTINE_STATE";
 /// change, tool call, turn, message, lease, exit) with OTel GenAI-aligned
 /// attributes. Append-only; retention is TTL + GC, never rewritten.
 pub const CF_AGENT_EVENTS: &str = "CF_AGENT_EVENTS";
+/// Normalized spawned-agent transcripts (#900), keyed
+/// `spawn_id || 0x00 || line_no BE`.
+///
+/// Exactly one row per source JSONL line (parsed or invalid) so rows
+/// reconcile line-for-line against the raw file. Idempotently
+/// re-ingestable: the same line always maps to the same key.
+pub const CF_AGENT_TRANSCRIPTS: &str = "CF_AGENT_TRANSCRIPTS";
 
 /// PRD §4 column family names, excluding `RocksDB`'s implicit `default` CF.
-pub const ALL_COLUMN_FAMILIES: [&str; 16] = [
+pub const ALL_COLUMN_FAMILIES: [&str; 17] = [
     CF_EVENTS,
     CF_OBSERVATIONS,
     CF_PROFILES,
@@ -57,4 +64,5 @@ pub const ALL_COLUMN_FAMILIES: [&str; 16] = [
     CF_ROUTINES,
     CF_ROUTINE_STATE,
     CF_AGENT_EVENTS,
+    CF_AGENT_TRANSCRIPTS,
 ];

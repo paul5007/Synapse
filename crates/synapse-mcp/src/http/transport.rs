@@ -278,6 +278,15 @@ pub(super) async fn serve(
     )
     .context("spawn periodic routine miner")?;
 
+    // Periodic transcript ingester (#900): tails spawned-agent stdout JSONL
+    // into CF_AGENT_TRANSCRIPTS. Same contract as the miner: a misconfigured
+    // schedule is a startup failure, not a silently substituted default.
+    let _transcript_ingest_task = crate::server::agent_transcripts::spawn_periodic_transcript_ingest(
+        service.m3_state_handle(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic transcript ingester")?;
+
     let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.m3_state_handle())
         .context("install operator panic hotkey")?;
     let m2_emitter_done = service.m2_emitter_done_receiver();
@@ -424,6 +433,10 @@ fn router(
             )),
         )
         .route("/agent-events/stats", get(agent_events_ingress_stats))
+        .route(
+            "/agent-transcripts/stats",
+            get(agent_transcripts_ingest_stats),
+        )
         .route(
             "/chrome-debugger/native/register",
             post(crate::chrome_debugger_bridge::http_register),
@@ -1914,6 +1927,10 @@ fn agent_events_refusal_response(
 /// "no silent drops" (#899 acceptance).
 async fn agent_events_ingress_stats() -> Response {
     Json(crate::server::agent_event_ingress::ingress_stats()).into_response()
+}
+
+async fn agent_transcripts_ingest_stats() -> Response {
+    Json(crate::server::agent_transcripts::ingest_stats()).into_response()
 }
 
 fn spawn_server(

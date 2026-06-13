@@ -341,6 +341,10 @@ fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {
         // writable like CF_ACTION_LOG: it is the control-plane audit journal
         // (#897) and losing lifecycle events would blind fleet supervision
         // exactly when the system is degrading.
+        // CF_AGENT_TRANSCRIPTS sheds with the rebuildable set: rows are
+        // re-ingestable from the spawn log files on disk, and the ingester
+        // (#900) gates on `pressure_permits_write` BEFORE advancing its
+        // cursor, so a shed cycle is a loud deferral, never silent loss.
         DiskPressureLevel::Level3 => !matches!(
             cf_name,
             cf::CF_OBSERVATIONS
@@ -351,6 +355,7 @@ fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {
                 | cf::CF_TIMELINE
                 | cf::CF_EPISODES
                 | cf::CF_ROUTINES
+                | cf::CF_AGENT_TRANSCRIPTS
         ),
         DiskPressureLevel::Level4 => matches!(cf_name, cf::CF_REFLEX_AUDIT | cf::CF_SESSIONS),
     }
