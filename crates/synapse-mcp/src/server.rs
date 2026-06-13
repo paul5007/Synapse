@@ -107,7 +107,8 @@ use crate::{
         reflex::{
             ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse,
             ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse,
-            cancel_reflex, history_reflexes, list_reflexes, register_reflex,
+            cancel_file_jsonl_tail_watcher, cancel_reflex, history_reflexes,
+            install_file_jsonl_tail_watcher, list_reflexes, register_reflex,
         },
         replay::{ReplayRecordParams, ReplayRecordResponse, record_replay},
         routines::{

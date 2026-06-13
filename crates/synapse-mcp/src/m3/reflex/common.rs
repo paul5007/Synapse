@@ -1,9 +1,9 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, path::Path};
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use synapse_core::{
-    Action, Backend, ButtonAction, ComboInput, ComboStep, DataPredicate, EventFilter,
+    Action, Backend, ButtonAction, ComboInput, ComboStep, DataPredicate, EventFilter, EventSource,
     ReflexButtonTarget, ReflexLifetime, ReflexThen,
 };
 use synapse_reflex::ReflexError;
@@ -32,11 +32,61 @@ pub(super) const fn default_backend() -> Backend {
     Backend::Auto
 }
 
+pub(super) const FILE_JSONL_TAIL_EVENT_KIND: &str = "file_jsonl_tail";
+pub(super) const AUDIT_READBACK_ACTION: &str = "audit/readback";
+const DEFAULT_FILE_JSONL_TAIL_POLL_INTERVAL_MS: u64 = 1000;
+const MIN_FILE_JSONL_TAIL_POLL_INTERVAL_MS: u64 = 50;
+const MAX_FILE_JSONL_TAIL_POLL_INTERVAL_MS: u64 = 600_000;
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum ReflexWhenParam {
+    FileJsonlTail(FileJsonlTailWhen),
     Filter(EventFilter),
     WindowEvent(WindowEventWhen),
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileJsonlTailWhen {
+    pub kind: FileJsonlTailKind,
+    pub host: String,
+    pub path: String,
+    pub predicate: FileJsonlTailPredicate,
+    #[schemars(range(min = 1))]
+    pub min_lines: u64,
+    #[serde(default = "default_file_jsonl_tail_poll_interval_ms")]
+    #[schemars(
+        default = "default_file_jsonl_tail_poll_interval_ms",
+        range(min = 50, max = 600000)
+    )]
+    pub poll_interval_ms: u64,
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileJsonlTailKind {
+    FileJsonlTail,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileJsonlTailPredicate {
+    pub json_path: String,
+    pub equals: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ValidatedFileJsonlTailWhen {
+    pub host: String,
+    pub path: String,
+    pub json_path: String,
+    pub json_pointer: String,
+    pub event_data_pointer: String,
+    pub equals: serde_json::Value,
+    pub min_lines: u64,
+    pub poll_interval_ms: u64,
+    pub local_host: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -58,7 +108,20 @@ pub struct WindowEventMatch {
 #[serde(untagged)]
 pub enum ReflexThenParam {
     Core(ReflexThen),
+    AuditAction(ReflexThenAuditActionParam),
     Steps { steps: Vec<ReflexThenStep> },
+}
+
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(
+    dead_code,
+    reason = "schema-only wrapper; runtime uses ReflexThenParam"
+)]
+enum ReflexThenPublicSchema {
+    Core(ReflexThen),
+    AuditAction(ReflexThenAuditActionParam),
+    Steps(ReflexThenStepsPublicSchema),
 }
 
 #[derive(JsonSchema)]
@@ -67,8 +130,15 @@ pub enum ReflexThenParam {
     dead_code,
     reason = "schema-only wrapper; runtime uses ReflexThenParam"
 )]
-struct ReflexThenPublicSchema {
+struct ReflexThenStepsPublicSchema {
     steps: Vec<ReflexThenStep>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReflexThenAuditActionParam {
+    #[schemars(schema_with = "audit_readback_action_schema")]
+    pub action: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -139,6 +209,7 @@ pub(super) fn actions_from_then(
             steps,
             backend: combo_backend,
         }],
+        ReflexThenParam::AuditAction(action) => actions_from_audit_action(action)?,
         ReflexThenParam::Steps { steps } => actions_from_demo_steps(steps)?,
     };
     for action in &mut actions {
@@ -193,6 +264,9 @@ pub(super) fn combo_steps_from_params(
             .enumerate()
             .map(|(index, step)| timed_demo_step_to_combo_step(index, 0, step))
             .collect(),
+        Some(ReflexThenParam::AuditAction(_)) => Err(ReflexError::ParamsInvalid {
+            detail: "combo reflex cannot use then.action=audit/readback".to_owned(),
+        }),
         Some(ReflexThenParam::Core(_)) | None => Err(ReflexError::ParamsInvalid {
             detail: "combo reflex requires steps or then.kind=combo".to_owned(),
         }),
@@ -202,6 +276,7 @@ pub(super) fn combo_steps_from_params(
 impl ReflexWhenParam {
     pub(super) fn requires_a11y_event_bridge(&self) -> bool {
         match self {
+            Self::FileJsonlTail(_) => false,
             Self::Filter(filter) => a11y_events::event_filter_requires_a11y_bridge(filter),
             Self::WindowEvent(_) => true,
         }
@@ -209,9 +284,95 @@ impl ReflexWhenParam {
 
     pub(super) fn into_event_filter(self) -> Result<EventFilter, ReflexError> {
         match self {
+            Self::FileJsonlTail(when) => when.into_event_filter(),
             Self::Filter(filter) => Ok(filter),
             Self::WindowEvent(when) => when.into_event_filter(),
         }
+    }
+
+    pub(super) fn file_jsonl_tail(&self) -> Option<&FileJsonlTailWhen> {
+        match self {
+            Self::FileJsonlTail(when) => Some(when),
+            Self::Filter(_) | Self::WindowEvent(_) => None,
+        }
+    }
+}
+
+impl FileJsonlTailWhen {
+    pub(super) fn validate(&self) -> Result<ValidatedFileJsonlTailWhen, ReflexError> {
+        match self.kind {
+            FileJsonlTailKind::FileJsonlTail => {}
+        }
+        let host = validate_file_jsonl_tail_host(&self.host)?;
+        let local_host = is_local_file_jsonl_tail_host(&host);
+        let path = validate_file_jsonl_tail_path(&self.path, local_host)?;
+        if self.min_lines == 0 {
+            return Err(ReflexError::ParamsInvalid {
+                detail: "file_jsonl_tail min_lines must be at least 1".to_owned(),
+            });
+        }
+        let poll_interval_ms = self.poll_interval_ms;
+        if !(MIN_FILE_JSONL_TAIL_POLL_INTERVAL_MS..=MAX_FILE_JSONL_TAIL_POLL_INTERVAL_MS)
+            .contains(&poll_interval_ms)
+        {
+            return Err(ReflexError::ParamsInvalid {
+                detail: format!(
+                    "file_jsonl_tail poll_interval_ms must be between {MIN_FILE_JSONL_TAIL_POLL_INTERVAL_MS} and {MAX_FILE_JSONL_TAIL_POLL_INTERVAL_MS}"
+                ),
+            });
+        }
+        let json_path = self.predicate.json_path.trim().to_owned();
+        let json_pointer = json_path_to_pointer(&json_path)?;
+        let event_data_pointer = format!("/last_json{json_pointer}");
+        Ok(ValidatedFileJsonlTailWhen {
+            host,
+            path,
+            json_path,
+            json_pointer,
+            event_data_pointer,
+            equals: self.predicate.equals.clone(),
+            min_lines: self.min_lines,
+            poll_interval_ms,
+            local_host,
+        })
+    }
+
+    fn into_event_filter(self) -> Result<EventFilter, ReflexError> {
+        let validated = self.validate()?;
+        Ok(EventFilter::And {
+            args: vec![
+                EventFilter::Source {
+                    source: EventSource::Filesystem,
+                },
+                EventFilter::Kind {
+                    kind: FILE_JSONL_TAIL_EVENT_KIND.to_owned(),
+                },
+                EventFilter::Data {
+                    path: "/host".to_owned(),
+                    predicate: DataPredicate::Eq {
+                        value: serde_json::json!(validated.host),
+                    },
+                },
+                EventFilter::Data {
+                    path: "/path".to_owned(),
+                    predicate: DataPredicate::Eq {
+                        value: serde_json::json!(validated.path),
+                    },
+                },
+                EventFilter::Data {
+                    path: "/line_count".to_owned(),
+                    predicate: DataPredicate::Ge {
+                        value: serde_json::json!(validated.min_lines),
+                    },
+                },
+                EventFilter::Data {
+                    path: validated.event_data_pointer,
+                    predicate: DataPredicate::Eq {
+                        value: validated.equals,
+                    },
+                },
+            ],
+        })
     }
 }
 
@@ -293,6 +454,141 @@ fn normalize_window_event_kind(raw: &str) -> Result<String, ReflexError> {
     Ok(kind)
 }
 
+fn validate_file_jsonl_tail_host(raw: &str) -> Result<String, ReflexError> {
+    let host = raw.trim();
+    if host.is_empty() {
+        return Err(ReflexError::ParamsInvalid {
+            detail: "file_jsonl_tail host must not be empty".to_owned(),
+        });
+    }
+    if host.chars().any(|ch| {
+        ch.is_ascii_control()
+            || ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '\'' | '"' | '`' | '$' | ';' | '|' | '&' | '<' | '>' | '\\' | '/'
+            )
+    }) {
+        return Err(ReflexError::ParamsInvalid {
+            detail: "file_jsonl_tail host contains unsupported characters".to_owned(),
+        });
+    }
+    if !host
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ReflexError::ParamsInvalid {
+            detail: "file_jsonl_tail host must contain only letters, digits, '.', '_' or '-'"
+                .to_owned(),
+        });
+    }
+    Ok(host.to_owned())
+}
+
+fn validate_file_jsonl_tail_path(raw: &str, local_host: bool) -> Result<String, ReflexError> {
+    let path = raw.trim();
+    if path.is_empty() {
+        return Err(ReflexError::ParamsInvalid {
+            detail: "file_jsonl_tail path must not be empty".to_owned(),
+        });
+    }
+    if path
+        .chars()
+        .any(|ch| ch == '\0' || ch == '\n' || ch == '\r' || ch.is_ascii_control())
+    {
+        return Err(ReflexError::ParamsInvalid {
+            detail: "file_jsonl_tail path contains unsupported control characters".to_owned(),
+        });
+    }
+    if local_host {
+        if path.starts_with('/') || Path::new(path).is_absolute() || is_windows_absolute_path(path)
+        {
+            return Ok(path.to_owned());
+        }
+        return Err(ReflexError::ParamsInvalid {
+            detail: "file_jsonl_tail local path must be absolute".to_owned(),
+        });
+    }
+    if path.starts_with('/') {
+        return Ok(path.to_owned());
+    }
+    Err(ReflexError::ParamsInvalid {
+        detail: "file_jsonl_tail remote path must be POSIX absolute".to_owned(),
+    })
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || path.starts_with("\\\\")
+}
+
+pub(super) fn is_local_file_jsonl_tail_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "127.0.0.1") {
+        return true;
+    }
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .is_some_and(|name| name.eq_ignore_ascii_case(&host))
+}
+
+fn json_path_to_pointer(json_path: &str) -> Result<String, ReflexError> {
+    if json_path == "$" {
+        return Ok(String::new());
+    }
+    let Some(path) = json_path.strip_prefix("$.") else {
+        return Err(ReflexError::ParamsInvalid {
+            detail:
+                "file_jsonl_tail predicate.json_path must be '$' or a simple '$.field[.field]' path"
+                    .to_owned(),
+        });
+    };
+    if path.is_empty() {
+        return Err(ReflexError::ParamsInvalid {
+            detail: "file_jsonl_tail predicate.json_path must not end at '$.'".to_owned(),
+        });
+    }
+    let mut pointer = String::new();
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return Err(ReflexError::ParamsInvalid {
+                detail: "file_jsonl_tail predicate.json_path has an empty segment".to_owned(),
+            });
+        }
+        if !segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(ReflexError::ParamsInvalid {
+                detail: "file_jsonl_tail predicate.json_path supports only simple object fields"
+                    .to_owned(),
+            });
+        }
+        pointer.push('/');
+        pointer.push_str(&segment.replace('~', "~0").replace('/', "~1"));
+    }
+    Ok(pointer)
+}
+
+fn actions_from_audit_action(
+    action: ReflexThenAuditActionParam,
+) -> Result<Vec<Action>, ReflexError> {
+    if action.action == AUDIT_READBACK_ACTION {
+        return Ok(Vec::new());
+    }
+    Err(ReflexError::ParamsInvalid {
+        detail: format!(
+            "then.action {:?} is unsupported; supported actions: {AUDIT_READBACK_ACTION}",
+            action.action
+        ),
+    })
+}
+
 fn validate_regex(pattern: &str) -> Result<(), ReflexError> {
     if pattern.trim().is_empty() {
         return Err(ReflexError::ParamsInvalid {
@@ -351,6 +647,17 @@ fn action_from_demo_step(index: usize, step: ReflexThenStep) -> Result<Action, R
 
 fn empty_params() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
+}
+
+const fn default_file_jsonl_tail_poll_interval_ms() -> u64 {
+    DEFAULT_FILE_JSONL_TAIL_POLL_INTERVAL_MS
+}
+
+fn audit_readback_action_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "string",
+        "enum": [AUDIT_READBACK_ACTION]
+    })
 }
 
 fn apply_backend_default(action: &mut Action, fallback: Backend) {

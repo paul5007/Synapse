@@ -6,9 +6,9 @@
 
 use serde_json::json;
 use synapse_core::{
-    Action, Backend, ComboInput, DataPredicate, EventFilter, KeyCode, KeystrokeDynamics,
-    KeystrokeNaturalParams, MouseButton, ReflexAimAxis, ReflexLifetime, StrokeTiming,
-    VelocityProfile,
+    Action, Backend, ComboInput, DataPredicate, EventFilter, EventSource, KeyCode,
+    KeystrokeDynamics, KeystrokeNaturalParams, MouseButton, ReflexAimAxis, ReflexLifetime,
+    StrokeTiming, VelocityProfile,
 };
 use synapse_reflex::{AimTrackTarget, ScheduledReflexDriver, SchedulerTrigger};
 
@@ -133,6 +133,112 @@ fn on_event_debounce_ms_maps_to_scheduler_debounce() {
         scheduled_reflex_from_params(params).expect("debounced on_event should build a reflex");
 
     assert_eq!(reflex.debounce, std::time::Duration::from_millis(250));
+}
+
+#[test]
+fn file_jsonl_tail_shape_maps_to_filesystem_event_filter_and_audit_then() {
+    let params: ReflexRegisterParams = serde_json::from_value(json!({
+        "kind": "on_event",
+        "when": {
+            "kind": "file_jsonl_tail",
+            "host": "aiwonder",
+            "path": "/zfs/hot/calyx/metrics/anneal_j_series.jsonl",
+            "predicate": {"json_path": "$.soak_status", "equals": "complete"},
+            "min_lines": 100
+        },
+        "then": {"action": "audit/readback"}
+    }))
+    .expect("file_jsonl_tail issue shape should deserialize");
+
+    let reflex =
+        scheduled_reflex_from_params(params).expect("file_jsonl_tail issue shape should build");
+
+    let SchedulerTrigger::OnEvent(EventFilter::And { args }) = reflex.trigger else {
+        panic!("file_jsonl_tail should map to a compound on_event filter");
+    };
+    assert!(args.contains(&EventFilter::Source {
+        source: EventSource::Filesystem
+    }));
+    assert!(args.contains(&EventFilter::Kind {
+        kind: "file_jsonl_tail".to_owned()
+    }));
+    assert!(args.contains(&EventFilter::Data {
+        path: "/host".to_owned(),
+        predicate: DataPredicate::Eq {
+            value: json!("aiwonder")
+        }
+    }));
+    assert!(args.contains(&EventFilter::Data {
+        path: "/path".to_owned(),
+        predicate: DataPredicate::Eq {
+            value: json!("/zfs/hot/calyx/metrics/anneal_j_series.jsonl")
+        }
+    }));
+    assert!(args.contains(&EventFilter::Data {
+        path: "/line_count".to_owned(),
+        predicate: DataPredicate::Ge { value: json!(100) }
+    }));
+    assert!(args.contains(&EventFilter::Data {
+        path: "/last_json/soak_status".to_owned(),
+        predicate: DataPredicate::Eq {
+            value: json!("complete")
+        }
+    }));
+    assert!(reflex.then.is_empty());
+}
+
+#[test]
+fn file_jsonl_tail_rejects_invalid_json_path() {
+    let params: ReflexRegisterParams = serde_json::from_value(json!({
+        "kind": "on_event",
+        "when": {
+            "kind": "file_jsonl_tail",
+            "host": "aiwonder",
+            "path": "/zfs/hot/calyx/metrics/anneal_j_series.jsonl",
+            "predicate": {"json_path": "$[*]", "equals": "complete"},
+            "min_lines": 100
+        },
+        "then": {"action": "audit/readback"}
+    }))
+    .expect("invalid json_path shape should deserialize before validation");
+
+    let error = scheduled_reflex_from_params(params)
+        .expect_err("invalid file_jsonl_tail json_path should fail closed");
+    assert!(error.to_string().contains("predicate.json_path"), "{error}");
+}
+
+#[test]
+fn file_jsonl_tail_rejects_remote_relative_path() {
+    let params: ReflexRegisterParams = serde_json::from_value(json!({
+        "kind": "on_event",
+        "when": {
+            "kind": "file_jsonl_tail",
+            "host": "aiwonder",
+            "path": "metrics/anneal_j_series.jsonl",
+            "predicate": {"json_path": "$.soak_status", "equals": "complete"},
+            "min_lines": 100
+        },
+        "then": {"action": "audit/readback"}
+    }))
+    .expect("relative path shape should deserialize before validation");
+
+    let error = scheduled_reflex_from_params(params)
+        .expect_err("remote relative file_jsonl_tail path should fail closed");
+    assert!(error.to_string().contains("remote path"), "{error}");
+}
+
+#[test]
+fn audit_readback_then_rejects_unknown_action() {
+    let params: ReflexRegisterParams = serde_json::from_value(json!({
+        "kind": "on_event",
+        "when": { "op": "kind", "kind": "support-invalid-audit-action" },
+        "then": {"action": "audit/not-real"}
+    }))
+    .expect("unknown audit action shape should deserialize before validation");
+
+    let error =
+        scheduled_reflex_from_params(params).expect_err("unknown audit action should fail closed");
+    assert!(error.to_string().contains("unsupported"), "{error}");
 }
 
 #[test]

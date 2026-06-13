@@ -31,11 +31,12 @@ use super::{
     SubscribeResponse, SynapseService, TimelineExclusionsParams, TimelineExclusionsResponse,
     TimelinePauseParams, TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse,
     TimelineResumeParams, TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
-    apply_storage_pressure_sample, cancel_reflex, cancel_subscription, decide_approval,
-    decide_profile_authoring_candidate, disable_registry_profile, export_audit_bundle,
-    export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
-    get_episode, history_reflexes, import_registry, inspect_profile_authoring_candidate,
-    inspect_routine, inspect_storage, install_registry_package, list_approvals, list_episodes,
+    apply_storage_pressure_sample, cancel_file_jsonl_tail_watcher, cancel_reflex,
+    cancel_subscription, decide_approval, decide_profile_authoring_candidate,
+    disable_registry_profile, export_audit_bundle, export_profile_authoring_candidate,
+    export_registry, generate_profile_authoring_candidate, get_episode, history_reflexes,
+    import_registry, inspect_profile_authoring_candidate, inspect_routine, inspect_storage,
+    install_file_jsonl_tail_watcher, install_registry_package, list_approvals, list_episodes,
     list_profile_authoring_candidates, list_profiles, list_reflexes, list_routines,
     mine_and_store_routines, pause_timeline, prepare_activation_links, purge_timeline,
     put_probe_rows, query_audit_intelligence, query_flags, query_registry, record_replay,
@@ -163,19 +164,32 @@ impl SynapseService {
             priority = params.0.priority,
             "tool.invocation kind=reflex_register"
         );
-        let required = crate::m3::reflex::required_permissions_register(&params.0)?;
+        let params = params.0;
+        let required = crate::m3::reflex::required_permissions_register(&params)?;
         self.require_m3_permissions("reflex_register", &required)?;
         if let Err(error) = self.ensure_supported_use_allows_action("reflex_register") {
             self.audit_action_denied("reflex_register", &error);
             return Err(error);
         }
         self.refresh_reflex_audit_context()?;
-        if crate::m3::reflex::requires_a11y_event_bridge(&params.0) {
+        if crate::m3::reflex::requires_a11y_event_bridge(&params) {
             self.ensure_a11y_event_bridge()?;
         }
         let runtime = self.reflex_runtime()?;
         self.install_reflex_action_gate(&runtime)?;
-        register_reflex(&runtime, params.0).map(Json)
+        let response = register_reflex(&runtime, params.clone())?;
+        if let Some(request) = params.file_jsonl_tail_watcher_request(response.reflex_id.clone()) {
+            let m3_state = self.m3_state_handle();
+            let event_bus = self.sse_state()?.event_bus();
+            if let Err(error) = install_file_jsonl_tail_watcher(&m3_state, request, event_bus) {
+                let rollback = ReflexCancelParams {
+                    reflex_id: response.reflex_id.clone(),
+                };
+                let _rollback_result = cancel_reflex(&runtime, &rollback);
+                return Err(error);
+            }
+        }
+        Ok(Json(response))
     }
 
     #[tool(description = "Cancel a reflex")]
@@ -194,7 +208,12 @@ impl SynapseService {
             &crate::m3::reflex::required_permissions_cancel(&params.0),
         )?;
         let runtime = self.reflex_runtime()?;
-        cancel_reflex(&runtime, &params.0).map(Json)
+        let response = cancel_reflex(&runtime, &params.0)?;
+        if response.cancelled {
+            let _cancelled_watcher =
+                cancel_file_jsonl_tail_watcher(&self.m3_state_handle(), &params.0.reflex_id)?;
+        }
+        Ok(Json(response))
     }
 
     #[tool(description = "List registered reflexes")]

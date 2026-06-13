@@ -157,5 +157,34 @@ fn assert_reflex_register_schema(tool: &Value) {
         shape["inputSchema"]["properties"]["backend"]["default"],
         "auto"
     );
+    let defs = &shape["inputSchema"]["$defs"];
+    assert_eq!(
+        defs["ReflexWhenParam"]["anyOf"][0]["$ref"],
+        "#/$defs/FileJsonlTailWhen"
+    );
+    assert_eq!(defs["FileJsonlTailKind"]["enum"][0], "file_jsonl_tail");
+    assert_eq!(
+        defs["FileJsonlTailWhen"]["properties"]["min_lines"]["minimum"],
+        1
+    );
+    assert_eq!(
+        defs["FileJsonlTailWhen"]["properties"]["poll_interval_ms"]["default"],
+        1000
+    );
+    assert_eq!(
+        defs["FileJsonlTailPredicate"]["properties"]["equals"]["type"],
+        json!(["object", "array", "string", "number", "boolean", "null"])
+    );
+    assert!(
+        defs["ReflexThenParam"]["anyOf"]
+            .as_array()
+            .is_some_and(|any_of| any_of
+                .iter()
+                .any(|entry| entry["$ref"] == "#/$defs/ReflexThenAuditActionParam"))
+    );
+    assert_eq!(
+        defs["ReflexThenAuditActionParam"]["properties"]["action"]["enum"][0],
+        "audit/readback"
+    );
     insta::assert_json_snapshot!("m3_reflex_register_tool", shape);
 }

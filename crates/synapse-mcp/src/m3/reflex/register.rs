@@ -83,6 +83,23 @@ pub struct ReflexRegisterParams {
     pub exclusive: bool,
 }
 
+impl ReflexRegisterParams {
+    pub(crate) fn file_jsonl_tail_watcher_request(
+        &self,
+        reflex_id: String,
+    ) -> Option<super::FileJsonlTailWatcherRequest> {
+        if self.kind != "on_event" {
+            return None;
+        }
+        let when = self.when.as_ref()?.file_jsonl_tail()?.clone();
+        Some(super::FileJsonlTailWatcherRequest {
+            reflex_id,
+            when,
+            lifetime: self.lifetime.clone(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReflexRegisterResponse {
