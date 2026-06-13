@@ -95,6 +95,9 @@ pub enum CdpCapability {
     AccessibilityFullAxTree,
     DomQuerySelector,
     PageCaptureScreenshot,
+    PageFrameTree,
+    FlatIframeSessions,
+    PiercedShadowDom,
 }
 
 /// Diagnostics describing the CDP probe/attach outcome for the current
@@ -148,6 +151,18 @@ pub struct CdpDiagnostics {
     /// Number of live page targets considered for selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_candidate_count: Option<u32>,
+    /// Number of frame documents enumerated from the selected page target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_tree_frame_count: Option<u32>,
+    /// Number of related iframe targets surfaced through flat-session attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_frame_target_count: Option<u32>,
+    /// Related iframe targets discovered but not surfaced, with explicit reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_frame_targets: Vec<String>,
+    /// Non-fatal per-frame snapshot errors retained for manual verification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frame_snapshot_errors: Vec<String>,
 }
 
 impl CdpDiagnostics {
@@ -168,6 +183,10 @@ impl CdpDiagnostics {
             selected_session_id: None,
             target_selection_reason: None,
             target_candidate_count: None,
+            frame_tree_frame_count: None,
+            attached_frame_target_count: None,
+            blocked_frame_targets: Vec::new(),
+            frame_snapshot_errors: Vec::new(),
         }
     }
 
@@ -188,6 +207,10 @@ impl CdpDiagnostics {
             selected_session_id: None,
             target_selection_reason: None,
             target_candidate_count: None,
+            frame_tree_frame_count: None,
+            attached_frame_target_count: None,
+            blocked_frame_targets: Vec::new(),
+            frame_snapshot_errors: Vec::new(),
         }
     }
 
@@ -218,6 +241,10 @@ impl CdpDiagnostics {
             selected_session_id: None,
             target_selection_reason: None,
             target_candidate_count: None,
+            frame_tree_frame_count: None,
+            attached_frame_target_count: None,
+            blocked_frame_targets: Vec::new(),
+            frame_snapshot_errors: Vec::new(),
         }
     }
 }

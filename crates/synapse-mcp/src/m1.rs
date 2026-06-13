@@ -924,6 +924,11 @@ pub async fn enrich_input_with_cdp_for_target(
                     diagnostics.target_selection_reason =
                         Some(snapshot.target_selection_reason.clone());
                     diagnostics.target_candidate_count = Some(snapshot.target_candidate_count);
+                    diagnostics.frame_tree_frame_count = Some(snapshot.frame_tree_frame_count);
+                    diagnostics.attached_frame_target_count =
+                        Some(snapshot.attached_frame_target_count);
+                    diagnostics.blocked_frame_targets = snapshot.blocked_frame_targets.clone();
+                    diagnostics.frame_snapshot_errors = snapshot.frame_snapshot_errors.clone();
                 }
                 tracing::info!(
                     code = "A11Y_CDP_DOM_ATTACHED",
@@ -934,6 +939,10 @@ pub async fn enrich_input_with_cdp_for_target(
                     session_id = %snapshot.session_id,
                     requested_target_id = target_id_hint.unwrap_or_default(),
                     target_candidate_count = snapshot.target_candidate_count,
+                    frame_tree_frame_count = snapshot.frame_tree_frame_count,
+                    attached_frame_target_count = snapshot.attached_frame_target_count,
+                    blocked_frame_target_count = snapshot.blocked_frame_targets.len(),
+                    frame_snapshot_error_count = snapshot.frame_snapshot_errors.len(),
                     target_selection_reason = %snapshot.target_selection_reason,
                     node_count = count,
                     total_ax_nodes = snapshot.total_ax_nodes,
@@ -2743,6 +2752,10 @@ mod tests {
             selected_session_id: None,
             target_selection_reason: None,
             target_candidate_count: None,
+            frame_tree_frame_count: None,
+            attached_frame_target_count: None,
+            blocked_frame_targets: Vec::new(),
+            frame_snapshot_errors: Vec::new(),
         });
         assert!(!should_attempt_browser_ocr(&input));
 

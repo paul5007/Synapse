@@ -51,6 +51,8 @@ pub struct CdpDomNode {
     pub name: String,
     /// Accessible value (form fields, sliders), if any.
     pub value: Option<String>,
+    /// CDP Page.FrameId owning this node, when known.
+    pub frame_id: Option<String>,
     /// Element rectangle in CSS px / page-layout coords, if a box model resolved.
     pub bbox: Option<Rect>,
     /// Number of mapped child nodes.
@@ -175,7 +177,7 @@ pub fn build_accessible_nodes_for_target(
                     }),
                 name: node.name.clone(),
                 role: node.role.clone(),
-                automation_id: Some(format!("cdp:backendNodeId={}", node.backend_node_id)),
+                automation_id: Some(cdp_automation_id(target_id, node)),
                 value: node.value.clone(),
                 bbox: node.bbox.unwrap_or(Rect {
                     x: 0,
@@ -191,6 +193,22 @@ pub fn build_accessible_nodes_for_target(
             }
         })
         .collect()
+}
+
+fn cdp_automation_id(target_id: Option<&str>, node: &CdpDomNode) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if let Some(target_id) = target_id.filter(|value| !value.trim().is_empty()) {
+        parts.push(format!("targetId={}", target_id.trim()));
+    }
+    if let Some(frame_id) = node
+        .frame_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        parts.push(format!("frameId={}", frame_id.trim()));
+    }
+    parts.push(format!("backendNodeId={}", node.backend_node_id));
+    format!("cdp:{}", parts.join(";"))
 }
 
 /// Depth of `backend` = chain length to a root, memoised in `cache`. `guard`
@@ -263,6 +281,14 @@ pub struct CdpDomSnapshot {
     pub target_candidate_count: u32,
     /// Machine-readable reason this target was selected.
     pub target_selection_reason: String,
+    /// Number of frame documents enumerated from the selected page target.
+    pub frame_tree_frame_count: u32,
+    /// Number of related iframe targets reached through flat-session attachment.
+    pub attached_frame_target_count: u32,
+    /// Related iframe targets discovered but not surfaced, with explicit reasons.
+    pub blocked_frame_targets: Vec<String>,
+    /// Non-fatal per-frame snapshot errors. Root-page attach/tree failures still fail loud.
+    pub frame_snapshot_errors: Vec<String>,
 }
 
 /// Attaches CDP at `endpoint` and maps the selected tab into web nodes.
@@ -297,11 +323,7 @@ pub async fn fetch_dom_snapshot(
     target_id_hint: Option<&str>,
     max_nodes: usize,
 ) -> crate::A11yResult<CdpDomSnapshot> {
-    use std::collections::HashMap;
-
     use chromiumoxide::Browser;
-    use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetFullAxTreeParams};
-    use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, GetBoxModelParams};
     use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
     use futures_util::StreamExt as _;
 
@@ -343,27 +365,217 @@ pub async fn fetch_dom_snapshot(
             .filter(|url| !url.is_empty())
             .unwrap_or_else(|| selection.target_url.clone());
 
-        page.execute(EnableParams::default())
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Accessibility.enable: {err}"),
-            })?;
-        let tree = page
-            .execute(GetFullAxTreeParams::default())
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Accessibility.getFullAXTree: {err}"),
-            })?;
+        let mut frame_snapshot_errors = Vec::new();
+        if let Err(detail) = enable_flat_iframe_auto_attach(&page).await {
+            frame_snapshot_errors.push(detail);
+        } else {
+            // Give the handler one tick to receive Target.attachedToTarget events
+            // for already-present child frame targets before we read getTargets.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        let target_infos = match browser.execute(GetTargetsParams::default()).await {
+            Ok(response) => response.result.target_infos,
+            Err(error) => {
+                frame_snapshot_errors.push(format!(
+                    "Target.getTargets after iframe auto-attach failed: {error}; using initial target table"
+                ));
+                target_infos
+            }
+        };
+
+        let main_read =
+            fetch_target_dom_read(&page, &selection.target_id, max_nodes).await?;
+        frame_snapshot_errors.extend(main_read.frame_snapshot_errors.clone());
+
+        let mut nodes = build_accessible_nodes_for_target(
+            hwnd,
+            Some(&selection.target_id),
+            &main_read.dom_nodes,
+            max_nodes,
+        );
+        let mut total_ax_nodes = main_read.total_ax_nodes;
+        let mut frame_tree_frame_count = main_read.frame_tree_frame_count;
+        let mut attached_frame_target_count = 0_u32;
+        let mut blocked_frame_targets = Vec::new();
+        let related_iframe_targets = related_iframe_targets(&target_infos, &main_read.frame_ids);
+        for target in related_iframe_targets {
+            if nodes.len() >= max_nodes {
+                blocked_frame_targets.push(format!(
+                    "iframe target {} ({}) skipped because max_nodes={} was already reached",
+                    target.target_id.inner(),
+                    target.url,
+                    max_nodes
+                ));
+                continue;
+            }
+            let iframe_page = match wait_for_page_target(&browser, target.target_id.clone()).await {
+                Ok(page) => page,
+                Err(error) => {
+                    blocked_frame_targets.push(format!(
+                        "iframe target {} parentFrameId={} url={} was discovered in Target.getTargets but did not expose a callable flat session through chromiumoxide: {error}",
+                        target.target_id.inner(),
+                        target
+                            .parent_frame_id
+                            .as_ref()
+                            .map_or("", |frame_id| frame_id.inner().as_str()),
+                        target.url
+                    ));
+                    continue;
+                }
+            };
+            let remaining = max_nodes.saturating_sub(nodes.len());
+            match fetch_target_dom_read(&iframe_page, target.target_id.inner(), remaining).await {
+                Ok(read) => {
+                    attached_frame_target_count = attached_frame_target_count.saturating_add(1);
+                    total_ax_nodes = total_ax_nodes.saturating_add(read.total_ax_nodes);
+                    frame_tree_frame_count =
+                        frame_tree_frame_count.saturating_add(read.frame_tree_frame_count);
+                    frame_snapshot_errors.extend(read.frame_snapshot_errors.clone());
+                    nodes.extend(build_accessible_nodes_for_target(
+                        hwnd,
+                        Some(target.target_id.inner()),
+                        &read.dom_nodes,
+                        remaining,
+                    ));
+                }
+                Err(error) => {
+                    blocked_frame_targets.push(format!(
+                        "iframe target {} parentFrameId={} url={} attached but DOM/AX snapshot failed: {error}",
+                        target.target_id.inner(),
+                        target
+                            .parent_frame_id
+                            .as_ref()
+                            .map_or("", |frame_id| frame_id.inner().as_str()),
+                        target.url
+                    ));
+                }
+            }
+        }
+        Ok(CdpDomSnapshot {
+            nodes,
+            total_ax_nodes,
+            page_url,
+            target_id: selection.target_id,
+            session_id: selection.session_id,
+            target_candidate_count: selection.target_candidate_count,
+            target_selection_reason: selection.selection_reason,
+            frame_tree_frame_count,
+            attached_frame_target_count,
+            blocked_frame_targets,
+            frame_snapshot_errors,
+        })
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct CdpTargetDomRead {
+    dom_nodes: Vec<CdpDomNode>,
+    total_ax_nodes: u32,
+    frame_tree_frame_count: u32,
+    frame_ids: Vec<String>,
+    frame_snapshot_errors: Vec<String>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct CdpFrameDescriptor {
+    frame_id: Option<chromiumoxide::cdp::browser_protocol::page::FrameId>,
+    frame_id_wire: Option<String>,
+}
+
+#[cfg(windows)]
+async fn enable_flat_iframe_auto_attach(page: &chromiumoxide::Page) -> Result<(), String> {
+    use chromiumoxide::cdp::browser_protocol::target::{
+        FilterEntry, SetAutoAttachParams, TargetFilter,
+    };
+
+    let filter = TargetFilter::new(vec![
+        FilterEntry::builder()
+            .r#type("iframe")
+            .exclude(false)
+            .build(),
+    ]);
+    let params = SetAutoAttachParams::builder()
+        .auto_attach(true)
+        .wait_for_debugger_on_start(false)
+        .flatten(true)
+        .filter(filter)
+        .build()
+        .map_err(|error| format!("Target.setAutoAttach iframe params: {error}"))?;
+    page.execute(params)
+        .await
+        .map_err(|error| format!("Target.setAutoAttach iframe flatten=true failed: {error}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn fetch_target_dom_read(
+    page: &chromiumoxide::Page,
+    target_id: &str,
+    max_nodes: usize,
+) -> crate::A11yResult<CdpTargetDomRead> {
+    use std::collections::{HashMap, HashSet};
+
+    use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetFullAxTreeParams};
+    use chromiumoxide::cdp::browser_protocol::dom::{
+        BackendNodeId, GetBoxModelParams, GetDocumentParams,
+    };
+
+    use crate::A11yError;
+
+    page.execute(EnableParams::default())
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("target {target_id} Accessibility.enable: {err}"),
+        })?;
+
+    let mut frame_snapshot_errors = Vec::new();
+    let prime = GetDocumentParams::builder().depth(-1).pierce(true).build();
+    if let Err(error) = page.execute(prime).await {
+        frame_snapshot_errors.push(format!(
+            "target {target_id} DOM.getDocument depth=-1 pierce=true failed: {error}"
+        ));
+    }
+
+    let frames = frame_descriptors_for_page(page, target_id, &mut frame_snapshot_errors).await;
+    let mut dom_nodes = Vec::new();
+    let mut total_ax_nodes = 0_u32;
+    let mut first_frame_error = None;
+    let mut seen_backends = HashSet::new();
+
+    for frame in &frames {
+        let params = frame
+            .frame_id
+            .clone()
+            .map_or_else(GetFullAxTreeParams::default, |frame_id| {
+                GetFullAxTreeParams::builder().frame_id(frame_id).build()
+            });
+        let tree = match page.execute(params).await {
+            Ok(tree) => tree,
+            Err(error) => {
+                let detail = format!(
+                    "target {target_id} frame {} Accessibility.getFullAXTree failed: {error}",
+                    frame.frame_id_wire.as_deref().unwrap_or("<root>")
+                );
+                if first_frame_error.is_none() {
+                    first_frame_error = Some(detail.clone());
+                }
+                frame_snapshot_errors.push(detail);
+                continue;
+            }
+        };
 
         let ax_nodes = &tree.result.nodes;
-        // Index by AX node id so we can resolve the nearest backend-bearing ancestor.
         let by_ax_id: HashMap<&str, &_> = ax_nodes
             .iter()
             .map(|node| (node.node_id.inner().as_str(), node))
             .collect();
 
-        let mut dom_nodes: Vec<CdpDomNode> = Vec::new();
-        let mut total_ax_nodes = 0_u32;
         for node in ax_nodes {
             if node.ignored {
                 continue;
@@ -372,6 +584,9 @@ pub async fn fetch_dom_snapshot(
             let Some(backend) = node.backend_dom_node_id.as_ref().map(|id| *id.inner()) else {
                 continue;
             };
+            if !seen_backends.insert(backend) {
+                continue;
+            }
             let role = ax_value_string(node.role.as_ref());
             if role.is_empty() {
                 continue;
@@ -398,6 +613,7 @@ pub async fn fetch_dom_snapshot(
             } else {
                 None
             };
+            let frame_id = frame.frame_id_wire.clone();
 
             dom_nodes.push(CdpDomNode {
                 backend_node_id: backend,
@@ -405,33 +621,118 @@ pub async fn fetch_dom_snapshot(
                 role,
                 name,
                 value,
+                frame_id,
                 bbox,
                 child_count,
                 enabled: true,
                 focused: false,
             });
         }
-
-        let nodes = build_accessible_nodes_for_target(
-            hwnd,
-            Some(&selection.target_id),
-            &dom_nodes,
-            max_nodes,
-        );
-        Ok(CdpDomSnapshot {
-            nodes,
-            total_ax_nodes,
-            page_url,
-            target_id: selection.target_id,
-            session_id: selection.session_id,
-            target_candidate_count: selection.target_candidate_count,
-            target_selection_reason: selection.selection_reason,
-        })
     }
-    .await;
 
-    handler_task.abort();
-    result
+    if dom_nodes.is_empty()
+        && let Some(detail) = first_frame_error
+    {
+        return Err(A11yError::CdpAxtreeFailed { detail });
+    }
+
+    Ok(CdpTargetDomRead {
+        dom_nodes,
+        total_ax_nodes,
+        frame_tree_frame_count: u32::try_from(frames.len()).unwrap_or(u32::MAX),
+        frame_ids: frames
+            .iter()
+            .filter_map(|frame| frame.frame_id_wire.clone())
+            .collect(),
+        frame_snapshot_errors,
+    })
+}
+
+#[cfg(windows)]
+async fn frame_descriptors_for_page(
+    page: &chromiumoxide::Page,
+    target_id: &str,
+    frame_snapshot_errors: &mut Vec<String>,
+) -> Vec<CdpFrameDescriptor> {
+    use chromiumoxide::cdp::browser_protocol::page::GetFrameTreeParams;
+
+    match page.execute(GetFrameTreeParams::default()).await {
+        Ok(response) => {
+            let mut frames = Vec::new();
+            collect_frame_descriptors(&response.result.frame_tree, &mut frames);
+            if frames.is_empty() {
+                frame_snapshot_errors.push(format!(
+                    "target {target_id} Page.getFrameTree returned zero frames; falling back to root AX tree"
+                ));
+                vec![CdpFrameDescriptor {
+                    frame_id: None,
+                    frame_id_wire: None,
+                }]
+            } else {
+                frames
+            }
+        }
+        Err(error) => {
+            frame_snapshot_errors.push(format!(
+                "target {target_id} Page.getFrameTree failed: {error}; falling back to root AX tree"
+            ));
+            vec![CdpFrameDescriptor {
+                frame_id: None,
+                frame_id_wire: None,
+            }]
+        }
+    }
+}
+
+#[cfg(windows)]
+fn collect_frame_descriptors(
+    frame_tree: &chromiumoxide::cdp::browser_protocol::page::FrameTree,
+    out: &mut Vec<CdpFrameDescriptor>,
+) {
+    out.push(CdpFrameDescriptor {
+        frame_id: Some(frame_tree.frame.id.clone()),
+        frame_id_wire: Some(frame_tree.frame.id.inner().clone()),
+    });
+    if let Some(children) = frame_tree.child_frames.as_ref() {
+        for child in children {
+            collect_frame_descriptors(child, out);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn related_iframe_targets<'a>(
+    target_infos: &'a [chromiumoxide::cdp::browser_protocol::target::TargetInfo],
+    selected_frame_ids: &[String],
+) -> Vec<&'a chromiumoxide::cdp::browser_protocol::target::TargetInfo> {
+    target_infos
+        .iter()
+        .filter(|target| target.r#type == "iframe")
+        .filter(|target| {
+            target
+                .parent_frame_id
+                .as_ref()
+                .is_some_and(|frame_id| selected_frame_ids.iter().any(|id| id == frame_id.inner()))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+async fn wait_for_page_target(
+    browser: &chromiumoxide::Browser,
+    target_id: chromiumoxide::cdp::browser_protocol::target::TargetId,
+) -> Result<chromiumoxide::Page, String> {
+    let mut last_error = None;
+    for _ in 0..10 {
+        match browser.get_page(target_id.clone()).await {
+            Ok(page) => return Ok(page),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "target was not present".to_owned()))
 }
 
 #[cfg(windows)]
@@ -725,6 +1026,7 @@ mod tests {
                 role: "RootWebArea".to_owned(),
                 name: "Apply to YC".to_owned(),
                 value: None,
+                frame_id: None,
                 bbox: Some(Rect {
                     x: 0,
                     y: 0,
@@ -741,6 +1043,7 @@ mod tests {
                 role: "button".to_owned(),
                 name: "Apply".to_owned(),
                 value: None,
+                frame_id: None,
                 bbox: Some(Rect {
                     x: 16,
                     y: 69,
@@ -782,6 +1085,7 @@ mod tests {
                 role: "RootWebArea".to_owned(),
                 name: "Tab".to_owned(),
                 value: None,
+                frame_id: None,
                 bbox: None,
                 child_count: 1,
                 enabled: true,
@@ -793,6 +1097,7 @@ mod tests {
                 role: "button".to_owned(),
                 name: "Apply".to_owned(),
                 value: None,
+                frame_id: None,
                 bbox: None,
                 child_count: 0,
                 enabled: true,
@@ -828,6 +1133,7 @@ mod tests {
                 role: "link".to_owned(),
                 name: format!("link-{index}"),
                 value: None,
+                frame_id: None,
                 bbox: None,
                 child_count: 0,
                 enabled: true,

@@ -25,6 +25,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, GetLayoutMetricsParams, GetNavigationHistoryParams, NavigateParams,
     NavigateToHistoryEntryParams, ReloadParams, Viewport,
 };
+use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt as _;
@@ -1587,17 +1588,17 @@ async fn resolve_owning_page(
     target_id_hint: Option<&str>,
     backend_node_id: i64,
 ) -> A11yResult<chromiumoxide::Page> {
-    let pages = wait_for_pages(browser).await?;
     if let Some(target_id_hint) = target_id_hint.filter(|hint| !hint.trim().is_empty()) {
         let target_id_hint = target_id_hint.trim();
-        let page = pages
-            .into_iter()
-            .find(|page| page.target_id().inner().eq_ignore_ascii_case(target_id_hint))
-            .ok_or_else(|| A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "selected target {target_id_hint} is no longer present for backendNodeId {backend_node_id}"
-                ),
-            })?;
+        let page =
+            browser
+                .get_page(TargetId::new(target_id_hint.to_owned()))
+                .await
+                .map_err(|error| A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "selected target {target_id_hint} is no longer present for backendNodeId {backend_node_id}: {error}"
+                    ),
+                })?;
         return if page_owns_backend_node(&page, backend_node_id).await {
             Ok(page)
         } else {
@@ -1609,6 +1610,7 @@ async fn resolve_owning_page(
         };
     }
 
+    let pages = wait_for_pages(browser).await?;
     let mut ordered = Vec::with_capacity(pages.len());
     let mut tail = Vec::new();
     for page in pages {

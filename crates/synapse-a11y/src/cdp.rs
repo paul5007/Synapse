@@ -48,6 +48,9 @@ pub fn cdp_capabilities() -> Vec<CdpCapability> {
         CdpCapability::AccessibilityFullAxTree,
         CdpCapability::DomQuerySelector,
         CdpCapability::PageCaptureScreenshot,
+        CdpCapability::PageFrameTree,
+        CdpCapability::FlatIframeSessions,
+        CdpCapability::PiercedShadowDom,
     ]
 }
 
@@ -174,6 +177,10 @@ fn ok_diagnostics(process_name: &str, port: u16, checked_ports: Vec<u16>) -> Cdp
         selected_session_id: None,
         target_selection_reason: None,
         target_candidate_count: None,
+        frame_tree_frame_count: None,
+        attached_frame_target_count: None,
+        blocked_frame_targets: Vec::new(),
+        frame_snapshot_errors: Vec::new(),
     }
 }
 

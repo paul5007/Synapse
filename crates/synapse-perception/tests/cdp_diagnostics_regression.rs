@@ -159,6 +159,10 @@ fn attached_cdp_surfaces_ok_status_and_dom_elements() {
         selected_session_id: Some("session-1".to_owned()),
         target_selection_reason: Some("url_hint".to_owned()),
         target_candidate_count: Some(1),
+        frame_tree_frame_count: Some(1),
+        attached_frame_target_count: Some(0),
+        blocked_frame_targets: Vec::new(),
+        frame_snapshot_errors: Vec::new(),
     });
     input.web_path = Some(WebPerceptionPath::Cdp);
 

@@ -1327,6 +1327,7 @@ pub(crate) async fn fetch_dom_snapshot(
             role: node.role,
             name: node.name,
             value: node.value,
+            frame_id: None,
             bbox: node.bbox,
             child_count: node.child_count,
             enabled: node.enabled,
