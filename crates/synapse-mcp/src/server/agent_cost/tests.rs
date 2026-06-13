@@ -168,6 +168,16 @@ fn cost_params(spawn: Option<&str>, since: Option<u64>, until: Option<u64>) -> A
         spawn_id: spawn.map(ToOwned::to_owned),
         since_ns: since,
         until_ns: until,
+        include_per_turn: false,
+    }
+}
+
+fn cost_params_per_turn(spawn: Option<&str>) -> AgentCostParams {
+    AgentCostParams {
+        spawn_id: spawn.map(ToOwned::to_owned),
+        since_ns: None,
+        until_ns: None,
+        include_per_turn: true,
     }
 }
 
@@ -1031,5 +1041,245 @@ fn range_with_since_ge_until_is_rejected() {
         err.message.contains("AGENT_COST_RANGE_INVALID"),
         "{:?}",
         err.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-turn cost series (#950) — real ingestion path, synthetic known I/O
+// ---------------------------------------------------------------------------
+
+#[test]
+fn per_turn_codex_cumulative_delta_reconciles_to_spawn_total() {
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+
+    // Price the synthetic model: $1/Mtok input, $2/Mtok output, $0.1/Mtok cache-read.
+    service
+        .agent_cost_price_put_impl(AgentCostPricePutParams {
+            model_id: "synthetic-codex-turn".to_owned(),
+            provider: Some("local".to_owned()),
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 2.0,
+            cache_read_usd_per_mtok: 0.1,
+            cache_creation_usd_per_mtok: 0.0,
+            cache_creation_5m_usd_per_mtok: None,
+            cache_creation_1h_usd_per_mtok: None,
+        })
+        .expect("price");
+
+    // Synthetic 3-turn Codex stream. turn.completed usage is CUMULATIVE, so the
+    // per-turn series is the consecutive delta. Cumulatives chosen so the deltas
+    // are clean and each turn keeps cached <= input:
+    //   T1 cum (in=1000, cached=200, out=100) -> delta billable in=800  cr=200  out=100
+    //   T2 cum (in=3000, cached=900, out=300) -> delta billable in=1300 cr=700  out=200
+    //   T3 cum (in=6000, cached=2400,out=750) -> delta billable in=1500 cr=1500 out=450
+    // Session total billable: in=3600 cr=2400 out=750 (== sum of turns).
+    let stdout = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"th_synth\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"cached_input_tokens\":200,\"output_tokens\":100,\"reasoning_output_tokens\":0}}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":3000,\"cached_input_tokens\":900,\"output_tokens\":300,\"reasoning_output_tokens\":0}}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":6000,\"cached_input_tokens\":2400,\"output_tokens\":750,\"reasoning_output_tokens\":0}}\n",
+    );
+    let root = TempDir::new().expect("spawn root");
+    let spawn = "agent-spawn-codexturns";
+    let log_dir = plant_spawn_dir(root.path(), spawn, TranscriptSource::CodexExecJson, stdout);
+    // Codex exec --json carries no model id; the spawn manifest is authoritative.
+    std::fs::write(
+        log_dir.join("spawn-manifest.json"),
+        br#"{"model":"synthetic-codex-turn"}"#,
+    )
+    .expect("manifest");
+
+    let outcome = ingest_spawn_dir_once(&db, spawn, &log_dir, false).expect("ingest");
+    assert_eq!(
+        outcome.new_invalid_rows, 0,
+        "synthetic Codex stream must parse fully"
+    );
+
+    let out = service
+        .agent_cost_impl(cost_params_per_turn(Some(spawn)))
+        .expect("agent_cost per-turn");
+    assert_eq!(out.per_spawn.len(), 1);
+    let spawn_cost = &out.per_spawn[0];
+    assert_eq!(spawn_cost.status, "complete");
+
+    // Spawn total reconciles with the cumulative last row.
+    assert_eq!(spawn_cost.usage.input_tokens, 3600);
+    assert_eq!(spawn_cost.usage.cache_read_tokens, 2400);
+    assert_eq!(spawn_cost.usage.output_tokens, 750);
+
+    // Per-turn series: exact deltas.
+    let turns = spawn_cost.turns.as_ref().expect("per-turn series present");
+    assert_eq!(turns.len(), 3);
+    let expect = [
+        (1u64, 800u64, 200u64, 100u64),
+        (2, 1300, 700, 200),
+        (3, 1500, 1500, 450),
+    ];
+    for (turn, (ti, input, cache_read, output)) in turns.iter().zip(expect) {
+        assert_eq!(turn.turn_index, ti, "turn_index");
+        assert_eq!(turn.usage.input_tokens, input, "turn {ti} input");
+        assert_eq!(turn.usage.cache_read_tokens, cache_read, "turn {ti} cache_read");
+        assert_eq!(turn.usage.output_tokens, output, "turn {ti} output");
+        assert!(
+            matches!(turn.output_basis, TurnOutputBasis::Exact),
+            "codex output is exact"
+        );
+    }
+
+    // Reconciliation summary.
+    let summary = spawn_cost.turns_summary.as_ref().expect("turns summary");
+    assert_eq!(summary.method, "codex_cumulative_delta");
+    assert_eq!(summary.turn_count, 3);
+    assert!(summary.reconciles, "codex per-turn must reconcile exactly");
+    assert_eq!(
+        summary.turns_usage_sum, spawn_cost.usage,
+        "sum of per-turn usage == spawn total"
+    );
+
+    // Cost reconciliation: per-turn micro-USD costs sum to the spawn cost.
+    //   T1: 800*1 + 200*0.1 + 100*2 = 1020
+    //   T2: 1300*1 + 700*0.1 + 200*2 = 1770
+    //   T3: 1500*1 + 1500*0.1 + 450*2 = 2550   sum = 5340
+    let turn_costs: Vec<u64> = turns
+        .iter()
+        .map(|t| match &t.cost {
+            CostOutcome::Priced { cost } => cost.total_micro_usd,
+            CostOutcome::Unpriced { model_id } => panic!("turn unpriced: {model_id}"),
+        })
+        .collect();
+    assert_eq!(turn_costs, vec![1020, 1770, 2550]);
+    let CostOutcome::Priced { cost } = &spawn_cost.cost else {
+        panic!("spawn must be priced");
+    };
+    assert_eq!(cost.total_micro_usd, 5340);
+    assert_eq!(turn_costs.iter().sum::<u64>(), cost.total_micro_usd);
+}
+
+#[test]
+fn per_turn_omitted_by_default_and_present_only_when_requested() {
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+    let stdout = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"th_x\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":500,\"cached_input_tokens\":0,\"output_tokens\":50,\"reasoning_output_tokens\":0}}\n",
+    );
+    let root = TempDir::new().expect("spawn root");
+    let spawn = "agent-spawn-codex-single";
+    let log_dir = plant_spawn_dir(root.path(), spawn, TranscriptSource::CodexExecJson, stdout);
+    ingest_spawn_dir_once(&db, spawn, &log_dir, false).expect("ingest");
+
+    // Default: no turns field.
+    let out = service
+        .agent_cost_impl(cost_params(Some(spawn), None, None))
+        .expect("agent_cost default");
+    assert!(out.per_spawn[0].turns.is_none(), "turns omitted by default");
+    assert!(out.per_spawn[0].turns_summary.is_none());
+
+    // include_per_turn: a single-turn session yields a single reconciling turn.
+    let out = service
+        .agent_cost_impl(cost_params_per_turn(Some(spawn)))
+        .expect("agent_cost per-turn");
+    let turns = out.per_spawn[0].turns.as_ref().expect("turns present");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].turn_index, 1);
+    assert_eq!(turns[0].usage.input_tokens, 500);
+    assert_eq!(turns[0].usage.output_tokens, 50);
+    assert!(out.per_spawn[0].turns_summary.as_ref().unwrap().reconciles);
+}
+
+#[test]
+fn per_turn_codex_nonmonotonic_cumulative_is_a_loud_error() {
+    // Edge case (invalid input): Codex cumulative totals MUST be monotonic.
+    // A decrease means the transcript is corrupt — surfaced loudly, never
+    // clamped into a bogus negative-delta "turn".
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+    let stdout = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"th_bad\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":5000,\"cached_input_tokens\":0,\"output_tokens\":500,\"reasoning_output_tokens\":0}}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":3000,\"cached_input_tokens\":0,\"output_tokens\":600,\"reasoning_output_tokens\":0}}\n",
+    );
+    let root = TempDir::new().expect("spawn root");
+    let spawn = "agent-spawn-codexbad";
+    let log_dir = plant_spawn_dir(root.path(), spawn, TranscriptSource::CodexExecJson, stdout);
+    ingest_spawn_dir_once(&db, spawn, &log_dir, false).expect("ingest");
+
+    // Without per-turn the rollup still works (elementwise max).
+    service
+        .agent_cost_impl(cost_params(Some(spawn), None, None))
+        .expect("session rollup tolerates the rows");
+
+    // With per-turn the corrupt cumulative is surfaced as a loud error.
+    let err = service
+        .agent_cost_impl(cost_params_per_turn(Some(spawn)))
+        .expect_err("non-monotonic cumulative must error");
+    assert!(
+        err.message.contains("AGENT_COST_TURN_NONMONOTONIC"),
+        "{:?}",
+        err.message
+    );
+}
+
+#[test]
+fn per_turn_claude_real_fixture_exposes_per_message_with_partial_output_flag() {
+    // Edge case (different source, REAL capture): Claude per-turn is per-message
+    // (deduped by distinct message id, highest streaming line wins). Input/cache
+    // are reliable; output is a partial streaming snapshot, so the series is
+    // flagged partial_snapshot and does NOT claim to reconcile to the
+    // authoritative session `result` total.
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+    let root = TempDir::new().expect("spawn root");
+    let spawn = "agent-spawn-claudeturns";
+    let log_dir = plant_spawn_dir(
+        root.path(),
+        spawn,
+        TranscriptSource::ClaudeStreamJson,
+        CLAUDE_REAL_STREAM,
+    );
+    let outcome = ingest_spawn_dir_once(&db, spawn, &log_dir, false).expect("ingest");
+    assert_eq!(outcome.new_invalid_rows, 0, "real Claude capture parses fully");
+
+    let out = service
+        .agent_cost_impl(cost_params_per_turn(Some(spawn)))
+        .expect("agent_cost per-turn");
+    let sp = &out.per_spawn[0];
+    let turns = sp.turns.as_ref().expect("per-turn present");
+    // The real capture has 9 distinct assistant message ids = 9 turns.
+    assert_eq!(turns.len(), 9, "one turn per distinct assistant message");
+    for (i, turn) in turns.iter().enumerate() {
+        assert_eq!(
+            turn.turn_index,
+            u64::try_from(i + 1).unwrap(),
+            "claude turns are 1-based contiguous"
+        );
+        assert!(
+            matches!(turn.output_basis, TurnOutputBasis::PartialSnapshot),
+            "claude per-turn output is a partial snapshot"
+        );
+    }
+    let summary = sp.turns_summary.as_ref().expect("summary");
+    assert_eq!(summary.method, "claude_per_message");
+    assert_eq!(summary.turn_count, 9);
+    assert!(
+        !summary.reconciles,
+        "claude per-turn output is partial — must not claim reconciliation"
+    );
+    // The authoritative session output (spawn-level) exceeds the partial
+    // per-message output sum — the gap is surfaced, never hidden.
+    assert!(
+        summary.turns_usage_sum.output_tokens <= sp.usage.output_tokens,
+        "partial per-message output undercounts the authoritative session output"
     );
 }

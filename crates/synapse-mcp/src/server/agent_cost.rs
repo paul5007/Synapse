@@ -35,10 +35,24 @@
 //!   maximum across `turn.completed` rows (== the last, since totals are
 //!   monotonic) is the session total. (Summing turns over-counts.)
 //!
-//! Per-turn deltas and exact multi-model attribution from Claude `modelUsage`
-//! are tracked as follow-ups (#900 stores only the top-level result usage);
-//! the source-cost reconciliation delta surfaces any multi-model gap rather
-//! than hiding it.
+//! ## Per-turn series (#950)
+//!
+//! With `include_per_turn`, each completed spawn also carries a per-turn cost
+//! series reconstructed from the `turn_index`-stamped transcript rows:
+//!
+//! - **Codex** `turn.completed` rows are cumulative, so the per-turn usage is
+//!   the consecutive-`turn_index` delta. The deltas telescope to the spawn
+//!   total, so the series reconciles exactly; a non-monotonic cumulative is
+//!   corrupt data and is surfaced loudly, never clamped.
+//! - **Claude** per-turn is per-message (deduped by distinct message id, the
+//!   final streaming line winning). Input/cache are reliable but `output_tokens`
+//!   is a partial streaming snapshot, so each turn is flagged `partial_snapshot`
+//!   and the series is marked non-reconciling — the authoritative session output
+//!   stays the spawn-level `result` total, with the gap surfaced not hidden.
+//! - **Local** `local.turn.finished` rows are already per-turn and exact.
+//!
+//! Exact multi-model attribution from Claude `modelUsage` (#949) is per-spawn;
+//! per-turn cost is priced by the spawn's primary model.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -168,6 +182,15 @@ pub struct AgentCostParams {
     /// Upper bound (exclusive) on transcript-row ingestion time, unix ns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ns: Option<u64>,
+    /// When true, each completed `per_spawn` entry additionally carries a
+    /// per-turn cost series (`turns` + `turns_summary`). Codex turns are exact
+    /// cumulative-delta reconstructions that reconcile to the spawn total;
+    /// Claude turns expose reliable per-message input/cache with output flagged
+    /// as a partial streaming snapshot (the stream carries no authoritative
+    /// per-turn output — only the session `result` row does). Off by default so
+    /// the common rollup stays compact.
+    #[serde(default)]
+    pub include_per_turn: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -205,6 +228,13 @@ pub struct AgentSpawnCost {
     /// spawn carries exactly one entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<AgentSpawnModelCost>,
+    /// Per-turn cost series — present only when `include_per_turn` was set and
+    /// the spawn completed. Ordered by `turn_index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<Vec<AgentTurnCost>>,
+    /// Reconstruction method + reconciliation status for `turns`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns_summary: Option<TurnsSummary>,
 }
 
 /// One model's slice of a single spawn's cost, derived from the Claude
@@ -219,6 +249,56 @@ pub struct AgentSpawnModelCost {
     /// The CLI's own per-model cost (`modelUsage[model].costUSD`), micro-USD.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_reported_micro_usd: Option<u64>,
+}
+
+/// Whether a per-turn `output_tokens` figure is exact or a partial snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutputBasis {
+    /// Output is exact for this turn (Codex cumulative-delta reconstruction).
+    Exact,
+    /// Output is a partial streaming snapshot that undercounts the spawn's
+    /// authoritative session total (Claude repeats each message's `usage` across
+    /// streaming lines and the per-line `output_tokens` is partial). Use the
+    /// spawn-level total for billable output; this per-turn output is indicative.
+    PartialSnapshot,
+}
+
+/// One turn's cost within a spawn.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTurnCost {
+    /// 1-based turn index within the session (from the transcript row's
+    /// `turn_index`: Codex `turn.started`, Claude distinct assistant message id).
+    pub turn_index: u64,
+    /// Line number of the source row this turn was derived from, for
+    /// physical-row verification.
+    pub line_no: u64,
+    /// Canonical disjoint usage attributed to this turn.
+    pub usage: BillableUsage,
+    pub total_tokens: u64,
+    /// This turn priced by the spawn's primary model (or `unpriced`).
+    pub cost: CostOutcome,
+    /// Whether `usage.output_tokens` is exact or a partial snapshot.
+    pub output_basis: TurnOutputBasis,
+}
+
+/// How a spawn's per-turn series was reconstructed and whether it reconciles to
+/// the spawn's authoritative usage.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TurnsSummary {
+    /// `codex_cumulative_delta` or `claude_per_message`.
+    pub method: String,
+    pub turn_count: usize,
+    /// True only when the per-turn usage sums exactly to the spawn's
+    /// authoritative usage (Codex). False for Claude, whose per-turn output is a
+    /// partial snapshot — `turns_usage_sum` then differs from the spawn total in
+    /// output, by design, never silently.
+    pub reconciles: bool,
+    /// Sum of every turn's usage — lets the caller verify reconciliation against
+    /// the spawn-level `usage` directly.
+    pub turns_usage_sum: BillableUsage,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -559,6 +639,8 @@ impl SynapseService {
                     reconciliation_delta_micro_usd: None,
                     authoritative_line_no: None,
                     models: Vec::new(),
+                    turns: None,
+                    turns_summary: None,
                 });
                 continue;
             };
@@ -701,6 +783,17 @@ impl SynapseService {
                 Vec::new()
             };
 
+            // Optional per-turn series (#950). Built from the per-turn rows the
+            // accumulator collected, priced by the spawn's primary model.
+            let (turns, turns_summary) = if params.include_per_turn {
+                match build_spawn_turns(&acc, &resolved, &prices)? {
+                    Some((turns, summary)) => (Some(turns), Some(summary)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
             per_spawn.push(AgentSpawnCost {
                 spawn_id,
                 source: resolved.source_label(),
@@ -713,6 +806,8 @@ impl SynapseService {
                 reconciliation_delta_micro_usd: reconciliation_delta,
                 authoritative_line_no: Some(resolved.line_no),
                 models,
+                turns,
+                turns_summary,
             });
         }
 
@@ -774,7 +869,28 @@ struct SpawnAccumulator {
     /// endpoints report per-turn prompt/completion usage, not a cumulative
     /// terminal row.
     local_sum: Option<LocalSum>,
+    /// Per-turn raw usage keyed by `turn_index`, for the optional per-turn
+    /// series. Holds the turn's cumulative usage (Codex `turn.completed`), the
+    /// per-message usage (Claude `assistant`), or the per-turn usage (local
+    /// `local.turn.finished`). When a turn repeats across streaming lines the
+    /// highest-line row wins — the final chunk is the authoritative one;
+    /// first-seen would keep a placeholder snapshot.
+    turns: BTreeMap<u64, TurnRaw>,
     mixed_source: bool,
+}
+
+/// Raw token counts collected for one turn before delta / per-message
+/// resolution. Dimensions are source-native: for Codex `input`/`cache_read`
+/// are cumulative-through-this-turn; for Claude/local they are per-turn.
+#[derive(Clone, Copy, Debug, Default)]
+struct TurnRaw {
+    line_no: u64,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    cache_creation_5m: u64,
+    cache_creation_1h: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -916,6 +1032,29 @@ impl SpawnAccumulator {
             }
             _ => {}
         }
+
+        // Per-turn collection (consumed only when include_per_turn is set).
+        // The row class that carries a turn's usage differs by source; a turn
+        // repeated across streaming lines keeps the highest-line row.
+        let is_turn_usage_row = match record.source {
+            TranscriptSource::ClaudeStreamJson => kind == "assistant",
+            TranscriptSource::CodexExecJson => kind == "turn.completed",
+            TranscriptSource::LocalModelJson => kind == "local.turn.finished",
+        };
+        if is_turn_usage_row && let Some(turn_index) = record.turn_index {
+            let entry = self.turns.entry(turn_index).or_default();
+            if record.line_no >= entry.line_no {
+                *entry = TurnRaw {
+                    line_no: record.line_no,
+                    input: usage.input_tokens.unwrap_or(0),
+                    output: usage.output_tokens.unwrap_or(0),
+                    cache_read: usage.cache_read_input_tokens.unwrap_or(0),
+                    cache_creation: usage.cache_creation_input_tokens.unwrap_or(0),
+                    cache_creation_5m: usage.cache_creation_5m_input_tokens.unwrap_or(0),
+                    cache_creation_1h: usage.cache_creation_1h_input_tokens.unwrap_or(0),
+                };
+            }
+        }
         Ok(())
     }
 
@@ -1038,6 +1177,136 @@ fn sum_usage(models: &[ResolvedModel]) -> BillableUsage {
         add_usage(&mut total, &model.usage);
     }
     total
+}
+
+/// Prices one turn's usage by the spawn's primary model, or returns an honest
+/// `unpriced` marker carrying the model id (never a guess).
+fn price_turn_usage(
+    usage: &BillableUsage,
+    price: Option<&ModelPrice>,
+    model_label: &str,
+) -> Result<CostOutcome, ErrorData> {
+    match price {
+        Some(price) => {
+            let cost = price
+                .cost_micro_usd(usage)
+                .map_err(|detail| mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail))?;
+            Ok(CostOutcome::Priced { cost })
+        }
+        None => Ok(CostOutcome::Unpriced {
+            model_id: model_label.to_owned(),
+        }),
+    }
+}
+
+/// Reconstructs a spawn's per-turn cost series from the raw per-turn rows.
+///
+/// - **Codex**: the rows hold cumulative-through-turn totals; consecutive
+///   `turn_index` deltas recover the exact per-turn block (each turn's
+///   `cached <= input` holds, so the delta is well-formed). The deltas
+///   telescope to the spawn total, so the series reconciles exactly. A
+///   non-monotonic cumulative is corrupt data and is surfaced, never clamped.
+/// - **Claude**: the rows hold per-message usage. Input/cache are reliable;
+///   `output_tokens` is a partial streaming snapshot, so the series is flagged
+///   `partial_snapshot` and does not reconcile to the authoritative session
+///   `result` total in output (by design, surfaced via `reconciles=false`).
+/// - **Local**: `local.turn.finished` rows are already per-turn and exact.
+fn build_spawn_turns(
+    acc: &SpawnAccumulator,
+    resolved: &ResolvedSpawn,
+    prices: &BTreeMap<String, ModelPrice>,
+) -> Result<Option<(Vec<AgentTurnCost>, TurnsSummary)>, ErrorData> {
+    if acc.turns.is_empty() {
+        return Ok(None);
+    }
+    let model_label = resolved
+        .model
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    let price = prices.get(&ModelPrice::normalize_id(&model_label));
+
+    let (method, output_basis, exact) = match resolved.source {
+        TranscriptSource::CodexExecJson => {
+            ("codex_cumulative_delta", TurnOutputBasis::Exact, true)
+        }
+        TranscriptSource::ClaudeStreamJson => {
+            ("claude_per_message", TurnOutputBasis::PartialSnapshot, false)
+        }
+        TranscriptSource::LocalModelJson => ("local_per_turn", TurnOutputBasis::Exact, true),
+    };
+
+    let mut turns = Vec::with_capacity(acc.turns.len());
+    let mut turns_usage_sum = BillableUsage::default();
+    // Codex delta state: previous turn's cumulative (input, output, cached).
+    let mut prev_cumulative = (0u64, 0u64, 0u64);
+
+    for (&turn_index, raw) in &acc.turns {
+        let usage = match resolved.source {
+            TranscriptSource::CodexExecJson => {
+                let delta_input = raw.input.checked_sub(prev_cumulative.0);
+                let delta_output = raw.output.checked_sub(prev_cumulative.1);
+                let delta_cached = raw.cache_read.checked_sub(prev_cumulative.2);
+                let (Some(delta_input), Some(delta_output), Some(delta_cached)) =
+                    (delta_input, delta_output, delta_cached)
+                else {
+                    return Err(mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "AGENT_COST_TURN_NONMONOTONIC: spawn turn {turn_index} cumulative \
+                             usage decreased (in={} out={} cached={} vs prev in={} out={} \
+                             cached={}); Codex turn totals must be monotonic — transcript corrupt",
+                            raw.input,
+                            raw.output,
+                            raw.cache_read,
+                            prev_cumulative.0,
+                            prev_cumulative.1,
+                            prev_cumulative.2,
+                        ),
+                    ));
+                };
+                prev_cumulative = (raw.input, raw.output, raw.cache_read);
+                BillableUsage::from_codex_cumulative(delta_input, delta_output, delta_cached)
+                    .map_err(|detail| mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail))?
+            }
+            TranscriptSource::ClaudeStreamJson => BillableUsage::from_claude_with_ttl(
+                raw.input,
+                raw.output,
+                raw.cache_read,
+                raw.cache_creation,
+                raw.cache_creation_5m,
+                raw.cache_creation_1h,
+            ),
+            TranscriptSource::LocalModelJson => BillableUsage {
+                input_tokens: raw.input,
+                output_tokens: raw.output,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_creation_5m_tokens: 0,
+                cache_creation_1h_tokens: 0,
+            },
+        };
+        add_usage(&mut turns_usage_sum, &usage);
+        let cost = price_turn_usage(&usage, price, &model_label)?;
+        turns.push(AgentTurnCost {
+            turn_index,
+            line_no: raw.line_no,
+            usage,
+            total_tokens: usage.total_tokens(),
+            cost,
+            output_basis,
+        });
+    }
+
+    let summary = TurnsSummary {
+        method: method.to_owned(),
+        turn_count: turns.len(),
+        // Exact only for the cumulative-delta / per-turn sources AND only when
+        // the reconstructed series actually sums to the spawn total — surfaced,
+        // never asserted blindly.
+        reconciles: exact && turns_usage_sum == resolved.usage,
+        turns_usage_sum,
+    };
+    Ok(Some((turns, summary)))
 }
 
 fn acc_source_label(acc: &SpawnAccumulator) -> Option<String> {
