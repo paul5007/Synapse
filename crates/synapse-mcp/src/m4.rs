@@ -6244,14 +6244,13 @@ fn attempt_shell_job_remote_cleanup(
     };
     let cleanup_status = parse_remote_cleanup_status(&readback.stdout, &pid, &pgid);
     match cleanup_status.as_deref() {
-        Some("already_gone" | "terminated" | "killed") => {
+        Some(status @ ("already_gone" | "terminated" | "killed")) => {
             job.remote_process_scope.remote_cleanup_verified = true;
             job.remote_process_scope.remote_cleanup_status =
                 SHELL_REMOTE_CLEANUP_VERIFIED.to_owned();
             job.remote_process_scope.remote_cleanup_error_code = None;
             job.remote_process_scope.remote_cleanup_message = Some(format!(
-                "{trigger} verified SSH remote cleanup for remote pid {pid}, process group {pgid}; cleanup command status={}",
-                cleanup_status.unwrap()
+                "{trigger} verified SSH remote cleanup for remote pid {pid}, process group {pgid}; cleanup command status={status}"
             ));
             push_unique_evidence(
                 &mut job.remote_process_scope.detection_evidence,

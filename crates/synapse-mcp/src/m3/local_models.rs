@@ -34,16 +34,14 @@ const MAX_PROBE_TIMEOUT_MS: u64 = 120_000;
 const RAW_RESPONSE_EXCERPT_CHARS: usize = 2048;
 const PROBE_TOOL_NAME: &str = "synapse_probe";
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+/// A raw `(key, value)` row as returned by a column-family scan.
+type RawRow = (Vec<u8>, Vec<u8>);
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalModelApiShape {
+    #[default]
     OpenAiChatCompletions,
-}
-
-impl Default for LocalModelApiShape {
-    fn default() -> Self {
-        Self::OpenAiChatCompletions
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -997,7 +995,7 @@ fn read_model_row_optional(
     })
 }
 
-fn scan_exact_row(db: &Arc<Db>, row_key: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>, ErrorData> {
+fn scan_exact_row(db: &Arc<Db>, row_key: &str) -> Result<Option<RawRow>, ErrorData> {
     let key_bytes = row_key.as_bytes();
     let rows = db
         .scan_cf_prefix(cf::CF_KV, key_bytes)
