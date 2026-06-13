@@ -4,147 +4,16 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 139] = [
-    "act_click",
-    "act_clipboard",
-    "act_combo",
-    "act_focus_window",
-    "act_keymap",
-    "act_launch",
-    "act_pad",
-    "act_press",
-    "act_run_shell",
-    "act_run_shell_cancel",
-    "act_run_shell_start",
-    "act_run_shell_status",
-    "act_scroll",
-    "act_set_field_text",
-    "act_set_value",
-    "act_spawn_agent",
-    "act_stroke",
-    "act_type",
-    "action_diagnostic_queue_full_setup",
-    "action_diagnostic_rate_limit_override",
-    "agent_cost",
-    "agent_cost_price_delete",
-    "agent_cost_price_list",
-    "agent_cost_price_put",
-    "agent_inbox",
-    "agent_send",
-    "agent_stats",
-    "agent_wait",
-    "approval_decide",
-    "approval_list",
-    "approval_request",
-    "audio_tail",
-    "audio_transcribe",
-    "audit_export_bundle",
-    "audit_intelligence_query",
-    "capture_screenshot",
-    "cdp_close_tab",
-    "cdp_navigate_tab",
-    "cdp_open_tab",
-    "clear_target",
-    "control_lease_acquire",
-    "control_lease_handoff",
-    "control_lease_release",
-    "control_lease_status",
-    "episode_get",
-    "episode_list",
-    "episode_segment",
-    "everquest_action_prior_record",
-    "everquest_action_prior_scorecard",
-    "everquest_autocombat",
-    "everquest_chat_input_state",
-    "everquest_contextgraph_ingest",
-    "everquest_contextgraph_search",
-    "everquest_current_state",
-    "everquest_domain_normalize",
-    "everquest_episode_export",
-    "everquest_loc_probe",
-    "everquest_map_sensor",
-    "everquest_memory_consult",
-    "everquest_memory_record",
-    "everquest_outcome_ingest",
-    "everquest_planner_guard",
-    "everquest_predictive_model_fit",
-    "everquest_predictive_model_predict",
-    "everquest_route_plan",
-    "everquest_safe_command",
-    "everquest_surprise_detect",
-    "everquest_survival_readiness",
-    "everquest_trajectory_record",
-    "everquest_world_model_inspect",
-    "everquest_world_model_record",
-    "everquest_world_summary",
-    "find",
-    "get_target",
-    "health",
-    "hidden_desktop_pip_frame",
-    "hygiene_flags",
-    "hygiene_scan_storage",
-    "hygiene_scan_text",
-    "local_model_list",
-    "local_model_probe",
-    "local_model_register",
-    "local_model_remove",
-    "local_model_update",
-    "notify_human",
-    "observe",
-    "observe_delta",
-    "profile_activate",
-    "profile_authoring_decide",
-    "profile_authoring_export",
-    "profile_authoring_generate",
-    "profile_authoring_inspect",
-    "profile_authoring_list",
-    "profile_list",
-    "profile_quality_refresh",
-    "profile_registry_disable",
-    "profile_registry_export",
-    "profile_registry_import",
-    "profile_registry_install",
-    "profile_registry_query",
-    "profile_registry_rollback",
-    "read_text",
-    "reality_audit",
-    "reality_baseline",
-    "reflex_cancel",
-    "reflex_history",
-    "reflex_list",
-    "reflex_register",
-    "release_all",
-    "replay_record",
-    "routine_inspect",
-    "routine_list",
-    "routine_mine",
-    "routine_update",
-    "session_end",
-    "session_list",
-    "session_status",
-    "set_capture_target",
-    "set_perception_mode",
-    "set_target",
-    "storage_gc_once",
-    "storage_inspect",
-    "storage_pressure_sample",
-    "storage_put_probe_rows",
-    "subscribe",
-    "subscribe_cancel",
-    "target_claim",
-    "target_claim_adopt",
-    "target_claim_status",
-    "target_release",
-    "timeline_exclusions",
-    "timeline_pause",
-    "timeline_purge",
-    "timeline_resume",
-    "timeline_search",
-    "workspace_get",
-    "workspace_list",
-    "workspace_put",
-    "workspace_subscribe",
-];
+// The exact full tool surface is recorded by the insta snapshot in
+// `m4_tools_list_snapshot_defaults_and_closed_schemas` — that snapshot is the
+// single source of truth (golden master) for the names and the count. There is
+// deliberately NO hardcoded `EXPECTED_TOOLS` array/count literal here: a second
+// hand-maintained copy of the surface silently drifts whenever a tool lands
+// under `[skip ci]` (the old array was stale by 13 tools by #903). Adding or
+// removing a tool is now a single reviewable `cargo insta review` of the
+// snapshot, never a stale magic array. This test asserts only the structural
+// invariants the snapshot cannot express on its own (non-empty surface, unique
+// names, closed schemas, defaults/required fields). See #953.
 
 #[tokio::test]
 async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<()> {
@@ -165,13 +34,10 @@ async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<
         .context("tools array missing")?;
 
     let names = sorted_tool_names(tools)?;
-    let expected = EXPECTED_TOOLS
-        .iter()
-        .copied()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    assert_eq!(names, expected);
-    assert_eq!(names.len(), EXPECTED_TOOLS.len());
+    // Structural invariants only — the exact names/count are pinned by the insta
+    // snapshot below (the single source of truth), so a drift fails loudly there
+    // and is fixed with `cargo insta review`, not by editing a magic array (#953).
+    ensure!(!names.is_empty(), "tools/list returned an empty tool surface");
     assert_no_duplicate_names(&names)?;
 
     assert_schema_roots_closed(tools)?;
