@@ -49,7 +49,12 @@ pub enum LocalModelApiShape {
 pub enum LocalModelRuntimePreset {
     #[default]
     OpenAiCompatible,
+    #[serde(
+        rename = "deepseek_v4_flash_non_thinking",
+        alias = "deep_seek_v4_flash_non_thinking"
+    )]
     DeepSeekV4FlashNonThinking,
+    #[serde(rename = "deepseek_v4_reasoning", alias = "deep_seek_v4_reasoning")]
     DeepSeekV4Reasoning,
 }
 
@@ -1438,6 +1443,27 @@ mod tests {
             updated_by_session: "test".to_owned(),
             last_probe: None,
         })
+    }
+
+    #[test]
+    fn deepseek_runtime_preset_wire_names_do_not_gain_word_boundary() {
+        assert_eq!(
+            serde_json::to_value(LocalModelRuntimePreset::DeepSeekV4FlashNonThinking)
+                .expect("runtime preset serializes"),
+            json!("deepseek_v4_flash_non_thinking")
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalModelRuntimePreset>(json!(
+                "deep_seek_v4_flash_non_thinking"
+            ))
+            .expect("legacy accidental spelling remains accepted"),
+            LocalModelRuntimePreset::DeepSeekV4FlashNonThinking
+        );
+        assert_eq!(
+            serde_json::to_value(LocalModelRuntimePreset::DeepSeekV4Reasoning)
+                .expect("runtime preset serializes"),
+            json!("deepseek_v4_reasoning")
+        );
     }
 
     #[test]
