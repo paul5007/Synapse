@@ -25,8 +25,12 @@
 .PARAMETER Bind
   Daemon bind address. Default 127.0.0.1:7700 (the shared daemon).
 
-.PARAMETER Db
+.PARAMETER DbPath
   RocksDB path. Default: the daemon's standard %LOCALAPPDATA% location.
+
+.PARAMETER ProfileDir
+  Profile directory passed to synapse-mcp. Defaults to the installed binary's
+  sibling profiles directory, matching the standard shared daemon launcher.
 
 .EXAMPLE
   pwsh -File scripts/run-daemon-with-secrets.ps1
@@ -37,7 +41,9 @@ param(
   [string]$UaEnvFile = (Join-Path $env:USERPROFILE ".config\aiwonder.env"),
   [string]$Env = "dev",
   [string]$Bind = "127.0.0.1:7700",
-  [string]$Db
+  [string]$DbPath,
+  [string]$ProfileDir,
+  [string]$LogLevel = "info"
 )
 $ErrorActionPreference = "Stop"
 
@@ -70,8 +76,14 @@ $token = & infisical login --method=universal-auth `
 if ([string]::IsNullOrWhiteSpace($token)) { Fail "Infisical universal-auth login failed (check the UA client id/secret)" }
 
 # --- exec the daemon under infisical run (secrets injected as env vars) ---
+if (-not $ProfileDir) {
+  $ProfileDir = Join-Path (Split-Path -Parent $exe) "profiles"
+}
+
 $daemonArgs = @('--mode','http','--bind',$Bind)
-if ($Db) { $daemonArgs += @('--db',$Db) }
+if ($DbPath) { $daemonArgs += @('--db',$DbPath) }
+if ($ProfileDir) { $daemonArgs += @('--profile-dir',$ProfileDir) }
+if ($LogLevel) { $daemonArgs += @('--log-level',$LogLevel) }
 
 Write-Host "Starting daemon with Infisical-injected secrets: $exe $($daemonArgs -join ' ')"
 & infisical run `
