@@ -3933,15 +3933,17 @@ fn read_spawned_agent_control_artifact(
             "control_path": path.display().to_string(),
         }));
     }
-    let control = serde_json::from_slice::<SpawnedAgentControlRead>(&bytes).map_err(|error| {
-        json!({
-            "reason": "codex_control_artifact_json_invalid",
-            "control_path": path.display().to_string(),
-            "bytes": bytes.len(),
-            "error": error.to_string(),
-            "text": String::from_utf8_lossy(&bytes).into_owned(),
-        })
-    })?;
+    let json_bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let control =
+        serde_json::from_slice::<SpawnedAgentControlRead>(json_bytes).map_err(|error| {
+            json!({
+                "reason": "codex_control_artifact_json_invalid",
+                "control_path": path.display().to_string(),
+                "bytes": bytes.len(),
+                "error": error.to_string(),
+                "text": String::from_utf8_lossy(&bytes).into_owned(),
+            })
+        })?;
     let mut validation_errors = Vec::new();
     if control.schema_version != 1 {
         validation_errors.push("schema_version mismatch");
@@ -4467,6 +4469,35 @@ mod tests {
         assert_eq!(control.thread_id.as_deref(), Some("thread-1"));
         assert_eq!(control.turn_id.as_deref(), Some("turn-1"));
 
+        let mut bom_prefixed = vec![0xEF, 0xBB, 0xBF];
+        bom_prefixed.extend(
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "protocol": "codex_app_server_ws",
+                "endpoint": "ws://127.0.0.1:38658",
+                "control_path": control_path.display().to_string(),
+                "events_path": files
+                    .codex_app_server_events_path
+                    .as_ref()
+                    .expect("events path")
+                    .display()
+                    .to_string(),
+                "app_server_process_id": 1234,
+                "thread_id": "thread-bom",
+                "turn_id": "turn-bom",
+                "turn_status": "inProgress",
+                "last_error": null,
+                "updated_at_unix_ms": 123456
+            }))
+            .expect("encode bom control"),
+        );
+        fs::write(&control_path, bom_prefixed).expect("write bom control");
+        let control = read_spawned_agent_control_artifact(&files, ActSpawnAgentCli::Codex)
+            .expect("bom control read")
+            .expect("codex control present");
+        assert_eq!(control.thread_id.as_deref(), Some("thread-bom"));
+        assert_eq!(control.turn_id.as_deref(), Some("turn-bom"));
+
         fs::write(
             &control_path,
             serde_json::to_vec_pretty(&json!({
@@ -4541,6 +4572,20 @@ mod tests {
         assert!(
             CODEX_APP_SERVER_RUNNER_SCRIPT.contains("ConvertTo-Json -Compress -Depth 20"),
             "JSON-RPC request encoding should use bounded schema depth, not an unbounded diagnostic depth"
+        );
+        assert!(
+            CODEX_APP_SERVER_RUNNER_SCRIPT
+                .contains("$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)")
+                && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("Write-TextNoBom -Path $tmp")
+                && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("Append-LineNoBom"),
+            "Codex app-server control/events files must be written without a UTF-8 BOM"
+        );
+        let interrupt_script = include_str!("codex_app_server_interrupt.ps1");
+        assert!(
+            interrupt_script.contains("$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)")
+                && interrupt_script.contains("Write-TextNoBom -Path $tmp")
+                && interrupt_script.contains("Append-LineNoBom"),
+            "Codex app-server interrupt control/events files must be written without a UTF-8 BOM"
         );
     }
 

@@ -38,6 +38,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+function Write-TextNoBom([string]$Path, [string]$Value) {
+    [System.IO.File]::WriteAllText($Path, $Value, $Utf8NoBom)
+}
+
+function Append-LineNoBom([string]$Path, [string]$Value) {
+    [System.IO.File]::AppendAllText($Path, ($Value + [Environment]::NewLine), $Utf8NoBom)
+}
 
 function Get-UnixMs {
     return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -52,7 +61,7 @@ function Add-JsonLine([string]$Path, [object]$Value) {
     if ($Value -isnot [string]) {
         $json = $Value | ConvertTo-Json -Compress -Depth 100
     }
-    Add-Content -LiteralPath $Path -Value $json -Encoding UTF8
+    Append-LineNoBom -Path $Path -Value $json
 }
 
 function Get-JsonProperty($Object, [string]$Name) {
@@ -94,7 +103,7 @@ function Write-Control([hashtable]$Patch) {
     $current['updated_at_unix_ms'] = Get-UnixMs
     [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($ControlPath)) | Out-Null
     $tmp = "$ControlPath.tmp.$PID"
-    $current | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $tmp -Encoding UTF8
+    Write-TextNoBom -Path $tmp -Value ($current | ConvertTo-Json -Depth 100)
     Move-Item -LiteralPath $tmp -Destination $ControlPath -Force
 }
 
@@ -390,7 +399,7 @@ try {
                     control_path = $ControlPath
                 } | ConvertTo-Json -Depth 20)
             }
-            Set-Content -LiteralPath $FinalMessagePath -Value $finalText -Encoding UTF8
+            Write-TextNoBom -Path $FinalMessagePath -Value $finalText
             Write-Control @{ turn_status = $script:TurnStatus }
             exit 0
         }
@@ -398,7 +407,7 @@ try {
 } catch {
     $script:LastErrorText = $_.Exception.Message
     Write-Control @{ last_error = $script:LastErrorText; turn_status = 'runner_error' }
-    Add-Content -LiteralPath $StderrPath -Value ("SYNAPSE_CODEX_APP_SERVER_RUNNER_ERROR: " + $script:LastErrorText) -Encoding UTF8
+    Append-LineNoBom -Path $StderrPath -Value ("SYNAPSE_CODEX_APP_SERVER_RUNNER_ERROR: " + $script:LastErrorText)
     exit 1
 } finally {
     if ($null -ne $socket) {

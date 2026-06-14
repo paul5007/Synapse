@@ -18,6 +18,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+function Write-TextNoBom([string]$Path, [string]$Value) {
+    [System.IO.File]::WriteAllText($Path, $Value, $Utf8NoBom)
+}
+
+function Append-LineNoBom([string]$Path, [string]$Value) {
+    [System.IO.File]::AppendAllText($Path, ($Value + [Environment]::NewLine), $Utf8NoBom)
+}
 
 function Get-UnixMs {
     return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -28,7 +37,7 @@ function Add-JsonLine([string]$Path, [object]$Value) {
     if ($Value -isnot [string]) {
         $json = $Value | ConvertTo-Json -Compress -Depth 100
     }
-    Add-Content -LiteralPath $Path -Value $json -Encoding UTF8
+    Append-LineNoBom -Path $Path -Value $json
 }
 
 function Get-JsonProperty($Object, [string]$Name) {
@@ -59,7 +68,7 @@ function Update-Control([string]$Status, [string]$ErrorText) {
     $current['last_interrupt_at_unix_ms'] = Get-UnixMs
     $current['updated_at_unix_ms'] = Get-UnixMs
     $tmp = "$ControlPath.tmp.interrupt.$PID"
-    $current | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $tmp -Encoding UTF8
+    Write-TextNoBom -Path $tmp -Value ($current | ConvertTo-Json -Depth 100)
     Move-Item -LiteralPath $tmp -Destination $ControlPath -Force
 }
 

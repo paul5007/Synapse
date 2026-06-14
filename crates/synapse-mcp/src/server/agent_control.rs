@@ -482,9 +482,7 @@ impl SynapseService {
         let mut send_row = None;
 
         let codex = self.deliver_codex_app_server_interrupt(target);
-        if delivered_via.is_none() && codex.status == "delivered" {
-            delivered_via = Some(codex.channel.clone());
-        }
+        record_first_delivered_channel(&mut delivered_via, &codex);
         attempts.push(codex);
         attempts.push(ChannelAttempt {
             channel: "claude_stream_json_control".to_owned(),
@@ -500,7 +498,7 @@ impl SynapseService {
         // Rank 3: cooperative mailbox interrupt — the one wired channel.
         let mailbox = self.deliver_mailbox_interrupt(target, caller_session);
         if mailbox.status == "delivered" {
-            delivered_via = Some(mailbox.channel.clone());
+            record_first_delivered_channel(&mut delivered_via, &mailbox);
             send_row.clone_from(&mailbox.row_key);
         }
         attempts.push(mailbox);
@@ -1289,6 +1287,12 @@ fn compact_for_channel_reason(value: &str) -> String {
         compact
     } else {
         format!("{}...", &compact[..LIMIT])
+    }
+}
+
+fn record_first_delivered_channel(delivered_via: &mut Option<String>, attempt: &ChannelAttempt) {
+    if delivered_via.is_none() && attempt.status == "delivered" {
+        *delivered_via = Some(attempt.channel.clone());
     }
 }
 

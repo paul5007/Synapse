@@ -107,6 +107,36 @@ async fn wait_for_tree_exit_reports_survivors_after_grace() {
     );
 }
 
+#[test]
+fn delivered_via_preserves_highest_ranked_successful_channel() {
+    let mut delivered_via = None;
+    let codex = ChannelAttempt {
+        channel: "codex_app_server_turn_interrupt".to_owned(),
+        rank: 1,
+        status: "delivered".to_owned(),
+        reason: "synthetic rank-1 delivery".to_owned(),
+        message_id: Some("turn-1".to_owned()),
+        row_key: Some("codex-control.json".to_owned()),
+    };
+    let mailbox = ChannelAttempt {
+        channel: "mailbox_interrupt".to_owned(),
+        rank: 3,
+        status: "delivered".to_owned(),
+        reason: "synthetic cooperative fallback delivery".to_owned(),
+        message_id: Some("message-1".to_owned()),
+        row_key: Some("agent-mailbox/v1/row".to_owned()),
+    };
+
+    record_first_delivered_channel(&mut delivered_via, &codex);
+    record_first_delivered_channel(&mut delivered_via, &mailbox);
+
+    assert_eq!(
+        delivered_via.as_deref(),
+        Some("codex_app_server_turn_interrupt"),
+        "lower-ranked mailbox delivery must not overwrite the rank-1 Codex interrupt verdict"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Real-process supporting regression coverage (#904)
 // ---------------------------------------------------------------------------
