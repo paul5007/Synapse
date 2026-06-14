@@ -7189,7 +7189,7 @@ fn reconcile_shell_job_process_state(
             job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
             job.error_message =
                 Some("job process exited before the monitor persisted final status".to_owned());
-            write_shell_job_status(&paths.status_path, &job)?;
+            job = write_shell_job_reconciliation_status(paths, job)?;
         }
         return Ok(job);
     }
@@ -7204,8 +7204,7 @@ fn reconcile_shell_job_process_state(
             .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
         job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
         job.error_message = Some("job status had no pid while marked live".to_owned());
-        write_shell_job_status(&paths.status_path, &job)?;
-        return Ok(job);
+        return write_shell_job_reconciliation_status(paths, job);
     };
     if shell_job_live_process_ids(&[pid]).contains(&pid) {
         return Ok(job);
@@ -7221,16 +7220,53 @@ fn reconcile_shell_job_process_state(
             .get_or_insert_with(|| chrono::Utc::now().to_rfc3339());
         job.duration_ms
             .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
-        write_shell_job_status(&paths.status_path, &job)?;
-        return Ok(job);
+        return write_shell_job_reconciliation_status(paths, job);
     }
     job.status = "finalizing".to_owned();
     job.completed_at
         .get_or_insert_with(|| chrono::Utc::now().to_rfc3339());
     job.duration_ms
         .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
-    write_shell_job_status(&paths.status_path, &job)?;
-    Ok(job)
+    write_shell_job_reconciliation_status(paths, job)
+}
+
+fn write_shell_job_reconciliation_status(
+    paths: &ShellJobPaths,
+    candidate: ActRunShellJobStatus,
+) -> Result<ActRunShellJobStatus, ErrorData> {
+    let latest = read_shell_job_status(&paths.status_path, &candidate.job_id)?;
+    if shell_job_latest_terminal_should_win(&latest, &candidate) {
+        tracing::info!(
+            code = "M4_ACT_RUN_SHELL_RECONCILE_PRESERVED_TERMINAL_STATUS",
+            job_id = %candidate.job_id,
+            candidate_status = %candidate.status,
+            latest_status = %latest.status,
+            latest_exit_code = ?latest.exit_code,
+            "act_run_shell_status preserved monitor-written terminal status"
+        );
+        return Ok(latest);
+    }
+    write_shell_job_status(&paths.status_path, &candidate)?;
+    Ok(candidate)
+}
+
+fn shell_job_latest_terminal_should_win(
+    latest: &ActRunShellJobStatus,
+    candidate: &ActRunShellJobStatus,
+) -> bool {
+    if !shell_job_terminal_status(&latest.status) {
+        return false;
+    }
+    if !shell_job_terminal_status(&candidate.status) {
+        return true;
+    }
+    if matches!(
+        candidate.status.as_str(),
+        "exited_unobserved" | "pid_unavailable"
+    ) {
+        return true;
+    }
+    candidate.exit_code.is_none() && latest.exit_code.is_some()
 }
 
 fn wait_for_shell_job_terminal_status(
@@ -9498,6 +9534,96 @@ mod tests {
         assert_eq!(read_status.request_sha256, request_sha);
         assert!(read_status.args_sha256.len() == 64);
         assert!(read_status.command_line_sha256.len() == 64);
+    }
+
+    #[test]
+    fn shell_job_reconciliation_preserves_monitor_terminal_status() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = ShellJobPaths {
+            job_dir: temp.path().to_path_buf(),
+            stdout_path: temp.path().join("stdout.log"),
+            stderr_path: temp.path().join("stderr.log"),
+            status_path: temp.path().join("status.json"),
+            request_path: temp.path().join("request.json"),
+        };
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "Write-Output issue970-ok".to_owned(),
+            ],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue970-reconcile".to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: shell_command_line_from_parts(&params.command, &params.args),
+            matched_pattern: "__any_permitted__".to_owned(),
+        };
+        let request_sha = run_shell_start_request_sha256(&params)
+            .unwrap_or_else(|error| panic!("start request should hash: {error}"));
+        let mut terminal = shell_job_status_record(
+            "issue970-reconcile",
+            "ok",
+            &params,
+            &paths,
+            &request_sha,
+            &authorization,
+            "2026-06-14T00:00:00Z".to_owned(),
+            Some(4242),
+            None,
+        );
+        terminal.exit_code = Some(0);
+        terminal.completed_at = Some("2026-06-14T00:00:01Z".to_owned());
+        terminal.duration_ms = Some(1000);
+        write_shell_job_status(&paths.status_path, &terminal)
+            .unwrap_or_else(|error| panic!("terminal status should write: {error}"));
+
+        let mut finalizing = terminal.clone();
+        finalizing.status = "finalizing".to_owned();
+        finalizing.exit_code = None;
+        finalizing.completed_at = Some("2026-06-14T00:00:02Z".to_owned());
+        finalizing.duration_ms = Some(2000);
+
+        let preserved = write_shell_job_reconciliation_status(&paths, finalizing)
+            .unwrap_or_else(|error| panic!("reconcile write should preserve terminal: {error}"));
+        let readback = read_shell_job_status(&paths.status_path, "issue970-reconcile")
+            .unwrap_or_else(|error| panic!("status should read: {error}"));
+
+        println!(
+            "readback=act_run_shell_status edge=terminal_preservation before=candidate:finalizing after=file_status:{} exit_code:{:?}",
+            readback.status, readback.exit_code
+        );
+        assert_eq!(preserved.status, "ok");
+        assert_eq!(preserved.exit_code, Some(0));
+        assert_eq!(readback.status, "ok");
+        assert_eq!(readback.exit_code, Some(0));
+
+        let mut exited_unobserved = terminal.clone();
+        exited_unobserved.status = "exited_unobserved".to_owned();
+        exited_unobserved.exit_code = None;
+        exited_unobserved.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+        exited_unobserved.error_message =
+            Some("job process exited before the monitor persisted final status".to_owned());
+        let preserved_after_unobserved =
+            write_shell_job_reconciliation_status(&paths, exited_unobserved).unwrap_or_else(
+                |error| panic!("reconcile write should not downgrade terminal: {error}"),
+            );
+        let readback_after_unobserved =
+            read_shell_job_status(&paths.status_path, "issue970-reconcile")
+                .unwrap_or_else(|error| panic!("status should read after unobserved: {error}"));
+
+        println!(
+            "readback=act_run_shell_status edge=terminal_preservation before=candidate:exited_unobserved after=file_status:{} exit_code:{:?}",
+            readback_after_unobserved.status, readback_after_unobserved.exit_code
+        );
+        assert_eq!(preserved_after_unobserved.status, "ok");
+        assert_eq!(preserved_after_unobserved.exit_code, Some(0));
+        assert_eq!(readback_after_unobserved.status, "ok");
+        assert_eq!(readback_after_unobserved.exit_code, Some(0));
     }
 
     #[test]
