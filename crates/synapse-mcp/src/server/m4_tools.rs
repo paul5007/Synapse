@@ -606,17 +606,30 @@ impl SynapseService {
         params: Parameters<ActSpawnAgentRequest>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActSpawnAgentResponse>, ErrorData> {
+        self.spawn_agent_journaled(params.0, &request_context)
+            .await
+            .map(Json)
+    }
+}
+
+impl SynapseService {
+    /// Shared audited spawn path for `act_spawn_agent` and task auto-dispatch.
+    pub(crate) async fn spawn_agent_journaled(
+        &self,
+        request: ActSpawnAgentRequest,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<ActSpawnAgentResponse, ErrorData> {
         if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
-            self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, &request_context);
+            self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, request_context);
             return Err(error);
         }
         // Resolve the request — direct spawn or template-rendered — into the
         // concrete spawn params before any side effect, so a bad template id or
         // param contract fails loudly with nothing launched (#909).
-        let params = match self.resolve_spawn_request(params.0) {
+        let params = match self.resolve_spawn_request(request) {
             Ok(params) => params,
             Err(error) => {
-                self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, &request_context);
+                self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, request_context);
                 return Err(error);
             }
         };
@@ -631,12 +644,12 @@ impl SynapseService {
             "tool.invocation kind=act_spawn_agent"
         );
         let started_by_session_id =
-            super::context::mcp_session_id_from_request_context(&request_context)?;
+            super::context::mcp_session_id_from_request_context(request_context)?;
         let actor_session_id_for_audit = started_by_session_id.clone();
         self.audit_action_started_with_details_for_request(
             ACT_SPAWN_AGENT,
             &agent_spawn_request_details(&params, started_by_session_id.as_deref()),
-            &request_context,
+            request_context,
         )?;
         // The spawn id is allocated before any side effect so every journal
         // event of this lifecycle (#897) shares one attribution anchor; a
@@ -669,7 +682,7 @@ impl SynapseService {
                     self.audit_action_result_for_request::<ActSpawnAgentResponse>(
                         ACT_SPAWN_AGENT,
                         &Err(journal_error.clone()),
-                        &request_context,
+                        request_context,
                     )?;
                     self.command_audit_final(
                         super::command_audit::CommandAuditInput::mcp(
@@ -736,8 +749,8 @@ impl SynapseService {
                 .with_error(super::command_audit::command_audit_error_from_error_data(error)),
             )?,
         };
-        self.audit_action_result_for_request(ACT_SPAWN_AGENT, &result, &request_context)?;
-        result.map(Json)
+        self.audit_action_result_for_request(ACT_SPAWN_AGENT, &result, request_context)?;
+        result
     }
 }
 

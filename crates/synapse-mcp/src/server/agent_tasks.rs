@@ -24,21 +24,31 @@
 //! session, so parallel attempts (different templates) are recorded and the UI
 //! can compare-and-pick. **Crash safety**: `task_reconcile` (run explicitly and
 //! lazily on `task_list`/`task_dispatch_once`) checks every `in_progress` task's
-//! live attempt against the session registry; an attempt whose session is gone
-//! is flagged `orphaned` and the task is moved to `review` — never silently
-//! re-queued.
+//! live attempt against the session registry; a completed spawned agent is
+//! settled from its terminal artifact and moved to `review`, while an attempt
+//! whose session is gone without terminal evidence is flagged `orphaned` and
+//! moved to `review` — never silently re-queued.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 use rmcp::{RoleServer, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use synapse_core::error_codes;
 use synapse_storage::{Db, cf};
 
 use super::{
-    ErrorData, Json, Parameters, SynapseService, mcp_error,
-    session_registry::unix_time_ms_now, tool, tool_router,
+    ErrorData, Json, Parameters, SynapseService, mcp_error, session_registry::unix_time_ms_now,
+    tool, tool_router,
+};
+use crate::m4::{
+    ActSpawnAgentRequest, default_agent_spawn_hold_open_ms, default_agent_spawn_mcp_url,
+    default_agent_spawn_wait_timeout_ms,
 };
 
 /// CF_KV key namespace for task rows. Versioned prefix so a format change is a
@@ -365,6 +375,55 @@ pub struct TaskReconcileResponse {
     pub flagged_orphans: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDispatchOnceParams {
+    /// Max concurrently in-flight tasks; no spawn occurs when already at cap.
+    #[serde(default = "default_cap")]
+    #[schemars(default = "default_cap", range(min = 1))]
+    pub concurrency_cap: usize,
+    /// Streamable HTTP MCP endpoint forwarded to `act_spawn_agent`.
+    #[serde(default = "default_agent_spawn_mcp_url")]
+    #[schemars(default = "default_agent_spawn_mcp_url")]
+    pub mcp_url: String,
+    /// Spawn readback wait budget forwarded to `act_spawn_agent`.
+    #[serde(default = "default_agent_spawn_wait_timeout_ms")]
+    #[schemars(
+        default = "default_agent_spawn_wait_timeout_ms",
+        range(min = 1, max = 1_800_000)
+    )]
+    pub wait_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchSpawnReadback {
+    pub spawn_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_process_id: Option<u32>,
+    pub launched_at_unix_ms: u64,
+    pub task_started_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDispatchOnceResponse {
+    pub ok: bool,
+    /// `dispatched`, `empty`, or `at_capacity:N`.
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<AgentTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<DispatchSpawnReadback>,
+    pub in_flight: usize,
+    pub concurrency_cap: usize,
+}
+
 // ---- key encoding & validation -------------------------------------------
 
 fn task_key(task_id: &str) -> String {
@@ -384,6 +443,15 @@ fn task_not_found(task_id: &str) -> ErrorData {
         error_codes::AGENT_TASK_NOT_FOUND,
         format!("agent_task not found: no task with id {task_id:?}"),
     )
+}
+
+fn error_code_str(error: &ErrorData) -> &str {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("UNKNOWN")
 }
 
 fn is_kebab_id(value: &str) -> bool {
@@ -496,17 +564,15 @@ fn order_for_list(mut tasks: Vec<AgentTask>) -> Vec<AgentTask> {
         // by enqueue_seq.
         let a_todo = a.state == TaskState::Todo;
         let b_todo = b.state == TaskState::Todo;
-        b_todo
-            .cmp(&a_todo)
-            .then_with(|| {
-                if a_todo {
-                    a.priority
-                        .cmp(&b.priority)
-                        .then_with(|| a.enqueue_seq.cmp(&b.enqueue_seq))
-                } else {
-                    a.enqueue_seq.cmp(&b.enqueue_seq)
-                }
-            })
+        b_todo.cmp(&a_todo).then_with(|| {
+            if a_todo {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| a.enqueue_seq.cmp(&b.enqueue_seq))
+            } else {
+                a.enqueue_seq.cmp(&b.enqueue_seq)
+            }
+        })
     });
     tasks
 }
@@ -531,6 +597,77 @@ fn decode_task(row_key: &str, bytes: &[u8]) -> Result<AgentTask, ErrorData> {
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpawnTerminalCompletion {
+    path: PathBuf,
+    status: String,
+    error_message: Option<String>,
+}
+
+impl SpawnTerminalCompletion {
+    fn is_success(&self) -> bool {
+        self.status == "ok"
+    }
+
+    fn reason(&self) -> String {
+        match self
+            .error_message
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some(error) => format!(
+                "spawned agent terminal artifact status={} at {} ({error})",
+                self.status,
+                self.path.display()
+            ),
+            None => format!(
+                "spawned agent terminal artifact status={} at {}",
+                self.status,
+                self.path.display()
+            ),
+        }
+    }
+}
+
+fn default_agent_spawn_log_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("Synapse").join("agent-spawns"))
+}
+
+fn is_spawn_id_shape(value: &str) -> bool {
+    value.starts_with("agent-spawn-")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+fn read_spawn_terminal_completion(
+    spawn_log_root: Option<&Path>,
+    spawn_id: &str,
+) -> Option<SpawnTerminalCompletion> {
+    if !is_spawn_id_shape(spawn_id) {
+        return None;
+    }
+    let root = spawn_log_root?;
+    let path = root.join(spawn_id).join("completion-status.json");
+    let bytes = fs::read(&path).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let status = value.get("status").and_then(Value::as_str)?.to_owned();
+    if status == "running" {
+        return None;
+    }
+    let error_message = value
+        .get("error_message")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Some(SpawnTerminalCompletion {
+        path,
+        status,
+        error_message,
+    })
+}
+
 impl SynapseService {
     fn agent_task_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {
         let state = self.m3_state_handle();
@@ -547,12 +684,14 @@ impl SynapseService {
 
     fn read_task(db: &Db, task_id: &str) -> Result<Option<AgentTask>, ErrorData> {
         let key = task_key(task_id);
-        let rows = db.scan_cf_prefix(cf::CF_KV, key.as_bytes()).map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("agent_task failed to read {key}: {error}"),
-            )
-        })?;
+        let rows = db
+            .scan_cf_prefix(cf::CF_KV, key.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("agent_task failed to read {key}: {error}"),
+                )
+            })?;
         for (raw_key, raw_value) in rows {
             if raw_key == key.as_bytes() {
                 return Ok(Some(decode_task(&key, &raw_value)?));
@@ -620,12 +759,12 @@ impl SynapseService {
             .collect())
     }
 
-    /// Flags every `in_progress` task whose live attempt's session is no longer
-    /// live as `orphaned`, moving it to `review`. Returns the flagged task ids.
-    /// Never silently re-queues — a human (or operator tool) decides what next.
-    fn reconcile_tasks(&self, db: &Db) -> Result<(usize, Vec<String>), ErrorData> {
-        let now = unix_time_ms_now();
-        let live = self.live_session_ids(now)?;
+    fn reconcile_task_rows(
+        db: &Db,
+        live: &BTreeSet<String>,
+        now: u64,
+        spawn_log_root: Option<&Path>,
+    ) -> Result<(usize, Vec<String>), ErrorData> {
         let tasks = Self::read_all_tasks(db)?;
         let mut scanned = 0usize;
         let mut flagged = Vec::new();
@@ -634,31 +773,63 @@ impl SynapseService {
                 continue;
             }
             scanned += 1;
-            let orphaned = match task.live_attempt() {
+            let missing_live_session = match task.live_attempt() {
                 // An in_progress task with no live attempt is itself orphaned.
                 None => true,
                 Some(attempt) => !live.contains(&attempt.session_id),
             };
-            if !orphaned {
+            if !missing_live_session {
                 continue;
             }
-            let reason = format!(
-                "orphaned: in_progress attempt session no longer live (reconciled at {now} ms)"
-            );
+
+            let terminal_completion = task
+                .live_attempt()
+                .and_then(|attempt| attempt.spawn_id.as_deref())
+                .and_then(|spawn_id| read_spawn_terminal_completion(spawn_log_root, spawn_id));
+            let (outcome, attempt_reason, review_reason, flagged_orphan) = match terminal_completion
+            {
+                Some(completion) if completion.is_success() => {
+                    (AttemptOutcome::Succeeded, completion.reason(), None, false)
+                }
+                Some(completion) => {
+                    let reason = completion.reason();
+                    (AttemptOutcome::Failed, reason.clone(), Some(reason), false)
+                }
+                None => {
+                    let reason = format!(
+                        "orphaned: in_progress attempt session no longer live and no terminal completion artifact was available (reconciled at {now} ms)"
+                    );
+                    (AttemptOutcome::Orphaned, reason.clone(), Some(reason), true)
+                }
+            };
             for attempt in &mut task.attempts {
                 if attempt.outcome == AttemptOutcome::Pending {
-                    attempt.outcome = AttemptOutcome::Orphaned;
+                    attempt.outcome = outcome;
                     attempt.ended_unix_ms = Some(now);
-                    attempt.reason = Some(reason.clone());
+                    attempt.reason = Some(attempt_reason.clone());
                 }
             }
             task.state = TaskState::Review;
-            task.review_reason = Some(reason);
+            task.review_reason = review_reason;
             task.updated_unix_ms = now;
             Self::write_task(db, &task)?;
-            flagged.push(task.task_id.clone());
+            if flagged_orphan {
+                flagged.push(task.task_id.clone());
+            }
         }
         Ok((scanned, flagged))
+    }
+
+    /// Settles every `in_progress` task whose live attempt's session is no
+    /// longer live. Spawned attempts with terminal completion artifacts become
+    /// succeeded/failed review rows; missing terminal evidence is flagged as an
+    /// orphan. Never silently re-queues — a human (or operator tool) decides
+    /// what next.
+    fn reconcile_tasks(&self, db: &Db) -> Result<(usize, Vec<String>), ErrorData> {
+        let now = unix_time_ms_now();
+        let live = self.live_session_ids(now)?;
+        let spawn_log_root = default_agent_spawn_log_root();
+        Self::reconcile_task_rows(db, &live, now, spawn_log_root.as_deref())
     }
 
     /// Shared claim primitive: transitions a `todo` task to `in_progress` and
@@ -701,7 +872,10 @@ impl SynapseService {
         Ok(task)
     }
 
-    fn task_create_impl(&self, params: TaskCreateParams) -> Result<TaskMutationResponse, ErrorData> {
+    fn task_create_impl(
+        &self,
+        params: TaskCreateParams,
+    ) -> Result<TaskMutationResponse, ErrorData> {
         if !is_kebab_id(&params.task_id) || params.task_id.len() > MAX_TASK_ID_CHARS {
             return Err(params_error(format!(
                 "agent_task task_id must be non-empty [a-z0-9._-] and <= {MAX_TASK_ID_CHARS} chars"
@@ -782,7 +956,10 @@ impl SynapseService {
         Ok(TaskGetResponse { ok: true, task })
     }
 
-    fn task_update_impl(&self, params: TaskUpdateParams) -> Result<TaskMutationResponse, ErrorData> {
+    fn task_update_impl(
+        &self,
+        params: TaskUpdateParams,
+    ) -> Result<TaskMutationResponse, ErrorData> {
         let db = self.agent_task_db()?;
         let mut task = Self::read_task(&db, &params.task_id)?
             .ok_or_else(|| task_not_found(&params.task_id))?;
@@ -862,7 +1039,9 @@ impl SynapseService {
 
     fn task_claim_impl(&self, params: TaskClaimParams) -> Result<TaskMutationResponse, ErrorData> {
         if params.session_id.trim().is_empty() {
-            return Err(params_error("agent_task claim session_id must not be empty"));
+            return Err(params_error(
+                "agent_task claim session_id must not be empty",
+            ));
         }
         let db = self.agent_task_db()?;
         let task = Self::claim_internal(&db, &params.task_id, &params.session_id, None, None)?;
@@ -884,7 +1063,10 @@ impl SynapseService {
         })
     }
 
-    fn task_cancel_impl(&self, params: TaskCancelParams) -> Result<TaskMutationResponse, ErrorData> {
+    fn task_cancel_impl(
+        &self,
+        params: TaskCancelParams,
+    ) -> Result<TaskMutationResponse, ErrorData> {
         self.task_update_impl(TaskUpdateParams {
             task_id: params.task_id,
             state: Some(TaskState::Cancelled),
@@ -955,6 +1137,172 @@ impl SynapseService {
             flagged_orphans: flagged,
         })
     }
+
+    fn record_failed_attempt_internal(
+        db: &Db,
+        task_id: &str,
+        reason: String,
+    ) -> Result<AgentTask, ErrorData> {
+        let mut task = Self::read_task(db, task_id)?.ok_or_else(|| task_not_found(task_id))?;
+        if task.state != TaskState::Todo {
+            return Err(mcp_error(
+                error_codes::AGENT_TASK_INVALID_TRANSITION,
+                format!(
+                    "agent_task {task_id:?} cannot record a dispatch-failure attempt: it is {}, not todo (raced by another dispatcher?)",
+                    task.state.as_str()
+                ),
+            ));
+        }
+        let now = unix_time_ms_now();
+        let attempt_id = u32::try_from(task.attempts.len()).unwrap_or(u32::MAX) + 1;
+        task.attempts.push(TaskAttempt {
+            attempt_id,
+            session_id: String::new(),
+            spawn_id: None,
+            template_version: None,
+            outcome: AttemptOutcome::Failed,
+            started_unix_ms: now,
+            ended_unix_ms: Some(now),
+            reason: Some(reason),
+        });
+        task.updated_unix_ms = now;
+        Self::write_task(db, &task)?;
+        Ok(task)
+    }
+
+    async fn task_dispatch_once_impl(
+        &self,
+        params: TaskDispatchOnceParams,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<TaskDispatchOnceResponse, ErrorData> {
+        let db = self.agent_task_db()?;
+        self.reconcile_tasks(&db)?;
+        let tasks = Self::read_all_tasks(&db)?;
+        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
+        let task_id = match dispatch_decision(&tasks, params.concurrency_cap) {
+            DispatchDecision::Empty => {
+                return Ok(TaskDispatchOnceResponse {
+                    ok: true,
+                    decision: "empty".to_owned(),
+                    task: None,
+                    spawn: None,
+                    in_flight,
+                    concurrency_cap: params.concurrency_cap,
+                });
+            }
+            DispatchDecision::AtCapacity { in_flight } => {
+                return Ok(TaskDispatchOnceResponse {
+                    ok: true,
+                    decision: format!("at_capacity:{in_flight}"),
+                    task: None,
+                    spawn: None,
+                    in_flight,
+                    concurrency_cap: params.concurrency_cap,
+                });
+            }
+            DispatchDecision::Dispatch { task_id } => task_id,
+        };
+
+        let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
+        let request = ActSpawnAgentRequest {
+            template_id: Some(task.template_id.clone()),
+            template_version: None,
+            template_params: task.template_params.clone(),
+            cli: None,
+            kind: None,
+            model: None,
+            model_ref: None,
+            prompt: None,
+            target: None,
+            working_dir: None,
+            mcp_url: params.mcp_url,
+            wait_timeout_ms: params.wait_timeout_ms,
+            hold_open_ms: default_agent_spawn_hold_open_ms(),
+        };
+
+        tracing::info!(
+            code = "AGENT_TASK_DISPATCH_SPAWN",
+            task_id = %task_id,
+            template_id = %task.template_id,
+            "readback=agent_tasks edge=dispatch_spawn_begin"
+        );
+
+        let response = match self.spawn_agent_journaled(request, request_context).await {
+            Ok(response) => response,
+            Err(spawn_error) => {
+                let error_code = error_code_str(&spawn_error);
+                let reason = format!(
+                    "dispatch spawn failed [{error_code}]: {}",
+                    spawn_error.message
+                );
+                Self::record_failed_attempt_internal(&db, &task_id, reason.clone())?;
+                tracing::error!(
+                    code = "AGENT_TASK_DISPATCH_SPAWN_FAILED",
+                    task_id = %task_id,
+                    template_id = %task.template_id,
+                    error_code = %error_code,
+                    "readback=agent_tasks edge=dispatch_spawn_failed reason={reason}"
+                );
+                return Err(spawn_error);
+            }
+        };
+
+        let claimed = match Self::claim_internal(
+            &db,
+            &task_id,
+            &response.session_id,
+            Some(response.spawn_id.clone()),
+            response.template_version,
+        ) {
+            Ok(task) => task,
+            Err(claim_error) => {
+                tracing::error!(
+                    code = "AGENT_TASK_DISPATCH_ORPHAN",
+                    task_id = %task_id,
+                    spawn_id = %response.spawn_id,
+                    session_id = %response.session_id,
+                    "readback=agent_tasks edge=dispatch_claim_failed: live agent is unbound"
+                );
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "task_dispatch_once spawned agent session {:?} (spawn {:?}) for task {task_id:?} but could not bind the attempt: {}. The agent is live and unbound; use agent_kill on the spawn. Underlying error: {}",
+                        response.session_id,
+                        response.spawn_id,
+                        claim_error.message,
+                        claim_error.message
+                    ),
+                ));
+            }
+        };
+
+        tracing::info!(
+            code = "AGENT_TASK_DISPATCH",
+            task_id = %task_id,
+            spawn_id = %response.spawn_id,
+            session_id = %response.session_id,
+            template_id = %task.template_id,
+            template_version = response.template_version.unwrap_or(0),
+            "readback=agent_tasks edge=dispatch"
+        );
+
+        Ok(TaskDispatchOnceResponse {
+            ok: true,
+            decision: "dispatched".to_owned(),
+            task: Some(claimed),
+            spawn: Some(DispatchSpawnReadback {
+                spawn_id: response.spawn_id,
+                session_id: response.session_id,
+                template_id: response.template_id,
+                template_version: response.template_version,
+                agent_process_id: response.agent_process_id,
+                launched_at_unix_ms: response.launched_at_unix_ms,
+                task_started_at_unix_ms: response.task_started_at_unix_ms,
+            }),
+            in_flight: in_flight + 1,
+            concurrency_cap: params.concurrency_cap,
+        })
+    }
 }
 
 #[tool_router(router = agent_task_tool_router, vis = "pub(super)")]
@@ -976,7 +1324,9 @@ impl SynapseService {
         self.task_create_impl(params.0).map(Json)
     }
 
-    #[tool(description = "Read one agent task by id, including its full attempt history. Errors AGENT_TASK_NOT_FOUND if absent.")]
+    #[tool(
+        description = "Read one agent task by id, including its full attempt history. Errors AGENT_TASK_NOT_FOUND if absent."
+    )]
     pub async fn task_get(
         &self,
         params: Parameters<TaskIdParams>,
@@ -1025,7 +1375,9 @@ impl SynapseService {
         self.task_claim_impl(params.0).map(Json)
     }
 
-    #[tool(description = "Cancel an agent task (move it to the terminal cancelled state), settling any live attempt as failed. Errors AGENT_TASK_INVALID_TRANSITION if already terminal.")]
+    #[tool(
+        description = "Cancel an agent task (move it to the terminal cancelled state), settling any live attempt as failed. Errors AGENT_TASK_INVALID_TRANSITION if already terminal."
+    )]
     pub async fn task_cancel(
         &self,
         params: Parameters<TaskCancelParams>,
@@ -1073,7 +1425,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Reconcile the queue against live sessions: every in_progress task whose attempt session is no longer live is flagged orphaned and moved to review (never silently re-queued). Crash-safe recovery; also runs lazily on task_list/task_next."
+        description = "Reconcile the queue against live sessions: completed spawned attempts are settled from completion-status.json into review, while in_progress attempts whose session is gone without terminal evidence are flagged orphaned and moved to review (never silently re-queued). Crash-safe recovery; also runs lazily on task_list/task_next/task_dispatch_once."
     )]
     pub async fn task_reconcile(
         &self,
@@ -1086,6 +1438,25 @@ impl SynapseService {
             "tool.invocation kind=task_reconcile"
         );
         self.task_reconcile_impl().map(Json)
+    }
+
+    #[tool(
+        description = "Atomically dispatch the next eligible task: reconcile orphans, apply the priority/fairness/FIFO selector under concurrency_cap, spawn a real agent from the task's template, and bind the task attempt to the spawned session_id + spawn_id + template_version. Returns empty / at_capacity:N with no spawn when nothing is eligible. A spawn failure leaves the task todo with a recorded failed attempt and returns the structured error."
+    )]
+    pub async fn task_dispatch_once(
+        &self,
+        params: Parameters<TaskDispatchOnceParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TaskDispatchOnceResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "task_dispatch_once",
+            concurrency_cap = params.0.concurrency_cap,
+            "tool.invocation kind=task_dispatch_once"
+        );
+        self.task_dispatch_once_impl(params.0, &request_context)
+            .await
+            .map(Json)
     }
 }
 
@@ -1141,6 +1512,9 @@ impl SynapseService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
+    use serde_json::json;
+    use synapse_core::SCHEMA_VERSION;
 
     fn task(id: &str, state: TaskState, priority: u8, template: &str, seq: u64) -> AgentTask {
         AgentTask {
@@ -1159,6 +1533,46 @@ mod tests {
             created_unix_ms: 1_000,
             updated_unix_ms: 1_000,
         }
+    }
+
+    fn task_result<T>(result: std::result::Result<T, ErrorData>) -> Result<T> {
+        result.map_err(|error| anyhow::anyhow!("{}", error.message))
+    }
+
+    fn task_with_pending_spawn(task_id: &str, session_id: &str, spawn_id: &str) -> AgentTask {
+        let mut task = task(task_id, TaskState::InProgress, 1, "reviewer", 1);
+        task.attempts.push(TaskAttempt {
+            attempt_id: 1,
+            session_id: session_id.to_owned(),
+            spawn_id: Some(spawn_id.to_owned()),
+            template_version: Some(7),
+            outcome: AttemptOutcome::Pending,
+            started_unix_ms: 1_500,
+            ended_unix_ms: None,
+            reason: None,
+        });
+        task
+    }
+
+    fn write_completion_artifact(
+        root: &Path,
+        spawn_id: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let dir = root.join(spawn_id);
+        std::fs::create_dir_all(&dir)?;
+        let value = json!({
+            "schema_version": 1,
+            "spawn_id": spawn_id,
+            "status": status,
+            "error_message": error_message,
+        });
+        std::fs::write(
+            dir.join("completion-status.json"),
+            serde_json::to_vec(&value)?,
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -1248,5 +1662,76 @@ mod tests {
             vec!["in_progress", "cancelled"]
         );
         assert!(TaskState::Done.allowed_targets().is_empty());
+    }
+
+    #[test]
+    fn reconcile_settles_terminal_ok_spawn_as_review_succeeded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let spawn_root = temp.path().join("agent-spawns");
+        let task =
+            task_with_pending_spawn("terminal-ok", "closed-session", "agent-spawn-terminal-ok");
+        task_result(SynapseService::write_task(&db, &task))?;
+        write_completion_artifact(&spawn_root, "agent-spawn-terminal-ok", "ok", None)?;
+
+        let (scanned, flagged) = task_result(SynapseService::reconcile_task_rows(
+            &db,
+            &BTreeSet::new(),
+            2_000,
+            Some(&spawn_root),
+        ))?;
+
+        assert_eq!(scanned, 1);
+        assert!(flagged.is_empty());
+        let read = task_result(SynapseService::read_task(&db, "terminal-ok"))?
+            .context("terminal-ok task row")?;
+        assert_eq!(read.state, TaskState::Review);
+        assert_eq!(read.review_reason, None);
+        assert_eq!(read.attempts[0].outcome, AttemptOutcome::Succeeded);
+        assert_eq!(read.attempts[0].ended_unix_ms, Some(2_000));
+        assert!(
+            read.attempts[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("status=ok"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_settles_terminal_non_ok_spawn_as_review_failed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let spawn_root = temp.path().join("agent-spawns");
+        let task = task_with_pending_spawn(
+            "terminal-failed",
+            "closed-session",
+            "agent-spawn-terminal-failed",
+        );
+        task_result(SynapseService::write_task(&db, &task))?;
+        write_completion_artifact(
+            &spawn_root,
+            "agent-spawn-terminal-failed",
+            "failed",
+            Some("synthetic exit 7"),
+        )?;
+
+        let (scanned, flagged) = task_result(SynapseService::reconcile_task_rows(
+            &db,
+            &BTreeSet::new(),
+            2_000,
+            Some(&spawn_root),
+        ))?;
+
+        assert_eq!(scanned, 1);
+        assert!(flagged.is_empty());
+        let read = task_result(SynapseService::read_task(&db, "terminal-failed"))?
+            .context("terminal-failed task row")?;
+        assert_eq!(read.state, TaskState::Review);
+        assert_eq!(read.attempts[0].outcome, AttemptOutcome::Failed);
+        assert!(read.review_reason.as_deref().is_some_and(
+            |reason| reason.contains("status=failed") && reason.contains("synthetic exit 7")
+        ));
+        Ok(())
     }
 }
