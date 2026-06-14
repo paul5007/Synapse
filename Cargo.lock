@@ -3629,6 +3629,7 @@ dependencies = [
  "synapse-core",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uiautomation",
  "windows 0.62.2",

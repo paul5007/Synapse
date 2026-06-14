@@ -30,9 +30,10 @@ use chromiumoxide::cdp::browser_protocol::page::{
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::page::ScreenshotParams;
-use futures_util::StreamExt as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
 
@@ -559,18 +560,19 @@ pub async fn cdp_mouse_stroke_target(
     let button = button
         .map(CdpMouseButton::to_cdp)
         .unwrap_or(MouseButton::None);
-    with_target_page(endpoint, target_id, |page| async move {
+    let dispatched_target_id = with_target_page(endpoint, target_id, |page| async move {
         let dispatched_target_id = page.target_id().inner().clone();
-        dispatch_cdp_mouse_stroke(&page, &points, button).await?;
-        Ok(CdpMouseStrokeResult {
-            target_id: dispatched_target_id,
-            point_count: points.len(),
-            start,
-            end,
-            duration_ms,
-        })
+        Ok(dispatched_target_id)
     })
-    .await
+    .await?;
+    dispatch_cdp_mouse_stroke_raw(endpoint, &dispatched_target_id, &points, button).await?;
+    Ok(CdpMouseStrokeResult {
+        target_id: dispatched_target_id,
+        point_count: points.len(),
+        start,
+        end,
+        duration_ms,
+    })
 }
 
 /// Reads the target page's active DOM element, value, and selection without
@@ -1117,23 +1119,38 @@ fn validate_cdp_mouse_stroke_points(points: &[CdpMouseStrokePoint]) -> A11yResul
     Ok(())
 }
 
-async fn dispatch_cdp_mouse_stroke(
-    page: &chromiumoxide::Page,
+async fn dispatch_cdp_mouse_stroke_raw(
+    endpoint: &str,
+    target_id: &str,
     points: &[CdpMouseStrokePoint],
     button: MouseButton,
 ) -> A11yResult<()> {
+    let ws_url = cdp_page_websocket_url(endpoint, target_id)?;
+    let connect = tokio_tungstenite::connect_async(ws_url.as_str());
+    let (mut socket, _response) = tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, connect)
+        .await
+        .map_err(|_| A11yError::CdpAttachFailed {
+            detail: format!(
+                "CDP page WebSocket connect timed out after {} ms for target {target_id}",
+                CDP_INPUT_COMMAND_TIMEOUT.as_millis()
+            ),
+        })?
+        .map_err(|err| A11yError::CdpAttachFailed {
+            detail: format!("connect CDP page WebSocket {ws_url}: {err}"),
+        })?;
+    let mut command_id = 1_u64;
     let first = points[0];
     let first_point = cdp_stroke_action_point(first);
     if button == MouseButton::None {
         let mut previous_elapsed_ms = first.elapsed_ms;
-        dispatch_mouse_event(
-            page,
-            mouse_event(
-                DispatchMouseEventType::MouseMoved,
-                first_point,
-                MouseButton::None,
-                0,
-            ),
+        send_raw_mouse_event(
+            &mut socket,
+            &mut command_id,
+            DispatchMouseEventType::MouseMoved,
+            first_point,
+            MouseButton::None,
+            0,
+            0,
             "move",
             0,
         )
@@ -1141,42 +1158,43 @@ async fn dispatch_cdp_mouse_stroke(
         for (index, point) in points.iter().enumerate().skip(1) {
             sleep_until_sample(previous_elapsed_ms, point.elapsed_ms).await;
             previous_elapsed_ms = point.elapsed_ms;
-            dispatch_mouse_event(
-                page,
-                mouse_event(
-                    DispatchMouseEventType::MouseMoved,
-                    cdp_stroke_action_point(*point),
-                    MouseButton::None,
-                    0,
-                ),
+            send_raw_mouse_event(
+                &mut socket,
+                &mut command_id,
+                DispatchMouseEventType::MouseMoved,
+                cdp_stroke_action_point(*point),
+                MouseButton::None,
+                0,
+                0,
                 "move",
                 index,
             )
             .await?;
         }
+        settle_and_close_raw_input_socket(&mut socket).await;
         return Ok(());
     }
 
-    dispatch_mouse_event(
-        page,
-        mouse_event(
-            DispatchMouseEventType::MouseMoved,
-            first_point,
-            button.clone(),
-            0,
-        ),
+    send_raw_mouse_event(
+        &mut socket,
+        &mut command_id,
+        DispatchMouseEventType::MouseMoved,
+        first_point,
+        button.clone(),
+        0,
+        0,
         "pre_press_move",
         0,
     )
     .await?;
-    dispatch_mouse_event(
-        page,
-        mouse_event(
-            DispatchMouseEventType::MousePressed,
-            first_point,
-            button.clone(),
-            1,
-        ),
+    dispatch_raw_mouse_event(
+        &mut socket,
+        &mut command_id,
+        DispatchMouseEventType::MousePressed,
+        first_point,
+        button.clone(),
+        Some(mouse_button_bit(&button)),
+        1,
         "press",
         0,
     )
@@ -1187,52 +1205,178 @@ async fn dispatch_cdp_mouse_stroke(
     for (index, point) in points.iter().enumerate().skip(1) {
         sleep_until_sample(previous_elapsed_ms, point.elapsed_ms).await;
         previous_elapsed_ms = point.elapsed_ms;
-        dispatch_mouse_event(
-            page,
-            mouse_event_with_buttons(
-                DispatchMouseEventType::MouseMoved,
-                cdp_stroke_action_point(*point),
-                button.clone(),
-                0,
-                Some(held_buttons),
-            ),
+        dispatch_raw_mouse_event(
+            &mut socket,
+            &mut command_id,
+            DispatchMouseEventType::MouseMoved,
+            cdp_stroke_action_point(*point),
+            button.clone(),
+            Some(held_buttons),
+            0,
             "drag_move",
             index,
         )
         .await?;
     }
-    dispatch_mouse_event(
-        page,
-        mouse_event(
-            DispatchMouseEventType::MouseReleased,
-            points
-                .last()
-                .map_or(first_point, |point| cdp_stroke_action_point(*point)),
-            button,
-            1,
-        ),
+    dispatch_raw_mouse_event(
+        &mut socket,
+        &mut command_id,
+        DispatchMouseEventType::MouseReleased,
+        points
+            .last()
+            .map_or(first_point, |point| cdp_stroke_action_point(*point)),
+        button,
+        Some(0),
+        1,
         "release",
         points.len().saturating_sub(1),
     )
     .await?;
+    settle_and_close_raw_input_socket(&mut socket).await;
     Ok(())
 }
 
-async fn dispatch_mouse_event(
-    page: &chromiumoxide::Page,
-    params: DispatchMouseEventParams,
+async fn dispatch_raw_mouse_event(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    command_id: &mut u64,
+    event_type: DispatchMouseEventType,
+    point: CdpActionPoint,
+    button: MouseButton,
+    buttons: Option<i64>,
+    click_count: i64,
     stage: &'static str,
     sample_index: usize,
 ) -> A11yResult<()> {
-    match tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, page.execute(params)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(dispatch_err(&err)),
+    let button_bits = buttons.unwrap_or_else(|| mouse_button_bit(&button));
+    let payload = raw_mouse_event_message(
+        *command_id,
+        event_type,
+        point,
+        button,
+        button_bits,
+        click_count,
+    );
+    *command_id = command_id.saturating_add(1);
+    send_raw_mouse_event_payload(socket, payload, stage, sample_index).await
+}
+
+async fn send_raw_mouse_event(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    command_id: &mut u64,
+    event_type: DispatchMouseEventType,
+    point: CdpActionPoint,
+    button: MouseButton,
+    buttons: i64,
+    click_count: i64,
+    stage: &'static str,
+    sample_index: usize,
+) -> A11yResult<()> {
+    dispatch_raw_mouse_event(
+        socket,
+        command_id,
+        event_type,
+        point,
+        button,
+        Some(buttons),
+        click_count,
+        stage,
+        sample_index,
+    )
+    .await
+}
+
+async fn send_raw_mouse_event_payload(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    payload: Value,
+    stage: &'static str,
+    sample_index: usize,
+) -> A11yResult<()> {
+    let text = serde_json::to_string(&payload).map_err(|err| A11yError::CdpAxtreeFailed {
+        detail: format!(
+            "serialize raw CDP Input.dispatchMouseEvent at stage {stage} sample_index={sample_index}: {err}"
+        ),
+    })?;
+    let send = socket.send(Message::Text(text.into()));
+    match tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, send).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "CDP raw input send failed at stage {stage} sample_index={sample_index}: {err}"
+            ),
+        }),
         Err(_) => Err(A11yError::CdpAxtreeFailed {
             detail: format!(
-                "CDP input dispatch timed out after {} ms at stage {stage} sample_index={sample_index}",
+                "CDP raw input send timed out after {} ms at stage {stage} sample_index={sample_index}",
                 CDP_INPUT_COMMAND_TIMEOUT.as_millis()
             ),
         }),
+    }
+}
+
+async fn settle_and_close_raw_input_socket(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), socket.close(None)).await;
+}
+
+fn cdp_page_websocket_url(endpoint: &str, target_id: &str) -> A11yResult<String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let target_id = target_id.trim();
+    if endpoint.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP endpoint must not be empty".to_owned(),
+        });
+    }
+    if target_id.is_empty() || target_id.contains('/') || target_id.contains('\\') {
+        return Err(A11yError::CdpAttachFailed {
+            detail: format!("CDP target id is not safe for a page WebSocket URL: {target_id:?}"),
+        });
+    }
+    let base = if let Some(rest) = endpoint.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if let Some(rest) = endpoint.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        endpoint.to_owned()
+    } else {
+        return Err(A11yError::CdpAttachFailed {
+            detail: format!(
+                "CDP endpoint {endpoint:?} must start with http://, https://, ws://, or wss://"
+            ),
+        });
+    };
+    Ok(format!("{base}/devtools/page/{target_id}"))
+}
+
+fn raw_mouse_event_message(
+    command_id: u64,
+    event_type: DispatchMouseEventType,
+    point: CdpActionPoint,
+    button: MouseButton,
+    buttons: i64,
+    click_count: i64,
+) -> Value {
+    json!({
+        "id": command_id,
+        "method": "Input.dispatchMouseEvent",
+        "params": {
+            "type": event_type.as_ref(),
+            "x": point.x,
+            "y": point.y,
+            "button": mouse_button_wire(&button),
+            "buttons": buttons,
+            "clickCount": click_count,
+        },
+    })
+}
+
+fn mouse_button_wire(button: &MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Right => "right",
+        MouseButton::Middle => "middle",
+        _ => "none",
     }
 }
 
@@ -2028,6 +2172,36 @@ mod tests {
         assert_eq!(CdpMouseButton::Left.to_cdp(), MouseButton::Left);
         assert_eq!(CdpMouseButton::Right.to_cdp(), MouseButton::Right);
         assert_eq!(CdpMouseButton::Middle.to_cdp(), MouseButton::Middle);
+    }
+
+    #[test]
+    fn cdp_page_websocket_url_maps_browser_endpoint_to_page_socket() {
+        let ws = cdp_page_websocket_url("http://127.0.0.1:64499/", "ABC123")
+            .unwrap_or_else(|err| panic!("valid CDP endpoint rejected: {err}"));
+
+        assert_eq!(ws, "ws://127.0.0.1:64499/devtools/page/ABC123");
+    }
+
+    #[test]
+    fn raw_mouse_event_message_uses_cdp_wire_values() {
+        let message = raw_mouse_event_message(
+            7,
+            DispatchMouseEventType::MousePressed,
+            CdpActionPoint { x: 52.0, y: 191.0 },
+            MouseButton::Left,
+            1,
+            1,
+        );
+
+        println!("readback=raw_cdp_mouse_event_message {message}");
+        assert_eq!(message["id"], json!(7));
+        assert_eq!(message["method"], json!("Input.dispatchMouseEvent"));
+        assert_eq!(message["params"]["type"], json!("mousePressed"));
+        assert_eq!(message["params"]["x"], json!(52.0));
+        assert_eq!(message["params"]["y"], json!(191.0));
+        assert_eq!(message["params"]["button"], json!("left"));
+        assert_eq!(message["params"]["buttons"], json!(1));
+        assert_eq!(message["params"]["clickCount"], json!(1));
     }
 
     #[test]
