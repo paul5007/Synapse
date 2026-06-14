@@ -24,7 +24,7 @@ use synapse_core::{
 };
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{
-    cf, decode_json, encode_json, episodes as episode_codec, routines as routine_codec,
+    Db, cf, decode_json, encode_json, episodes as episode_codec, routines as routine_codec,
     timeline as timeline_codec,
 };
 
@@ -256,6 +256,11 @@ pub struct HygieneImpactedEpisode {
     pub app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<String>,
+    /// True when `hygiene/taint/v1/episode/<episode_id>` exists.
+    pub tainted: bool,
+    /// Exact taint ledger row for this episode, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<HygieneTaintRecord>,
 }
 
 /// One mined routine whose evidence references an episode a flagged row fed.
@@ -278,6 +283,11 @@ pub struct HygieneImpactedRoutine {
     /// Impacted episode ids that link this flag to this routine (the
     /// intersection of the flag's episodes with the routine's evidence).
     pub via_episode_ids: Vec<String>,
+    /// True when `hygiene/taint/v1/routine/<routine_id>` exists.
+    pub tainted: bool,
+    /// Exact taint ledger row for this routine, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<HygieneTaintRecord>,
 }
 
 /// One profile-authoring candidate whose generated evidence/patch references
@@ -299,6 +309,11 @@ pub struct HygieneImpactedAuthoringCandidate {
     pub via_routine_ids: Vec<String>,
     /// Impacted episode ids referenced by the candidate JSON.
     pub via_episode_ids: Vec<String>,
+    /// True when `hygiene/taint/v1/authoring_candidate/<candidate_id>` exists.
+    pub tainted: bool,
+    /// Exact taint ledger row for this candidate, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<HygieneTaintRecord>,
 }
 
 /// One flagged row plus the derived state (episodes, routines, authoring
@@ -836,6 +851,7 @@ pub fn report(
 
     // 4. Bounded CF_ROUTINES scan shared with cleaning invalidation.
     let impacted_episode_ids: BTreeSet<String> = episodes_by_id.keys().cloned().collect();
+    let episode_taints = read_taint_records(&runtime, "episode", &impacted_episode_ids)?;
     let (episode_to_routine_ids, routines_by_id, scanned_routine_rows) =
         scan_impacted_routines(&runtime, &impacted_episode_ids, ImpactScanCaller::Report)?;
 
@@ -868,6 +884,7 @@ pub fn report(
     // 6. Bounded profile-authoring candidate scan shared with cleaning
     //    invalidation.
     let impacted_routine_ids: BTreeSet<String> = routines_by_id.keys().cloned().collect();
+    let routine_taints = read_taint_records(&runtime, "routine", &impacted_routine_ids)?;
     let (
         authoring_candidates_by_id,
         routine_to_authoring_candidate_ids,
@@ -879,6 +896,10 @@ pub fn report(
         &impacted_episode_ids,
         ImpactScanCaller::Report,
     )?;
+    let impacted_candidate_ids: BTreeSet<String> =
+        authoring_candidates_by_id.keys().cloned().collect();
+    let authoring_candidate_taints =
+        read_taint_records(&runtime, "authoring_candidate", &impacted_candidate_ids)?;
 
     // 7. Assemble each flag's impact from the maps.
     let mut flags_with_downstream_impact = 0_u64;
@@ -890,7 +911,13 @@ pub fn report(
                     let episode_ids = ts_to_episode_ids.get(&ts_ns).cloned().unwrap_or_default();
                     let derived_episodes: Vec<HygieneImpactedEpisode> = episode_ids
                         .iter()
-                        .filter_map(|episode_id| episodes_by_id.get(episode_id).cloned())
+                        .filter_map(|episode_id| {
+                            episodes_by_id.get(episode_id).cloned().map(|mut episode| {
+                                episode.taint = episode_taints.get(episode_id).cloned();
+                                episode.tainted = episode.taint.is_some();
+                                episode
+                            })
+                        })
                         .collect();
                     // Routines reachable from this flag's episodes, with the exact
                     // linking episodes recorded per routine.
@@ -915,6 +942,8 @@ pub fn report(
                                         (Some(lifecycle.clone()), label.clone())
                                     })
                                     .unwrap_or((None, None));
+                                let taint = routine_taints.get(&routine_id).cloned();
+                                let tainted = taint.is_some();
                                 HygieneImpactedRoutine {
                                     routine_id: record.routine_id.clone(),
                                     schedule_label: record.schedule_label.clone(),
@@ -924,6 +953,8 @@ pub fn report(
                                     lifecycle,
                                     label,
                                     via_episode_ids: via.into_iter().collect(),
+                                    tainted,
+                                    taint,
                                 }
                             })
                         })
@@ -947,7 +978,14 @@ pub fn report(
                         authoring_candidate_ids
                             .into_iter()
                             .filter_map(|candidate_id| {
-                                authoring_candidates_by_id.get(&candidate_id).cloned()
+                                authoring_candidates_by_id.get(&candidate_id).cloned().map(
+                                    |mut candidate| {
+                                        candidate.taint =
+                                            authoring_candidate_taints.get(&candidate_id).cloned();
+                                        candidate.tainted = candidate.taint.is_some();
+                                        candidate
+                                    },
+                                )
                             })
                             .collect();
                     let note = if derived_episodes.is_empty() {
@@ -2058,29 +2096,68 @@ fn taint_row(
 /// verification evidence and by the upcoming taint-surfacing consumers deciding
 /// whether learned state is poisoned (a routine_inspect / hygiene_report taint
 /// column, #875 follow-up).
-#[allow(
-    dead_code,
-    reason = "taint-ledger reader for the #875 follow-up taint-surfacing tool"
-)]
 pub(crate) fn read_taint_record(
     runtime: &ReflexRuntime,
     artifact_kind: &str,
     artifact_id: &str,
 ) -> Result<Option<HygieneTaintRecord>, ErrorData> {
-    let key = format!("{TAINT_PREFIX}{artifact_kind}/{artifact_id}").into_bytes();
+    let key = taint_key(artifact_kind, artifact_id);
     let rows = runtime
         .storage_cf_prefix_rows(cf::CF_KV, &key, 1)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) else {
         return Ok(None);
     };
-    let record = decode_json::<HygieneTaintRecord>(&value).map_err(|error| {
+    decode_taint_record(artifact_kind, artifact_id, &value).map(Some)
+}
+
+pub(crate) fn read_taint_record_from_db(
+    db: &Db,
+    artifact_kind: &str,
+    artifact_id: &str,
+) -> Result<Option<HygieneTaintRecord>, ErrorData> {
+    let key = taint_key(artifact_kind, artifact_id);
+    let rows = db.scan_cf_prefix(cf::CF_KV, &key).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("HYGIENE_TAINT_READ_FAILED for {artifact_kind}/{artifact_id}: {error}"),
+        )
+    })?;
+    let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) else {
+        return Ok(None);
+    };
+    decode_taint_record(artifact_kind, artifact_id, &value).map(Some)
+}
+
+fn read_taint_records(
+    runtime: &ReflexRuntime,
+    artifact_kind: &str,
+    artifact_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, HygieneTaintRecord>, ErrorData> {
+    let mut records = BTreeMap::new();
+    for artifact_id in artifact_ids {
+        if let Some(record) = read_taint_record(runtime, artifact_kind, artifact_id)? {
+            records.insert(artifact_id.clone(), record);
+        }
+    }
+    Ok(records)
+}
+
+fn taint_key(artifact_kind: &str, artifact_id: &str) -> Vec<u8> {
+    format!("{TAINT_PREFIX}{artifact_kind}/{artifact_id}").into_bytes()
+}
+
+fn decode_taint_record(
+    artifact_kind: &str,
+    artifact_id: &str,
+    value: &[u8],
+) -> Result<HygieneTaintRecord, ErrorData> {
+    decode_json::<HygieneTaintRecord>(value).map_err(|error| {
         mcp_error(
             error.code(),
             format!("HYGIENE_TAINT_DECODE_FAILED for {artifact_kind}/{artifact_id}: {error}"),
         )
-    })?;
-    Ok(Some(record))
+    })
 }
 
 /// `(flag-ts → impacted episode ids, impacted episodes by id, rows scanned)`.
@@ -2266,6 +2343,8 @@ fn scan_impacted_episodes(
                     actor: actor_label(&record.actor),
                     app: record.app.clone(),
                     document: record.document.clone(),
+                    tainted: false,
+                    taint: None,
                 });
         }
         if !more {
@@ -2424,6 +2503,8 @@ fn scan_impacted_candidates(
                     rejected_at_ns: candidate.rejected_at_ns,
                     via_routine_ids,
                     via_episode_ids,
+                    tainted: false,
+                    taint: None,
                 },
             );
         }

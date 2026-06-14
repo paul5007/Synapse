@@ -1821,7 +1821,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "List mined routines (CF_ROUTINES) joined with their operator lifecycle state (CF_ROUTINE_STATE): candidate/confirmed/disabled/archived, labels, confidence, schedule. Filters by lifecycle, minimum confidence, app, and granularity; include_unmined also lists lifecycle rows whose routine the last mine no longer derived. Run routine_mine first to materialize routines"
+        description = "List mined routines (CF_ROUTINES) joined with their operator lifecycle state (CF_ROUTINE_STATE) and hygiene taint ledger status: candidate/confirmed/disabled/archived, labels, confidence, schedule, tainted flag, and taint provenance when a hygiene/taint/v1 routine row exists. Filters by lifecycle, minimum confidence, app, and granularity; include_unmined also lists lifecycle rows whose routine the last mine no longer derived. Run routine_mine first to materialize routines"
     )]
     pub async fn routine_list(
         &self,
@@ -1847,7 +1847,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Fetch one routine by stable id: the full mined record (template steps, schedule signature, support evidence with episode ids resolvable via episode_get) plus its operator lifecycle state (transitions audit trail, confidence history)"
+        description = "Fetch one routine by stable id: the full mined record (template steps, schedule signature, support evidence with episode ids resolvable via episode_get), its operator lifecycle state (transitions audit trail, confidence history), and hygiene taint provenance when a hygiene/taint/v1 routine row exists"
     )]
     pub async fn routine_inspect(
         &self,

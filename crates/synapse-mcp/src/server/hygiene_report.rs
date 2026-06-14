@@ -22,7 +22,7 @@ use crate::m3::hygiene::{HygieneReportParams, HygieneReportResponse, report};
 #[tool_router(router = hygiene_report_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Report prompt-injection hygiene flags with downstream-impact: for each flagged CF_TIMELINE/CF_OBSERVATIONS row, the CF_EPISODES rows it fed, the CF_ROUTINES mined from those episodes (with operator lifecycle), and profile-authoring candidates that reference those impacted routines/episodes (with review/install state). Links flags → physical source rows → derived artifacts so a caller can tell whether learned state was poisoned, not just which raw rows are flagged. Paged (limit/cursor), filterable (source_cf/source_key_hex/min_score/time_range), and honest-empty when clean. Returns scanned_flag/episode/routine/authoring_candidate row counts so the derivation is verifiably non-truncated."
+        description = "Report prompt-injection hygiene flags with downstream-impact: for each flagged CF_TIMELINE/CF_OBSERVATIONS row, the CF_EPISODES rows it fed, the CF_ROUTINES mined from those episodes (with operator lifecycle and hygiene taint status), and profile-authoring candidates that reference those impacted routines/episodes (with review/install state and hygiene taint status). Links flags → physical source rows → derived artifacts so a caller can tell whether learned state was poisoned, not just which raw rows are flagged. Paged (limit/cursor), filterable (source_cf/source_key_hex/min_score/time_range), and honest-empty when clean. Returns scanned_flag/episode/routine/authoring_candidate row counts so the derivation is verifiably non-truncated."
     )]
     pub async fn hygiene_report(
         &self,

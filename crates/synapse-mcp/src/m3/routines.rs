@@ -46,6 +46,7 @@ use crate::m1::mcp_error;
 use super::episodes::{
     decode_episode_row, hex_encode, key_after, local_day_start, next_local_day_start, now_ts_ns,
 };
+use super::hygiene::{HygieneTaintRecord, read_taint_record_from_db};
 use super::{
     M3ToolStub,
     permissions::{Permission, RequiredPermissions, required},
@@ -425,8 +426,8 @@ fn load_all_state_rows(
 
 /// Point lookup of one `CF_ROUTINE_STATE` row by routine id.
 fn load_state_row(db: &Db, routine_id: &str) -> Result<Option<RoutineStateRecord>, ErrorData> {
-    let key = routine_codec::routine_state_key(routine_id)
-        .map_err(|error| invalid(error.to_string()))?;
+    let key =
+        routine_codec::routine_state_key(routine_id).map_err(|error| invalid(error.to_string()))?;
     let rows = db
         .scan_cf_prefix(cf::CF_ROUTINE_STATE, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -449,8 +450,7 @@ fn load_state_row(db: &Db, routine_id: &str) -> Result<Option<RoutineStateRecord
 
 /// Point lookup of one `CF_ROUTINES` row by routine id.
 fn load_routine_record(db: &Db, routine_id: &str) -> Result<Option<RoutineRecord>, ErrorData> {
-    let key =
-        routine_codec::routine_key(routine_id).map_err(|error| invalid(error.to_string()))?;
+    let key = routine_codec::routine_key(routine_id).map_err(|error| invalid(error.to_string()))?;
     let rows = db
         .scan_cf_prefix(cf::CF_ROUTINES, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -545,8 +545,7 @@ fn push_confidence_point(record: &mut RoutineStateRecord, point: RoutineConfiden
     record.confidence_history.push(point);
     while record.confidence_history.len() > ROUTINE_STATE_MAX_CONFIDENCE_POINTS {
         record.confidence_history.remove(0);
-        record.confidence_history_truncated =
-            record.confidence_history_truncated.saturating_add(1);
+        record.confidence_history_truncated = record.confidence_history_truncated.saturating_add(1);
     }
     true
 }
@@ -775,8 +774,7 @@ pub fn mine_and_store_routines(
         // CF_ROUTINES and CF_ROUTINE_STATE are separate flushed batches; if
         // this reconcile fails the error is loud, lifecycle rows are intact,
         // and the next mining run repairs the presence bookkeeping.
-        state_counters =
-            reconcile_state_rows(db, &mining.routines, mined_at, &mut scanned_rows)?;
+        state_counters = reconcile_state_rows(db, &mining.routines, mined_at, &mut scanned_rows)?;
         tracing::info!(
             code = "ROUTINE_MINE_REPLACED",
             range_start_ns = range_start_snapped,
@@ -938,6 +936,12 @@ pub struct RoutineListEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_mined_ts_ns: Option<u64>,
     pub updated_ts_ns: u64,
+    /// True when the hygiene cleaning path has marked this derived routine as
+    /// poisoned by a cleaned prompt-injection source row.
+    pub tainted: bool,
+    /// Exact `hygiene/taint/v1/routine/<routine_id>` ledger row, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<HygieneTaintRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
@@ -977,6 +981,12 @@ pub struct RoutineInspectResponse {
     pub record: Option<RoutineRecord>,
     /// Lifecycle state, transition audit trail, and confidence history.
     pub state: RoutineStateRecord,
+    /// True when the hygiene cleaning path has marked this derived routine as
+    /// poisoned by a cleaned prompt-injection source row.
+    pub tainted: bool,
+    /// Exact `hygiene/taint/v1/routine/<routine_id>` ledger row, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<HygieneTaintRecord>,
 }
 
 /// Lifecycle operations accepted by `routine_update`.
@@ -1059,19 +1069,26 @@ pub fn required_permissions_update(_params: &RoutineUpdateParams) -> RequiredPer
 }
 
 fn validate_routine_id_param(tool: &str, routine_id: &str) -> Result<(), ErrorData> {
-    routine_codec::routine_key(routine_id).map(|_key| ()).map_err(|_error| {
-        invalid(format!(
-            "{tool} routine_id is invalid: ROUTINE_KEY_INVALID: expected \
+    routine_codec::routine_key(routine_id)
+        .map(|_key| ())
+        .map_err(|_error| {
+            invalid(format!(
+                "{tool} routine_id is invalid: ROUTINE_KEY_INVALID: expected \
              {:?} + 16 lowercase hex chars, got {routine_id:?}",
-            routine_codec::ROUTINE_ID_PREFIX
-        ))
-    })
+                routine_codec::ROUTINE_ID_PREFIX
+            ))
+        })
 }
 
 /// Builds one list entry from a mined record and its (possibly synthesized)
 /// state row.
-fn list_entry_mined(record: &RoutineRecord, state: &RoutineStateRecord, exists: bool)
--> RoutineListEntry {
+fn list_entry_mined(
+    record: &RoutineRecord,
+    state: &RoutineStateRecord,
+    exists: bool,
+    taint: Option<HygieneTaintRecord>,
+) -> RoutineListEntry {
+    let tainted = taint.is_some();
     RoutineListEntry {
         routine_id: record.routine_id.clone(),
         lifecycle: state.lifecycle,
@@ -1086,11 +1103,17 @@ fn list_entry_mined(record: &RoutineRecord, state: &RoutineStateRecord, exists: 
         occurrence_count: Some(record.occurrence_count),
         last_mined_ts_ns: state.last_mined_ts_ns.or(Some(record.ts_ns)),
         updated_ts_ns: state.updated_ts_ns,
+        tainted,
+        taint,
     }
 }
 
-fn list_entry_unmined(state: &RoutineStateRecord) -> RoutineListEntry {
+fn list_entry_unmined(
+    state: &RoutineStateRecord,
+    taint: Option<HygieneTaintRecord>,
+) -> RoutineListEntry {
     let last_point = state.confidence_history.last();
+    let tainted = taint.is_some();
     RoutineListEntry {
         routine_id: state.routine_id.clone(),
         lifecycle: state.lifecycle,
@@ -1105,6 +1128,8 @@ fn list_entry_unmined(state: &RoutineStateRecord) -> RoutineListEntry {
         occurrence_count: None,
         last_mined_ts_ns: state.last_mined_ts_ns,
         updated_ts_ns: state.updated_ts_ns,
+        tainted,
+        taint,
     }
 }
 
@@ -1160,7 +1185,8 @@ pub fn list_routines(
             Some(state) => (state.clone(), true),
             None => (synthesized_default_state(record), false),
         };
-        let entry = list_entry_mined(record, &state, exists);
+        let taint = read_taint_record_from_db(db, "routine", routine_id)?;
+        let entry = list_entry_mined(record, &state, exists, taint);
         if !lifecycle_allowed(entry.lifecycle) {
             continue;
         }
@@ -1186,7 +1212,8 @@ pub fn list_routines(
             if records.contains_key(routine_id) {
                 continue;
             }
-            let entry = list_entry_unmined(state);
+            let taint = read_taint_record_from_db(db, "routine", routine_id)?;
+            let entry = list_entry_unmined(state, taint);
             if !lifecycle_allowed(entry.lifecycle) {
                 continue;
             }
@@ -1252,12 +1279,16 @@ pub fn inspect_routine(
             )));
         }
     };
+    let taint = read_taint_record_from_db(db, "routine", &params.routine_id)?;
+    let tainted = taint.is_some();
     Ok(RoutineInspectResponse {
         routine_id: params.routine_id.clone(),
         mined: record.is_some(),
         state_row_exists,
         record,
         state,
+        tainted,
+        taint,
     })
 }
 
@@ -1591,7 +1622,11 @@ mod tests {
         };
         let mut rename_missing_label = base(RoutineUpdateAction::Rename);
         let error = validate_update_fields(&rename_missing_label).expect_err("label required");
-        assert!(error.message.contains("requires a label"), "{}", error.message);
+        assert!(
+            error.message.contains("requires a label"),
+            "{}",
+            error.message
+        );
         rename_missing_label.label = Some("  ".to_owned());
         let error = validate_update_fields(&rename_missing_label).expect_err("blank label");
         assert!(error.message.contains("not be blank"), "{}", error.message);

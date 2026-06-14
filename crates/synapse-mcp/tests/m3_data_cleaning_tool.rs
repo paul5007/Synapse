@@ -151,12 +151,30 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
             i64::try_from(local_ts_ns(days_ago, 9, 0)?)? + jitter * 60 * 1_000_000_000,
         )?;
         let tag = format!("d{days_ago}");
-        seed_focus(&mut client, &format!("{tag}-outlook"), base, "outlook.exe", "Inbox - Outlook")
-            .await?;
-        seed_focus(&mut client, &format!("{tag}-excel"), base + 2 * MIN, "excel.exe", INJECTION)
-            .await?;
-        seed_focus(&mut client, &format!("{tag}-teams"), base + 7 * MIN, "teams.exe", "Chat - Teams")
-            .await?;
+        seed_focus(
+            &mut client,
+            &format!("{tag}-outlook"),
+            base,
+            "outlook.exe",
+            "Inbox - Outlook",
+        )
+        .await?;
+        seed_focus(
+            &mut client,
+            &format!("{tag}-excel"),
+            base + 2 * MIN,
+            "excel.exe",
+            INJECTION,
+        )
+        .await?;
+        seed_focus(
+            &mut client,
+            &format!("{tag}-teams"),
+            base + 7 * MIN,
+            "teams.exe",
+            "Chat - Teams",
+        )
+        .await?;
         seed_idle(&mut client, &format!("{tag}-idle"), base + 9 * MIN).await?;
     }
 
@@ -170,47 +188,86 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
         .context("routine_id")?
         .to_owned();
     println!("readback=routine_mine routine_id={routine_id}");
+    let clean_routine = structured(
+        &client
+            .tools_call("routine_inspect", json!({"routine_id": routine_id.clone()}))
+            .await?,
+    )?;
+    println!(
+        "readback=routine_inspect edge=clean_taint routine_id={} tainted={}",
+        routine_id, clean_routine["tainted"]
+    );
+    assert_eq!(clean_routine["tainted"], false);
+    assert!(
+        clean_routine.get("taint").is_none_or(Value::is_null),
+        "clean routine should omit taint provenance: {clean_routine}"
+    );
 
     // Flag the five injected excel titles.
     let scan = structured(
         &client
-            .tools_call("hygiene_scan_storage", json!({"source_cfs": [cf::CF_TIMELINE]}))
+            .tools_call(
+                "hygiene_scan_storage",
+                json!({"source_cfs": [cf::CF_TIMELINE]}),
+            )
             .await?,
     )?;
-    let persisted = scan["persisted_flags"].as_array().context("persisted_flags")?;
+    let persisted = scan["persisted_flags"]
+        .as_array()
+        .context("persisted_flags")?;
     println!(
         "readback=hygiene_scan_storage flags_written={} persisted={}",
         scan["flags_written"],
         persisted.len()
     );
-    anyhow::ensure!(persisted.len() >= 5, "expected >=5 timeline flags, got {}", persisted.len());
+    anyhow::ensure!(
+        persisted.len() >= 5,
+        "expected >=5 timeline flags, got {}",
+        persisted.len()
+    );
 
     // Group flag ids by physical source row so a clean op fully masks/deletes a
     // row (a title can carry several heuristic spans → several flags).
-    let mut by_row: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut by_row: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for flag in persisted {
         let record = &flag["record"];
         assert_eq!(record["source_cf"], cf::CF_TIMELINE);
-        let key = record["source_key_hex"].as_str().context("source_key_hex")?.to_owned();
+        let key = record["source_key_hex"]
+            .as_str()
+            .context("source_key_hex")?
+            .to_owned();
         let id = record["flag_id"].as_str().context("flag_id")?.to_owned();
         by_row.entry(key).or_default().push(id);
     }
     let mut rows: Vec<(String, Vec<String>)> = by_row.into_iter().collect();
-    anyhow::ensure!(rows.len() >= 2, "need >=2 distinct poisoned rows, got {}", rows.len());
+    anyhow::ensure!(
+        rows.len() >= 2,
+        "need >=2 distinct poisoned rows, got {}",
+        rows.len()
+    );
     let (redact_key_hex, redact_flag_ids) = rows.remove(0);
     let (purge_key_hex, purge_flag_ids) = rows.pop().context("purge row")?;
     println!(
         "readback=clean_targets redact_row={redact_key_hex} redact_flags={redact_flag_ids:?} purge_row={purge_key_hex} purge_flags={purge_flag_ids:?}"
     );
 
-    assert_eq!(injection_hits(&mut client).await?, 5, "all five rows poisoned at start");
+    assert_eq!(
+        injection_hits(&mut client).await?,
+        5,
+        "all five rows poisoned at start"
+    );
 
     // EDGE: unknown flag id is a hard error (never a silent skip).
     let unknown = client
         .tools_call_error("timeline_redact", json!({"flag_ids": ["does-not-exist"]}))
         .await?;
     println!("readback=edge unknown_flag_id error={unknown}");
-    assert!(unknown.to_string().contains("HYGIENE_CLEAN_FLAG_IDS_UNRESOLVED"));
+    assert!(
+        unknown
+            .to_string()
+            .contains("HYGIENE_CLEAN_FLAG_IDS_UNRESOLVED")
+    );
 
     // EDGE: flag_ids + query selector is mutually exclusive.
     let both = client
@@ -221,7 +278,9 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
         .await?;
     assert!(both.to_string().contains("TOOL_PARAMS_INVALID"));
     // EDGE: empty selector.
-    let neither = client.tools_call_error("timeline_redact", json!({})).await?;
+    let neither = client
+        .tools_call_error("timeline_redact", json!({}))
+        .await?;
     assert!(neither.to_string().contains("TOOL_PARAMS_INVALID"));
     println!("readback=edge mutual_exclusivity+empty_selector both_error=true");
 
@@ -242,57 +301,160 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
     assert_eq!(dry["redacted_rows"], 1);
     assert!(dry["audit_key_hex"].is_null());
     assert_eq!(dry["invalidation"]["taint_records_written"], 0);
-    assert_eq!(injection_hits(&mut client).await?, 5, "dry_run must not mutate any row");
+    assert_eq!(
+        injection_hits(&mut client).await?,
+        5,
+        "dry_run must not mutate any row"
+    );
 
     // REAL redact: masks the row and taints derived state.
     let red = structured(
         &client
-            .tools_call("timeline_redact", json!({"flag_ids": redact_flag_ids.clone()}))
+            .tools_call(
+                "timeline_redact",
+                json!({"flag_ids": redact_flag_ids.clone()}),
+            )
             .await?,
     )?;
     println!(
         "readback=timeline_redact real redacted_flags={} redacted_rows={} audit={} tainted_routines={} tainted_episodes={} note={}",
-        red["redacted_flags"], red["redacted_rows"], red["audit_key_hex"],
-        red["invalidation"]["tainted_routine_ids"], red["invalidation"]["tainted_episode_ids"],
+        red["redacted_flags"],
+        red["redacted_rows"],
+        red["audit_key_hex"],
+        red["invalidation"]["tainted_routine_ids"],
+        red["invalidation"]["tainted_episode_ids"],
         red["invalidation"]["note"]
     );
     assert_eq!(red["redacted_rows"], 1);
     assert!(red["audit_key_hex"].is_string());
     for outcome in red["outcomes"].as_array().context("outcomes")? {
-        assert_eq!(outcome["status"], "redacted", "every selected flag must redact: {outcome}");
+        assert_eq!(
+            outcome["status"], "redacted",
+            "every selected flag must redact: {outcome}"
+        );
     }
     let tainted_routines = red["invalidation"]["tainted_routine_ids"]
         .as_array()
         .context("tainted_routine_ids")?;
     assert!(
-        tainted_routines.iter().any(|id| id == &json!(routine_id.clone())),
+        tainted_routines
+            .iter()
+            .any(|id| id == &json!(routine_id.clone())),
         "redacting a poisoned row must taint the mined routine, got {tainted_routines:?}"
     );
     assert!(
-        red["invalidation"]["tainted_episode_ids"].as_array().map_or(0, Vec::len) >= 1,
+        red["invalidation"]["tainted_episode_ids"]
+            .as_array()
+            .map_or(0, Vec::len)
+            >= 1,
         "the redacted row's episode must be tainted"
     );
-    assert_eq!(injection_hits(&mut client).await?, 4, "one poisoned row was masked");
+    let routine_after_redact = structured(
+        &client
+            .tools_call("routine_inspect", json!({"routine_id": routine_id.clone()}))
+            .await?,
+    )?;
+    println!(
+        "readback=routine_inspect taint tainted={} reason={} flags={} audit={}",
+        routine_after_redact["tainted"],
+        routine_after_redact["taint"]["reason"],
+        routine_after_redact["taint"]["source_flag_ids"],
+        routine_after_redact["taint"]["cleaning_audit_key_hex"]
+    );
+    assert_eq!(routine_after_redact["tainted"], true);
+    assert_eq!(routine_after_redact["taint"]["artifact_kind"], "routine");
+    assert_eq!(routine_after_redact["taint"]["artifact_id"], routine_id);
+    assert_eq!(
+        routine_after_redact["taint"]["cleaning_audit_key_hex"],
+        red["audit_key_hex"]
+    );
+    assert!(
+        routine_after_redact["taint"]["source_flag_ids"]
+            .as_array()
+            .map_or(0, Vec::len)
+            >= 1,
+        "taint provenance must name source flags: {routine_after_redact}"
+    );
+    let list_after_redact = structured(
+        &client
+            .tools_call("routine_list", json!({"app": "excel.exe"}))
+            .await?,
+    )?;
+    println!(
+        "readback=routine_list taint entries={} first_tainted={}",
+        list_after_redact["returned"], list_after_redact["entries"][0]["tainted"]
+    );
+    assert_eq!(list_after_redact["entries"][0]["tainted"], true);
+    assert_eq!(
+        list_after_redact["entries"][0]["taint"]["artifact_id"],
+        routine_id
+    );
+    let report_after_redact = structured(
+        &client
+            .tools_call(
+                "hygiene_report",
+                json!({"source_cf": cf::CF_TIMELINE, "source_key_hex": redact_key_hex.clone()}),
+            )
+            .await?,
+    )?;
+    let report_routines = report_after_redact["flags"][0]["derived_routines"]
+        .as_array()
+        .context("report routines")?;
+    let report_routine = report_routines
+        .iter()
+        .find(|routine| routine["routine_id"] == routine_id)
+        .context("tainted routine in hygiene_report")?;
+    println!(
+        "readback=hygiene_report taint routine_id={} tainted={} audit={}",
+        report_routine["routine_id"],
+        report_routine["tainted"],
+        report_routine["taint"]["cleaning_audit_key_hex"]
+    );
+    assert_eq!(report_routine["tainted"], true);
+    assert_eq!(
+        report_routine["taint"]["cleaning_audit_key_hex"],
+        red["audit_key_hex"]
+    );
+    let report_episodes = report_after_redact["flags"][0]["derived_episodes"]
+        .as_array()
+        .context("report episodes")?;
+    assert!(
+        report_episodes
+            .iter()
+            .any(|episode| episode["tainted"] == true),
+        "hygiene_report must surface episode taint too: {report_after_redact}"
+    );
+    assert_eq!(
+        injection_hits(&mut client).await?,
+        4,
+        "one poisoned row was masked"
+    );
 
     // IDEMPOTENT: re-running is an already_redacted no-op.
     let again = structured(
         &client
-            .tools_call("timeline_redact", json!({"flag_ids": redact_flag_ids.clone()}))
+            .tools_call(
+                "timeline_redact",
+                json!({"flag_ids": redact_flag_ids.clone()}),
+            )
             .await?,
     )?;
     println!(
         "readback=timeline_redact idempotent redacted_rows={} statuses={:?}",
         again["redacted_rows"],
-        again["outcomes"].as_array().map(|outs| outs
-            .iter()
-            .map(|o| o["status"].clone())
-            .collect::<Vec<_>>())
+        again["outcomes"]
+            .as_array()
+            .map(|outs| outs.iter().map(|o| o["status"].clone()).collect::<Vec<_>>())
     );
     assert_eq!(again["redacted_rows"], 0);
     for outcome in again["outcomes"].as_array().context("outcomes")? {
         assert_eq!(outcome["status"], "already_redacted");
     }
-    assert_eq!(injection_hits(&mut client).await?, 4, "idempotent redact changes nothing");
+    assert_eq!(
+        injection_hits(&mut client).await?,
+        4,
+        "idempotent redact changes nothing"
+    );
 
     // EDGE: purge flag_ids combined with a scan filter is rejected.
     let purge_conflict = client
@@ -315,22 +477,36 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
     )?;
     assert_eq!(pdry["matched_rows"], 1);
     assert_eq!(pdry["deleted_rows"], 0);
-    assert_eq!(injection_hits(&mut client).await?, 4, "purge dry_run deletes nothing");
+    assert_eq!(
+        injection_hits(&mut client).await?,
+        4,
+        "purge dry_run deletes nothing"
+    );
 
     let purge = structured(
         &client
-            .tools_call("timeline_purge", json!({"flag_ids": purge_flag_ids.clone()}))
+            .tools_call(
+                "timeline_purge",
+                json!({"flag_ids": purge_flag_ids.clone()}),
+            )
             .await?,
     )?;
     println!(
         "readback=timeline_purge by_flags matched={} deleted={} stopped={} audit={}",
-        purge["matched_rows"], purge["deleted_rows"], purge["stopped_because"], purge["audit_key_hex"]
+        purge["matched_rows"],
+        purge["deleted_rows"],
+        purge["stopped_because"],
+        purge["audit_key_hex"]
     );
     assert_eq!(purge["matched_rows"], 1);
     assert_eq!(purge["deleted_rows"], 1);
     assert_eq!(purge["stopped_because"], "flag_ids");
     assert!(purge["audit_key_hex"].is_string());
-    assert_eq!(injection_hits(&mut client).await?, 3, "one poisoned row hard-deleted");
+    assert_eq!(
+        injection_hits(&mut client).await?,
+        3,
+        "one poisoned row hard-deleted"
+    );
 
     let status = client.shutdown().await?;
     assert!(status.success());
@@ -349,7 +525,10 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
     let redacted: TimelineRecord = decode_json(redacted_value)?;
     let redacted_title = redacted.payload["title"].as_str().context("title")?;
     println!("readback=physical_redacted title={redacted_title:?}");
-    assert!(redacted_title.contains("[REDACTED]"), "marker must be present: {redacted_title:?}");
+    assert!(
+        redacted_title.contains("[REDACTED]"),
+        "marker must be present: {redacted_title:?}"
+    );
     assert!(
         !redacted_title.contains("ignore previous instructions"),
         "the flagged span must be gone: {redacted_title:?}"
@@ -370,7 +549,10 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
         .iter()
         .map(|(k, _v)| String::from_utf8_lossy(k).into_owned())
         .collect();
-    println!("readback=physical_taint count={} keys={taint_keys:?}", taint_rows.len());
+    println!(
+        "readback=physical_taint count={} keys={taint_keys:?}",
+        taint_rows.len()
+    );
     let routine_taint_key = format!("hygiene/taint/v1/routine/{routine_id}");
     let (_k, routine_taint_value) = taint_rows
         .iter()
@@ -380,11 +562,16 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
     assert_eq!(routine_taint["artifact_kind"], "routine");
     assert_eq!(routine_taint["artifact_id"], routine_id);
     assert!(
-        routine_taint["source_flag_ids"].as_array().map_or(0, Vec::len) >= 1,
+        routine_taint["source_flag_ids"]
+            .as_array()
+            .map_or(0, Vec::len)
+            >= 1,
         "taint must carry its source flag ids: {routine_taint}"
     );
     assert!(
-        taint_keys.iter().any(|k| k.starts_with("hygiene/taint/v1/episode/")),
+        taint_keys
+            .iter()
+            .any(|k| k.starts_with("hygiene/taint/v1/episode/")),
         "at least one episode must be tainted"
     );
 
@@ -406,9 +593,14 @@ async fn timeline_redact_and_purge_clean_poisoned_rows_and_invalidate() -> anyho
             _ => {}
         }
     }
-    println!("readback=physical_audit redact_audit_rows={redact_audit} purge_audit_rows={purge_audit}");
+    println!(
+        "readback=physical_audit redact_audit_rows={redact_audit} purge_audit_rows={purge_audit}"
+    );
     assert!(redact_audit >= 1, "a redact audit row must be persisted");
-    assert!(purge_audit >= 1, "a purge-by-flags audit row must be persisted");
+    assert!(
+        purge_audit >= 1,
+        "a purge-by-flags audit row must be persisted"
+    );
 
     Ok(())
 }
