@@ -47,6 +47,8 @@ const STROKE_DETAIL_TARGET_UNRESOLVED: &str = "STROKE_TARGET_UNRESOLVED";
 const CDP_STROKE_MIN_DISPATCH_INTERVAL_MS: f64 = 8.0;
 #[cfg(windows)]
 const CDP_STROKE_MAX_DISPATCH_POINTS: usize = 256;
+#[cfg(windows)]
+const CDP_STROKE_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -275,17 +277,28 @@ pub(crate) async fn act_stroke_cdp_target(
         })?;
         let points = cdp_dispatch_points_from_stroke_plan(&stroke_plan);
         let button = cdp_mouse_button(params.button)?;
-        let dispatch =
-            synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button)
-                .await
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "act_stroke CDP Input.dispatchMouseEvent failed for target {cdp_target_id:?}: {error}"
-                        ),
-                    )
-                })?;
+        let dispatch = tokio::time::timeout(
+            CDP_STROKE_ROUTE_TIMEOUT,
+            synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button),
+        )
+        .await
+        .map_err(|_| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!(
+                    "act_stroke CDP Input.dispatchMouseEvent route timed out after {} ms for target {cdp_target_id:?}",
+                    CDP_STROKE_ROUTE_TIMEOUT.as_millis()
+                ),
+            )
+        })?
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "act_stroke CDP Input.dispatchMouseEvent failed for target {cdp_target_id:?}: {error}"
+                ),
+            )
+        })?;
         tracing::info!(
             code = "M2_ACT_STROKE_CDP_TARGET_DISPATCHED",
             cdp_target_id = %dispatch.target_id,

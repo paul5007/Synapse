@@ -1606,6 +1606,7 @@ where
 
     let result = async {
         let page = get_target_page_with_discovery(&browser, target_id).await?;
+        prime_target_page_for_input(&page, target_id).await?;
         action(page).await
     }
     .await;
@@ -1686,6 +1687,23 @@ async fn get_target_page_with_discovery(
             last_error.unwrap_or_else(|| "none".to_owned())
         ),
     })
+}
+
+async fn prime_target_page_for_input(
+    page: &chromiumoxide::Page,
+    target_id: &str,
+) -> A11yResult<()> {
+    use chromiumoxide::cdp::browser_protocol::dom::GetDocumentParams;
+
+    let document = GetDocumentParams::builder().depth(0).pierce(true).build();
+    page.execute(document)
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "DOM.getDocument before Input.dispatchMouseEvent for target {target_id}: {err}"
+            ),
+        })?;
+    Ok(())
 }
 
 /// Finds the attached page that owns `backend_node_id`, priming each candidate's
