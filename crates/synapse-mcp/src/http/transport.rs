@@ -2161,8 +2161,11 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         .health_payload_with_http_sessions(Some(active_sessions));
     let sessions = match state.health_service.session_list_impl(false) {
         Ok(sessions) => DashboardPanel::ok(
-            "session_list dashboard primary agent feed",
-            dashboard_primary_session_list_data(&sessions),
+            "session_list dashboard primary agent feed + acknowledged escalation suppression",
+            dashboard_primary_session_list_data(
+                &sessions,
+                state.health_service.acked_open_attention_anchors_snapshot(),
+            ),
         ),
         Err(error) => DashboardPanel::error("session_list", format!("{error:?}")),
     };
@@ -3605,7 +3608,10 @@ fn with_dashboard_security_headers(mut response: Response) -> Response {
     response
 }
 
-fn dashboard_primary_session_list_data(sessions: impl Serialize) -> serde_json::Value {
+fn dashboard_primary_session_list_data(
+    sessions: impl Serialize,
+    acked_attention_anchors: Result<BTreeSet<String>, rmcp::ErrorData>,
+) -> serde_json::Value {
     let mut data = serde_json::to_value(sessions).unwrap_or_else(|error| {
         serde_json::json!({
             "serialization_error": error.to_string(),
@@ -3623,20 +3629,32 @@ fn dashboard_primary_session_list_data(sessions: impl Serialize) -> serde_json::
     };
 
     let mut primary_rows = Vec::new();
+    let mut acknowledged_rows = Vec::new();
     let mut terminal_rows = Vec::new();
+    let (acked_anchors, acked_anchor_error) = match acked_attention_anchors {
+        Ok(anchors) => (anchors, None),
+        Err(error) => (BTreeSet::new(), Some(error.message.to_string())),
+    };
     for row in unbound_rows.iter().cloned() {
         if dashboard_agent_row_is_terminal(&row) {
             terminal_rows.push(row);
+        } else if dashboard_agent_row_is_acknowledged_attention(&row, &acked_anchors) {
+            acknowledged_rows.push(dashboard_mark_acknowledged_attention(row));
         } else {
             primary_rows.push(row);
         }
     }
     let primary_count = primary_rows.len();
+    let acknowledged_count = acknowledged_rows.len();
     let terminal_count = terminal_rows.len();
 
     object.insert(
         "unbound_agent_states".to_owned(),
         serde_json::Value::Array(primary_rows),
+    );
+    object.insert(
+        "acknowledged_unbound_agent_states".to_owned(),
+        serde_json::Value::Array(acknowledged_rows),
     );
     object.insert(
         "terminal_unbound_agent_states".to_owned(),
@@ -3645,10 +3663,14 @@ fn dashboard_primary_session_list_data(sessions: impl Serialize) -> serde_json::
     object.insert(
         "dashboard_unbound_agent_filter".to_owned(),
         serde_json::json!({
-            "source_of_truth": "session_list unbound_agent_states split for dashboard attention feed",
+            "source_of_truth": "session_list unbound_agent_states + CF_KV escalation/v1/item acknowledged-open anchors split for dashboard attention feed",
             "primary_unbound_agent_count": primary_count,
+            "acknowledged_unbound_agent_count": acknowledged_count,
             "terminal_unbound_agent_count": terminal_count,
             "terminal_states": ["dead", "done", "exited", "closed"],
+            "acknowledged_attention_statuses": ["acked"],
+            "acknowledged_attention_anchor_count": acked_anchors.len(),
+            "acknowledged_attention_read_error": acked_anchor_error,
             "reason": "terminal unbound history is diagnostic history, not actionable attention",
         }),
     );
@@ -3660,6 +3682,42 @@ fn dashboard_agent_row_is_terminal(row: &serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_str)
         .map(|state| matches!(state, "dead" | "done" | "exited" | "closed"))
         .unwrap_or(false)
+}
+
+fn dashboard_agent_row_is_acknowledged_attention(
+    row: &serde_json::Value,
+    acked_anchors: &BTreeSet<String>,
+) -> bool {
+    let Some(state) = row.get("state").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if !matches!(
+        state,
+        "stuck" | "needs_input" | "awaiting_approval" | "ready_for_review"
+    ) {
+        return false;
+    }
+    dashboard_agent_row_anchor(row).is_some_and(|anchor| acked_anchors.contains(anchor))
+}
+
+fn dashboard_agent_row_anchor(row: &serde_json::Value) -> Option<&str> {
+    row.get("anchor")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| row.get("spawn_id").and_then(serde_json::Value::as_str))
+        .or_else(|| row.get("session_id").and_then(serde_json::Value::as_str))
+}
+
+fn dashboard_mark_acknowledged_attention(mut row: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = row.as_object_mut() {
+        object.insert(
+            "dashboard_attention_suppressed".to_owned(),
+            serde_json::json!({
+                "reason": "acknowledged_escalation",
+                "source_of_truth": "CF_KV escalation/v1/item status=acked",
+            }),
+        );
+    }
+    row
 }
 
 fn dashboard_events_panel(state: &HttpState) -> DashboardPanel {
@@ -4225,27 +4283,51 @@ mod tests {
                     "reason_code": "silent_timeout"
                 },
                 {
+                    "anchor": "agent-spawn-acked-stuck",
+                    "spawn_id": "agent-spawn-acked-stuck",
+                    "state": "stuck",
+                    "reason_code": "silent_timeout_unprobeable"
+                },
+                {
                     "anchor": "agent-spawn-needs-input",
                     "spawn_id": "agent-spawn-needs-input",
                     "state": "needs_input",
                     "reason_code": "permission_prompt"
-                }
+                },
+                "malformed-row"
             ]
         });
 
-        let data = dashboard_primary_session_list_data(&source);
+        let data = dashboard_primary_session_list_data(
+            &source,
+            Ok(BTreeSet::from(["agent-spawn-acked-stuck".to_owned()])),
+        );
         let primary = data["unbound_agent_states"]
             .as_array()
             .expect("primary rows");
+        let acknowledged = data["acknowledged_unbound_agent_states"]
+            .as_array()
+            .expect("acknowledged rows");
         let terminal = data["terminal_unbound_agent_states"]
             .as_array()
             .expect("terminal rows");
 
-        assert_eq!(primary.len(), 2);
+        assert_eq!(primary.len(), 3);
         assert_eq!(primary[0]["state"], "stuck");
         assert_eq!(primary[1]["state"], "needs_input");
+        assert_eq!(primary[2], "malformed-row");
+        assert_eq!(acknowledged.len(), 1);
+        assert_eq!(acknowledged[0]["anchor"], "agent-spawn-acked-stuck");
+        assert_eq!(
+            acknowledged[0]["dashboard_attention_suppressed"]["reason"],
+            "acknowledged_escalation"
+        );
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0]["anchor"], "agent-spawn-dead");
+        assert_eq!(
+            data["dashboard_unbound_agent_filter"]["acknowledged_unbound_agent_count"],
+            1
+        );
         assert_eq!(
             data["dashboard_unbound_agent_filter"]["terminal_unbound_agent_count"],
             1

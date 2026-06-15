@@ -7,7 +7,7 @@ use super::{
     activate_profile, apply_profile_runtime_config_in_state, authorization_error, error_codes,
     mcp_error,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
@@ -367,6 +367,15 @@ impl SynapseService {
     ) -> Result<Vec<crate::m3::approvals::ApprovalQueueItem>, ErrorData> {
         let db = self.m3_storage()?;
         crate::m3::approvals::approval_snapshot(&db, kind)
+    }
+
+    pub(crate) fn acked_open_attention_anchors_snapshot(
+        &self,
+    ) -> Result<BTreeSet<String>, ErrorData> {
+        let db = self.m3_storage()?;
+        Ok(super::escalation::acked_open_attention_anchors(&db)?
+            .into_iter()
+            .collect())
     }
 
     pub(crate) fn local_model_registry_snapshot(

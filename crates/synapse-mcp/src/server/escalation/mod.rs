@@ -552,6 +552,17 @@ fn open_items_for_anchor(db: &Db, anchor: &str) -> Result<Vec<EscalationItem>, E
         .collect())
 }
 
+pub(crate) fn acked_open_attention_anchors(db: &Db) -> Result<Vec<String>, ErrorData> {
+    let mut anchors: Vec<String> = scan_items(db)?
+        .into_iter()
+        .filter(|item| item.status == EscalationStatus::Acked)
+        .map(|item| item.anchor)
+        .collect();
+    anchors.sort();
+    anchors.dedup();
+    Ok(anchors)
+}
+
 fn open_tier0_toast_tags(db: &Db) -> Result<Vec<String>, ErrorData> {
     Ok(scan_items(db)?
         .into_iter()
