@@ -527,23 +527,6 @@ impl SynapseService {
         }
     }
 
-    /// Resolves the session's active **window** target to an HWND, if any. The
-    /// map guard is dropped before returning (a copied `i64`), so it is never
-    /// held across the non-`Send` perception path or an `.await`.
-    pub(crate) fn session_target_hwnd(
-        &self,
-        session_id: Option<&str>,
-    ) -> Result<Option<i64>, ErrorData> {
-        let Some(session_id) = session_id else {
-            return Ok(None);
-        };
-        match self.session_target(Some(session_id))? {
-            Some(SessionTarget::Window { hwnd }) => Ok(Some(hwnd)),
-            Some(SessionTarget::Cdp { window_hwnd, .. }) => Ok(Some(window_hwnd)),
-            None => Ok(None),
-        }
-    }
-
     pub(crate) fn unscoped_action_handle(&self) -> anyhow::Result<ActionHandle> {
         self.m2_state
             .lock()

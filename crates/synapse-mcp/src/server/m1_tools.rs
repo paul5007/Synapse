@@ -116,7 +116,7 @@ impl SynapseService {
         mcp_session_id: Option<&str>,
     ) -> Result<Json<synapse_core::Observation>, ErrorData> {
         let explicit_hwnd = params.0.window_hwnd;
-        let target_hwnd = explicit_hwnd.or_else(|| target_hwnd(&target));
+        let target_hwnd = perception_window_hwnd("observe", &target, explicit_hwnd)?;
         let cdp_target_id_hint = if explicit_hwnd.is_some() {
             None
         } else {
@@ -294,7 +294,7 @@ impl SynapseService {
         mcp_session_id: Option<&str>,
     ) -> Result<Json<FindResponse>, ErrorData> {
         let explicit_hwnd = params.0.window_hwnd;
-        let target_hwnd = explicit_hwnd.or_else(|| target_hwnd(&target));
+        let target_hwnd = perception_window_hwnd("find", &target, explicit_hwnd)?;
         let cdp_target_id_hint = if explicit_hwnd.is_some() {
             None
         } else {
@@ -363,7 +363,8 @@ impl SynapseService {
             return Ok(Json(result));
         }
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
-        let target_hwnd = self.request_session_target_hwnd(&request_context)?;
+        let target = self.request_session_target(&request_context)?;
+        let target_hwnd = perception_window_hwnd("read_text", &target, params.0.window_hwnd)?;
         self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())
     }
 
@@ -420,7 +421,9 @@ impl SynapseService {
             "tool.invocation kind=capture_screenshot"
         );
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
-        let session_target_hwnd = self.request_session_target_hwnd(&request_context)?;
+        let target = self.request_session_target(&request_context)?;
+        let session_target_hwnd =
+            perception_window_hwnd("capture_screenshot", &target, params.0.window_hwnd)?;
         if let Some(window_hwnd) = params.0.window_hwnd.or(session_target_hwnd) {
             if let Some(session_id) = session_id.as_deref() {
                 if self
@@ -1332,23 +1335,6 @@ impl SynapseService {
         Ok(target)
     }
 
-    fn request_session_target_hwnd(
-        &self,
-        request_context: &RequestContext<RoleServer>,
-    ) -> Result<Option<i64>, ErrorData> {
-        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
-        let target_hwnd = self.session_target_hwnd(session_id.as_deref())?;
-        if let (Some(session_id), Some(hwnd)) = (session_id.as_deref(), target_hwnd) {
-            tracing::debug!(
-                code = "SESSION_TARGET_RESOLVED",
-                session_id = %session_id,
-                hwnd,
-                "readback=session_target outcome=resolved_window"
-            );
-        }
-        Ok(target_hwnd)
-    }
-
     fn resolve_cdp_context_window(
         &self,
         session_id: &str,
@@ -2232,12 +2218,35 @@ impl SynapseService {
     }
 }
 
-fn target_hwnd(target: &Option<SessionTarget>) -> Option<i64> {
-    match target {
-        Some(SessionTarget::Window { hwnd }) => Some(*hwnd),
-        Some(SessionTarget::Cdp { window_hwnd, .. }) => Some(*window_hwnd),
-        None => None,
+fn perception_window_hwnd(
+    tool: &str,
+    target: &Option<SessionTarget>,
+    explicit_hwnd: Option<i64>,
+) -> Result<Option<i64>, ErrorData> {
+    if explicit_hwnd.is_some() {
+        return Ok(explicit_hwnd);
     }
+    match target {
+        Some(SessionTarget::Window { hwnd }) => Ok(Some(*hwnd)),
+        Some(SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        }) => Err(cdp_target_perception_error(
+            tool,
+            *window_hwnd,
+            cdp_target_id,
+        )),
+        None => Ok(None),
+    }
+}
+
+fn cdp_target_perception_error(tool: &str, window_hwnd: i64, cdp_target_id: &str) -> ErrorData {
+    mcp_error(
+        error_codes::TARGET_CDP_UNRESOLVED,
+        format!(
+            "{tool} cannot use session CDP target {cdp_target_id:?} in browser window {window_hwnd:#x} through the window/foreground perception path; refusing to downgrade the tab target to the browser HWND because that can read the human foreground tab. Use a true target-specific browser readback surface or pass an explicit window_hwnd intentionally."
+        ),
+    )
 }
 
 fn target_cdp_id(target: &Option<SessionTarget>) -> Option<String> {
@@ -4087,8 +4096,8 @@ mod tests {
     use super::{
         SessionTarget, TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
         hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
-        resolve_capture_target_window_context, sha256_hex, target_wire, template_value,
-        validate_target_window,
+        perception_window_hwnd, resolve_capture_target_window_context, sha256_hex, target_wire,
+        template_value, validate_target_window,
     };
     use crate::m1::{
         FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
@@ -4283,6 +4292,31 @@ mod tests {
             }
             other => panic!("expected cdp wire, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cdp_target_perception_refuses_window_downgrade() {
+        let target = Some(SessionTarget::Cdp {
+            window_hwnd: 0x4321,
+            cdp_target_id: "chrome-tab:abc".to_owned(),
+        });
+        let error = perception_window_hwnd("observe", &target, None)
+            .expect_err("CDP target must not downgrade to the browser HWND");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TARGET_CDP_UNRESOLVED));
+        assert!(
+            error
+                .message
+                .contains("refusing to downgrade the tab target to the browser HWND")
+        );
+
+        let explicit = perception_window_hwnd("observe", &target, Some(0x9999))
+            .expect("explicit window_hwnd remains an intentional override");
+        assert_eq!(explicit, Some(0x9999));
     }
     use crate::m1::{ReadTextCaptureSource, ResolvedReadTextRequest};
     use synapse_core::OcrBackend;
