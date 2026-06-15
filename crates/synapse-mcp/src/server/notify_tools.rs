@@ -386,13 +386,28 @@ fn notify_request_details(params: &NotifyHumanParams, tag: &str) -> Value {
     })
 }
 
+fn is_escalation_toast_payload(payload: &str) -> bool {
+    payload.contains("<text>Synapse: Agent appears stuck and needs attention [")
+        || payload.contains("<text>Synapse: Agent needs your input to continue [")
+        || payload.contains("<text>Synapse: Agent is waiting for your approval [")
+        || payload.contains("<text>Synapse: Agent finished and is ready for review [")
+}
+
+fn is_payload_empty_dedupe_toast_candidate(payload: &str, tag: &str) -> bool {
+    payload.trim().is_empty() && tag.starts_with("dk-")
+}
+
+fn is_orphan_cleanup_candidate(payload: &str, tag: &str) -> bool {
+    is_escalation_toast_payload(payload) || is_payload_empty_dedupe_toast_candidate(payload, tag)
+}
+
 #[cfg(windows)]
 mod windows_toast {
     use super::{
         HISTORY_VERIFY_POLL_MS, HISTORY_VERIFY_TIMEOUT_MS, NotifyFailure, NotifyHumanParams,
         SYNAPSE_AUMID, SYNAPSE_NOTIFY_DISPLAY_NAME, SYNAPSE_TOAST_GROUP, ToastAction,
         ToastActivationCallback, ToastCleanupReport, ToastOutcome, ToastRemovalOutcome,
-        error_codes, toast_xml_with_actions,
+        error_codes, is_orphan_cleanup_candidate, toast_xml_with_actions,
     };
     use std::{
         collections::BTreeSet,
@@ -934,19 +949,19 @@ mod windows_toast {
             if toast_group != SYNAPSE_TOAST_GROUP {
                 continue;
             }
+            let tag = toast
+                .Tag()
+                .map(|tag| tag.to_string_lossy())
+                .unwrap_or_default();
             let payload = toast
                 .Content()
                 .and_then(|document| document.GetXml())
                 .map(|xml| xml.to_string_lossy())
                 .unwrap_or_default();
-            if !is_escalation_toast_payload(&payload) {
+            if !is_orphan_cleanup_candidate(&payload, &tag) {
                 continue;
             }
             report.candidates = report.candidates.saturating_add(1);
-            let tag = toast
-                .Tag()
-                .map(|tag| tag.to_string_lossy())
-                .unwrap_or_default();
             if tag.is_empty() {
                 report.status = "error".to_owned();
                 report.failed = report.failed.saturating_add(1);
@@ -977,13 +992,6 @@ mod windows_toast {
             report.status = "partial_error".to_owned();
         }
         report
-    }
-
-    fn is_escalation_toast_payload(payload: &str) -> bool {
-        payload.contains("<text>Synapse: Agent appears stuck and needs attention [")
-            || payload.contains("<text>Synapse: Agent needs your input to continue [")
-            || payload.contains("<text>Synapse: Agent is waiting for your approval [")
-            || payload.contains("<text>Synapse: Agent finished and is ready for review [")
     }
 
     fn remove_toast_blocking(tag: &str) -> ToastRemovalOutcome {
@@ -1518,6 +1526,28 @@ mod tests {
         assert_ne!(unique_a, unique_b);
         assert!(unique_a.starts_with("id-"));
         assert!(unique_a.len() <= 64);
+    }
+
+    #[test]
+    fn orphan_cleanup_candidates_include_empty_dedupe_payloads_only() {
+        let escalation_payload = "<toast><visual><binding><text>Synapse: Agent appears stuck and needs attention [critical]</text></binding></visual></toast>";
+        assert!(is_orphan_cleanup_candidate(escalation_payload, "id-legacy"));
+        assert!(is_orphan_cleanup_candidate(
+            "",
+            "dk-0123456789abcdef0123456789abcdef"
+        ));
+        assert!(is_orphan_cleanup_candidate(
+            "   \r\n",
+            "dk-0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_orphan_cleanup_candidate(
+            "",
+            "id-0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_orphan_cleanup_candidate(
+            "<toast><visual><binding><text>Regular Synapse update</text></binding></visual></toast>",
+            "dk-0123456789abcdef0123456789abcdef",
+        ));
     }
 
     #[test]
