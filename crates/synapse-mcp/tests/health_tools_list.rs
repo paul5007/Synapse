@@ -175,6 +175,27 @@ async fn health_and_action_tools_appear_in_tools_list_with_schema() -> anyhow::R
         action_health.get("run_shell_durable_max_timeout_ms"),
         Some(&Value::Null)
     );
+    let chrome_bridge = health["subsystems"]["chrome_bridge"]
+        .as_object()
+        .context("chrome_bridge health object missing")?;
+    assert!(
+        chrome_bridge
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(
+                status,
+                "ok" | "connecting" | "unavailable" | "unsafe_profile"
+            )),
+        "chrome_bridge status should be an explicit readiness state: {chrome_bridge:?}"
+    );
+    let chrome_bridge_detail = chrome_bridge
+        .get("detail")
+        .and_then(Value::as_str)
+        .context("chrome_bridge detail missing")?;
+    assert!(chrome_bridge_detail.contains("tab_control_available="));
+    assert!(
+        chrome_bridge_detail.contains("expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk")
+    );
     let status = client.shutdown().await?;
     assert!(status.success());
     Ok(())

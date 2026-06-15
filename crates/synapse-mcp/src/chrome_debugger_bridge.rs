@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use synapse_core::{AccessibleNode, CdpCapability, CdpStatus, Rect, error_codes};
+use synapse_core::{AccessibleNode, CdpCapability, CdpStatus, Rect, SubsystemHealth, error_codes};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Notify, RwLock, oneshot},
@@ -689,6 +689,20 @@ struct HostRecord {
     last_detach_reason: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ChromeBridgeHealthRecord {
+    host_id: String,
+    origin: String,
+    extension_id: Option<String>,
+    pid: u32,
+    parent_window: Option<String>,
+    transport: Option<String>,
+    registered_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    last_disconnect_detail: Option<String>,
+    last_detach_reason: Option<String>,
+}
+
 struct QueuedCommand {
     host_id: String,
     command: ChromeCommand,
@@ -1275,6 +1289,138 @@ fn bridge() -> &'static ChromeDebuggerBridge {
         notify: Notify::new(),
         command_seq: AtomicU64::new(1),
     })
+}
+
+pub(crate) fn health_subsystem() -> SubsystemHealth {
+    let popup_risks = external_chrome_popup_risks();
+    let snapshot = match bridge().inner.lock() {
+        Ok(inner) => {
+            let active_host = inner
+                .active_host_id
+                .as_ref()
+                .and_then(|host_id| inner.hosts.get(host_id).map(|host| (host_id, host)))
+                .map(|(host_id, host)| ChromeBridgeHealthRecord {
+                    host_id: host_id.clone(),
+                    origin: host.origin.clone(),
+                    extension_id: host.extension_id.clone(),
+                    pid: host.pid,
+                    parent_window: host.parent_window.clone(),
+                    transport: host.transport.clone(),
+                    registered_unix_ms: host.registered_unix_ms,
+                    last_seen_unix_ms: host.last_seen_unix_ms,
+                    last_disconnect_detail: host.last_disconnect_detail.clone(),
+                    last_detach_reason: host.last_detach_reason.clone(),
+                });
+            (
+                active_host,
+                inner.hosts.len(),
+                inner.commands.len(),
+                inner.pending.len(),
+            )
+        }
+        Err(_poisoned) => {
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(
+                    "chrome_bridge_state_lock_poisoned tab_control_available=false".to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        }
+    };
+    chrome_bridge_health_from_snapshot(
+        snapshot.0.as_ref(),
+        snapshot.1,
+        snapshot.2,
+        snapshot.3,
+        &popup_risks,
+    )
+}
+
+fn chrome_bridge_health_from_snapshot(
+    active_host: Option<&ChromeBridgeHealthRecord>,
+    host_count: usize,
+    queued_count: usize,
+    pending_count: usize,
+    popup_risks: &[String],
+) -> SubsystemHealth {
+    let risk_summary = format_external_chrome_popup_risks(popup_risks);
+    if !popup_risks.is_empty() {
+        return SubsystemHealth {
+            status: "unsafe_profile".to_owned(),
+            detail: Some(format!(
+                "tab_control_available=false reason=external_chrome_popup_risk risk_count={} external_chrome_popup_risk={} host_count={} queued_count={} pending_count={} install_guidance={}",
+                popup_risks.len(),
+                risk_summary,
+                host_count,
+                queued_count,
+                pending_count,
+                INSTALL_GUIDANCE
+            )),
+            ..SubsystemHealth::default()
+        };
+    }
+
+    let Some(host) = active_host else {
+        return SubsystemHealth {
+            status: "unavailable".to_owned(),
+            detail: Some(format!(
+                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} install_guidance={}",
+                host_count,
+                queued_count,
+                pending_count,
+                EXTENSION_ID,
+                chrome_debugger_health_endpoint(EXTENSION_ID),
+                INSTALL_GUIDANCE
+            )),
+            ..SubsystemHealth::default()
+        };
+    };
+
+    let transport = host.transport.as_deref().unwrap_or("native_messaging");
+    let extension_id = host.extension_id.as_deref().unwrap_or("not_seen_yet");
+    let endpoint_extension_id = host.extension_id.as_deref().unwrap_or(EXTENSION_ID);
+    let parent_window = host.parent_window.as_deref().unwrap_or("");
+    let tab_control_available =
+        extension_id == EXTENSION_ID && host.last_disconnect_detail.is_none();
+    let status = if tab_control_available {
+        "ok"
+    } else if host.last_disconnect_detail.is_some() {
+        "unavailable"
+    } else {
+        "connecting"
+    };
+    let disconnect_detail = host.last_disconnect_detail.as_deref().unwrap_or("");
+    let detach_reason = host.last_detach_reason.as_deref().unwrap_or("");
+
+    SubsystemHealth {
+        status: status.to_owned(),
+        detail: Some(format!(
+            "tab_control_available={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} install_guidance={}",
+            tab_control_available,
+            host.host_id,
+            host_count,
+            host.origin,
+            extension_id,
+            EXTENSION_ID,
+            chrome_debugger_health_endpoint(endpoint_extension_id),
+            transport,
+            host.pid,
+            parent_window,
+            host.registered_unix_ms,
+            host.last_seen_unix_ms,
+            queued_count,
+            pending_count,
+            disconnect_detail,
+            detach_reason,
+            INSTALL_GUIDANCE
+        )),
+        ..SubsystemHealth::default()
+    }
+}
+
+fn chrome_debugger_health_endpoint(extension_id: &str) -> String {
+    format!("chrome-extension://{extension_id}/chrome.tabs")
 }
 
 async fn send_attach_command(
@@ -2358,6 +2504,78 @@ mod tests {
                 .detail()
                 .contains("install the bundled Synapse Chrome extension")
         );
+    }
+
+    #[test]
+    fn chrome_bridge_health_reports_unavailable_without_active_host() {
+        let health = chrome_bridge_health_from_snapshot(None, 0, 0, 0, &[]);
+
+        assert_eq!(health.status, "unavailable");
+        let detail = health.detail.as_deref().expect("health detail");
+        assert!(detail.contains("tab_control_available=false"));
+        assert!(detail.contains("reason=no_active_chrome_bridge_host"));
+        assert!(detail.contains("expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk"));
+        assert!(detail.contains("scripts\\install-synapse-chrome-debugger.ps1"));
+    }
+
+    #[test]
+    fn chrome_bridge_health_reports_ready_active_host() {
+        let host = ChromeBridgeHealthRecord {
+            host_id: "chrome-native-test".to_owned(),
+            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            pid: 42,
+            parent_window: Some("1001".to_owned()),
+            transport: Some("direct_http".to_owned()),
+            registered_unix_ms: 1000,
+            last_seen_unix_ms: 2000,
+            last_disconnect_detail: None,
+            last_detach_reason: None,
+        };
+
+        let health = chrome_bridge_health_from_snapshot(Some(&host), 1, 2, 3, &[]);
+
+        assert_eq!(health.status, "ok");
+        let detail = health.detail.as_deref().expect("health detail");
+        assert!(detail.contains("tab_control_available=true"));
+        assert!(detail.contains("active_host_id=chrome-native-test"));
+        assert!(
+            detail.contains(
+                "endpoint=chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs"
+            )
+        );
+        assert!(detail.contains("queued_count=2"));
+        assert!(detail.contains("pending_count=3"));
+    }
+
+    #[test]
+    fn chrome_bridge_health_reports_unsafe_profile_before_ready() {
+        let host = ChromeBridgeHealthRecord {
+            host_id: "chrome-native-test".to_owned(),
+            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            pid: 42,
+            parent_window: None,
+            transport: Some("direct_http".to_owned()),
+            registered_unix_ms: 1000,
+            last_seen_unix_ms: 2000,
+            last_disconnect_detail: None,
+            last_detach_reason: None,
+        };
+
+        let health = chrome_bridge_health_from_snapshot(
+            Some(&host),
+            1,
+            0,
+            0,
+            &["profile=Default extension_id=external active_api=debugger".to_owned()],
+        );
+
+        assert_eq!(health.status, "unsafe_profile");
+        let detail = health.detail.as_deref().expect("health detail");
+        assert!(detail.contains("tab_control_available=false"));
+        assert!(detail.contains("reason=external_chrome_popup_risk"));
+        assert!(detail.contains("extension_id=external"));
     }
 
     #[test]

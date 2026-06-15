@@ -38,6 +38,10 @@ impl SynapseService {
         subsystems.insert("perception".to_owned(), self.perception_health());
         subsystems.insert("action".to_owned(), self.action_health());
         subsystems.insert("audio".to_owned(), self.audio_health());
+        subsystems.insert(
+            "chrome_bridge".to_owned(),
+            crate::chrome_debugger_bridge::health_subsystem(),
+        );
         subsystems.insert("http".to_owned(), self.http_health(active_sessions));
         subsystems.insert("daemon_drain".to_owned(), self.daemon_drain_health());
         subsystems.insert(
