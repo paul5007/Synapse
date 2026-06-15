@@ -3396,10 +3396,10 @@ function FleetList({
                 size="sm"
                 disabled={!agent.killable || pending}
                 onClick={() => onKill(agent)}
-                aria-label={`Kill ${agent.killId || agent.id} from fleet list`}
+                aria-label={agent.killable ? `Kill ${agent.killId || agent.id} from fleet list` : `Historical row ${agent.id}`}
               >
-                <X aria-hidden="true" className="h-4 w-4" />
-                {pending ? "Killing" : "Kill"}
+                {agent.killable ? <X aria-hidden="true" className="h-4 w-4" /> : <FileSearch aria-hidden="true" className="h-4 w-4" />}
+                {agent.killable ? (pending ? "Killing" : "Kill") : "History"}
               </Button>
             </div>
           </div>
@@ -3467,10 +3467,10 @@ function FleetTable({
                     size="sm"
                     disabled={!agent.killable || pending}
                     onClick={() => onKill(agent)}
-                    aria-label={`Kill ${agent.killId || agent.id}`}
+                    aria-label={agent.killable ? `Kill ${agent.killId || agent.id}` : `Historical row ${agent.id}`}
                   >
-                    <X aria-hidden="true" className="h-4 w-4" />
-                    {pending ? "Killing" : "Kill"}
+                    {agent.killable ? <X aria-hidden="true" className="h-4 w-4" /> : <FileSearch aria-hidden="true" className="h-4 w-4" />}
+                    {agent.killable ? (pending ? "Killing" : "Kill") : "History"}
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>{agent.killable ? `Kill ${agent.killId}` : "Historical row"}</TooltipContent>

@@ -9,6 +9,7 @@ const statusClasses: Record<FleetStatus, string> = {
   needs_input: "border-warning-border bg-warning-bg text-warning-fg",
   awaiting_approval: "border-warning-border bg-warning-bg text-warning-fg",
   stuck: "border-danger-border bg-danger-bg text-danger-fg",
+  failed: "border-danger-border bg-danger-bg text-danger-fg",
   done: "border-success-border bg-success-bg text-success-fg"
 };
 
@@ -19,6 +20,7 @@ const statusShape: Record<FleetStatus, string> = {
   needs_input: "◆",
   awaiting_approval: "⚑",
   stuck: "▲",
+  failed: "×",
   done: "✓"
 };
 
@@ -29,6 +31,7 @@ const statusLabel: Record<FleetStatus, string> = {
   needs_input: "Needs input",
   awaiting_approval: "Approval",
   stuck: "Stuck",
+  failed: "Failed",
   done: "Done"
 };
 

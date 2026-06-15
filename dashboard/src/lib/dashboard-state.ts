@@ -60,6 +60,7 @@ export type FleetStatus =
   | "needs_input"
   | "awaiting_approval"
   | "stuck"
+  | "failed"
   | "done";
 
 export interface ToolCallSummary {
@@ -734,7 +735,7 @@ export function buildAgents(state?: DashboardState): AgentSummary[] {
       killable: true,
       kind: rawText(row.agent_kind || row.client_name || "agent"),
       lifecycle: rawText(row.lifecycle),
-      status: statusFromLiveSession(stateName, lastSeenMs, lastAction),
+      status: statusFromLiveSession(stateName, lastSeenMs, lastAction, rawText(agentState.reason_code)),
       summary: lastAction || stateName || "session live",
       lastSeenMs: Number.isFinite(lastSeenMs) ? lastSeenMs : undefined,
       lastAction,
@@ -798,17 +799,34 @@ export function buildToolCalls(state?: DashboardState): ToolCallSummary[] {
   });
 }
 
-function statusFromLiveSession(stateName: string, lastSeenMs: number, lastAction: string): FleetStatus {
+const TERMINAL_STATE_RE = /dead|done|exited|closed/i;
+const FAILURE_REASON_RE = /failed|failure|unhealthy|missing|error|interrupted|timeout|readback/i;
+
+function terminalStatus(stateName: string, reason: string): FleetStatus | null {
+  if (!TERMINAL_STATE_RE.test(stateName)) return null;
+  return FAILURE_REASON_RE.test(`${stateName} ${reason}`) ? "failed" : "done";
+}
+
+function statusFromLiveSession(stateName: string, lastSeenMs: number, lastAction: string, reason: string): FleetStatus {
+  const terminal = terminalStatus(stateName, reason);
+  if (terminal) return terminal;
+  if (/stuck/i.test(stateName)) return "stuck";
   if (Number.isFinite(lastSeenMs) && lastSeenMs > 300000) return "stuck";
-  if (/approval/i.test(lastAction)) return "awaiting_approval";
-  if (/wait|inbox|input/i.test(lastAction)) return "needs_input";
-  if (/review/i.test(lastAction)) return "ready_for_review";
+  if (FAILURE_REASON_RE.test(reason)) return "stuck";
+  if (/approval/i.test(`${stateName} ${lastAction} ${reason}`)) return "awaiting_approval";
+  if (/wait|inbox|input/i.test(`${stateName} ${lastAction} ${reason}`)) return "needs_input";
+  if (/review/i.test(`${stateName} ${lastAction} ${reason}`)) return "ready_for_review";
   if (/idle/i.test(stateName)) return "idle";
   return "working";
 }
 
 function statusFromHistorical(stateName: string, reason: string): FleetStatus {
-  if (/failed|unhealthy|missing|error|interrupted|timeout/i.test(`${stateName} ${reason}`)) return "stuck";
-  if (/dead|done|exited|closed/i.test(stateName)) return "done";
+  const terminal = terminalStatus(stateName, reason);
+  if (terminal) return terminal;
+  if (/approval/i.test(`${stateName} ${reason}`)) return "awaiting_approval";
+  if (/wait|inbox|input/i.test(`${stateName} ${reason}`)) return "needs_input";
+  if (/review/i.test(`${stateName} ${reason}`)) return "ready_for_review";
+  if (/stuck|failed|failure|unhealthy|missing|error|interrupted|timeout/i.test(`${stateName} ${reason}`)) return "stuck";
+  if (/working|spawning/i.test(stateName)) return "working";
   return "idle";
 }

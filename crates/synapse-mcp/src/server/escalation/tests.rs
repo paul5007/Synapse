@@ -323,6 +323,50 @@ fn changing_attention_state_supersedes_old_escalation() {
     assert_eq!(open[0].severity, Severity::Critical);
 }
 
+#[tokio::test]
+async fn process_pending_resolves_terminal_anchor_before_toast() {
+    use crate::server::agent_events::record_agent_events;
+    use synapse_core::{AgentEventKind, AgentEventRecord};
+
+    let db = db();
+    let anchor = format!("issue1010-dead-anchor-{}", Uuid::now_v7().simple());
+    let mut exited = AgentEventRecord::new(
+        crate::server::agent_events::unix_time_ns_now(),
+        AgentEventKind::Exited,
+    );
+    exited.spawn_id = Some(anchor.clone());
+    exited.reason_code = Some("local_model_registry_row_missing".to_owned());
+    record_agent_events(&db, &[exited]).expect("dead agent event");
+
+    let transition = StateTransition {
+        anchor: anchor.clone(),
+        spawn_id: Some(anchor.clone()),
+        session_id: None,
+        state_from: AgentLifecycleState::Working,
+        state_to: AgentLifecycleState::Stuck,
+        reason_code: "silent_timeout_unprobeable".to_owned(),
+        waiting_for: Some("silent_for_ms:600000".to_owned()),
+        runaway: false,
+        evidence: json!({ "edge": "stale_open_escalation_after_dead_anchor" }),
+    };
+    let policy = EscalationPolicy::default();
+    let item =
+        open_escalation(&db, &transition, Severity::Critical, &policy, 300).expect("open stale");
+
+    let report = process_pending(&db, 301).await.expect("sweep");
+    assert_eq!(report.terminal_resolved, 1);
+    assert_eq!(report.tier0_fired, 0, "terminal anchors must not toast");
+
+    let readback = read_item(&db, &item.escalation_id)
+        .unwrap()
+        .expect("item readback");
+    assert_eq!(readback.status, EscalationStatus::Resolved);
+    assert_eq!(
+        readback.closed_reason.as_deref(),
+        Some("terminal_agent_state:dead:local_model_registry_row_missing")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Constraint: no operator egress ⇒ zero outbound calls
 // ---------------------------------------------------------------------------

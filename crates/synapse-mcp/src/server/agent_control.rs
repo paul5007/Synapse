@@ -1291,6 +1291,13 @@ impl SynapseService {
 }
 
 fn process_readback_for_target(target: &ResolvedAgent) -> ProcessReadback {
+    if target.launcher_process_id == 0 {
+        return ProcessReadback {
+            launcher_process_id: 0,
+            process_tree_ids: Vec::new(),
+            live_process_ids: Vec::new(),
+        };
+    }
     let mut process_tree_ids = crate::m4::owned_process_tree_ids(target.launcher_process_id);
     if let Some(agent_pid) = target.agent_process_id {
         process_tree_ids.extend(crate::m4::owned_process_tree_ids(agent_pid));
@@ -1326,22 +1333,39 @@ fn resolved_agent_from_durable_state_read(
     if !session_matches && !spawn_matches {
         return Ok(None);
     }
-    let Some(session_id) = read.session_id.clone() else {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "AGENT_NOT_READY: {tool} resolved spawn {spawn_id} from durable agent state but no MCP session id is linked yet"
-            ),
-        ));
+    let terminal_dead = read.state == super::agent_state::AgentLifecycleState::Dead;
+    let session_id = match read.session_id.clone() {
+        Some(session_id) => session_id,
+        None if terminal_dead => spawn_id.clone(),
+        None => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_NOT_READY: {tool} resolved spawn {spawn_id} from durable agent state but no MCP session id is linked yet"
+                ),
+            ));
+        }
     };
-    let Some(launcher_process_id) = read.launcher_process_id else {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "AGENT_PROCESS_UNAVAILABLE: {tool} resolved spawn {spawn_id} from durable agent state but no launcher process id is recorded"
-            ),
-        ));
+    let launcher_process_id = match read.launcher_process_id {
+        Some(launcher_process_id) => launcher_process_id,
+        None if terminal_dead => 0,
+        None => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_PROCESS_UNAVAILABLE: {tool} resolved spawn {spawn_id} from durable agent state but no launcher process id is recorded"
+                ),
+            ));
+        }
     };
+    if session_id == spawn_id && terminal_dead {
+        tracing::info!(
+            code = "AGENT_KILL_ALREADY_DEAD_UNLINKED",
+            spawn_id,
+            tool,
+            "durable terminal spawn has no session registration; resolving as already dead"
+        );
+    }
     let log_dir = read.log_dir.clone().unwrap_or_else(|| {
         super::m4_tools::agent_spawn_root_dir()
             .ok()

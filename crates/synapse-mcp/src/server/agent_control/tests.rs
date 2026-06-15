@@ -592,6 +592,48 @@ async fn agent_kill_is_idempotent_double_kill_reports_already_dead() {
 }
 
 #[tokio::test]
+async fn agent_kill_dead_unlinked_spawn_reports_already_dead() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let spawn = "agent-spawn-regression-dead-unlinked";
+    let db = service.agent_control_db().expect("open storage");
+    let mut exited = AgentEventRecord::new(
+        crate::server::agent_events::unix_time_ns_now(),
+        AgentEventKind::Exited,
+    );
+    exited.spawn_id = Some(spawn.to_owned());
+    exited.reason_code = Some("local_model_registry_row_missing".to_owned());
+    exited.end_state = Some(AgentEndState::Error);
+    exited.attributes.agent_name = Some("local-model".to_owned());
+    crate::server::agent_events::record_agent_event(&db, &exited)
+        .expect("journal terminal unlinked spawn");
+
+    let response = service
+        .agent_kill_impl(
+            AgentKillParams {
+                session_id: spawn.to_owned(),
+                grace_ms: 0,
+                interrupt_first: false,
+            },
+            Some("operator-regression"),
+        )
+        .await
+        .expect("terminal unlinked spawn must be an idempotent kill success");
+
+    assert_eq!(response.session_id, spawn);
+    assert_eq!(response.spawn_id.as_deref(), Some(spawn));
+    assert_eq!(response.resolution_source, "durable_agent_state");
+    assert!(response.already_dead, "dead setup failure is already dead");
+    assert!(response.killed, "already-dead is still a successful kill");
+    assert!(response.process_before.live_process_ids.is_empty());
+    assert_eq!(response.process_before.launcher_process_id, 0);
+    assert!(
+        response.journal_killed_event.is_none(),
+        "nothing was force-terminated, so no Killed journal row is added"
+    );
+}
+
+#[tokio::test]
 async fn agent_kill_unknown_session_errors_structurally() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());

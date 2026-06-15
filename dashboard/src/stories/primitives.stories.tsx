@@ -54,7 +54,7 @@ export const BadgesStatuses: Story = {
   parameters: { docs: { description: { story: "coverage:StatusBadge coverage:FlagBadge" } } },
   render: () => (
     <div className="flex flex-wrap gap-2">
-      {(["working", "idle", "ready_for_review", "needs_input", "awaiting_approval", "stuck", "done"] as const).map((status) => (
+      {(["working", "idle", "ready_for_review", "needs_input", "awaiting_approval", "stuck", "failed", "done"] as const).map((status) => (
         <StatusBadge key={status} status={status} />
       ))}
       <FlagBadge tone="warn">truncated</FlagBadge>

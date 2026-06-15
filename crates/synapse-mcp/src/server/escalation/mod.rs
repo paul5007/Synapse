@@ -46,7 +46,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::agent_state::{AgentLifecycleState, StateTransition};
+use super::agent_state::{AgentLifecycleState, AgentStateRead, StateTransition};
 use super::notify_tools::{NotifyHumanParams, NotifyKind, run_internal_toast, toast_tag_for};
 use super::session_registry::unix_time_ms_now;
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
@@ -995,6 +995,7 @@ pub(crate) struct ProcessReport {
     pub tier1_fired: usize,
     pub tier1_failed: usize,
     pub expired: usize,
+    pub terminal_resolved: usize,
     pub scanned: usize,
 }
 
@@ -1008,9 +1009,38 @@ pub(crate) async fn process_pending(
 ) -> Result<ProcessReport, ErrorData> {
     let mut report = ProcessReport::default();
     let items = scan_items(db)?;
+    let terminal_agent_reads: Vec<AgentStateRead> = super::agent_state::reads(now_unix_ms)
+        .into_iter()
+        .filter(|read| read.state == AgentLifecycleState::Dead)
+        .collect();
     report.scanned = items.len();
     for mut item in items {
         if !item.status.is_open() {
+            continue;
+        }
+        if let Some(agent_state) = terminal_agent_read_for_item(&terminal_agent_reads, &item) {
+            item.status = EscalationStatus::Resolved;
+            item.updated_at_unix_ms = now_unix_ms;
+            item.next_escalate_at_unix_ms = None;
+            let reason = agent_state.reason_code.as_deref().unwrap_or("dead");
+            item.closed_reason = Some(format!("terminal_agent_state:dead:{reason}"));
+            write_item_and_audit(
+                db,
+                &item,
+                "resolved",
+                json!({
+                    "reason": "terminal_agent_state",
+                    "agent_state": agent_state,
+                }),
+            )?;
+            report.terminal_resolved += 1;
+            tracing::info!(
+                code = "ESCALATION_RESOLVED",
+                escalation_id = %item.escalation_id,
+                anchor = %item.anchor,
+                reason,
+                "readback=CF_KV escalation resolved because anchor is terminal"
+            );
             continue;
         }
         // TTL expiry takes precedence over further delivery.
@@ -1110,6 +1140,37 @@ pub(crate) async fn process_pending(
         }
     }
     Ok(report)
+}
+
+fn terminal_agent_read_for_item(
+    terminal_agent_reads: &[AgentStateRead],
+    item: &EscalationItem,
+) -> Option<AgentStateRead> {
+    terminal_agent_reads
+        .iter()
+        .find(|read| escalation_item_matches_agent_read(item, read))
+        .cloned()
+}
+
+fn escalation_item_matches_agent_read(item: &EscalationItem, read: &AgentStateRead) -> bool {
+    let anchor = item.anchor.as_str();
+    if read.anchor == anchor
+        || read.spawn_id.as_deref() == Some(anchor)
+        || read.session_id.as_deref() == Some(anchor)
+    {
+        return true;
+    }
+    if let Some(spawn_id) = item.spawn_id.as_deref()
+        && (read.anchor == spawn_id || read.spawn_id.as_deref() == Some(spawn_id))
+    {
+        return true;
+    }
+    if let Some(session_id) = item.session_id.as_deref()
+        && (read.anchor == session_id || read.session_id.as_deref() == Some(session_id))
+    {
+        return true;
+    }
+    false
 }
 
 async fn fire_tier0(item: &EscalationItem) -> Result<(), ErrorData> {
@@ -1281,6 +1342,7 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                         + report.tier1_fired
                         + report.tier1_failed
                         + report.expired
+                        + report.terminal_resolved
                         > 0 =>
                 {
                     tracing::info!(
@@ -1289,6 +1351,7 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                         tier1_fired = report.tier1_fired,
                         tier1_failed = report.tier1_failed,
                         expired = report.expired,
+                        terminal_resolved = report.terminal_resolved,
                         scanned = report.scanned,
                         "escalation sweep delivered"
                     );

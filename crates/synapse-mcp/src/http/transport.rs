@@ -3271,7 +3271,11 @@ async fn dashboard_api_model_update(
     ) {
         return with_dashboard_security_headers(response);
     }
-    match state.health_service.dashboard_update_local_model(params).await {
+    match state
+        .health_service
+        .dashboard_update_local_model(params)
+        .await
+    {
         Ok(update) => with_dashboard_security_headers(
             Json(DashboardModelUpdateResponse {
                 ok: true,
@@ -3303,9 +3307,7 @@ async fn dashboard_api_model_remove(
     ) {
         return with_dashboard_security_headers(response);
     }
-    let params = crate::m3::local_models::LocalModelRemoveParams {
-        name: request.name,
-    };
+    let params = crate::m3::local_models::LocalModelRemoveParams { name: request.name };
     match state.health_service.dashboard_remove_local_model(params) {
         Ok(remove) => with_dashboard_security_headers(
             Json(DashboardModelRemoveResponse {
@@ -3770,11 +3772,11 @@ fn dashboard_unix_time_ms() -> u64 {
 }
 
 const DASHBOARD_CSS_FILE: &str = "dashboard-DGTECjYz.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-CZx4g_x2.js";
+const DASHBOARD_JS_FILE: &str = "dashboard-BsSO2kBX.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-DGTECjYz.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-CZx4g_x2.js");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-BsSO2kBX.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
