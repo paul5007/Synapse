@@ -5,8 +5,9 @@ use serde_json::Value;
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
 const MATRIX_DOC: &str = include_str!("../../../docs/multi-agent-capability-matrix.md");
+const TOOL_PROFILES_SOURCE: &str = include_str!("../src/server/tool_profiles.rs");
 
-const EXPECTED_MATRIX_TOOLS: [&str; 79] = [
+const EXPECTED_MATRIX_TOOLS: [&str; 81] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -82,6 +83,8 @@ const EXPECTED_MATRIX_TOOLS: [&str; 79] = [
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "tool_profile_set",
+    "tool_profile_status",
     "workspace_get",
     "workspace_list",
     "workspace_put",
@@ -98,6 +101,9 @@ const ALLOWED_STATUS: [&str; 7] = [
     "sessionless",
 ];
 
+const ALLOWED_DEFAULT_EXPOSURE: [&str; 3] = ["normal_agent", "break_glass", "debug_only"];
+const YES_NO: [&str; 2] = ["yes", "no"];
+
 #[derive(Debug)]
 struct MatrixRow {
     tool: String,
@@ -110,10 +116,23 @@ struct MatrixRow {
     manual_source_of_truth: String,
 }
 
+#[derive(Debug)]
+struct ExposureRow {
+    tool: String,
+    default_exposure: String,
+    break_glass_only: String,
+    hidden_internal: String,
+    deprecated_alias: String,
+    foreground_prone_wording: String,
+    safe_replacement_tool: String,
+}
+
 #[tokio::test]
 async fn multi_agent_capability_matrix_covers_action_perception_surface() -> anyhow::Result<()> {
     let rows = parse_matrix(MATRIX_DOC)?;
     let by_tool = rows_by_tool(&rows)?;
+    let exposure_rows = parse_exposure_overlay(MATRIX_DOC)?;
+    let exposure_by_tool = exposure_rows_by_tool(&exposure_rows)?;
     let expected_tools = expected_tool_set();
     let matrix_tools = by_tool.keys().cloned().collect::<BTreeSet<_>>();
     ensure!(
@@ -126,6 +145,10 @@ async fn multi_agent_capability_matrix_covers_action_perception_surface() -> any
     for row in &rows {
         assert_row_complete(row)?;
     }
+    for row in &exposure_rows {
+        assert_exposure_row_complete(row)?;
+    }
+    assert_exposure_overlay_matches_policy(&exposure_by_tool, &expected_tools)?;
 
     let mut client = StdioMcpClient::launch_and_init_with_env(
         None,
@@ -155,6 +178,67 @@ async fn multi_agent_capability_matrix_covers_action_perception_surface() -> any
     let status = client.shutdown().await?;
     assert!(status.success());
     Ok(())
+}
+
+fn parse_exposure_overlay(markdown: &str) -> anyhow::Result<Vec<ExposureRow>> {
+    let mut rows = Vec::new();
+    let mut saw_header = false;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+            continue;
+        }
+
+        let cells = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        if cells.len() != 7 {
+            continue;
+        }
+        if cells[0] == "Tool" && cells[1] == "Default exposure" {
+            ensure!(
+                cells
+                    == [
+                        "Tool",
+                        "Default exposure",
+                        "Break-glass only",
+                        "Hidden/internal",
+                        "Deprecated alias",
+                        "Foreground-prone wording",
+                        "Safe replacement tool"
+                    ],
+                "exposure overlay header changed: {cells:?}"
+            );
+            saw_header = true;
+            continue;
+        }
+        if cells.iter().all(|cell| cell.chars().all(|ch| ch == '-')) {
+            continue;
+        }
+
+        rows.push(ExposureRow {
+            tool: cells[0].to_owned(),
+            default_exposure: cells[1].to_owned(),
+            break_glass_only: cells[2].to_owned(),
+            hidden_internal: cells[3].to_owned(),
+            deprecated_alias: cells[4].to_owned(),
+            foreground_prone_wording: cells[5].to_owned(),
+            safe_replacement_tool: cells[6].to_owned(),
+        });
+    }
+
+    ensure!(
+        saw_header,
+        "model-selection exposure overlay header missing"
+    );
+    ensure!(
+        !rows.is_empty(),
+        "model-selection exposure overlay has no rows"
+    );
+    Ok(rows)
 }
 
 fn parse_matrix(markdown: &str) -> anyhow::Result<Vec<MatrixRow>> {
@@ -226,6 +310,18 @@ fn rows_by_tool(rows: &[MatrixRow]) -> anyhow::Result<BTreeMap<String, &MatrixRo
     Ok(by_tool)
 }
 
+fn exposure_rows_by_tool(rows: &[ExposureRow]) -> anyhow::Result<BTreeMap<String, &ExposureRow>> {
+    let mut by_tool = BTreeMap::new();
+    for row in rows {
+        ensure!(
+            by_tool.insert(row.tool.clone(), row).is_none(),
+            "duplicate exposure overlay row for {}",
+            row.tool
+        );
+    }
+    Ok(by_tool)
+}
+
 fn assert_row_complete(row: &MatrixRow) -> anyhow::Result<()> {
     ensure!(!row.tool.is_empty(), "matrix row has empty tool");
     ensure!(!row.class.is_empty(), "{} class missing", row.tool);
@@ -280,6 +376,235 @@ fn assert_row_complete(row: &MatrixRow) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn assert_exposure_row_complete(row: &ExposureRow) -> anyhow::Result<()> {
+    ensure!(!row.tool.is_empty(), "exposure row has empty tool");
+    ensure!(
+        ALLOWED_DEFAULT_EXPOSURE.contains(&row.default_exposure.as_str()),
+        "{} has unsupported default exposure {}",
+        row.tool,
+        row.default_exposure
+    );
+    ensure!(
+        YES_NO.contains(&row.break_glass_only.as_str()),
+        "{} has unsupported break-glass-only value {}",
+        row.tool,
+        row.break_glass_only
+    );
+    ensure!(
+        YES_NO.contains(&row.hidden_internal.as_str()),
+        "{} has unsupported hidden/internal value {}",
+        row.tool,
+        row.hidden_internal
+    );
+    ensure!(
+        YES_NO.contains(&row.deprecated_alias.as_str()),
+        "{} has unsupported deprecated-alias value {}",
+        row.tool,
+        row.deprecated_alias
+    );
+    ensure!(
+        YES_NO.contains(&row.foreground_prone_wording.as_str()),
+        "{} has unsupported foreground-prone value {}",
+        row.tool,
+        row.foreground_prone_wording
+    );
+    ensure!(
+        !row.safe_replacement_tool.is_empty(),
+        "{} safe replacement missing",
+        row.tool
+    );
+    if row.break_glass_only == "yes" {
+        ensure!(
+            row.default_exposure != "normal_agent",
+            "{} cannot be both default normal_agent and break-glass-only",
+            row.tool
+        );
+    }
+    if row.foreground_prone_wording == "yes" {
+        ensure!(
+            !row.safe_replacement_tool.starts_with("none"),
+            "{} foreground-prone row must name a safe replacement tool or issue",
+            row.tool
+        );
+    }
+    Ok(())
+}
+
+fn assert_exposure_overlay_matches_policy(
+    exposure_by_tool: &BTreeMap<String, &ExposureRow>,
+    expected_tools: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let exposure_tools = exposure_by_tool.keys().cloned().collect::<BTreeSet<_>>();
+    ensure!(
+        exposure_tools == *expected_tools,
+        "exposure overlay tool set drift: missing={:?} extra={:?}",
+        expected_tools
+            .difference(&exposure_tools)
+            .collect::<Vec<_>>(),
+        exposure_tools
+            .difference(expected_tools)
+            .collect::<Vec<_>>()
+    );
+
+    let normal_exact = parse_string_array_const(TOOL_PROFILES_SOURCE, "NORMAL_ALLOWED_EXACT")?;
+    let normal_prefixes =
+        parse_string_array_const(TOOL_PROFILES_SOURCE, "NORMAL_ALLOWED_PREFIXES")?;
+    let break_glass_hazards =
+        parse_string_array_const(TOOL_PROFILES_SOURCE, "BREAK_GLASS_HAZARDOUS_TOOLS")?;
+
+    for tool in expected_tools {
+        let row = exposure_by_tool
+            .get(tool)
+            .with_context(|| format!("exposure row missing for {tool}"))?;
+        let visible_in_normal = normal_exact.contains(tool)
+            || normal_prefixes
+                .iter()
+                .any(|prefix| tool.starts_with(prefix.as_str()));
+        if visible_in_normal {
+            ensure!(
+                row.default_exposure == "normal_agent",
+                "{} is visible in normal_agent policy but matrix says {}",
+                tool,
+                row.default_exposure
+            );
+            ensure!(
+                row.break_glass_only == "no",
+                "{} visible in normal_agent cannot be break-glass-only",
+                tool
+            );
+        } else if tool.starts_with("action_diagnostic_") {
+            ensure!(
+                row.default_exposure == "debug_only" && row.hidden_internal == "yes",
+                "{} diagnostic tool must be debug_only hidden/internal",
+                tool
+            );
+        } else {
+            ensure!(
+                row.default_exposure == "break_glass",
+                "{} hidden from normal_agent must be classified break_glass or debug_only, got {}",
+                tool,
+                row.default_exposure
+            );
+            ensure!(
+                row.break_glass_only == "yes",
+                "{} hidden from normal_agent must be break-glass-only",
+                tool
+            );
+        }
+
+        if break_glass_hazards.contains(tool) && !tool.starts_with("action_diagnostic_") {
+            ensure!(
+                row.default_exposure == "break_glass",
+                "{} is in BREAK_GLASS_HAZARDOUS_TOOLS but matrix says {}",
+                tool,
+                row.default_exposure
+            );
+        }
+    }
+
+    assert_representative_exposure(exposure_by_tool, "act_type", "break_glass", "yes", "yes")?;
+    assert_representative_exposure(exposure_by_tool, "act_click", "break_glass", "yes", "yes")?;
+    assert_representative_exposure(
+        exposure_by_tool,
+        "act_focus_window",
+        "break_glass",
+        "yes",
+        "yes",
+    )?;
+    assert_representative_exposure(exposure_by_tool, "release_all", "break_glass", "yes", "yes")?;
+    assert_representative_exposure(
+        exposure_by_tool,
+        "cdp_navigate_tab",
+        "normal_agent",
+        "no",
+        "no",
+    )?;
+    assert_representative_exposure(
+        exposure_by_tool,
+        "cdp_target_info",
+        "normal_agent",
+        "no",
+        "no",
+    )?;
+    assert_representative_exposure(exposure_by_tool, "set_target", "normal_agent", "no", "no")?;
+    assert_representative_exposure(
+        exposure_by_tool,
+        "tool_profile_status",
+        "normal_agent",
+        "no",
+        "no",
+    )?;
+    assert_representative_exposure(
+        exposure_by_tool,
+        "action_diagnostic_queue_full_setup",
+        "debug_only",
+        "yes",
+        "no",
+    )?;
+    Ok(())
+}
+
+fn assert_representative_exposure(
+    exposure_by_tool: &BTreeMap<String, &ExposureRow>,
+    tool: &str,
+    default_exposure: &str,
+    break_glass_only: &str,
+    foreground_prone_wording: &str,
+) -> anyhow::Result<()> {
+    let row = exposure_by_tool
+        .get(tool)
+        .with_context(|| format!("representative exposure row missing for {tool}"))?;
+    ensure!(
+        row.default_exposure == default_exposure,
+        "{} default exposure expected {}, got {}",
+        tool,
+        default_exposure,
+        row.default_exposure
+    );
+    ensure!(
+        row.break_glass_only == break_glass_only,
+        "{} break-glass-only expected {}, got {}",
+        tool,
+        break_glass_only,
+        row.break_glass_only
+    );
+    ensure!(
+        row.foreground_prone_wording == foreground_prone_wording,
+        "{} foreground-prone expected {}, got {}",
+        tool,
+        foreground_prone_wording,
+        row.foreground_prone_wording
+    );
+    Ok(())
+}
+
+fn parse_string_array_const(source: &str, const_name: &str) -> anyhow::Result<BTreeSet<String>> {
+    let marker = format!("const {const_name}: &[&str] = &[");
+    let start = source
+        .find(&marker)
+        .with_context(|| format!("{const_name} const missing"))?;
+    let after_start = &source[start + marker.len()..];
+    let end = after_start
+        .find("];")
+        .with_context(|| format!("{const_name} const terminator missing"))?;
+    let body = &after_start[..end];
+    let mut values = BTreeSet::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('"') {
+            continue;
+        }
+        let value = trimmed
+            .trim_start_matches('"')
+            .split('"')
+            .next()
+            .with_context(|| format!("{const_name} malformed value: {trimmed}"))?;
+        values.insert(value.to_owned());
+    }
+    ensure!(!values.is_empty(), "{const_name} parsed as empty");
+    Ok(values)
+}
+
 fn listed_matrix_scope_tools(tools: &[Value]) -> anyhow::Result<BTreeSet<String>> {
     let mut scoped = BTreeSet::new();
     for tool in tools {
@@ -304,6 +629,7 @@ fn is_matrix_scope_tool(name: &str) -> bool {
         || name.starts_with("fleet_")
         || name.starts_with("reflex_")
         || name.starts_with("target_")
+        || name.starts_with("tool_profile_")
         || name.starts_with("workspace_")
         || matches!(
             name,

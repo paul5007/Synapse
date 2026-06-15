@@ -14,6 +14,98 @@ Status values:
 - `diagnostic`: test-only operational diagnostic surface, not a user workflow primitive.
 - `sessionless`: no window or cursor state is used, but the resource is not session-owned.
 
+Model-selection exposure values:
+
+- `normal_agent`: visible in the default HTTP MCP profile.
+- `break_glass`: hidden from the default profile; visible only after an explicit break-glass/admin profile transition.
+- `debug_only`: hidden from normal agent profiles and reserved for diagnostic/debug tool surfaces.
+
+The model-selection overlay is a checked extension of the capability matrix. It captures the affordance risk of exposing a tool name/schema to models, not only the technical implementation risk. The `Default exposure` and `Break-glass only` columns are kept in sync with `crates/synapse-mcp/src/server/tool_profiles.rs` by `crates/synapse-mcp/tests/multi_agent_capability_matrix.rs`.
+
+| Tool | Default exposure | Break-glass only | Hidden/internal | Deprecated alias | Foreground-prone wording | Safe replacement tool |
+| --- | --- | --- | --- | --- | --- | --- |
+| act_click | break_glass | yes | no | no | yes | cdp_navigate_tab, target_claim, #1005 |
+| act_clipboard | break_glass | yes | no | no | no | workspace_put, #1005 |
+| act_combo | break_glass | yes | no | no | yes | #1005 background router |
+| act_focus_window | break_glass | yes | no | no | yes | set_target, target_claim |
+| act_keymap | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
+| act_launch | break_glass | yes | no | no | yes | act_spawn_agent, cdp_open_tab |
+| act_pad | break_glass | yes | no | no | yes | #1005 background router |
+| act_press | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
+| act_run_shell | normal_agent | no | no | no | no | none - default-safe |
+| act_run_shell_cancel | normal_agent | no | no | no | no | none - default-safe |
+| act_run_shell_start | normal_agent | no | no | no | no | none - default-safe |
+| act_run_shell_status | normal_agent | no | no | no | no | none - default-safe |
+| act_scroll | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
+| act_set_field_text | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
+| act_set_value | break_glass | yes | no | no | yes | #1005 background router |
+| act_spawn_agent | normal_agent | no | no | no | no | none - default-safe |
+| act_stroke | break_glass | yes | no | no | yes | #1005 background router |
+| act_type | break_glass | yes | no | no | yes | cdp_target_info, #997, #1005 |
+| action_diagnostic_queue_full_setup | debug_only | yes | yes | no | no | action_diagnostic_rate_limit_override |
+| action_diagnostic_rate_limit_override | debug_only | yes | yes | no | no | action_diagnostic_queue_full_setup |
+| agent_cost | normal_agent | no | no | no | no | none - default-safe |
+| agent_cost_price_delete | break_glass | yes | no | no | no | agent_cost |
+| agent_cost_price_list | break_glass | yes | no | no | no | agent_cost |
+| agent_cost_price_put | break_glass | yes | no | no | no | agent_cost |
+| agent_inbox | normal_agent | no | no | no | no | none - default-safe |
+| agent_interrupt | normal_agent | no | no | no | no | none - default-safe |
+| agent_kill | normal_agent | no | no | no | no | none - default-safe |
+| agent_query | normal_agent | no | no | no | no | none - default-safe |
+| agent_receipts | normal_agent | no | no | no | no | none - default-safe |
+| agent_send | normal_agent | no | no | no | no | none - default-safe |
+| agent_send_broadcast | normal_agent | no | no | no | no | none - default-safe |
+| agent_stats | normal_agent | no | no | no | no | none - default-safe |
+| agent_template_delete | normal_agent | no | no | no | no | none - default-safe |
+| agent_template_get | normal_agent | no | no | no | no | none - default-safe |
+| agent_template_list | normal_agent | no | no | no | no | none - default-safe |
+| agent_template_put | normal_agent | no | no | no | no | none - default-safe |
+| agent_wait | normal_agent | no | no | no | no | none - default-safe |
+| audio_tail | break_glass | yes | no | no | no | #1005 background router |
+| audio_transcribe | break_glass | yes | no | no | no | #1005 background router |
+| capture_screenshot | normal_agent | no | no | no | no | none - default-safe |
+| cdp_bridge_reload | normal_agent | no | no | no | no | none - default-safe |
+| cdp_close_tab | normal_agent | no | no | no | no | none - default-safe |
+| cdp_navigate_tab | normal_agent | no | no | no | no | none - default-safe |
+| cdp_open_tab | normal_agent | no | no | no | no | none - default-safe |
+| cdp_target_info | normal_agent | no | no | no | no | none - default-safe |
+| clear_target | normal_agent | no | no | no | no | none - default-safe |
+| control_lease_acquire | normal_agent | no | no | no | no | none - default-safe |
+| control_lease_handoff | normal_agent | no | no | no | no | none - default-safe |
+| control_lease_release | normal_agent | no | no | no | no | none - default-safe |
+| control_lease_status | normal_agent | no | no | no | no | none - default-safe |
+| find | normal_agent | no | no | no | no | none - default-safe |
+| fleet_stop | normal_agent | no | no | no | no | none - default-safe |
+| get_target | normal_agent | no | no | no | no | none - default-safe |
+| hidden_desktop_pip_frame | break_glass | yes | yes | no | no | capture_screenshot |
+| observe | normal_agent | no | no | no | no | none - default-safe |
+| observe_delta | normal_agent | no | no | no | no | none - default-safe |
+| read_text | normal_agent | no | no | no | no | none - default-safe |
+| reality_audit | normal_agent | no | no | no | no | none - default-safe |
+| reality_baseline | normal_agent | no | no | no | no | none - default-safe |
+| reflex_cancel | break_glass | yes | no | no | no | task tools, #1005 |
+| reflex_history | break_glass | yes | no | no | no | observe_delta |
+| reflex_list | break_glass | yes | no | no | no | observe_delta |
+| reflex_register | break_glass | yes | no | no | no | task tools, #1005 |
+| release_all | break_glass | yes | no | no | yes | control_lease_release |
+| session_list | normal_agent | no | no | no | no | none - default-safe |
+| session_status | normal_agent | no | no | no | no | none - default-safe |
+| set_capture_target | normal_agent | no | no | no | no | none - default-safe |
+| set_perception_mode | normal_agent | no | no | no | no | none - default-safe |
+| set_target | normal_agent | no | no | no | no | none - default-safe |
+| subscribe | break_glass | yes | no | no | no | observe_delta |
+| subscribe_cancel | break_glass | yes | no | no | no | observe_delta |
+| target_claim | normal_agent | no | no | no | no | none - default-safe |
+| target_claim_adopt | normal_agent | no | no | no | no | none - default-safe |
+| target_claim_status | normal_agent | no | no | no | no | none - default-safe |
+| target_release | normal_agent | no | no | no | no | none - default-safe |
+| tool_profile_set | normal_agent | no | no | no | no | none - default-safe |
+| tool_profile_status | normal_agent | no | no | no | no | none - default-safe |
+| workspace_get | normal_agent | no | no | no | no | none - default-safe |
+| workspace_list | normal_agent | no | no | no | no | none - default-safe |
+| workspace_put | normal_agent | no | no | no | no | none - default-safe |
+| workspace_subscribe | normal_agent | no | no | no | no | none - default-safe |
+
 Research basis:
 
 - Microsoft UI Automation control patterns expose semantic behavior such as Invoke, Scroll, Value, Text, and Window through client/provider interfaces, which is the correct background-first path before coordinate input: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-controlpatternsoverview
@@ -98,6 +190,8 @@ Research basis:
 | target_claim_adopt | target control | live target claim owner read from target_claim_status/session_list plus current MCP session identity | explicit same-agent recovery: old owner must be older, same client identity, no in-flight tool, and no input lease; then session lifecycle teardown terminates old owner before new claim generation is written | no foreground lease; fails closed with TARGET_CLAIM_ADOPT_REFUSED or TARGET_CLAIM_OWNER_ACTIVE | control | #813 #797 #801 | target_claim_status/session_list before and after, owner teardown report, terminated-session rejection, and denied active/different-agent edge readbacks |
 | target_claim_status | target control | target ownership registry | read-only target claim registry read | no foreground lease | control | #797 | target_claim_status response and session_list target_claims |
 | target_release | target control | current MCP session active target or explicit window/CDP target | daemon-local target ownership registry mutation scoped to the owner session | no foreground lease | control | #797 | target_claim_status/session_list before and after |
+| tool_profile_set | session control | current MCP session id plus requested profile | durable CF_SESSIONS profile assignment controls the session-filtered tools/list surface; break_glass requires confirm_break_glass, non-empty reason, and owned foreground input lease | no foreground lease for normal_agent or browser_control; break_glass transition requires the foreground input lease proof | control | none (#1008) | CF_SESSIONS mcp/tool-profile row, health/tools-list names, and CF_ACTION_LOG profile_set rows |
+| tool_profile_status | session control | current MCP session id | reads the durable session profile row and recomputes visible tools/list names for the current profile | no foreground lease | control | none (#1008) | CF_SESSIONS mcp/tool-profile row plus visible_tool_names/count/hash readback |
 | workspace_get | session control | current MCP session id plus run-scoped key | exact CF_KV workspace-blackboard row read and hash readback | no foreground lease | control | none (#796) | CF_KV workspace row key/hash plus returned value/artifact handle |
 | workspace_list | session control | current MCP session id plus run/prefix | CF_KV run-prefix scan with expired-row delete and corrupt-row isolation | no foreground lease | control | none (#796) | CF_KV workspace run prefix before/after, skipped corrupt row report, returned row hashes |
 | workspace_put | session control | current MCP session id plus run/key/value/artifact | CF_KV workspace row write with artifact path size/hash verification, exact row readback, and workspace.put SSE publish | no foreground lease | control | none (#796) | artifact file bytes/hash, CF_KV exact row hash, SSE publish report |
