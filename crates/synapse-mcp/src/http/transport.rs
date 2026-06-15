@@ -3627,10 +3627,14 @@ fn dashboard_primary_session_list_data(
         object.insert("unbound_agent_states".to_owned(), unbound_value);
         return data;
     };
+    let existing_terminal_rows = object
+        .remove("terminal_unbound_agent_states")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
 
     let mut primary_rows = Vec::new();
     let mut acknowledged_rows = Vec::new();
-    let mut terminal_rows = Vec::new();
+    let mut terminal_rows = existing_terminal_rows;
     let (acked_anchors, acked_anchor_error) = match acked_attention_anchors {
         Ok(anchors) => (anchors, None),
         Err(error) => (BTreeSet::new(), Some(error.message.to_string())),
@@ -3663,7 +3667,7 @@ fn dashboard_primary_session_list_data(
     object.insert(
         "dashboard_unbound_agent_filter".to_owned(),
         serde_json::json!({
-            "source_of_truth": "session_list unbound_agent_states + CF_KV escalation/v1/item acknowledged-open anchors split for dashboard attention feed",
+            "source_of_truth": "session_list unbound_agent_states/terminal_unbound_agent_states + CF_KV escalation/v1/item acknowledged-open anchors split for dashboard attention feed",
             "primary_unbound_agent_count": primary_count,
             "acknowledged_unbound_agent_count": acknowledged_count,
             "terminal_unbound_agent_count": terminal_count,
