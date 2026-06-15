@@ -15,8 +15,12 @@ use synapse_core::error_codes;
 
 use super::{
     ErrorData, Json, Parameters, SessionTarget, SynapseService, TargetWire,
-    agent_state::AgentStateRead, mcp_error, session_registry::SessionRegistryRead,
-    session_registry::unix_time_ms_now, target_claims::TargetClaimRead, tool, tool_router,
+    agent_state::{AgentLifecycleState, AgentStateRead},
+    mcp_error,
+    session_registry::SessionRegistryRead,
+    session_registry::unix_time_ms_now,
+    target_claims::TargetClaimRead,
+    tool, tool_router,
 };
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -92,10 +96,26 @@ pub struct SessionListResponse {
     pub input_lease_owner_session_id: Option<String>,
     pub sessions: Vec<SessionSummary>,
     /// #898: agents tracked by the state machine that have no MCP session
-    /// (in-flight spawns and spawns that died before registering). Reported
-    /// rather than hidden so the fleet view never loses an agent.
+    /// (in-flight spawns and active attention rows before registration).
+    /// Terminal/dead history is split out below so default consumers do not
+    /// page on already-ended agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unbound_agent_states: Vec<AgentStateRead>,
+    /// Terminal unbound history retained for diagnostics. These rows are not
+    /// actionable attention and must not be counted as stuck/live work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_unbound_agent_states: Vec<AgentStateRead>,
+    pub unbound_agent_filter: SessionUnboundAgentFilterReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionUnboundAgentFilterReadback {
+    pub source_of_truth: &'static str,
+    pub active_unbound_agent_count: usize,
+    pub terminal_unbound_agent_count: usize,
+    pub terminal_states: Vec<&'static str>,
+    pub reason: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -298,6 +318,9 @@ impl SynapseService {
         }
         sessions.sort_by(|a, b| a.registry.session_id.cmp(&b.registry.session_id));
         let returned_count = sessions.len();
+        let raw_unbound_agent_states = super::agent_state::unbound_reads(now_unix_ms);
+        let (unbound_agent_states, terminal_unbound_agent_states, unbound_agent_filter) =
+            split_unbound_agent_states(raw_unbound_agent_states);
         Ok(SessionListResponse {
             now_unix_ms,
             stale_after_ms,
@@ -307,7 +330,9 @@ impl SynapseService {
             input_lease_held: lease_status.held,
             input_lease_owner_session_id: lease_status.owner_session_id.clone(),
             sessions,
-            unbound_agent_states: super::agent_state::unbound_reads(now_unix_ms),
+            unbound_agent_states,
+            terminal_unbound_agent_states,
+            unbound_agent_filter,
         })
     }
 
@@ -379,6 +404,36 @@ impl SynapseService {
         drop(guard);
         Ok(targets)
     }
+}
+
+fn split_unbound_agent_states(
+    rows: Vec<AgentStateRead>,
+) -> (
+    Vec<AgentStateRead>,
+    Vec<AgentStateRead>,
+    SessionUnboundAgentFilterReadback,
+) {
+    let mut active_rows = Vec::new();
+    let mut terminal_rows = Vec::new();
+    for row in rows {
+        if unbound_agent_row_is_terminal(&row) {
+            terminal_rows.push(row);
+        } else {
+            active_rows.push(row);
+        }
+    }
+    let filter = SessionUnboundAgentFilterReadback {
+        source_of_truth: "agent_state::unbound_reads split by lifecycle state",
+        active_unbound_agent_count: active_rows.len(),
+        terminal_unbound_agent_count: terminal_rows.len(),
+        terminal_states: vec!["dead"],
+        reason: "terminal unbound history is diagnostic history, not actionable attention",
+    };
+    (active_rows, terminal_rows, filter)
+}
+
+fn unbound_agent_row_is_terminal(row: &AgentStateRead) -> bool {
+    matches!(row.state, AgentLifecycleState::Dead)
 }
 
 fn build_session_summary(
@@ -478,6 +533,7 @@ pub(crate) fn validate_session_id(session_id: &str) -> Result<(), ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synapse_core::AgentEventKind;
 
     #[test]
     fn session_status_rejects_empty_or_non_visible_ascii_ids() {
@@ -510,5 +566,68 @@ mod tests {
         .unwrap();
         assert_eq!(summary.registry.lifecycle, "unregistered");
         assert!(summary.lease.is_owner);
+    }
+
+    #[test]
+    fn terminal_unbound_agents_are_split_from_actionable_session_list_rows() {
+        let rows = vec![
+            agent_read("active-working", AgentLifecycleState::Working, None),
+            agent_read(
+                "active-stuck",
+                AgentLifecycleState::Stuck,
+                Some("silent_timeout"),
+            ),
+            agent_read(
+                "dead-local-model",
+                AgentLifecycleState::Dead,
+                Some("local_model_registry_row_missing"),
+            ),
+            agent_read(
+                "active-needs-input",
+                AgentLifecycleState::NeedsInput,
+                Some("permission_prompt"),
+            ),
+        ];
+        let (active, terminal, filter) = split_unbound_agent_states(rows);
+
+        assert_eq!(
+            active
+                .iter()
+                .map(|row| row.anchor.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active-working", "active-stuck", "active-needs-input"]
+        );
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].anchor, "dead-local-model");
+        assert_eq!(terminal[0].state, AgentLifecycleState::Dead);
+        assert_eq!(filter.active_unbound_agent_count, 3);
+        assert_eq!(filter.terminal_unbound_agent_count, 1);
+        assert!(filter.reason.contains("not actionable attention"));
+    }
+
+    fn agent_read(
+        anchor: &str,
+        state: AgentLifecycleState,
+        reason_code: Option<&str>,
+    ) -> AgentStateRead {
+        AgentStateRead {
+            anchor: anchor.to_owned(),
+            spawn_id: Some(anchor.to_owned()),
+            session_id: None,
+            agent_kind: Some("test-agent".to_owned()),
+            state,
+            reason_code: reason_code.map(str::to_owned),
+            since_unix_ms: 1_000,
+            last_event_unix_ms: 1_000,
+            last_event_kind: AgentEventKind::StateChanged,
+            silent_ms: 0,
+            waiting_for: None,
+            runaway: false,
+            consecutive_identical_tool_calls: 0,
+            last_tool_name: None,
+            launcher_process_id: None,
+            agent_process_id: None,
+            log_dir: None,
+        }
     }
 }

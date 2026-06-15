@@ -743,6 +743,7 @@ struct ShellJobPaths {
     stderr_path: PathBuf,
     status_path: PathBuf,
     request_path: PathBuf,
+    remote_cleanup_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1889,6 +1890,7 @@ pub fn start_authorized_shell_job(
     let request_sha256 = run_shell_start_request_sha256(&params)?;
     let (job_id, paths) = create_shell_job_paths(params.job_id.as_deref())?;
     write_shell_job_request(&paths, &params, &request_sha256, context)?;
+    write_shell_remote_cleanup_invocation(&paths, &params)?;
 
     let stdout_file = open_shell_job_output(&paths.stdout_path, "stdout", &job_id)?;
     let stderr_file = open_shell_job_output(&paths.stderr_path, "stderr", &job_id)?;
@@ -2369,7 +2371,7 @@ pub fn cancel_shell_job(
         }
         refresh_shell_job_remote_metadata_from_outputs(&mut job, &paths)?;
         let _remote_cleanup_status =
-            attempt_shell_job_remote_cleanup(&mut job, "act_run_shell_cancel", None);
+            attempt_shell_job_remote_cleanup(&mut job, &paths, "act_run_shell_cancel", None);
         if job.remote_process_scope.remote_cleanup_required
             && !job.remote_process_scope.remote_cleanup_verified
             && job.remote_process_scope.remote_cleanup_status != SHELL_REMOTE_CLEANUP_FAILED
@@ -2388,7 +2390,7 @@ pub fn cancel_shell_job(
     {
         refresh_shell_job_remote_metadata_from_outputs(&mut job, &paths)?;
         let _remote_cleanup_status =
-            attempt_shell_job_remote_cleanup(&mut job, "act_run_shell_cancel", None);
+            attempt_shell_job_remote_cleanup(&mut job, &paths, "act_run_shell_cancel", None);
         if !job.remote_process_scope.remote_cleanup_verified
             && job.remote_process_scope.remote_cleanup_status != SHELL_REMOTE_CLEANUP_FAILED
         {
@@ -5767,6 +5769,7 @@ fn shell_job_paths_from_root(root: &Path, job_id: &str) -> ShellJobPaths {
         stderr_path: job_dir.join("stderr.log"),
         status_path: job_dir.join("status.json"),
         request_path: job_dir.join("request.json"),
+        remote_cleanup_path: job_dir.join("remote-cleanup.json"),
         job_dir,
     }
 }
@@ -6001,6 +6004,79 @@ fn write_shell_job_request(
     write_pretty_json_file(&paths.request_path, &request, "request")
 }
 
+fn shell_remote_cleanup_invocation_from_start_params(
+    params: &ActRunShellStartParams,
+) -> Option<ShellRemoteCleanupInvocation> {
+    let invocation = shell_job_ssh_command_invocation(&params.command, &params.args)?;
+    if ssh_family_client_for_executable(&invocation.command) != Some("ssh") {
+        return None;
+    }
+    let parts = ssh_direct_command_parts(&invocation.args)?;
+    parts.remote_command.as_ref()?;
+    if parts.tracking_unsupported_reason.is_some() {
+        return None;
+    }
+    Some(ShellRemoteCleanupInvocation {
+        schema_version: 1,
+        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
+        command: invocation.command,
+        control_args: parts.control_args,
+        remote_identity: parts.remote_identity,
+        source_evidence: invocation.evidence.to_owned(),
+        args_sha256: shell_args_sha256(&invocation.args),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+fn write_shell_remote_cleanup_invocation(
+    paths: &ShellJobPaths,
+    params: &ActRunShellStartParams,
+) -> Result<(), ErrorData> {
+    let Some(invocation) = shell_remote_cleanup_invocation_from_start_params(params) else {
+        return Ok(());
+    };
+    write_pretty_json_file(&paths.remote_cleanup_path, &invocation, "remote cleanup")
+}
+
+fn read_shell_remote_cleanup_invocation(
+    paths: &ShellJobPaths,
+    job_id: &str,
+) -> Result<Option<ShellRemoteCleanupInvocation>, String> {
+    if !paths.remote_cleanup_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&paths.remote_cleanup_path)
+        .map_err(|error| format!("failed to read remote cleanup sidecar for {job_id}: {error}"))?;
+    let invocation: ShellRemoteCleanupInvocation =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            format!("failed to decode remote cleanup sidecar for {job_id}: {error}")
+        })?;
+    if invocation.schema_version != 1 {
+        return Err(format!(
+            "unsupported remote cleanup sidecar schema_version={} for {job_id}",
+            invocation.schema_version
+        ));
+    }
+    if invocation.transport != SHELL_REMOTE_TRANSPORT_SSH {
+        return Err(format!(
+            "unsupported remote cleanup sidecar transport={} for {job_id}",
+            invocation.transport
+        ));
+    }
+    if ssh_family_client_for_executable(&invocation.command) != Some("ssh") {
+        return Err(format!(
+            "remote cleanup sidecar command is not ssh-family for {job_id}: {}",
+            invocation.command
+        ));
+    }
+    if ssh_direct_command_parts(&invocation.control_args).is_none() {
+        return Err(format!(
+            "remote cleanup sidecar control_args do not contain an ssh destination for {job_id}"
+        ));
+    }
+    Ok(Some(invocation))
+}
+
 fn write_pretty_json_file<T: Serialize>(
     path: &Path,
     value: &T,
@@ -6185,13 +6261,18 @@ fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
 fn shell_job_remote_process_scope_from_start_params(
     params: &ActRunShellStartParams,
 ) -> ActRunShellRemoteProcessScope {
-    if let Some(client) = ssh_family_client_for_executable(&params.command) {
-        let evidence = if client == "ssh" {
-            "direct_command_ssh".to_owned()
-        } else {
-            format!("direct_command_ssh_family:{client}")
-        };
-        ssh_remote_process_scope(&params.command, &params.args, evidence)
+    if let Some(invocation) = shell_job_remote_scope_invocation(&params.command, &params.args) {
+        ssh_remote_process_scope(
+            &invocation.command,
+            &invocation.args,
+            invocation.evidence.to_owned(),
+        )
+    } else if let Some(client) = ssh_family_client_for_executable(&params.command) {
+        ssh_remote_process_scope(
+            &params.command,
+            &params.args,
+            format!("direct_command_ssh_family:{client}"),
+        )
     } else {
         ActRunShellRemoteProcessScope::default()
     }
@@ -6355,6 +6436,26 @@ struct SshCommandParts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SshCommandInvocation {
+    command: String,
+    args: Vec<String>,
+    evidence: &'static str,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellRemoteCleanupInvocation {
+    schema_version: u32,
+    transport: String,
+    command: String,
+    control_args: Vec<String>,
+    remote_identity: String,
+    source_evidence: String,
+    args_sha256: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SshRemoteTrackingPlan {
     spawn_args: Vec<String>,
     remote_identity: String,
@@ -6362,19 +6463,154 @@ struct SshRemoteTrackingPlan {
     marker: String,
 }
 
-fn shell_job_spawn_args(params: &ActRunShellStartParams, job_id: &str) -> Vec<String> {
-    if let Some(plan) = ssh_remote_tracking_plan(&params.command, &params.args, job_id) {
-        tracing::info!(
-            code = "M4_ACT_RUN_SHELL_SSH_REMOTE_TRACKING_ENABLED",
-            job_id,
-            remote_identity = %plan.remote_identity,
-            marker = %plan.marker,
-            remote_command_sha256 = %sha256_hex(plan.remote_command.as_bytes()),
-            "act_run_shell_start will capture SSH remote pid/process-group metadata"
-        );
-        return plan.spawn_args;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellJobSpawnPlan {
+    command: String,
+    args: Vec<String>,
+}
+
+fn shell_job_spawn_plan(params: &ActRunShellStartParams, job_id: &str) -> ShellJobSpawnPlan {
+    if let Some(invocation) = shell_job_ssh_command_invocation(&params.command, &params.args) {
+        if let Some(plan) = ssh_remote_tracking_plan(&invocation.command, &invocation.args, job_id)
+        {
+            tracing::info!(
+                code = "M4_ACT_RUN_SHELL_SSH_REMOTE_TRACKING_ENABLED",
+                job_id,
+                remote_identity = %plan.remote_identity,
+                marker = %plan.marker,
+                source = invocation.evidence,
+                remote_command_sha256 = %sha256_hex(plan.remote_command.as_bytes()),
+                "act_run_shell_start will capture SSH remote pid/process-group metadata"
+            );
+            return ShellJobSpawnPlan {
+                command: invocation.command,
+                args: plan.spawn_args,
+            };
+        }
     }
-    params.args.clone()
+    ShellJobSpawnPlan {
+        command: params.command.clone(),
+        args: params.args.clone(),
+    }
+}
+
+fn shell_job_ssh_command_invocation(
+    command: &str,
+    args: &[String],
+) -> Option<SshCommandInvocation> {
+    if ssh_family_client_for_executable(command) == Some("ssh") {
+        return Some(SshCommandInvocation {
+            command: command.to_owned(),
+            args: args.to_vec(),
+            evidence: "direct_command_ssh",
+        });
+    }
+    shell_wrapped_ssh_command_invocation(command, args)
+}
+
+fn shell_wrapped_ssh_command_invocation(
+    command: &str,
+    args: &[String],
+) -> Option<SshCommandInvocation> {
+    let shell = executable_leaf(command).to_ascii_lowercase();
+    let (script, evidence) = match shell.as_str() {
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => (
+            powershell_command_script_arg(args)?,
+            "shell_wrapped_ssh:powershell",
+        ),
+        "cmd" | "cmd.exe" => (cmd_command_script_arg(args)?, "shell_wrapped_ssh:cmd"),
+        _ => return None,
+    };
+    let words = split_single_shell_command_words(script)?;
+    let (ssh_command, ssh_args) = words.split_first()?;
+    if ssh_family_client_for_executable(ssh_command) != Some("ssh") {
+        return None;
+    }
+    Some(SshCommandInvocation {
+        command: ssh_command.clone(),
+        args: ssh_args.to_vec(),
+        evidence,
+    })
+}
+
+fn powershell_command_script_arg(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = trim_arg_quotes(&args[index]).to_ascii_lowercase();
+        match arg.as_str() {
+            "-encodedcommand" | "-enc" | "-file" | "-f" => return None,
+            "-command" | "-c" => {
+                return (index + 2 == args.len()).then(|| args[index + 1].as_str());
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn cmd_command_script_arg(args: &[String]) -> Option<&str> {
+    for (index, arg) in args.iter().enumerate() {
+        let normalized = trim_arg_quotes(arg).to_ascii_lowercase();
+        if matches!(normalized.as_str(), "/c" | "/k") && index + 2 == args.len() {
+            return Some(args[index + 1].as_str());
+        }
+    }
+    None
+}
+
+fn split_single_shell_command_words(script: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in script.chars() {
+        match quote {
+            Some(quote_ch) if ch == quote_ch => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            None if matches!(ch, ';' | '|' | '&' | '<' | '>' | '\r' | '\n') => return None,
+            None => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Some(words)
+}
+
+fn shell_job_remote_scope_invocation(
+    command: &str,
+    args: &[String],
+) -> Option<SshCommandInvocation> {
+    shell_job_ssh_command_invocation(command, args)
+        .filter(|invocation| ssh_family_client_for_executable(&invocation.command) == Some("ssh"))
+}
+
+fn shell_job_cleanup_invocation(
+    job: &ActRunShellJobStatus,
+    original_args: Option<&[String]>,
+    remote_cleanup: Option<&ShellRemoteCleanupInvocation>,
+) -> Option<SshCommandInvocation> {
+    if let Some(args) = original_args {
+        if let Some(invocation) = shell_job_ssh_command_invocation(&job.command, args) {
+            return Some(invocation);
+        }
+    }
+    if let Some(remote_cleanup) = remote_cleanup {
+        return Some(SshCommandInvocation {
+            command: remote_cleanup.command.clone(),
+            args: remote_cleanup.control_args.clone(),
+            evidence: "remote_cleanup_sidecar",
+        });
+    }
+    shell_job_ssh_command_invocation(&job.command, &job.args)
 }
 
 fn ssh_remote_tracking_plan(
@@ -6682,7 +6918,7 @@ fn verify_shell_job_remote_cleanup_after_terminal(
     if job.remote_process_scope.remote_process_id.is_some()
         && job.remote_process_scope.remote_process_group_id.is_some()
     {
-        let _ = attempt_shell_job_remote_cleanup(job, trigger, original_args);
+        let _ = attempt_shell_job_remote_cleanup(job, paths, trigger, original_args);
         return;
     }
 
@@ -6772,6 +7008,7 @@ fn valid_remote_process_number(value: &str) -> bool {
 
 fn attempt_shell_job_remote_cleanup(
     job: &mut ActRunShellJobStatus,
+    paths: &ShellJobPaths,
     trigger: &'static str,
     original_args: Option<&[String]>,
 ) -> Option<String> {
@@ -6796,7 +7033,30 @@ fn attempt_shell_job_remote_cleanup(
         );
         return Some("remote_cleanup_metadata_invalid".to_owned());
     }
-    let Some(parts) = ssh_cleanup_command_parts(job, original_args) else {
+    let remote_cleanup = match read_shell_remote_cleanup_invocation(paths, &job.job_id) {
+        Ok(remote_cleanup) => remote_cleanup,
+        Err(message) => {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "remote_cleanup_sidecar_unreadable",
+                &message,
+            );
+            return Some("remote_cleanup_sidecar_unreadable".to_owned());
+        }
+    };
+    let Some(invocation) =
+        shell_job_cleanup_invocation(job, original_args, remote_cleanup.as_ref())
+    else {
+        mark_shell_job_remote_cleanup_failed(
+            job,
+            trigger,
+            "ssh_destination_unavailable",
+            "remote process metadata exists but the original SSH destination could not be parsed",
+        );
+        return Some("remote_cleanup_destination_unavailable".to_owned());
+    };
+    let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
         mark_shell_job_remote_cleanup_failed(
             job,
             trigger,
@@ -6809,7 +7069,7 @@ fn attempt_shell_job_remote_cleanup(
     let mut cleanup_args = parts.control_args;
     cleanup_args.push(cleanup_command);
     let output = run_shell_cleanup_command_with_timeout(
-        &job.command,
+        &invocation.command,
         &cleanup_args,
         Duration::from_millis(SHELL_REMOTE_CLEANUP_TIMEOUT_MS),
     );
@@ -6870,13 +7130,6 @@ fn attempt_shell_job_remote_cleanup(
             Some("remote_cleanup_readback_unrecognized".to_owned())
         }
     }
-}
-
-fn ssh_cleanup_command_parts(
-    job: &ActRunShellJobStatus,
-    original_args: Option<&[String]>,
-) -> Option<SshCommandParts> {
-    ssh_direct_command_parts(original_args.unwrap_or(&job.args))
 }
 
 fn mark_shell_job_remote_cleanup_failed(
@@ -7178,10 +7431,10 @@ fn spawn_shell_job_child(
     stderr_file: fs::File,
     context: Option<&ShellExecutionContext>,
 ) -> Result<SpawnedShellChild, ErrorData> {
-    let spawn_command = shell_spawn_command(&params.command);
+    let spawn_plan = shell_job_spawn_plan(params, job_id);
+    let spawn_command = shell_spawn_command(&spawn_plan.command);
     let mut command = TokioCommand::new(spawn_command.as_ref());
-    let spawn_args = shell_job_spawn_args(params, job_id);
-    command.args(&spawn_args);
+    command.args(&spawn_plan.args);
     if let Some(working_dir) = &params.working_dir {
         command.current_dir(working_dir);
     }
@@ -9776,6 +10029,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         let raw_body = format!(
             "Write-Output '{}'",
@@ -9865,6 +10119,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         let params = ActRunShellStartParams {
             command: "powershell.exe".to_owned(),
@@ -9949,6 +10204,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         let params = ActRunShellStartParams {
             command: "powershell.exe".to_owned(),
@@ -10039,6 +10295,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         std::fs::write(&paths.stdout_path, b"issue989-ok\r\n")
             .unwrap_or_else(|error| panic!("stdout should write: {error}"));
@@ -10202,6 +10459,88 @@ mod tests {
     }
 
     #[test]
+    fn shell_wrapped_powershell_ssh_remote_command_is_tracked() {
+        let args = vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "ssh -o BatchMode=yes aiwonder \"cd /repo/calyx && cargo test -p calyx-aster --test soak_ph58 -- --nocapture --test-threads=1\""
+                .to_owned(),
+        ];
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: args.clone(),
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue1019-powershell-ssh".to_owned()),
+        };
+
+        let invocation = shell_job_ssh_command_invocation(&params.command, &params.args)
+            .expect("single PowerShell SSH command should be parseable");
+        let scope = shell_job_remote_process_scope_from_start_params(&params);
+        let spawn_plan = shell_job_spawn_plan(&params, "issue1019-powershell-ssh");
+
+        println!(
+            "readback=act_run_shell_remote_tracking edge=powershell_ssh before=command:{} args:{args:?} after=invocation:{invocation:?} scope:{scope:?} spawn:{spawn_plan:?}",
+            params.command
+        );
+        assert_eq!(invocation.command, "ssh");
+        assert_eq!(invocation.evidence, "shell_wrapped_ssh:powershell");
+        assert_eq!(scope.transport, SHELL_REMOTE_TRANSPORT_SSH);
+        assert_eq!(scope.remote_identity.as_deref(), Some("aiwonder"));
+        assert_eq!(
+            scope.remote_cleanup_status,
+            SHELL_REMOTE_CLEANUP_TRACKING_PENDING
+        );
+        assert!(
+            scope
+                .detection_evidence
+                .iter()
+                .any(|evidence| evidence.contains("shell_wrapped_ssh:powershell"))
+        );
+        assert_eq!(spawn_plan.command, "ssh");
+        assert!(spawn_plan.args.last().is_some_and(|arg| {
+            arg.contains("SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1019-powershell-ssh")
+        }));
+    }
+
+    #[test]
+    fn shell_wrapped_complex_powershell_script_is_not_guessed_as_trackable_ssh() {
+        let args = vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "Write-Output before; ssh aiwonder sleep 60".to_owned(),
+        ];
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: args.clone(),
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue1019-complex-powershell".to_owned()),
+        };
+
+        let invocation = shell_job_ssh_command_invocation(&params.command, &params.args);
+        let scope = shell_job_remote_process_scope_from_start_params(&params);
+        let spawn_plan = shell_job_spawn_plan(&params, "issue1019-complex-powershell");
+
+        println!(
+            "readback=act_run_shell_remote_tracking edge=complex_powershell before=command:{} args:{args:?} after=invocation:{invocation:?} scope:{scope:?} spawn:{spawn_plan:?}",
+            params.command
+        );
+        assert!(invocation.is_none());
+        assert_eq!(scope.transport, SHELL_REMOTE_TRANSPORT_LOCAL);
+        assert_eq!(
+            scope.remote_cleanup_status,
+            SHELL_REMOTE_CLEANUP_NOT_APPLICABLE
+        );
+        assert_eq!(spawn_plan.command, "powershell.exe");
+        assert_eq!(spawn_plan.args, args);
+    }
+
+    #[test]
     fn shell_remote_tracking_plan_refuses_ssh_modes_without_cleanup_handle() {
         let forwarding = vec![
             "-N".to_owned(),
@@ -10243,6 +10582,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         std::fs::write(&paths.stdout_path, b"")
             .unwrap_or_else(|error| panic!("write stdout log: {error}"));
@@ -10304,6 +10644,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         std::fs::write(&paths.stdout_path, b"")
             .unwrap_or_else(|error| panic!("write stdout log: {error}"));
@@ -10361,6 +10702,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         let safe_args = vec![
             "-i".to_owned(),
@@ -10404,7 +10746,9 @@ mod tests {
             None,
         );
 
-        let live_parts = ssh_cleanup_command_parts(&status, Some(&original_args))
+        let live_invocation = shell_job_cleanup_invocation(&status, Some(&original_args), None)
+            .unwrap_or_else(|| panic!("parse live original cleanup invocation"));
+        let live_parts = ssh_direct_command_parts(&live_invocation.args)
             .unwrap_or_else(|| panic!("parse live original cleanup args"));
         assert!(
             live_parts
@@ -10419,7 +10763,9 @@ mod tests {
                 .any(|arg| arg.contains("[redacted-arg:"))
         );
 
-        let persisted_parts = ssh_cleanup_command_parts(&status, None)
+        let persisted_invocation = shell_job_cleanup_invocation(&status, None, None)
+            .unwrap_or_else(|| panic!("parse persisted cleanup invocation"));
+        let persisted_parts = ssh_direct_command_parts(&persisted_invocation.args)
             .unwrap_or_else(|| panic!("parse persisted cleanup args"));
         assert!(
             persisted_parts
@@ -10427,6 +10773,90 @@ mod tests {
                 .iter()
                 .any(|arg| arg.contains("[redacted-arg:"))
         );
+    }
+
+    #[test]
+    fn shell_wrapped_ssh_cleanup_sidecar_survives_redacted_status_args() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = ShellJobPaths {
+            job_dir: temp.path().to_path_buf(),
+            stdout_path: temp.path().join("stdout.log"),
+            stderr_path: temp.path().join("stderr.log"),
+            status_path: temp.path().join("status.json"),
+            request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+        };
+        let remote_body = format!("bash -lc 'exec -a issue1019 {}'", "sleep 600 ".repeat(80));
+        let script = format!(
+            "ssh -o BatchMode=yes -i //wsl.localhost/Ubuntu-24.04/home/cabdru/.ssh/id_ed25519 -l croyse aiwonder.mst.com \"{remote_body}\""
+        );
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                script,
+            ],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue1019-sidecar".to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: shell_command_line_from_parts(&params.command, &params.args),
+            matched_pattern: "__any_permitted__".to_owned(),
+        };
+        let status = shell_job_status_record(
+            "issue1019-sidecar",
+            "running",
+            &params,
+            &paths,
+            "request-sha",
+            &authorization,
+            "2026-06-15T00:00:00Z".to_owned(),
+            Some(1234),
+            None,
+        );
+
+        write_shell_remote_cleanup_invocation(&paths, &params)
+            .unwrap_or_else(|error| panic!("cleanup sidecar should write: {error}"));
+        let cleanup = read_shell_remote_cleanup_invocation(&paths, "issue1019-sidecar")
+            .unwrap_or_else(|error| panic!("cleanup sidecar should read: {error}"))
+            .unwrap_or_else(|| panic!("cleanup sidecar should exist"));
+        let persisted_invocation = shell_job_cleanup_invocation(&status, None, Some(&cleanup))
+            .unwrap_or_else(|| panic!("parse persisted cleanup sidecar invocation"));
+        let persisted_parts = ssh_direct_command_parts(&persisted_invocation.args)
+            .unwrap_or_else(|| panic!("parse persisted sidecar cleanup args"));
+
+        println!(
+            "readback=act_run_shell_remote_cleanup edge=shell_wrapped_redacted_status before=args_redacted:{} after=cleanup:{cleanup:?} invocation:{persisted_invocation:?}",
+            status.args_redacted
+        );
+        assert_eq!(persisted_invocation.command, "ssh");
+        assert!(status.args_redacted);
+        assert!(
+            persisted_parts
+                .control_args
+                .iter()
+                .any(|arg| arg == "//wsl.localhost/Ubuntu-24.04/home/cabdru/.ssh/id_ed25519")
+        );
+        assert!(
+            !persisted_parts
+                .control_args
+                .iter()
+                .any(|arg| arg.contains("[redacted-arg:"))
+        );
+        assert!(
+            !cleanup
+                .control_args
+                .iter()
+                .any(|arg| arg.contains("exec -a issue1019"))
+        );
+        assert_eq!(cleanup.remote_identity, "aiwonder.mst.com");
+        assert_eq!(cleanup.source_evidence, "shell_wrapped_ssh:powershell");
     }
 
     #[test]
@@ -10530,6 +10960,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         let params = ActRunShellStartParams {
             command: "scp.exe".to_owned(),
@@ -10614,6 +11045,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         let params = ActRunShellStartParams {
             command: "ssh.exe".to_owned(),
@@ -10677,6 +11109,7 @@ mod tests {
             stderr_path: temp.path().join("stderr.log"),
             status_path: temp.path().join("status.json"),
             request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
         };
         let params = ActRunShellStartParams {
             command: "ssh.exe".to_owned(),

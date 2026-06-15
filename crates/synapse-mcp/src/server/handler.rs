@@ -16,12 +16,18 @@ impl ServerHandler for SynapseService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
-        let mcp_session_id =
-            super::context::optional_mcp_session_id_from_request_context(&context)?;
+        let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
         let lifecycle_guard =
             self.begin_daemon_lifecycle_tool_call(&tool_name, mcp_session_id.as_deref())?;
         if let Some(session_id) = mcp_session_id.as_deref()
             && let Err(error) = self.reject_terminated_session_tool_call(&tool_name, session_id)
+        {
+            lifecycle_guard
+                .finish_error(error_snapshot(&error))
+                .map_err(lifecycle_mcp_error)?;
+            return Err(error);
+        }
+        if let Err(error) = self.admit_tool_call_for_profile(&tool_name, mcp_session_id.as_deref())
         {
             lifecycle_guard
                 .finish_error(error_snapshot(&error))
@@ -100,13 +106,13 @@ impl ServerHandler for SynapseService {
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
-        // Normalize schemas before they reach the client: schemars emits a bare
-        // boolean `true` schema for `serde_json::Value` fields, which strict MCP
-        // clients reject (failing the whole tools/list). See
-        // `super::schema_sanitize`.
-        let tools = super::schema_sanitize::sanitize_tools(self.tool_router.list_all());
+        let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
+        // Normalize schemas before they reach the client, then apply the
+        // session's durable tool profile. The policy gate in `call_tool` uses
+        // the same profile row so hand-written calls cannot bypass discovery.
+        let tools = self.tools_for_session_profile(mcp_session_id.as_deref())?;
         Ok(rmcp::model::ListToolsResult {
             tools,
             meta: None,

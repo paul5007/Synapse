@@ -872,9 +872,8 @@ function terminalStatus(stateName: string, reason: string): FleetStatus | null {
 }
 
 function statusFromLiveSession(stateName: string, lastSeenMs: number, lastAction: string, reason: string): FleetStatus {
-  const terminal = terminalStatus(stateName, reason);
-  if (terminal) return terminal;
-  if (/stuck/i.test(stateName)) return "stuck";
+  const authoritative = authoritativeAgentStatus(stateName, reason);
+  if (authoritative) return authoritative;
   if (Number.isFinite(lastSeenMs) && lastSeenMs > 300000) return "stuck";
   if (FAILURE_REASON_RE.test(reason)) return "stuck";
   if (/approval/i.test(`${stateName} ${lastAction} ${reason}`)) return "awaiting_approval";
@@ -888,9 +887,13 @@ function statusFromLiveSession(stateName: string, lastSeenMs: number, lastAction
 // status. The backend already folds heartbeat-silence and process-liveness into
 // this state, so the UI trusts it verbatim rather than re-deriving from idle ms.
 function statusFromAgentState(stateName: string, reason = ""): FleetStatus {
+  return authoritativeAgentStatus(stateName, reason) ?? "idle";
+}
+
+function authoritativeAgentStatus(stateName: string, reason = ""): FleetStatus | null {
   const terminal = terminalStatus(stateName, reason);
   if (terminal) return terminal;
-  switch (stateName) {
+  switch (stateName.toLowerCase()) {
     case "working":
     case "spawning":
       return "working";
@@ -905,7 +908,7 @@ function statusFromAgentState(stateName: string, reason = ""): FleetStatus {
     case "stuck":
       return "stuck";
     default:
-      return "idle";
+      return null;
   }
 }
 

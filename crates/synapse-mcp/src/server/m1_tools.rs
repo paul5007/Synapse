@@ -61,13 +61,17 @@ use synapse_reflex::ReflexRuntime;
 #[tool_router(router = m1_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(description = "Return server health", input_schema = empty_input_schema())]
-    pub async fn health(&self) -> Json<Health> {
+    pub async fn health(
+        &self,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<Health>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "health",
             "tool.invocation kind=health"
         );
-        Json(self.health_payload())
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
+        Ok(Json(self.health_payload_for_session(session_id.as_deref())))
     }
 
     #[tool(

@@ -23,13 +23,26 @@ fn storage_pressure_status(level: synapse_storage::DiskPressureLevel) -> String 
 }
 
 impl SynapseService {
+    #[cfg(test)]
     pub(crate) fn health_payload(&self) -> Health {
         self.health_payload_with_http_sessions(None)
+    }
+
+    pub(crate) fn health_payload_for_session(&self, session_id: Option<&str>) -> Health {
+        self.health_payload_with_http_sessions_and_session(None, session_id)
     }
 
     pub(crate) fn health_payload_with_http_sessions(
         &self,
         active_sessions: Option<usize>,
+    ) -> Health {
+        self.health_payload_with_http_sessions_and_session(active_sessions, None)
+    }
+
+    pub(crate) fn health_payload_with_http_sessions_and_session(
+        &self,
+        active_sessions: Option<usize>,
+        session_id: Option<&str>,
     ) -> Health {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
@@ -48,7 +61,7 @@ impl SynapseService {
             "daemon_lifecycle".to_owned(),
             crate::daemon_lifecycle::health_subsystem(),
         );
-        let tool_surface = self.tool_surface_fingerprint();
+        let tool_surface = self.tool_surface_fingerprint(session_id);
         if let Some(error) = &tool_surface.error {
             subsystems.insert(
                 "tool_surface".to_owned(),
@@ -101,8 +114,19 @@ impl SynapseService {
         }
     }
 
-    fn tool_surface_fingerprint(&self) -> ToolSurfaceFingerprint {
-        let mut tools = super::schema_sanitize::sanitize_tools(self.tool_router.list_all());
+    fn tool_surface_fingerprint(&self, session_id: Option<&str>) -> ToolSurfaceFingerprint {
+        let mut tools = match self.tools_for_session_profile(session_id) {
+            Ok(tools) => tools,
+            Err(error) => {
+                tracing::error!(
+                    code = "MCP_TOOL_SURFACE_PROFILE_READ_FAILED",
+                    session_id,
+                    error = ?error,
+                    "failed to resolve MCP tool profile while computing health tool surface"
+                );
+                super::schema_sanitize::sanitize_tools(self.tool_router.list_all())
+            }
+        };
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         let names = tools
             .iter()

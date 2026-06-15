@@ -7,7 +7,7 @@ use super::{
     activate_profile, apply_profile_runtime_config_in_state, authorization_error, error_codes,
     mcp_error,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
@@ -369,6 +369,15 @@ impl SynapseService {
         crate::m3::approvals::approval_snapshot(&db, kind)
     }
 
+    pub(crate) fn acked_open_attention_anchors_snapshot(
+        &self,
+    ) -> Result<BTreeSet<String>, ErrorData> {
+        let db = self.m3_storage()?;
+        Ok(super::escalation::acked_open_attention_anchors(&db)?
+            .into_iter()
+            .collect())
+    }
+
     pub(crate) fn local_model_registry_snapshot(
         &self,
     ) -> Result<Vec<crate::m3::local_models::LocalModelRegistryRow>, ErrorData> {
@@ -633,7 +642,9 @@ impl SynapseService {
                     "error",
                 )
                 .with_channel("dashboard")
-                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(error),
+                ),
             )?,
         };
         result
@@ -1300,18 +1311,6 @@ pub(super) fn mcp_session_id_from_request_context(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<Option<String>, ErrorData> {
     mcp_session_id_from_extensions(&request_context.extensions)
-}
-
-pub(super) fn optional_mcp_session_id_from_request_context(
-    request_context: &RequestContext<RoleServer>,
-) -> Result<Option<String>, ErrorData> {
-    let Some(parts) = request_context
-        .extensions
-        .get::<axum::http::request::Parts>()
-    else {
-        return Ok(crate::http::current_mcp_session_id());
-    };
-    mcp_session_id_from_headers(&parts.headers)
 }
 
 fn mcp_session_id_from_extensions(

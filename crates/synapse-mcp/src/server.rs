@@ -169,7 +169,6 @@ mod action_audit;
 mod action_preflight;
 pub(crate) mod agent_control;
 pub(crate) mod agent_cost;
-pub(crate) mod ambient_agents;
 pub(crate) mod agent_event_ingress;
 pub(crate) mod agent_events;
 mod agent_mailbox;
@@ -179,6 +178,7 @@ pub(crate) mod agent_stats;
 pub(crate) mod agent_tasks;
 pub(crate) mod agent_templates;
 pub(crate) mod agent_transcripts;
+pub(crate) mod ambient_agents;
 mod audit_context;
 pub(crate) mod command_audit;
 mod context;
@@ -229,6 +229,7 @@ mod target_policy;
 mod tests;
 mod timeline_digest;
 mod timeline_query;
+mod tool_profiles;
 mod workspace_blackboard;
 
 use session_registry::{SessionRegistry, SharedSessionRegistry};
@@ -563,7 +564,8 @@ impl SynapseService {
             + Self::hygiene_report_tool_router()
             + Self::data_cleaning_tool_router()
             + Self::permission_gate_tool_router()
-            + Self::escalation_tool_router();
+            + Self::escalation_tool_router()
+            + Self::tool_profile_tool_router();
         // The EverQuest domain pack (25 tools) is off the general-agent surface
         // unless the operator opts in (SYNAPSE_ENABLE_EVERQUEST). No capability
         // is lost — visibility is gated. rmcp builds the tool list once per
