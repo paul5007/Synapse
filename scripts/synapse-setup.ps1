@@ -2658,7 +2658,17 @@ if (-not $SkipClientWiring) {
         try {
             $j = Get-Content -Raw $desktopCfg | ConvertFrom-Json
             if (-not $j.mcpServers) { $j | Add-Member -NotePropertyName mcpServers -NotePropertyValue (@{}) -Force }
-            $j.mcpServers.synapse = @{ command = $ExePath; args = $bridgeArgs; env = @{ SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY = '1' } }
+            $desktopEntry = @{ command = $ExePath; args = $bridgeArgs; env = @{ SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY = '1' } }
+            # $j.mcpServers is a hashtable when freshly created above, but a PSCustomObject when
+            # parsed from an existing config. Dot-assigning a NEW property to a PSCustomObject throws
+            # "The property 'synapse' cannot be found on this object" under Windows PowerShell 5.1,
+            # so branch on type: index-assign dictionaries, Add-Member -Force PSCustomObjects (the
+            # latter both adds-or-overwrites and works on PS 5.1 and 7+).
+            if ($j.mcpServers -is [System.Collections.IDictionary]) {
+                $j.mcpServers['synapse'] = $desktopEntry
+            } else {
+                $j.mcpServers | Add-Member -NotePropertyName synapse -NotePropertyValue $desktopEntry -Force
+            }
             ($j | ConvertTo-Json -Depth 12) | Set-Content $desktopCfg -Encoding utf8
             Info "Claude Desktop wired -> connect bridge."
         } catch { Info "WARN: could not update $desktopCfg : $($_.Exception.Message)" }
