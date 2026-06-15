@@ -49,6 +49,11 @@ fn plant_spawn_dir(
         TranscriptSource::ClaudeStreamJson => "claude-mcp-config.json",
         TranscriptSource::CodexExecJson => "codex-notify.ps1",
         TranscriptSource::LocalModelJson => "local-model-runner.json",
+        // Session-file transcripts are not spawn-dir sourced; this helper never
+        // builds one. Panic loudly if a test ever asks for it here.
+        TranscriptSource::ClaudeSessionJsonl => {
+            unreachable!("spawn-dir ingester does not handle ClaudeSessionJsonl")
+        }
     };
     std::fs::write(log_dir.join(marker), b"{}").expect("write marker");
     std::fs::write(log_dir.join("stdout.jsonl"), stdout_content).expect("write stdout");

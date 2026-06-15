@@ -104,6 +104,15 @@ pub enum TranscriptSource {
     /// Claude Code `-p --output-format stream-json` stdout (verified against
     /// CLI 2.1.x event vocabulary).
     ClaudeStreamJson,
+    /// Claude Code persisted session transcript
+    /// (`~/.claude/projects/<cwd-slug>/<session-id>.jsonl`), written
+    /// unconditionally for every interactive session. Distinct vocabulary from
+    /// the stream-json stdout: each line is an enveloped record
+    /// (`parentUuid`/`sessionId`/`cwd`/`timestamp`) whose `message` is the raw
+    /// Anthropic API message, plus session metadata records
+    /// (`mode`/`file-history-snapshot`/`summary`/...). This is the source the
+    /// ambient-agent discovery pipeline tails for agents Synapse did not spawn.
+    ClaudeSessionJsonl,
     /// Codex `exec --json` stdout (verified against the
     /// `thread.*`/`turn.*`/`item.*` event vocabulary).
     CodexExecJson,

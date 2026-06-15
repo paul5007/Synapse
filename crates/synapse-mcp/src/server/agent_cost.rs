@@ -1186,7 +1186,13 @@ impl SpawnAccumulator {
         // The row class that carries a turn's usage differs by source; a turn
         // repeated across streaming lines keeps the highest-line row.
         let is_turn_usage_row = match record.source {
-            TranscriptSource::ClaudeStreamJson => kind == "assistant",
+            // Ambient session transcripts carry per-message usage on `assistant`
+            // rows exactly like stream-json; they have no terminal `result` row,
+            // so the spawn resolves to an honest `None` session total (the
+            // per-turn output series is still recovered below).
+            TranscriptSource::ClaudeStreamJson | TranscriptSource::ClaudeSessionJsonl => {
+                kind == "assistant"
+            }
             TranscriptSource::CodexExecJson => kind == "turn.completed",
             TranscriptSource::LocalModelJson => kind == "local.turn.finished",
         };
@@ -1376,7 +1382,7 @@ fn build_spawn_turns(
 
     let (method, output_basis, exact) = match resolved.source {
         TranscriptSource::CodexExecJson => ("codex_cumulative_delta", TurnOutputBasis::Exact, true),
-        TranscriptSource::ClaudeStreamJson => (
+        TranscriptSource::ClaudeStreamJson | TranscriptSource::ClaudeSessionJsonl => (
             "claude_per_message",
             TurnOutputBasis::PartialSnapshot,
             false,
@@ -1417,14 +1423,16 @@ fn build_spawn_turns(
                 BillableUsage::from_codex_cumulative(delta_input, delta_output, delta_cached)
                     .map_err(|detail| mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail))?
             }
-            TranscriptSource::ClaudeStreamJson => BillableUsage::from_claude_with_ttl(
-                raw.input,
-                raw.output,
-                raw.cache_read,
-                raw.cache_creation,
-                raw.cache_creation_5m,
-                raw.cache_creation_1h,
-            ),
+            TranscriptSource::ClaudeStreamJson | TranscriptSource::ClaudeSessionJsonl => {
+                BillableUsage::from_claude_with_ttl(
+                    raw.input,
+                    raw.output,
+                    raw.cache_read,
+                    raw.cache_creation,
+                    raw.cache_creation_5m,
+                    raw.cache_creation_1h,
+                )
+            }
             TranscriptSource::LocalModelJson => BillableUsage {
                 input_tokens: raw.input,
                 output_tokens: raw.output,
@@ -1465,6 +1473,7 @@ fn acc_source_label(acc: &SpawnAccumulator) -> Option<String> {
 fn source_label(source: TranscriptSource) -> String {
     match source {
         TranscriptSource::ClaudeStreamJson => "claude_stream_json".to_owned(),
+        TranscriptSource::ClaudeSessionJsonl => "claude_session_jsonl".to_owned(),
         TranscriptSource::CodexExecJson => "codex_exec_json".to_owned(),
         TranscriptSource::LocalModelJson => "local_model_json".to_owned(),
     }

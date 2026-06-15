@@ -850,6 +850,14 @@ fn parse_line(
         TranscriptSource::ClaudeStreamJson => parse_claude_object(object, &mut record, cursor),
         TranscriptSource::CodexExecJson => parse_codex_object(object, &mut record, cursor),
         TranscriptSource::LocalModelJson => parse_local_model_object(object, &mut record, cursor),
+        // The spawn-dir ingester never owns a session-file cursor; that
+        // vocabulary is tailed by `ambient_agents`. Seeing it here is a routing
+        // bug, surfaced as a fail-loud invalid row rather than a guessed parse.
+        TranscriptSource::ClaudeSessionJsonl => Err(
+            "CLAUDE_SESSION_JSONL_MISROUTED: ambient session transcripts are tailed by \
+             ambient_agents, not the spawn-dir ingester"
+                .to_owned(),
+        ),
     };
     if let Err(detail) = result {
         record.status = TranscriptParseStatus::Invalid;

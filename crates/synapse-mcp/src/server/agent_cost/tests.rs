@@ -700,6 +700,9 @@ fn plant_spawn_dir(root: &Path, spawn_id: &str, source: TranscriptSource, stdout
         TranscriptSource::ClaudeStreamJson => "claude-mcp-config.json",
         TranscriptSource::CodexExecJson => "codex-notify.ps1",
         TranscriptSource::LocalModelJson => "local-model-runner.json",
+        TranscriptSource::ClaudeSessionJsonl => {
+            unreachable!("cost spawn-dir helper does not handle ClaudeSessionJsonl")
+        }
     };
     std::fs::write(log_dir.join(marker), b"{}").expect("marker");
     std::fs::write(log_dir.join("stdout.jsonl"), stdout).expect("stdout");

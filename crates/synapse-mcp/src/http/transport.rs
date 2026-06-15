@@ -306,6 +306,18 @@ pub(super) async fn serve(
         )
         .context("spawn periodic transcript ingester")?;
 
+    // Ambient agent discovery (#fleet-ambient): tails the persisted Claude
+    // session transcripts under ~/.claude/projects so agents the operator
+    // launched themselves (not via act_spawn_agent) are registered into the
+    // same journal → state-machine → dashboard read path. A misconfigured
+    // schedule or an unresolvable home anchor is a startup failure, never a
+    // watcher that silently observes nothing.
+    let _ambient_ingest_task = crate::server::ambient_agents::spawn_periodic_ambient_ingest(
+        service.m3_state_handle(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic ambient agent discovery")?;
+
     let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.m3_state_handle())
         .context("install operator panic hotkey")?;
     let m2_emitter_done = service.m2_emitter_done_receiver();
@@ -3772,11 +3784,11 @@ fn dashboard_unix_time_ms() -> u64 {
 }
 
 const DASHBOARD_CSS_FILE: &str = "dashboard-DGTECjYz.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-BsSO2kBX.js";
+const DASHBOARD_JS_FILE: &str = "dashboard-Bdh1MToe.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-DGTECjYz.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-BsSO2kBX.js");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-Bdh1MToe.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
@@ -3922,7 +3934,11 @@ async fn agent_events_ingress_stats() -> Response {
 }
 
 async fn agent_transcripts_ingest_stats() -> Response {
-    Json(crate::server::agent_transcripts::ingest_stats()).into_response()
+    Json(serde_json::json!({
+        "spawn_dir": crate::server::agent_transcripts::ingest_stats(),
+        "ambient": crate::server::ambient_agents::ingest_stats(),
+    }))
+    .into_response()
 }
 
 fn spawn_server(

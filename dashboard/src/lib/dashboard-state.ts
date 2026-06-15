@@ -755,6 +755,35 @@ export function buildAgents(state?: DashboardState): AgentSummary[] {
     const spawnId = rawText(row.spawn_id);
     const stateName = rawText(row.state);
     const reason = rawText(row.reason_code);
+    // Ambient agents (discovered from ~/.claude/projects, not spawned by
+    // Synapse) are LIVE, not historical: render their real lifecycle state and
+    // current tool. We still cannot kill them — Synapse does not own the
+    // process — so killable stays false.
+    const isAmbient = spawnId.startsWith("agent-spawn-ambient-");
+    if (isAmbient) {
+      const lastTool = rawText(row.last_tool_name);
+      const silentMs = Number(row.silent_ms);
+      return {
+        id,
+        spawnId: spawnId || undefined,
+        killId: spawnId || id,
+        killable: false,
+        kind: `${rawText(row.agent_kind || "claude")} · ambient`,
+        lifecycle: stateName || "ambient",
+        status: statusFromAgentState(stateName),
+        summary: lastTool ? `tool: ${lastTool}` : stateName || "observed",
+        lastSeenMs: Number.isFinite(silentMs) ? silentMs : undefined,
+        lastAction: lastTool,
+        target: "",
+        reason,
+        diffStats: {
+          events: 1,
+          transcripts: transcriptCounts.get(spawnId) ?? 0,
+          actions: actionCounts.get(id) ?? 0
+        },
+        raw: row
+      } satisfies AgentSummary;
+    }
     return {
       id,
       spawnId: spawnId || undefined,
@@ -818,6 +847,30 @@ function statusFromLiveSession(stateName: string, lastSeenMs: number, lastAction
   if (/review/i.test(`${stateName} ${lastAction} ${reason}`)) return "ready_for_review";
   if (/idle/i.test(stateName)) return "idle";
   return "working";
+}
+
+// Maps the server-authoritative #898 lifecycle state straight onto a fleet
+// status. The backend already folds heartbeat-silence and process-liveness into
+// this state, so the UI trusts it verbatim rather than re-deriving from idle ms.
+function statusFromAgentState(stateName: string): FleetStatus {
+  switch (stateName) {
+    case "working":
+    case "spawning":
+      return "working";
+    case "idle":
+      return "idle";
+    case "needs_input":
+      return "needs_input";
+    case "awaiting_approval":
+      return "awaiting_approval";
+    case "ready_for_review":
+      return "ready_for_review";
+    case "stuck":
+    case "dead":
+      return "stuck";
+    default:
+      return "idle";
+  }
 }
 
 function statusFromHistorical(stateName: string, reason: string): FleetStatus {
