@@ -216,17 +216,24 @@ export interface SpawnRequest {
 export interface AgentTemplateRow {
   schema_version: number;
   template_id: string;
-  version: number;
   name: string;
-  agent_kind: "claude" | "codex" | "local_model" | string;
-  model?: string | null;
-  model_ref?: string | null;
-  prompt_template?: string | null;
-  required_params: string[];
-  working_dir?: string | null;
+  description: string;
+  /** "claude", "codex", or the name of a registered local/API model. */
+  model: string;
+  directory?: string | null;
+  prompt: string;
   config_hash: string;
   created_unix_ms: number;
   updated_unix_ms: number;
+}
+
+export interface TemplateUpsertRequest {
+  template_id: string;
+  name: string;
+  description?: string;
+  model: string;
+  directory?: string;
+  prompt: string;
 }
 
 export interface TemplateListResponse {
@@ -351,6 +358,29 @@ export async function fetchTemplates(): Promise<AgentTemplateRow[]> {
   const body = await readJsonOrThrow(response);
   const list = (body.list ?? {}) as { templates?: AgentTemplateRow[] };
   return list.templates ?? [];
+}
+
+export async function putTemplate(request: TemplateUpsertRequest): Promise<AgentTemplateRow> {
+  const response = await fetch("/dashboard/templates", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  const put = (body.put ?? {}) as { template?: AgentTemplateRow };
+  if (!put.template) throw new Error("template upsert returned no template row");
+  return put.template;
+}
+
+export async function deleteTemplate(templateId: string): Promise<void> {
+  const response = await fetch(`/dashboard/templates/${encodeURIComponent(templateId)}`, {
+    method: "DELETE",
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+  await readJsonOrThrow(response);
 }
 
 export async function fetchSavedViews(): Promise<DashboardSavedViewsResponse> {

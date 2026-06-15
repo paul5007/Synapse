@@ -1006,15 +1006,13 @@ pub struct ActSpawnAgentRequest {
     #[serde(default)]
     #[schemars(default)]
     pub template_id: Option<String>,
-    /// Pin a specific template version snapshot. Omit to render from the current
-    /// version (whichever the pointer holds at request time); the version
-    /// actually rendered is recorded on the spawn.
+    /// Legacy field, retained for contract stability and ignored: templates are
+    /// no longer versioned, so a spawn always renders from the current row.
     #[serde(default)]
     #[schemars(default)]
     pub template_version: Option<u32>,
-    /// Values for the template's declared `required_params`. The key set must
-    /// equal the template's contract exactly — missing or unknown keys are
-    /// rejected. Empty for a template with no parameters or a direct spawn.
+    /// Legacy field, retained for contract stability and ignored: a template's
+    /// prompt is used verbatim (no `${slot}` substitution), so no params apply.
     #[serde(default)]
     #[schemars(default)]
     pub template_params: BTreeMap<String, String>,

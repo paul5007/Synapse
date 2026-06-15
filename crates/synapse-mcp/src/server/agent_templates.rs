@@ -1,26 +1,22 @@
-//! Durable, versioned agent-spawn templates (#909).
+//! Durable agent-spawn templates (#909, simplified).
 //!
-//! A spawn template is the **config-time identity** of an agent: its kind,
-//! model, prompt template with typed parameter slots, working dir, and target
-//! binding — named and versioned as one unit. `act_spawn_agent` renders a
-//! concrete spawn from a template in a single atomic pass and records the exact
-//! `(template_id, version, config_hash)` it used, so every run is reproducible
-//! and the fleet is auditable (the "agent factory" pattern: an instance is never
-//! assembled piecemeal and always carries the template version it was rendered
-//! from).
+//! A template is a saved, reusable spawn preset with exactly five operator
+//! fields: a **name**, a **description** (what it's for), a **model**, a
+//! **directory**, and a **prompt**. That is the whole contract — nothing else.
 //!
-//! Storage is the daemon-owned `CF_KV` handle, mirroring the mailbox (#908):
-//! - a **current pointer** row per template id holds the latest version, and
-//! - an **immutable version snapshot** row per `(id, version)` lets a spawn's
-//!   recorded version resolve back to the exact config that produced it, even
-//!   after the template is later edited or deleted.
+//! `model` is a single string that selects the agent kind and the concrete
+//! model in one field:
+//! - `"claude"` spawns a Claude agent,
+//! - `"codex"` spawns a Codex agent,
+//! - any other value is the **name of a registered local/API model** (the
+//!   #931 runner row, e.g. `deepseek-flash`) and spawns through it.
 //!
-//! Editing a template never mutates a row in place: each `agent_template_put`
-//! writes a fresh immutable snapshot and atomically advances the pointer. A
-//! delete removes the pointer (so new spawns from it fail loudly) while keeping
-//! the version snapshots that past runs reference.
+//! `act_spawn_agent` renders a concrete spawn from a template by id (the prompt
+//! is used verbatim — there is no placeholder substitution). Storage is the
+//! daemon-owned `CF_KV` handle: a single current row per template id, edited in
+//! place. There is no versioning — a template is just its latest definition.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rmcp::{RoleServer, service::RequestContext};
 use schemars::JsonSchema;
@@ -34,82 +30,70 @@ use super::{
     session_registry::unix_time_ms_now, tool, tool_router,
 };
 
-/// CF_KV key namespace for template rows. The version is in the prefix so a
-/// future on-disk format change is a clean re-key, never an in-place migration.
-const TEMPLATE_NAMESPACE: &str = "agent-template/v1";
+/// CF_KV key namespace for template rows. `v2` is the simplified five-field
+/// shape; the version is in the prefix so a format change is a clean re-key,
+/// never an in-place migration (old `v1` rows are simply ignored).
+const TEMPLATE_NAMESPACE: &str = "agent-template/v2";
 /// Schema version stamped onto every stored template row.
-const TEMPLATE_SCHEMA_VERSION: u32 = 1;
+const TEMPLATE_SCHEMA_VERSION: u32 = 2;
 
 const MAX_TEMPLATE_ID_CHARS: usize = 200;
 const MAX_TEMPLATE_NAME_CHARS: usize = 200;
-const MAX_REQUIRED_PARAMS: usize = 64;
-const MAX_PARAM_NAME_CHARS: usize = 128;
-/// Matches the spawn prompt cap (`MAX_AGENT_SPAWN_PROMPT_BYTES`); the template
-/// prompt and every rendered prompt are held to the same limit so a template can
-/// never produce a prompt the spawn would reject.
-const MAX_PROMPT_TEMPLATE_BYTES: usize = 128 * 1024;
+const MAX_TEMPLATE_DESCRIPTION_CHARS: usize = 4000;
+/// Matches the spawn prompt cap (`MAX_AGENT_SPAWN_PROMPT_BYTES`); a template
+/// prompt is held to the same limit so it can never produce a prompt the spawn
+/// would reject.
+const MAX_PROMPT_BYTES: usize = 128 * 1024;
+const MAX_DIRECTORY_CHARS: usize = 4096;
 const MAX_MODEL_BYTES: usize = 256;
-/// Per-parameter value cap; the *rendered* prompt is additionally capped, so this
-/// only bounds a single substitution.
-const MAX_PARAM_VALUE_BYTES: usize = 16 * 1024;
 const MAX_LIST_TEMPLATES: usize = 1000;
 
-/// The agent kinds the spawner supports, as the template's `agent_kind`.
-const SUPPORTED_AGENT_KINDS: [&str; 3] = ["claude", "codex", "local_model"];
+/// Reserved model values that select a first-party agent kind rather than a
+/// registered local-model row.
+const MODEL_CLAUDE: &str = "claude";
+const MODEL_CODEX: &str = "codex";
 
-/// The durable, versioned template record. Field order is fixed so the canonical
-/// JSON used for `config_hash` is deterministic.
+/// The durable template record: exactly the five operator fields plus identity
+/// and timestamps. Field order is fixed so the canonical JSON used for
+/// `config_hash` is deterministic.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SpawnTemplate {
     pub schema_version: u32,
     pub template_id: String,
-    /// Monotonically increasing per template id; bumped on every edit. A spawn
-    /// records the version it rendered so the run is reproducible.
-    pub version: u32,
+    /// Human-readable label surfaced in the dashboard template list.
     pub name: String,
-    /// `claude`, `codex`, or `local_model`. Validated on write — unknown kinds
-    /// are rejected loudly, never silently coerced.
-    pub agent_kind: String,
+    /// What this template is for — a free-text description for easy
+    /// identification. May be empty.
+    pub description: String,
+    /// `claude`, `codex`, or the name of a registered local/API model.
+    pub model: String,
+    /// Working directory the spawned agent runs in. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Local-model only: registry row name to spawn through the #931 runner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_ref: Option<String>,
-    /// Prompt with `${slot}` placeholders. Every placeholder must be declared in
-    /// `required_params` and vice-versa, so a template is never internally
-    /// inconsistent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_template: Option<String>,
-    pub required_params: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<ActSpawnAgentTarget>,
-    /// sha256 of the canonical config (everything above `config_hash` except the
-    /// volatile `version`/timestamps). Two templates with the same hash render
-    /// identical spawns — the exact-provenance anchor recorded on each run.
+    pub directory: Option<String>,
+    /// The prompt, used verbatim (no placeholder substitution).
+    pub prompt: String,
+    /// sha256 of the canonical operator fields (name/description/model/
+    /// directory/prompt). Stable provenance anchor recorded on each spawn.
     pub config_hash: String,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
 }
 
-/// The immutable config inputs an operator supplies; hashing this gives
-/// `config_hash`. Kept as a distinct struct so the hash is independent of
-/// version/timestamps and reorderings of the public record.
+/// The operator-supplied fields; hashing this gives `config_hash`. Kept as a
+/// distinct struct so the hash is independent of timestamps/identity.
 #[derive(Serialize)]
 struct CanonicalTemplateConfig<'a> {
     name: &'a str,
-    agent_kind: &'a str,
-    model: &'a Option<String>,
-    model_ref: &'a Option<String>,
-    prompt_template: &'a Option<String>,
-    required_params: &'a [String],
-    working_dir: &'a Option<String>,
-    target: &'a Option<ActSpawnAgentTarget>,
+    description: &'a str,
+    model: &'a str,
+    directory: &'a Option<String>,
+    prompt: &'a str,
 }
 
-/// Provenance stamped onto a spawn rendered from a template.
+/// Provenance stamped onto a spawn rendered from a template. `version` is
+/// retained for the spawn-journal / cost-accounting contract but templates are
+/// unversioned, so it is always `1`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TemplateProvenance {
     pub template_id: String,
@@ -134,37 +118,23 @@ pub(crate) struct RenderedSpawn {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTemplatePutParams {
-    /// Stable template identity. Reusing an existing id edits it (a new version
-    /// snapshot is written and the current pointer advanced). `[a-z0-9._-]`.
+    /// Stable template identity (`[a-z0-9._-]`). Reusing an existing id edits it
+    /// in place.
     pub template_id: String,
-    /// Human-readable label surfaced in fleet/spawn UIs.
+    /// Human-readable label.
     pub name: String,
-    /// `claude`, `codex`, or `local_model`. The dashed alias `local-model` is
-    /// accepted and canonicalized to `local_model` when stored.
-    pub agent_kind: String,
+    /// What this template is for. Optional.
     #[serde(default)]
     #[schemars(default)]
-    pub model: Option<String>,
-    /// Local-model only: registry row name. `model` is accepted as a legacy
-    /// alias for local-model templates, but `model_ref` is the explicit field.
+    pub description: String,
+    /// `claude`, `codex`, or the name of a registered local/API model.
+    pub model: String,
+    /// Working directory for the spawned agent. Optional.
     #[serde(default)]
     #[schemars(default)]
-    pub model_ref: Option<String>,
-    /// Prompt body with `${slot}` placeholders. Each placeholder must appear in
-    /// `required_params` exactly once and vice-versa.
-    #[serde(default)]
-    #[schemars(default)]
-    pub prompt_template: Option<String>,
-    /// Declared parameter contract: the slot names a spawn must supply.
-    #[serde(default)]
-    #[schemars(default)]
-    pub required_params: Vec<String>,
-    #[serde(default)]
-    #[schemars(default)]
-    pub working_dir: Option<String>,
-    #[serde(default)]
-    #[schemars(default)]
-    pub target: Option<ActSpawnAgentTarget>,
+    pub directory: Option<String>,
+    /// The prompt, used verbatim.
+    pub prompt: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -172,9 +142,9 @@ pub struct AgentTemplatePutParams {
 pub struct AgentTemplatePutResponse {
     pub ok: bool,
     pub template: SpawnTemplate,
-    /// True when this put created a brand-new template id (version 1).
+    /// True when this put created a brand-new template id.
     pub created: bool,
-    /// Physical CF_KV rows written, for state verification.
+    /// Physical CF_KV row written, for state verification.
     pub written_rows: Vec<TemplateRowReadback>,
 }
 
@@ -191,11 +161,6 @@ pub struct TemplateRowReadback {
 #[serde(deny_unknown_fields)]
 pub struct AgentTemplateGetParams {
     pub template_id: String,
-    /// Omit for the current version; set to resolve a specific historical
-    /// version snapshot (what a past run recorded).
-    #[serde(default)]
-    #[schemars(default)]
-    pub version: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -237,31 +202,17 @@ pub struct AgentTemplateDeleteParams {
 pub struct AgentTemplateDeleteResponse {
     pub ok: bool,
     pub template_id: String,
-    /// The version the deleted current pointer held, for the audit trail.
-    pub deleted_version: u32,
     pub deleted_row_key: String,
-    /// Immutable version snapshots are intentionally retained so past runs stay
-    /// reproducible; this is how many remain.
-    pub retained_version_snapshots: usize,
 }
 
 // ---- key encoding ---------------------------------------------------------
 
-fn current_pointer_key(template_id: &str) -> String {
+fn template_key(template_id: &str) -> String {
     format!("{TEMPLATE_NAMESPACE}/cur/{template_id}")
 }
 
-fn current_pointer_prefix() -> String {
+fn template_prefix() -> String {
     format!("{TEMPLATE_NAMESPACE}/cur/")
-}
-
-fn version_snapshot_key(template_id: &str, version: u32) -> String {
-    // Zero-padded so a lexical prefix scan returns versions in numeric order.
-    format!("{TEMPLATE_NAMESPACE}/ver/{template_id}/{version:010}")
-}
-
-fn version_snapshot_prefix(template_id: &str) -> String {
-    format!("{TEMPLATE_NAMESPACE}/ver/{template_id}/")
 }
 
 // ---- validation & rendering (pure, unit-tested) ---------------------------
@@ -277,159 +228,30 @@ fn is_kebab_id(value: &str) -> bool {
         })
 }
 
-fn is_param_name(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-}
-
-/// Extracts the set of `${name}` placeholders from a prompt template. Returns an
-/// error on a malformed placeholder (`${`, unterminated, or non-identifier
-/// body) so a template can never carry a slot the renderer would silently miss.
-fn extract_placeholders(prompt: &str) -> Result<BTreeSet<String>, ErrorData> {
-    let mut placeholders = BTreeSet::new();
-    let bytes = prompt.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            let start = i + 2;
-            let Some(rel_end) = prompt[start..].find('}') else {
-                return Err(params_error(
-                    "agent_template prompt_template has an unterminated ${...} placeholder",
-                ));
-            };
-            let name = &prompt[start..start + rel_end];
-            if !is_param_name(name) {
-                return Err(params_error(format!(
-                    "agent_template prompt_template placeholder ${{{name}}} must be [a-z0-9_]+"
-                )));
-            }
-            placeholders.insert(name.to_owned());
-            i = start + rel_end + 1;
-        } else {
-            i += 1;
-        }
+/// Resolves a template's `model` string into the agent CLI it selects and, for
+/// a registered local/API model, the registry row name (`model_ref`).
+fn resolve_model(model: &str) -> Result<(ActSpawnAgentCli, Option<String>), ErrorData> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err(params_error("agent_template model must not be empty"));
     }
-    Ok(placeholders)
-}
-
-/// Renders `${name}` placeholders from `values`. Caller has already verified the
-/// key set matches; an absent key here is an internal error, surfaced loudly.
-fn render_prompt(prompt: &str, values: &BTreeMap<String, String>) -> Result<String, ErrorData> {
-    let mut out = String::with_capacity(prompt.len());
-    let bytes = prompt.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            let start = i + 2;
-            let rel_end = prompt[start..].find('}').ok_or_else(|| {
-                params_error(
-                    "agent_template prompt_template has an unterminated ${...} placeholder",
-                )
-            })?;
-            let name = &prompt[start..start + rel_end];
-            let value = values.get(name).ok_or_else(|| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("agent_template render missing already-validated slot ${{{name}}}"),
-                )
-            })?;
-            out.push_str(value);
-            i = start + rel_end + 1;
-        } else {
-            // Copy this byte as part of a char; push the whole char to keep UTF-8
-            // boundaries intact.
-            let ch = prompt[i..].chars().next().ok_or_else(|| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    "agent_template render walked off a UTF-8 boundary",
-                )
-            })?;
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    Ok(out)
-}
-
-fn validate_agent_kind(agent_kind: &str) -> Result<ActSpawnAgentCli, ErrorData> {
-    match agent_kind {
-        "claude" => Ok(ActSpawnAgentCli::Claude),
-        "codex" => Ok(ActSpawnAgentCli::Codex),
-        "local_model" | "local-model" => Ok(ActSpawnAgentCli::LocalModel),
-        other => Err(params_error(format!(
-            "agent_template agent_kind {other:?} is not supported; must be one of {SUPPORTED_AGENT_KINDS:?}"
-        ))),
-    }
-}
-
-fn canonical_agent_kind(agent_kind: ActSpawnAgentCli) -> &'static str {
-    match agent_kind {
-        ActSpawnAgentCli::Claude => "claude",
-        ActSpawnAgentCli::Codex => "codex",
-        ActSpawnAgentCli::LocalModel => "local_model",
-    }
-}
-
-fn validate_model(model: &str) -> Result<(), ErrorData> {
-    if model.trim().is_empty() {
-        return Err(params_error(
-            "agent_template model must not be empty when provided",
-        ));
-    }
-    if model.len() > MAX_MODEL_BYTES {
+    if trimmed.len() > MAX_MODEL_BYTES {
         return Err(params_error(format!(
             "agent_template model must be <= {MAX_MODEL_BYTES} bytes"
         )));
     }
-    if model
-        .chars()
-        .any(|ch| ch.is_whitespace() || ch.is_control())
-    {
+    if trimmed.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
         return Err(params_error(
             "agent_template model must not contain whitespace or control characters",
         ));
     }
-    Ok(())
+    match trimmed {
+        MODEL_CLAUDE => Ok((ActSpawnAgentCli::Claude, None)),
+        MODEL_CODEX => Ok((ActSpawnAgentCli::Codex, None)),
+        other => Ok((ActSpawnAgentCli::LocalModel, Some(other.to_owned()))),
+    }
 }
 
-fn validate_model_ref(model_ref: &str) -> Result<(), ErrorData> {
-    let trimmed = model_ref.trim();
-    if trimmed.is_empty() {
-        return Err(params_error(
-            "agent_template model_ref must not be empty when provided",
-        ));
-    }
-    if trimmed.chars().count() > 100 {
-        return Err(params_error(
-            "agent_template model_ref must be at most 100 characters",
-        ));
-    }
-    if trimmed.chars().any(char::is_control) {
-        return Err(params_error(
-            "agent_template model_ref must not contain control characters",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_target(target: &ActSpawnAgentTarget) -> Result<(), ErrorData> {
-    if let ActSpawnAgentTarget::Cdp { cdp_target_id, .. } = target {
-        if cdp_target_id.trim().is_empty()
-            || !cdp_target_id.chars().all(|ch| ('!'..='~').contains(&ch))
-        {
-            return Err(params_error(
-                "agent_template target cdp_target_id must contain only visible ASCII characters",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validates an operator's put params and returns the validated CLI plus the
-/// normalized required-params set. Internal consistency (placeholders ==
-/// required_params) is enforced here so a stored template is always renderable.
 fn validate_put_params(params: &AgentTemplatePutParams) -> Result<(), ErrorData> {
     if !is_kebab_id(&params.template_id) || params.template_id.len() > MAX_TEMPLATE_ID_CHARS {
         return Err(params_error(format!(
@@ -441,89 +263,36 @@ fn validate_put_params(params: &AgentTemplatePutParams) -> Result<(), ErrorData>
             "agent_template name must be non-empty and <= {MAX_TEMPLATE_NAME_CHARS} chars"
         )));
     }
-    let agent_kind = validate_agent_kind(&params.agent_kind)?;
-    if agent_kind.is_local_model() {
-        if params.model.is_some() && params.model_ref.is_some() {
-            return Err(params_error(
-                "agent_template local_model templates must set model_ref or legacy model, not both",
-            ));
-        }
-        let model_ref = params
-            .model_ref
-            .as_deref()
-            .or(params.model.as_deref())
-            .ok_or_else(|| {
-                params_error("agent_template local_model templates require model_ref")
-            })?;
-        validate_model_ref(model_ref)?;
-    } else {
-        if params.model_ref.is_some() {
-            return Err(params_error(
-                "agent_template model_ref is only valid when agent_kind is local_model",
-            ));
-        }
-        if let Some(model) = &params.model {
-            validate_model(model)?;
-        }
-    }
-    if params.required_params.len() > MAX_REQUIRED_PARAMS {
+    if params.description.len() > MAX_TEMPLATE_DESCRIPTION_CHARS {
         return Err(params_error(format!(
-            "agent_template required_params must be <= {MAX_REQUIRED_PARAMS} entries"
+            "agent_template description must be <= {MAX_TEMPLATE_DESCRIPTION_CHARS} chars"
         )));
     }
-    let mut declared = BTreeSet::new();
-    for name in &params.required_params {
-        if !is_param_name(name) || name.len() > MAX_PARAM_NAME_CHARS {
-            return Err(params_error(format!(
-                "agent_template required_params entry {name:?} must be non-empty [a-z0-9_]+ and <= {MAX_PARAM_NAME_CHARS} chars"
-            )));
-        }
-        if !declared.insert(name.clone()) {
-            return Err(params_error(format!(
-                "agent_template required_params has a duplicate entry {name:?}"
-            )));
-        }
+    resolve_model(&params.model)?;
+    if params.prompt.trim().is_empty() {
+        return Err(params_error("agent_template prompt must not be empty"));
     }
-    match &params.prompt_template {
-        Some(prompt) => {
-            if prompt.len() > MAX_PROMPT_TEMPLATE_BYTES {
-                return Err(params_error(format!(
-                    "agent_template prompt_template must be <= {MAX_PROMPT_TEMPLATE_BYTES} bytes"
-                )));
-            }
-            let placeholders = extract_placeholders(prompt)?;
-            if placeholders != declared {
-                let missing_decl: Vec<_> = placeholders.difference(&declared).cloned().collect();
-                let unused_decl: Vec<_> = declared.difference(&placeholders).cloned().collect();
-                return Err(params_error(format!(
-                    "agent_template prompt_template placeholders must exactly match required_params; \
-                     placeholders not declared: {missing_decl:?}; declared but absent from prompt: {unused_decl:?}"
-                )));
-            }
-        }
-        None => {
-            if !declared.is_empty() {
-                return Err(params_error(
-                    "agent_template declares required_params but has no prompt_template to substitute them into",
-                ));
-            }
-        }
+    if params.prompt.len() > MAX_PROMPT_BYTES {
+        return Err(params_error(format!(
+            "agent_template prompt must be <= {MAX_PROMPT_BYTES} bytes"
+        )));
     }
-    if let Some(working_dir) = &params.working_dir {
-        if working_dir.trim().is_empty() {
+    if let Some(directory) = &params.directory {
+        if directory.trim().is_empty() {
             return Err(params_error(
-                "agent_template working_dir must not be empty when provided",
+                "agent_template directory must not be empty when provided",
             ));
         }
-    }
-    if let Some(target) = &params.target {
-        validate_target(target)?;
+        if directory.chars().count() > MAX_DIRECTORY_CHARS {
+            return Err(params_error(format!(
+                "agent_template directory must be <= {MAX_DIRECTORY_CHARS} chars"
+            )));
+        }
     }
     Ok(())
 }
 
-/// Lowercase-hex sha256 of `bytes` (`Sha256::digest` returns a `GenericArray`
-/// that does not implement `LowerHex`, so we encode the bytes ourselves).
+/// Lowercase-hex sha256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
@@ -535,150 +304,59 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn config_hash(config: &CanonicalTemplateConfig<'_>) -> String {
-    // serde_json over a fixed-field-order struct is deterministic.
     let bytes = serde_json::to_vec(config).unwrap_or_default();
     sha256_hex(&bytes)
 }
 
-/// Builds the stored record for a put, given the prior version (if editing).
+/// Builds the stored record for a put, preserving `created_unix_ms` across edits.
 fn build_template(
     params: &AgentTemplatePutParams,
     prior: Option<&SpawnTemplate>,
     now_unix_ms: u64,
 ) -> SpawnTemplate {
-    let agent_kind = validate_agent_kind(&params.agent_kind)
-        .map(canonical_agent_kind)
-        .unwrap_or(params.agent_kind.as_str())
-        .to_owned();
-    let (model, model_ref) = if agent_kind == "local_model" {
-        (
-            None,
-            params
-                .model_ref
-                .clone()
-                .or_else(|| params.model.clone())
-                .map(|value| value.trim().to_owned()),
-        )
-    } else {
-        (params.model.clone(), None)
-    };
+    let model = params.model.trim().to_owned();
+    let directory = params
+        .directory
+        .as_ref()
+        .map(|value| value.trim().to_owned());
     let canonical = CanonicalTemplateConfig {
         name: &params.name,
-        agent_kind: &agent_kind,
+        description: &params.description,
         model: &model,
-        model_ref: &model_ref,
-        prompt_template: &params.prompt_template,
-        required_params: &params.required_params,
-        working_dir: &params.working_dir,
-        target: &params.target,
+        directory: &directory,
+        prompt: &params.prompt,
     };
     let hash = config_hash(&canonical);
-    let version = prior.map_or(1, |p| p.version + 1);
     let created = prior.map_or(now_unix_ms, |p| p.created_unix_ms);
     SpawnTemplate {
         schema_version: TEMPLATE_SCHEMA_VERSION,
         template_id: params.template_id.clone(),
-        version,
         name: params.name.clone(),
-        agent_kind,
+        description: params.description.clone(),
         model,
-        model_ref,
-        prompt_template: params.prompt_template.clone(),
-        required_params: params.required_params.clone(),
-        working_dir: params.working_dir.clone(),
-        target: params.target.clone(),
+        directory,
+        prompt: params.prompt.clone(),
         config_hash: hash,
         created_unix_ms: created,
         updated_unix_ms: now_unix_ms,
     }
 }
 
-/// Renders a concrete spawn from a stored template and caller-supplied params.
-/// The param key set must equal the template's `required_params` exactly:
-/// missing or unknown keys are rejected loudly (no silent defaults).
-pub(crate) fn render_spawn(
-    template: &SpawnTemplate,
-    provided_params: &BTreeMap<String, String>,
-) -> Result<RenderedSpawn, ErrorData> {
-    let cli = validate_agent_kind(&template.agent_kind)?;
-    let declared: BTreeSet<&String> = template.required_params.iter().collect();
-    let provided: BTreeSet<&String> = provided_params.keys().collect();
-
-    let missing: Vec<String> = declared
-        .difference(&provided)
-        .map(|s| (*s).clone())
-        .collect();
-    if !missing.is_empty() {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_spawn_agent template {:?} (v{}) is missing required template_params: {missing:?}",
-                template.template_id, template.version
-            ),
-        ));
-    }
-    let unknown: Vec<String> = provided
-        .difference(&declared)
-        .map(|s| (*s).clone())
-        .collect();
-    if !unknown.is_empty() {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_spawn_agent template {:?} (v{}) was given unknown template_params not in its contract: {unknown:?}",
-                template.template_id, template.version
-            ),
-        ));
-    }
-    for (name, value) in provided_params {
-        if value.len() > MAX_PARAM_VALUE_BYTES {
-            return Err(params_error(format!(
-                "act_spawn_agent template_params value for {name:?} must be <= {MAX_PARAM_VALUE_BYTES} bytes"
-            )));
-        }
-        if value.contains('\0') {
-            return Err(params_error(format!(
-                "act_spawn_agent template_params value for {name:?} must not contain NUL"
-            )));
-        }
-    }
-
-    let prompt = match &template.prompt_template {
-        Some(prompt_template) => {
-            let rendered = render_prompt(prompt_template, provided_params)?;
-            if rendered.len() > MAX_PROMPT_TEMPLATE_BYTES {
-                return Err(params_error(format!(
-                    "act_spawn_agent rendered prompt from template {:?} is {} bytes, over the {MAX_PROMPT_TEMPLATE_BYTES} cap",
-                    template.template_id,
-                    rendered.len()
-                )));
-            }
-            Some(rendered)
-        }
-        None => None,
-    };
-
+/// Renders a concrete spawn from a stored template. The prompt is used verbatim.
+pub(crate) fn render_spawn(template: &SpawnTemplate) -> Result<RenderedSpawn, ErrorData> {
+    let (cli, model_ref) = resolve_model(&template.model)?;
     Ok(RenderedSpawn {
         cli,
-        model: if cli.is_local_model() {
-            None
-        } else {
-            template.model.clone()
-        },
-        model_ref: if cli.is_local_model() {
-            template
-                .model_ref
-                .clone()
-                .or_else(|| template.model.clone())
-        } else {
-            None
-        },
-        prompt,
-        working_dir: template.working_dir.clone(),
-        target: template.target.clone(),
+        model: None,
+        model_ref,
+        prompt: Some(template.prompt.clone()),
+        working_dir: template.directory.clone(),
+        target: None,
         provenance: TemplateProvenance {
             template_id: template.template_id.clone(),
-            version: template.version,
+            // Templates are unversioned; the journal/cost contract keeps the
+            // field, pinned to 1.
+            version: 1,
             config_hash: template.config_hash.clone(),
         },
     })
@@ -727,21 +405,17 @@ impl SynapseService {
             .map_err(|error| mcp_error(error.code(), error.to_string()))
     }
 
+    /// For a local-model template, confirm the `model` names a registered
+    /// runner row. `claude`/`codex` need no registry check.
     fn validate_template_runtime_refs(
         &self,
         params: &AgentTemplatePutParams,
     ) -> Result<(), ErrorData> {
-        let agent_kind = validate_agent_kind(&params.agent_kind)?;
-        if !agent_kind.is_local_model() {
+        let (cli, model_ref) = resolve_model(&params.model)?;
+        if !cli.is_local_model() {
             return Ok(());
         }
-        let model_ref = params
-            .model_ref
-            .as_deref()
-            .or(params.model.as_deref())
-            .ok_or_else(|| {
-                params_error("agent_template local_model templates require model_ref")
-            })?;
+        let model_ref = model_ref.unwrap_or_default();
         let rows = self.local_model_registry_snapshot()?;
         if rows.iter().any(|row| row.name == model_ref) {
             return Ok(());
@@ -749,27 +423,24 @@ impl SynapseService {
         Err(mcp_error(
             error_codes::MODEL_REGISTRY_NOT_FOUND,
             format!(
-                "agent_template local_model model_ref {model_ref:?} is not registered in the local model registry"
+                "agent_template model {model_ref:?} is not 'claude'/'codex' and is not a registered local model"
             ),
         ))
     }
 
-    /// Reads the current pointer row for a template id, if any.
-    fn read_current_template(
-        db: &Db,
-        template_id: &str,
-    ) -> Result<Option<SpawnTemplate>, ErrorData> {
-        let key = current_pointer_key(template_id);
+    /// Reads the stored row for a template id, if any.
+    fn read_template(db: &Db, template_id: &str) -> Result<Option<SpawnTemplate>, ErrorData> {
+        let key = template_key(template_id);
         let rows = db
             .scan_cf_prefix(cf::CF_KV, key.as_bytes())
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("agent_template failed to read current pointer {key}: {error}"),
+                    format!("agent_template failed to read template {key}: {error}"),
                 )
             })?;
         for (raw_key, raw_value) in rows {
-            // scan_cf_prefix is a prefix scan; only the exact key is the pointer.
+            // scan_cf_prefix is a prefix scan; only the exact key is this row.
             if raw_key == key.as_bytes() {
                 return Ok(Some(decode_template(&key, &raw_value)?));
             }
@@ -784,44 +455,31 @@ impl SynapseService {
         validate_put_params(&params)?;
         self.validate_template_runtime_refs(&params)?;
         let db = self.agent_template_db()?;
-        let prior = Self::read_current_template(&db, &params.template_id)?;
+        let prior = Self::read_template(&db, &params.template_id)?;
         let created = prior.is_none();
         let now = unix_time_ms_now();
         let template = build_template(&params, prior.as_ref(), now);
 
         let encoded = encode_template(&template)?;
-        let pointer_key = current_pointer_key(&template.template_id);
-        let snapshot_key = version_snapshot_key(&template.template_id, template.version);
-
-        // Atomic: the immutable version snapshot and the advanced pointer land in
-        // one batch, so a reader never sees a pointer to a missing snapshot.
-        db.put_batch(
-            cf::CF_KV,
-            [
-                (snapshot_key.clone().into_bytes(), encoded.clone()),
-                (pointer_key.clone().into_bytes(), encoded.clone()),
-            ],
-        )
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "agent_template failed to persist template {:?} v{}: {error}",
-                    template.template_id, template.version
-                ),
-            )
-        })?;
-        // Templates are durable config, not a high-throughput stream: flush the
-        // storage batcher so the rows are physically on disk (and visible to the
-        // RocksDB-backed read path) before this put returns OK. Without this a
-        // subsequent get/list could miss the just-written row while it sat in the
-        // in-memory pending batch (read-after-write would be broken).
+        let key = template_key(&template.template_id);
+        db.put_batch(cf::CF_KV, [(key.clone().into_bytes(), encoded.clone())])
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "agent_template failed to persist template {:?}: {error}",
+                        template.template_id
+                    ),
+                )
+            })?;
+        // Templates are durable config, not a stream: flush so the row is on disk
+        // (and visible to the read path) before this returns OK (read-after-write).
         db.flush().map_err(|error| {
             mcp_error(
                 error.code(),
                 format!(
-                    "agent_template persisted template {:?} v{} but failed to flush it to disk: {error}",
-                    template.template_id, template.version
+                    "agent_template persisted template {:?} but failed to flush it to disk: {error}",
+                    template.template_id
                 ),
             )
         })?;
@@ -829,7 +487,6 @@ impl SynapseService {
         tracing::info!(
             code = "AGENT_TEMPLATE_PUT",
             template_id = %template.template_id,
-            version = template.version,
             created,
             config_hash = %template.config_hash,
             "readback=agent_templates edge=put"
@@ -837,10 +494,7 @@ impl SynapseService {
 
         Ok(AgentTemplatePutResponse {
             ok: true,
-            written_rows: vec![
-                row_readback(&snapshot_key, &encoded),
-                row_readback(&pointer_key, &encoded),
-            ],
+            written_rows: vec![row_readback(&key, &encoded)],
             created,
             template,
         })
@@ -856,38 +510,13 @@ impl SynapseService {
             ));
         }
         let db = self.agent_template_db()?;
-        let (row_key, template) = match params.version {
-            None => {
-                let key = current_pointer_key(&params.template_id);
-                let template = Self::read_current_template(&db, &params.template_id)?
-                    .ok_or_else(|| template_not_found(&params.template_id, None))?;
-                (key, template)
-            }
-            Some(version) => {
-                let key = version_snapshot_key(&params.template_id, version);
-                let rows = db
-                    .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-                    .map_err(|error| {
-                        mcp_error(
-                            error.code(),
-                            format!(
-                                "agent_template failed to read version snapshot {key}: {error}"
-                            ),
-                        )
-                    })?;
-                let found = rows
-                    .into_iter()
-                    .find(|(raw_key, _)| raw_key == key.as_bytes());
-                match found {
-                    Some((_, raw_value)) => (key.clone(), decode_template(&key, &raw_value)?),
-                    None => return Err(template_not_found(&params.template_id, Some(version))),
-                }
-            }
-        };
+        let key = template_key(&params.template_id);
+        let template = Self::read_template(&db, &params.template_id)?
+            .ok_or_else(|| template_not_found(&params.template_id))?;
         Ok(AgentTemplateGetResponse {
             ok: true,
             template,
-            row_key,
+            row_key: key,
         })
     }
 
@@ -896,13 +525,13 @@ impl SynapseService {
         params: AgentTemplateListParams,
     ) -> Result<AgentTemplateListResponse, ErrorData> {
         let db = self.agent_template_db()?;
-        let prefix = current_pointer_prefix();
+        let prefix = template_prefix();
         let rows = db
             .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("agent_template failed to list current pointers: {error}"),
+                    format!("agent_template failed to list templates: {error}"),
                 )
             })?;
         let mut templates = Vec::new();
@@ -929,6 +558,22 @@ impl SynapseService {
         })
     }
 
+    pub(crate) fn dashboard_put_agent_template(
+        &self,
+        params: AgentTemplatePutParams,
+    ) -> Result<AgentTemplatePutResponse, ErrorData> {
+        self.agent_template_put_impl(params)
+    }
+
+    pub(crate) fn dashboard_delete_agent_template(
+        &self,
+        template_id: &str,
+    ) -> Result<AgentTemplateDeleteResponse, ErrorData> {
+        self.agent_template_delete_impl(AgentTemplateDeleteParams {
+            template_id: template_id.to_owned(),
+        })
+    }
+
     fn agent_template_delete_impl(
         &self,
         params: AgentTemplateDeleteParams,
@@ -939,62 +584,46 @@ impl SynapseService {
             ));
         }
         let db = self.agent_template_db()?;
-        let current = Self::read_current_template(&db, &params.template_id)?
-            .ok_or_else(|| template_not_found(&params.template_id, None))?;
-        let pointer_key = current_pointer_key(&params.template_id);
-        db.delete_batch(cf::CF_KV, [pointer_key.clone().into_bytes()])
+        Self::read_template(&db, &params.template_id)?
+            .ok_or_else(|| template_not_found(&params.template_id))?;
+        let key = template_key(&params.template_id);
+        db.delete_batch(cf::CF_KV, [key.clone().into_bytes()])
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("agent_template failed to delete pointer {pointer_key}: {error}"),
+                    format!("agent_template failed to delete template {key}: {error}"),
                 )
             })?;
-        // Flush so the deletion is durable and immediately reflected on the
-        // RocksDB read path before this returns (read-after-write).
+        // Flush so the deletion is durable and immediately reflected (read-after-write).
         db.flush().map_err(|error| {
             mcp_error(
                 error.code(),
-                format!("agent_template deleted pointer {pointer_key} but failed to flush to disk: {error}"),
+                format!("agent_template deleted template {key} but failed to flush to disk: {error}"),
             )
         })?;
-        // Count retained immutable snapshots (kept so past runs stay reproducible).
-        let snapshot_prefix = version_snapshot_prefix(&params.template_id);
-        let retained = db
-            .scan_cf_prefix(cf::CF_KV, snapshot_prefix.as_bytes())
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("agent_template failed to count retained snapshots: {error}"),
-                )
-            })?
-            .len();
 
         tracing::info!(
             code = "AGENT_TEMPLATE_DELETE",
             template_id = %params.template_id,
-            deleted_version = current.version,
-            retained_version_snapshots = retained,
             "readback=agent_templates edge=delete"
         );
 
         Ok(AgentTemplateDeleteResponse {
             ok: true,
             template_id: params.template_id,
-            deleted_version: current.version,
-            deleted_row_key: pointer_key,
-            retained_version_snapshots: retained,
+            deleted_row_key: key,
         })
     }
 
-    /// Resolves a template id + version to a rendered spawn for `act_spawn_agent`
-    /// (#909). Always reads the **exact recorded version snapshot** so a spawn is
-    /// rendered from the config pinned at request time, never a drifted "latest".
-    /// When `version` is `None` it pins the current version and records it.
+    /// Resolves a template id to a rendered spawn for `act_spawn_agent` (#909).
+    /// `version` and `provided_params` are accepted for the (unchanged)
+    /// `act_spawn_agent` contract but ignored: templates are unversioned and the
+    /// prompt is verbatim.
     pub(crate) fn resolve_spawn_template(
         &self,
         template_id: &str,
-        version: Option<u32>,
-        provided_params: &BTreeMap<String, String>,
+        _version: Option<u32>,
+        _provided_params: &BTreeMap<String, String>,
     ) -> Result<RenderedSpawn, ErrorData> {
         if !is_kebab_id(template_id) {
             return Err(params_error(
@@ -1002,47 +631,23 @@ impl SynapseService {
             ));
         }
         let db = self.agent_template_db()?;
-        let template = match version {
-            None => Self::read_current_template(&db, template_id)?
-                .ok_or_else(|| template_not_found(template_id, None))?,
-            Some(version) => {
-                let key = version_snapshot_key(template_id, version);
-                let rows = db
-                    .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-                    .map_err(|error| {
-                        mcp_error(
-                            error.code(),
-                            format!(
-                                "agent_template failed to read version snapshot {key}: {error}"
-                            ),
-                        )
-                    })?;
-                rows.into_iter()
-                    .find(|(raw_key, _)| raw_key == key.as_bytes())
-                    .map(|(_, raw_value)| decode_template(&key, &raw_value))
-                    .transpose()?
-                    .ok_or_else(|| template_not_found(template_id, Some(version)))?
-            }
-        };
-        render_spawn(&template, provided_params)
+        let template =
+            Self::read_template(&db, template_id)?.ok_or_else(|| template_not_found(template_id))?;
+        render_spawn(&template)
     }
 }
 
-fn template_not_found(template_id: &str, version: Option<u32>) -> ErrorData {
-    let detail = match version {
-        Some(v) => format!("template {template_id:?} has no version {v}"),
-        None => format!("no current template with id {template_id:?}"),
-    };
+fn template_not_found(template_id: &str) -> ErrorData {
     mcp_error(
         error_codes::AGENT_TEMPLATE_NOT_FOUND,
-        format!("agent_template not found: {detail}"),
+        format!("agent_template not found: no template with id {template_id:?}"),
     )
 }
 
 #[tool_router(router = agent_template_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Create or edit a durable, versioned agent-spawn template (kind/model/prompt-template/params/working-dir/target). Reusing a template_id writes a new immutable version snapshot and advances the current pointer; prompt ${slot} placeholders must exactly match required_params. act_spawn_agent renders a spawn from a template by id and records the version used."
+        description = "Create or edit a reusable agent-spawn template: name, description, model, directory, and prompt. `model` is 'claude', 'codex', or the name of a registered local/API model. Reusing a template_id edits it in place. act_spawn_agent spawns from a template by id, using the prompt verbatim."
     )]
     pub async fn agent_template_put(
         &self,
@@ -1059,7 +664,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Read one agent-spawn template by id. Omit version for the current version, or pass a version to resolve a historical immutable snapshot (what a past run recorded). Errors AGENT_TEMPLATE_NOT_FOUND if absent."
+        description = "Read one agent-spawn template by id. Errors AGENT_TEMPLATE_NOT_FOUND if absent."
     )]
     pub async fn agent_template_get(
         &self,
@@ -1076,7 +681,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "List current agent-spawn templates (one row per template id, latest version), sorted by id."
+        description = "List agent-spawn templates (one row per template id), sorted by id."
     )]
     pub async fn agent_template_list(
         &self,
@@ -1092,7 +697,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Delete an agent-spawn template's current pointer so new spawns from it fail loudly. Immutable version snapshots are retained so past runs stay reproducible. Errors AGENT_TEMPLATE_NOT_FOUND if no current template."
+        description = "Delete an agent-spawn template by id so new spawns from it fail loudly. Errors AGENT_TEMPLATE_NOT_FOUND if absent."
     )]
     pub async fn agent_template_delete(
         &self,
@@ -1128,199 +733,114 @@ mod tests {
         AgentTemplatePutParams {
             template_id: id.to_owned(),
             name: "Code reviewer".to_owned(),
-            agent_kind: "claude".to_owned(),
-            model: Some("claude-opus-4-8".to_owned()),
-            model_ref: None,
-            prompt_template: Some("Review ${repo} for ${focus}.".to_owned()),
-            required_params: vec!["repo".to_owned(), "focus".to_owned()],
-            working_dir: Some(r"C:\code\Synapse".to_owned()),
-            target: None,
+            description: "Reviews the repo for correctness bugs.".to_owned(),
+            model: "claude".to_owned(),
+            directory: Some(r"C:\code\Synapse".to_owned()),
+            prompt: "Review the repo for correctness bugs.".to_owned(),
         }
     }
 
     #[test]
-    fn extract_placeholders_collects_unique_slots() {
-        let set = extract_placeholders("a ${x} b ${y} c ${x}").expect("parse");
-        assert_eq!(set, ["x", "y"].into_iter().map(str::to_owned).collect());
+    fn resolve_model_maps_first_party_and_registered() {
+        assert_eq!(resolve_model("claude").expect("ok").0, ActSpawnAgentCli::Claude);
+        assert_eq!(resolve_model("codex").expect("ok").0, ActSpawnAgentCli::Codex);
+        let (cli, model_ref) = resolve_model("deepseek-flash").expect("ok");
+        assert_eq!(cli, ActSpawnAgentCli::LocalModel);
+        assert_eq!(model_ref.as_deref(), Some("deepseek-flash"));
     }
 
     #[test]
-    fn extract_placeholders_rejects_unterminated() {
-        let err = extract_placeholders("hello ${oops").expect_err("must reject");
-        assert_eq!(error_code_str(&err), error_codes::TOOL_PARAMS_INVALID);
-        assert!(err.message.contains("unterminated"), "{}", err.message);
-    }
-
-    #[test]
-    fn extract_placeholders_rejects_bad_identifier() {
-        let err = extract_placeholders("hi ${Bad-Name}").expect_err("must reject");
-        assert!(err.message.contains("[a-z0-9_]+"), "{}", err.message);
-    }
-
-    #[test]
-    fn validate_put_rejects_unknown_agent_kind() {
-        let mut params = base_put("rev");
-        params.agent_kind = "gpt".to_owned();
-        let err = validate_put_params(&params).expect_err("must reject");
-        assert!(err.message.contains("not supported"), "{}", err.message);
-    }
-
-    #[test]
-    fn validate_put_rejects_placeholder_mismatch() {
-        let mut params = base_put("rev");
-        params.required_params = vec!["repo".to_owned()]; // prompt also has ${focus}
-        let err = validate_put_params(&params).expect_err("must reject");
+    fn resolve_model_rejects_empty_and_whitespace() {
+        assert_eq!(
+            error_code_str(&resolve_model("   ").expect_err("reject")),
+            error_codes::TOOL_PARAMS_INVALID
+        );
         assert!(
-            err.message
-                .contains("placeholders not declared: [\"focus\"]"),
-            "{}",
-            err.message
+            resolve_model("two words")
+                .expect_err("reject")
+                .message
+                .contains("whitespace")
         );
     }
 
     #[test]
-    fn validate_put_rejects_declared_param_with_no_prompt() {
+    fn validate_put_rejects_empty_prompt() {
         let mut params = base_put("rev");
-        params.prompt_template = None;
+        params.prompt = "   ".to_owned();
         let err = validate_put_params(&params).expect_err("must reject");
-        assert!(
-            err.message.contains("no prompt_template"),
-            "{}",
-            err.message
-        );
+        assert!(err.message.contains("prompt must not be empty"), "{}", err.message);
     }
 
     #[test]
-    fn validate_put_rejects_duplicate_required_param() {
-        let mut params = base_put("rev");
-        params.prompt_template = Some("${repo}".to_owned());
-        params.required_params = vec!["repo".to_owned(), "repo".to_owned()];
+    fn validate_put_rejects_bad_id() {
+        let mut params = base_put("Bad Id");
+        params.template_id = "Bad Id".to_owned();
         let err = validate_put_params(&params).expect_err("must reject");
-        assert!(err.message.contains("duplicate"), "{}", err.message);
+        assert!(err.message.contains("template_id"), "{}", err.message);
     }
 
     #[test]
-    fn build_template_starts_at_v1_and_bumps_on_edit() {
+    fn validate_put_rejects_empty_directory_when_present() {
+        let mut params = base_put("rev");
+        params.directory = Some("  ".to_owned());
+        let err = validate_put_params(&params).expect_err("must reject");
+        assert!(err.message.contains("directory"), "{}", err.message);
+    }
+
+    #[test]
+    fn build_template_preserves_created_and_hashes_config() {
         let params = base_put("rev");
         let v1 = build_template(&params, None, 1_000);
-        assert_eq!(v1.version, 1);
         assert_eq!(v1.created_unix_ms, 1_000);
+        assert_eq!(v1.schema_version, TEMPLATE_SCHEMA_VERSION);
         let v2 = build_template(&params, Some(&v1), 2_000);
-        assert_eq!(v2.version, 2);
-        // created is preserved across edits; updated advances.
         assert_eq!(v2.created_unix_ms, 1_000);
         assert_eq!(v2.updated_unix_ms, 2_000);
-        // Identical config => identical hash regardless of version/timestamps.
+        // Identical config => identical hash.
         assert_eq!(v1.config_hash, v2.config_hash);
     }
 
     #[test]
     fn config_hash_changes_when_config_changes() {
-        let params = base_put("rev");
-        let v1 = build_template(&params, None, 1_000);
+        let v1 = build_template(&base_put("rev"), None, 1_000);
         let mut edited = base_put("rev");
-        edited.model = Some("claude-sonnet-4-6".to_owned());
+        edited.model = "codex".to_owned();
         let v2 = build_template(&edited, Some(&v1), 2_000);
         assert_ne!(v1.config_hash, v2.config_hash);
     }
 
     #[test]
-    fn render_spawn_substitutes_and_carries_provenance() {
+    fn render_spawn_uses_prompt_verbatim_and_carries_provenance() {
         let template = build_template(&base_put("rev"), None, 1_000);
-        let params = [
-            ("repo".to_owned(), "Synapse".to_owned()),
-            ("focus".to_owned(), "perf".to_owned()),
-        ]
-        .into_iter()
-        .collect();
-        let rendered = render_spawn(&template, &params).expect("render");
+        let rendered = render_spawn(&template).expect("render");
         assert_eq!(rendered.cli, ActSpawnAgentCli::Claude);
-        assert_eq!(rendered.prompt.as_deref(), Some("Review Synapse for perf."));
-        assert_eq!(rendered.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            rendered.prompt.as_deref(),
+            Some("Review the repo for correctness bugs.")
+        );
+        assert_eq!(rendered.model, None);
         assert_eq!(rendered.model_ref, None);
+        assert_eq!(rendered.working_dir.as_deref(), Some(r"C:\code\Synapse"));
         assert_eq!(rendered.provenance.template_id, "rev");
         assert_eq!(rendered.provenance.version, 1);
         assert_eq!(rendered.provenance.config_hash, template.config_hash);
     }
 
     #[test]
-    fn render_spawn_supports_local_model_template_ref() {
+    fn render_spawn_supports_registered_local_model() {
         let mut params = base_put("local");
-        params.agent_kind = "local-model".to_owned();
-        params.model = None;
-        params.model_ref = Some("ollama-gemma4-e4b".to_owned());
+        params.model = "ollama-gemma4-e4b".to_owned();
         let template = build_template(&params, None, 1_000);
-        assert_eq!(template.agent_kind, "local_model");
-        assert_eq!(template.model, None);
-        assert_eq!(template.model_ref.as_deref(), Some("ollama-gemma4-e4b"));
-
-        let values = [
-            ("repo".to_owned(), "Synapse".to_owned()),
-            ("focus".to_owned(), "tools".to_owned()),
-        ]
-        .into_iter()
-        .collect();
-        let rendered = render_spawn(&template, &values).expect("render");
+        assert_eq!(template.model, "ollama-gemma4-e4b");
+        let rendered = render_spawn(&template).expect("render");
         assert_eq!(rendered.cli, ActSpawnAgentCli::LocalModel);
         assert_eq!(rendered.model, None);
         assert_eq!(rendered.model_ref.as_deref(), Some("ollama-gemma4-e4b"));
-        assert_eq!(
-            rendered.prompt.as_deref(),
-            Some("Review Synapse for tools.")
-        );
     }
 
     #[test]
-    fn render_spawn_rejects_missing_param() {
-        let template = build_template(&base_put("rev"), None, 1_000);
-        let params = [("repo".to_owned(), "Synapse".to_owned())]
-            .into_iter()
-            .collect();
-        let err = render_spawn(&template, &params).expect_err("must reject");
-        assert!(
-            err.message
-                .contains("missing required template_params: [\"focus\"]"),
-            "{}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn render_spawn_rejects_unknown_param() {
-        let template = build_template(&base_put("rev"), None, 1_000);
-        let params = [
-            ("repo".to_owned(), "Synapse".to_owned()),
-            ("focus".to_owned(), "perf".to_owned()),
-            ("extra".to_owned(), "nope".to_owned()),
-        ]
-        .into_iter()
-        .collect();
-        let err = render_spawn(&template, &params).expect_err("must reject");
-        assert!(
-            err.message.contains("unknown template_params"),
-            "{}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn render_spawn_handles_no_param_template() {
-        let mut params = base_put("idle");
-        params.prompt_template = Some("Just idle and wait.".to_owned());
-        params.required_params = vec![];
-        let template = build_template(&params, None, 1_000);
-        let rendered = render_spawn(&template, &BTreeMap::new()).expect("render");
-        assert_eq!(rendered.prompt.as_deref(), Some("Just idle and wait."));
-    }
-
-    #[test]
-    fn key_encoding_is_stable_and_ordered() {
-        assert_eq!(current_pointer_key("rev"), "agent-template/v1/cur/rev");
-        assert_eq!(
-            version_snapshot_key("rev", 7),
-            "agent-template/v1/ver/rev/0000000007"
-        );
-        // Zero-padding keeps a lexical scan in numeric order.
-        assert!(version_snapshot_key("rev", 2) < version_snapshot_key("rev", 10));
+    fn key_encoding_is_stable() {
+        assert_eq!(template_key("rev"), "agent-template/v2/cur/rev");
+        assert_eq!(template_prefix(), "agent-template/v2/cur/");
     }
 }

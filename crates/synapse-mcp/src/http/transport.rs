@@ -569,7 +569,16 @@ fn router(
             post(dashboard_target_claims_prune)
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
         )
-        .route("/dashboard/templates", get(dashboard_template_list))
+        .route(
+            "/dashboard/templates",
+            get(dashboard_template_list)
+                .post(dashboard_template_upsert)
+                .layer(DefaultBodyLimit::max(DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/templates/{template_id}",
+            delete(dashboard_template_delete),
+        )
         .route("/dashboard/models", get(dashboard_model_list))
         .route(
             "/dashboard/api-model/register",
@@ -1737,6 +1746,22 @@ struct DashboardTemplateListResponse {
     list: crate::server::agent_templates::AgentTemplateListResponse,
 }
 
+#[derive(Serialize)]
+struct DashboardTemplateUpsertResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    put: crate::server::agent_templates::AgentTemplatePutResponse,
+}
+
+#[derive(Serialize)]
+struct DashboardTemplateDeleteResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    delete: crate::server::agent_templates::AgentTemplateDeleteResponse,
+}
+
 /// Browser-facing request to register an OpenAI-compatible cloud API model
 /// (DeepSeek first) into the local-model registry. `api_shape` is fixed to
 /// `open_ai_chat_completions` and `allow_non_loopback` to `true` server-side —
@@ -2842,8 +2867,65 @@ async fn dashboard_template_list(State(state): State<HttpState>, headers: Header
             Json(DashboardTemplateListResponse {
                 ok: true,
                 trigger: "dashboard.template_list",
-                source_of_truth: "CF_KV agent-template/v1/current/",
+                source_of_truth: "CF_KV agent-template/v2/cur/",
                 list,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_template_upsert(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::server::agent_templates::AgentTemplatePutParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_put_agent_template(params) {
+        Ok(put) => with_dashboard_security_headers(
+            Json(DashboardTemplateUpsertResponse {
+                ok: true,
+                trigger: "dashboard.template_upsert",
+                source_of_truth: "CF_KV agent-template/v2/cur/",
+                put,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_template_delete(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(template_id): Path<String>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state
+        .health_service
+        .dashboard_delete_agent_template(&template_id)
+    {
+        Ok(delete) => with_dashboard_security_headers(
+            Json(DashboardTemplateDeleteResponse {
+                ok: true,
+                trigger: "dashboard.template_delete",
+                source_of_truth: "CF_KV agent-template/v2/cur/",
+                delete,
             })
             .into_response(),
         ),
@@ -3558,12 +3640,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-CxFc5IQw.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-NIwAXe2m.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-ZRO6uzyy.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-9Gpc_Jpa.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-CxFc5IQw.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-NIwAXe2m.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-ZRO6uzyy.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-9Gpc_Jpa.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
