@@ -100,6 +100,60 @@ export interface DashboardSavedViewsResponse {
   corrupt_row_count: number;
 }
 
+export interface AuditQueryFilters {
+  limit?: number | string;
+  scan_limit?: number | string;
+  cursor?: string;
+  start_ts_ns?: number | string;
+  end_ts_ns?: number | string;
+  session_id?: string;
+  tool?: string;
+  status?: string;
+  error_code?: string;
+  row_kind?: string;
+}
+
+export interface AuditQueryRow {
+  key_hex: string;
+  value_len_bytes: number;
+  value_sha256: string;
+  row_kind: string;
+  audit_id: string;
+  ts_ns: number;
+  ts_ns_text?: string;
+  phase?: string | null;
+  status?: string | null;
+  outcome?: string | null;
+  session_id?: string | null;
+  actor_session_id?: string | null;
+  target_session_id?: string | null;
+  tool: string;
+  verb?: string | null;
+  channel?: string | null;
+  error_code?: string | null;
+  payload_sha256?: string | null;
+  payload_truncated?: boolean | null;
+  source_of_truth: Record<string, unknown>;
+  record: Record<string, unknown>;
+}
+
+export interface AuditQueryResponse {
+  source_of_truth: string;
+  cf_name: string;
+  filters: Record<string, unknown>;
+  limit: number;
+  scan_limit: number;
+  scanned_rows: number;
+  matched_rows: number;
+  returned_count: number;
+  corrupt_row_count: number;
+  partial: boolean;
+  exhausted: boolean;
+  start_key_hex?: string | null;
+  next_start_key_hex?: string | null;
+  rows: AuditQueryRow[];
+}
+
 export interface SaveDashboardViewRequest {
   view_id?: string;
   name: string;
@@ -346,6 +400,25 @@ export async function fetchSavedViews(): Promise<DashboardSavedViewsResponse> {
     source_of_truth: rawText(body.source_of_truth),
     views: asArray<DashboardSavedView>(body.views),
     corrupt_row_count: Number(body.corrupt_row_count || 0)
+  };
+}
+
+export async function fetchAuditQuery(filters: AuditQueryFilters): Promise<AuditQueryResponse> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString();
+  const response = await fetch(`/dashboard/audit/query${suffix ? `?${suffix}` : ""}`, {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+  const body = await readJsonOrThrow(response);
+  const query = asRecord(body.query) as unknown as AuditQueryResponse;
+  return {
+    ...query,
+    rows: asArray<AuditQueryRow>(query.rows)
   };
 }
 

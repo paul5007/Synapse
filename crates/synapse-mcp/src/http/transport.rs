@@ -503,6 +503,7 @@ fn router(
         .route("/dashboard/auth/logout", post(dashboard_auth_logout))
         .route("/dashboard/auth/failures", get(dashboard_auth_failures))
         .route("/dashboard/state.json", get(dashboard_state))
+        .route("/dashboard/audit/query", get(dashboard_audit_query))
         .route(
             "/dashboard/saved-views",
             get(dashboard_saved_views)
@@ -1733,6 +1734,21 @@ struct DashboardSavedViewDeleteResponse {
     deleted_row_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardAuditQueryRequest {
+    limit: Option<usize>,
+    scan_limit: Option<usize>,
+    cursor: Option<String>,
+    start_key_hex: Option<String>,
+    start_ts_ns: Option<u64>,
+    end_ts_ns: Option<u64>,
+    session_id: Option<String>,
+    tool: Option<String>,
+    status: Option<String>,
+    error_code: Option<String>,
+    row_kind: Option<String>,
+}
+
 async fn dashboard_index(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
@@ -2026,6 +2042,57 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         local_models: local_model_panel(&state, &tool_names),
     };
     with_dashboard_security_headers(Json(response).into_response())
+}
+
+async fn dashboard_audit_query(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(request): Query<DashboardAuditQueryRequest>,
+) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "GET",
+        "/dashboard/audit/query",
+        CsrfPolicy::NotRequired,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = crate::server::command_audit::CommandAuditQueryParams {
+        limit: request.limit,
+        scan_limit: request.scan_limit,
+        start_key_hex: request.cursor.or(request.start_key_hex),
+        start_ts_ns: request.start_ts_ns,
+        end_ts_ns: request.end_ts_ns,
+        session_id: request.session_id,
+        tool: request.tool,
+        status: request.status,
+        error_code: request.error_code,
+        row_kind: request.row_kind,
+    };
+    match state.health_service.command_audit_query(params) {
+        Ok(query) => with_dashboard_security_headers(
+            Json(serde_json::json!({
+                "ok": true,
+                "source_of_truth": "CF_ACTION_LOG bounded scan",
+                "query": query,
+            }))
+            .into_response(),
+        ),
+        Err(error) => {
+            let code = dashboard_error_code(&error);
+            let status = if code == synapse_core::error_codes::TOOL_PARAMS_INVALID {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            with_dashboard_security_headers(dashboard_error_response(
+                status,
+                &code,
+                &error.message,
+                error.data.clone(),
+            ))
+        }
+    }
 }
 
 fn dashboard_saved_view_rows(db: &Db) -> Result<(Vec<DashboardSavedViewRow>, usize), Response> {
@@ -3111,12 +3178,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-_RxSULrX.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-o7Y2vVPu.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-Dx04S9D0.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-gEWBuoIw.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-_RxSULrX.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-o7Y2vVPu.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-Dx04S9D0.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-gEWBuoIw.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

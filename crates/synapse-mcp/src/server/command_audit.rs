@@ -20,6 +20,11 @@ const COMMAND_AUDIT_SCHEMA_VERSION: u32 = 1;
 const COMMAND_AUDIT_PAYLOAD_MAX_BYTES: usize = 8192;
 const COMMAND_AUDIT_SNAPSHOT_SCAN_LIMIT: usize = 1000;
 const COMMAND_AUDIT_SNAPSHOT_ROW_LIMIT: usize = 100;
+const COMMAND_AUDIT_QUERY_DEFAULT_LIMIT: usize = 100;
+const COMMAND_AUDIT_QUERY_MAX_LIMIT: usize = 250;
+const COMMAND_AUDIT_QUERY_DEFAULT_SCAN_LIMIT: usize = 1000;
+const COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT: usize = 5000;
+const COMMAND_AUDIT_QUERY_BATCH_ROWS: usize = 256;
 
 static COMMAND_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -87,6 +92,74 @@ pub(crate) struct CommandAuditSnapshotRow {
     pub outcome: String,
     pub error_code: Option<String>,
     pub source_of_truth: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CommandAuditQueryParams {
+    pub limit: Option<usize>,
+    pub scan_limit: Option<usize>,
+    pub start_key_hex: Option<String>,
+    pub start_ts_ns: Option<u64>,
+    pub end_ts_ns: Option<u64>,
+    pub session_id: Option<String>,
+    pub tool: Option<String>,
+    pub status: Option<String>,
+    pub error_code: Option<String>,
+    pub row_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CommandAuditQueryResponse {
+    pub source_of_truth: &'static str,
+    pub cf_name: &'static str,
+    pub filters: CommandAuditQueryFilters,
+    pub limit: usize,
+    pub scan_limit: usize,
+    pub scanned_rows: usize,
+    pub matched_rows: usize,
+    pub returned_count: usize,
+    pub corrupt_row_count: usize,
+    pub partial: bool,
+    pub exhausted: bool,
+    pub start_key_hex: Option<String>,
+    pub next_start_key_hex: Option<String>,
+    pub rows: Vec<CommandAuditQueryRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CommandAuditQueryFilters {
+    pub start_ts_ns: Option<u64>,
+    pub end_ts_ns: Option<u64>,
+    pub session_id: Option<String>,
+    pub tool: Option<String>,
+    pub status: Option<String>,
+    pub error_code: Option<String>,
+    pub row_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CommandAuditQueryRow {
+    pub key_hex: String,
+    pub value_len_bytes: u64,
+    pub value_sha256: String,
+    pub row_kind: String,
+    pub audit_id: String,
+    pub ts_ns: u64,
+    pub ts_ns_text: String,
+    pub phase: Option<String>,
+    pub status: Option<String>,
+    pub outcome: Option<String>,
+    pub session_id: Option<String>,
+    pub actor_session_id: Option<String>,
+    pub target_session_id: Option<String>,
+    pub tool: String,
+    pub verb: Option<String>,
+    pub channel: Option<String>,
+    pub error_code: Option<String>,
+    pub payload_sha256: Option<String>,
+    pub payload_truncated: Option<bool>,
+    pub source_of_truth: Value,
+    pub record: Value,
 }
 
 impl CommandAuditInput {
@@ -173,6 +246,140 @@ impl SynapseService {
             scanned_rows,
             row_count: parsed.len(),
             rows: parsed,
+        })
+    }
+
+    pub(crate) fn command_audit_query(
+        &self,
+        params: CommandAuditQueryParams,
+    ) -> Result<CommandAuditQueryResponse, ErrorData> {
+        let limit = audit_query_limit(
+            params.limit,
+            COMMAND_AUDIT_QUERY_DEFAULT_LIMIT,
+            COMMAND_AUDIT_QUERY_MAX_LIMIT,
+            "limit",
+        )?;
+        let scan_limit = audit_query_limit(
+            params.scan_limit,
+            COMMAND_AUDIT_QUERY_DEFAULT_SCAN_LIMIT,
+            COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT,
+            "scan_limit",
+        )?;
+        let row_kind = normalize_row_kind_filter(params.row_kind.as_deref())?;
+        let filters = CommandAuditQueryFilters {
+            start_ts_ns: params.start_ts_ns,
+            end_ts_ns: params.end_ts_ns,
+            session_id: normalized_filter(params.session_id),
+            tool: normalized_filter(params.tool),
+            status: normalized_filter(params.status),
+            error_code: normalized_filter(params.error_code),
+            row_kind,
+        };
+        if let (Some(start), Some(end)) = (filters.start_ts_ns, filters.end_ts_ns) {
+            if start > end {
+                return Err(command_audit_params_error(
+                    "audit query start_ts_ns must be <= end_ts_ns",
+                ));
+            }
+        }
+
+        let start_key = match normalized_filter(params.start_key_hex) {
+            Some(start_key_hex) => {
+                decode_hex(&start_key_hex).map_err(command_audit_params_error)?
+            }
+            None => filters
+                .start_ts_ns
+                .map(|start_ts_ns| command_audit_key(start_ts_ns, 0))
+                .unwrap_or_default(),
+        };
+        let start_key_hex = (!start_key.is_empty()).then(|| hex_encode(&start_key));
+
+        let runtime = self.reflex_runtime()?;
+        let runtime = runtime.lock().map_err(|_error| {
+            command_audit_internal_error("reflex runtime lock poisoned while querying action audit")
+        })?;
+
+        let mut cursor = start_key;
+        let mut scanned_rows = 0_usize;
+        let mut matched_rows = 0_usize;
+        let mut corrupt_row_count = 0_usize;
+        let mut returned = Vec::new();
+        let mut next_start_key_hex = None;
+        let mut more_after_window = false;
+        let mut stopped_at_end_ts = false;
+
+        while scanned_rows < scan_limit && returned.len() < limit {
+            let remaining_scan = scan_limit.saturating_sub(scanned_rows);
+            let batch_limit = remaining_scan.min(COMMAND_AUDIT_QUERY_BATCH_ROWS);
+            if batch_limit == 0 {
+                break;
+            }
+            let (batch, has_more) = runtime
+                .storage_cf_rows_from(cf::CF_ACTION_LOG, &cursor, batch_limit)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            if batch.is_empty() {
+                more_after_window = false;
+                break;
+            }
+            more_after_window = has_more;
+            let mut last_scanned_key: Option<Vec<u8>> = None;
+            for (key, value) in batch {
+                scanned_rows = scanned_rows.saturating_add(1);
+                last_scanned_key = Some(key.clone());
+                let row = match synapse_storage::decode_json::<Value>(&value) {
+                    Ok(row) => row,
+                    Err(_error) => {
+                        corrupt_row_count = corrupt_row_count.saturating_add(1);
+                        continue;
+                    }
+                };
+                let ts_ns = audit_row_ts_ns(&row);
+                if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
+                    stopped_at_end_ts = true;
+                    break;
+                }
+                if !audit_row_matches(&row, &filters) {
+                    continue;
+                }
+                matched_rows = matched_rows.saturating_add(1);
+                returned.push(command_audit_query_row(&key, &value, row));
+                if returned.len() >= limit {
+                    break;
+                }
+            }
+
+            if let Some(last_key) = last_scanned_key {
+                next_start_key_hex = Some(hex_encode(&key_after(&last_key)));
+                cursor = key_after(&last_key);
+            }
+
+            if stopped_at_end_ts || returned.len() >= limit || !more_after_window {
+                break;
+            }
+        }
+
+        let scan_budget_exhausted = scanned_rows >= scan_limit && more_after_window;
+        let row_budget_exhausted = returned.len() >= limit && !stopped_at_end_ts;
+        let partial = scan_budget_exhausted || row_budget_exhausted;
+        if !partial {
+            next_start_key_hex = None;
+        }
+        let returned_count = returned.len();
+        Ok(CommandAuditQueryResponse {
+            source_of_truth: "CF_ACTION_LOG bounded scan",
+            cf_name: cf::CF_ACTION_LOG,
+            filters,
+            limit,
+            scan_limit,
+            scanned_rows,
+            matched_rows,
+            returned_count,
+            corrupt_row_count,
+            partial,
+            exhausted: !partial,
+            start_key_hex,
+            next_start_key_hex,
+            rows: returned,
         })
     }
 
@@ -421,11 +628,229 @@ fn command_audit_snapshot_row(key: &[u8], row: &Value) -> CommandAuditSnapshotRo
     }
 }
 
+fn command_audit_query_row(key: &[u8], encoded_value: &[u8], row: Value) -> CommandAuditQueryRow {
+    let row_kind = audit_row_kind(&row).to_owned();
+    CommandAuditQueryRow {
+        key_hex: hex_encode(key),
+        value_len_bytes: encoded_value.len() as u64,
+        value_sha256: sha256_hex(encoded_value),
+        row_kind: row_kind.clone(),
+        audit_id: string_field(&row, "audit_id"),
+        ts_ns: audit_row_ts_ns(&row),
+        ts_ns_text: audit_row_ts_ns(&row).to_string(),
+        phase: optional_string_field(&row, "phase"),
+        status: optional_string_field(&row, "status"),
+        outcome: optional_string_field(&row, "outcome"),
+        session_id: optional_string_field(&row, "session_id")
+            .or_else(|| audit_context_session_id(&row)),
+        actor_session_id: actor_session_id(&row),
+        target_session_id: optional_string_field(&row, "target_session_id"),
+        tool: string_field(&row, "tool"),
+        verb: optional_string_field(&row, "verb"),
+        channel: optional_string_field(&row, "channel"),
+        error_code: optional_string_field(&row, "error_code"),
+        payload_sha256: optional_string_field(&row, "payload_sha256"),
+        payload_truncated: row.get("payload_truncated").and_then(Value::as_bool),
+        source_of_truth: row.get("source_of_truth").cloned().unwrap_or_else(|| {
+            json!({
+                "cf_name": cf::CF_ACTION_LOG,
+                "row_kind": row_kind,
+                "key_hex": hex_encode(key),
+                "retention": "24h",
+            })
+        }),
+        record: row,
+    }
+}
+
+fn audit_row_matches(row: &Value, filters: &CommandAuditQueryFilters) -> bool {
+    if filters
+        .start_ts_ns
+        .is_some_and(|start| audit_row_ts_ns(row) < start)
+    {
+        return false;
+    }
+    if filters
+        .end_ts_ns
+        .is_some_and(|end| audit_row_ts_ns(row) > end)
+    {
+        return false;
+    }
+    if filters
+        .row_kind
+        .as_deref()
+        .is_some_and(|row_kind| audit_row_kind(row) != row_kind)
+    {
+        return false;
+    }
+    if filters
+        .session_id
+        .as_deref()
+        .is_some_and(|session_id| !audit_row_session_matches(row, session_id))
+    {
+        return false;
+    }
+    if filters
+        .tool
+        .as_deref()
+        .is_some_and(|tool| row.get("tool").and_then(Value::as_str) != Some(tool))
+    {
+        return false;
+    }
+    if filters
+        .status
+        .as_deref()
+        .is_some_and(|status| !audit_row_status_matches(row, status))
+    {
+        return false;
+    }
+    if filters
+        .error_code
+        .as_deref()
+        .is_some_and(|error_code| row.get("error_code").and_then(Value::as_str) != Some(error_code))
+    {
+        return false;
+    }
+    true
+}
+
+fn audit_row_kind(row: &Value) -> &str {
+    match row.get("row_kind").and_then(Value::as_str) {
+        Some(COMMAND_AUDIT_ROW_KIND) => COMMAND_AUDIT_ROW_KIND,
+        Some(value) => value,
+        None => "action_audit",
+    }
+}
+
+fn audit_row_ts_ns(row: &Value) -> u64 {
+    row.get("ts_ns").and_then(Value::as_u64).unwrap_or_default()
+}
+
+fn audit_row_session_matches(row: &Value, session_id: &str) -> bool {
+    [
+        optional_string_field(row, "session_id"),
+        actor_session_id(row),
+        optional_string_field(row, "target_session_id"),
+        audit_context_session_id(row),
+        row.get("details")
+            .and_then(|details| details.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|candidate| candidate == session_id)
+}
+
+fn audit_row_status_matches(row: &Value, status: &str) -> bool {
+    [
+        row.get("status").and_then(Value::as_str),
+        row.get("outcome").and_then(Value::as_str),
+        row.get("phase").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|candidate| candidate == status)
+}
+
+fn actor_session_id(row: &Value) -> Option<String> {
+    row.get("actor")
+        .and_then(|actor| actor.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn audit_context_session_id(row: &Value) -> Option<String> {
+    row.get("audit_context")
+        .and_then(|context| context.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 fn string_field(row: &Value, field: &str) -> String {
     row.get(field)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned()
+}
+
+fn optional_string_field(row: &Value, field: &str) -> Option<String> {
+    row.get(field).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn audit_query_limit(
+    value: Option<usize>,
+    default: usize,
+    max: usize,
+    field: &'static str,
+) -> Result<usize, ErrorData> {
+    let value = value.unwrap_or(default);
+    if value == 0 || value > max {
+        return Err(command_audit_params_error(format!(
+            "audit query {field} must be between 1 and {max}"
+        )));
+    }
+    Ok(value)
+}
+
+fn normalized_filter(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+fn normalize_row_kind_filter(value: Option<&str>) -> Result<Option<String>, ErrorData> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value {
+        "all" => Ok(None),
+        "command" | "command_audit" => Ok(Some(COMMAND_AUDIT_ROW_KIND.to_owned())),
+        "action" | "action_audit" => Ok(Some("action_audit".to_owned())),
+        _ => Err(command_audit_params_error(
+            "audit query row_kind must be all, command_audit, or action_audit",
+        )),
+    }
+}
+
+fn key_after(key: &[u8]) -> Vec<u8> {
+    let mut next = Vec::with_capacity(key.len().saturating_add(1));
+    next.extend_from_slice(key);
+    next.push(0);
+    next
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim();
+    if value.len() % 2 != 0 {
+        return Err("audit query cursor must be even-length hex".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| "audit query cursor contains non-hex characters".to_owned())?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| "audit query cursor contains non-hex characters".to_owned())?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn command_audit_params_error(message: impl ToString) -> ErrorData {
+    mcp_error(
+        synapse_core::error_codes::TOOL_PARAMS_INVALID,
+        message.to_string(),
+    )
 }
 
 fn command_audit_internal_error(message: impl ToString) -> ErrorData {

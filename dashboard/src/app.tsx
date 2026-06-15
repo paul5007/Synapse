@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { ColumnDef } from "@tanstack/react-table";
+import { flexRender, getCoreRowModel, getSortedRowModel, useReactTable, type ColumnDef, type SortingState } from "@tanstack/react-table";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from "recharts";
 import {
+  ArrowUpDown,
   BarChart3,
   Bell,
+  ChevronDown,
   CheckCircle2,
   ClipboardList,
   Command,
+  FileSearch,
   Gauge,
   HardDrive,
   LogIn,
@@ -25,6 +28,7 @@ import {
   Search,
   ServerCog,
   ShieldCheck,
+  SkipForward,
   Sun,
   Trash2,
   UserRound,
@@ -56,6 +60,7 @@ import {
   buildAgents,
   buildToolCalls,
   deleteDashboardView,
+  fetchAuditQuery,
   fetchTemplates,
   fetchDashboardAuthStatus,
   fetchDashboardState,
@@ -71,6 +76,9 @@ import {
   saveDashboardView,
   spawnAgent,
   type AgentSummary,
+  type AuditQueryFilters,
+  type AuditQueryResponse,
+  type AuditQueryRow,
   type DashboardAuthStatus,
   type DashboardRouteReadback,
   type DashboardSavedView,
@@ -81,7 +89,7 @@ import {
   type SpawnAgentResponse,
   type TimelineControlResponse
 } from "@/lib/dashboard-state";
-import { asArray, asRecord, cn, rawText, timeAgo, unixMsToTime } from "@/lib/utils";
+import { asArray, asRecord, cn, nsToTime, rawText, timeAgo, unixMsToTime } from "@/lib/utils";
 import { useUiStore, type DashboardRouteId, type Density, type Theme } from "@/store/ui-store";
 
 type RouteDefinition = {
@@ -102,6 +110,47 @@ const routeDefinitions: RouteDefinition[] = [
   { id: "audit", label: "Audit", title: "Audit Explorer", icon: ShieldCheck }
 ];
 
+const auditTextFields = ["cursor", "start_ts_ns", "end_ts_ns", "session_id", "tool", "status", "error_code", "row_kind"] as const;
+
+function defaultAuditFilters(): AuditQueryFilters {
+  const sixHoursMs = 6 * 60 * 60 * 1000;
+  return {
+    limit: "100",
+    scan_limit: "1000",
+    row_kind: "all",
+    start_ts_ns: (BigInt(Date.now() - sixHoursMs) * 1_000_000n).toString()
+  };
+}
+
+function auditCursorFilters(keyHex: string): AuditQueryFilters {
+  return {
+    limit: "1",
+    scan_limit: "1",
+    cursor: keyHex,
+    row_kind: "all"
+  };
+}
+
+function sanitizeAuditFilters(value: unknown): AuditQueryFilters {
+  const source = asRecord(value);
+  const base = defaultAuditFilters();
+  const next: AuditQueryFilters = {
+    limit: rawText(source.limit || base.limit),
+    scan_limit: rawText(source.scan_limit || base.scan_limit)
+  };
+  for (const field of auditTextFields) {
+    const text = rawText(source[field]);
+    if (text) next[field] = text;
+  }
+  if (!next.row_kind) next.row_kind = "all";
+  return next;
+}
+
+function shortKey(value?: string | null) {
+  if (!value) return "";
+  return value.length > 18 ? `${value.slice(0, 10)}...${value.slice(-6)}` : value;
+}
+
 export function App() {
   const density = useUiStore((state) => state.density);
   const setDensity = useUiStore((state) => state.setDensity);
@@ -117,6 +166,7 @@ export function App() {
   const [hashRouteReady, setHashRouteReady] = useState(false);
   const [savedViewName, setSavedViewName] = useState("");
   const [savedViewError, setSavedViewError] = useState("");
+  const [auditFilters, setAuditFilters] = useState<AuditQueryFilters>(() => defaultAuditFilters());
 
   const authQuery = useQuery({
     queryKey: ["dashboard-auth"],
@@ -197,6 +247,12 @@ export function App() {
     const next = attentionAgents[(current + 1 + attentionAgents.length) % attentionAgents.length];
     setSelectedAgentId(next.id);
     setRoute("agent");
+  };
+
+  const focusAuditKey = (keyHex: string) => {
+    if (!keyHex) return;
+    setAuditFilters(auditCursorFilters(keyHex));
+    setRoute("audit");
   };
 
   useEffect(() => {
@@ -293,6 +349,7 @@ export function App() {
     if (agentId) setSelectedAgentId(agentId);
     if (isDensity(filters.density)) setDensity(filters.density);
     if (isTheme(filters.theme)) setTheme(filters.theme);
+    if (filters.audit) setAuditFilters(sanitizeAuditFilters(filters.audit));
   };
 
   const saveCurrentView = async () => {
@@ -307,7 +364,8 @@ export function App() {
         filters: {
           selectedAgentId,
           density,
-          theme
+          theme,
+          audit: auditFilters
         }
       });
       setSavedViewId(saved.view.view_id);
@@ -407,15 +465,18 @@ export function App() {
           toolCalls={toolCalls}
           advanceAttention={advanceAttention}
           onSpawned={() => query.refetch()}
+          onAuditKeySelect={focusAuditKey}
         />
       ) : null}
-      {route === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} /> : null}
+      {route === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} onAuditKeySelect={focusAuditKey} /> : null}
       {route === "tasks" ? <TasksView agents={agents} attentionCount={attentionCount} /> : null}
       {route === "approvals" ? <ApprovalsView state={state} /> : null}
       {route === "analytics" ? <AnalyticsView state={state} agents={agents} attentionCount={attentionCount} stale={stale} /> : null}
       {route === "timeline" ? <TimelineView state={state} toolCalls={toolCalls} /> : null}
       {route === "system" ? <SystemView state={state} stale={stale} onRefresh={() => query.refetch()} /> : null}
-      {route === "audit" ? <AuditView state={state} toolCalls={toolCalls} /> : null}
+      {route === "audit" ? (
+        <AuditView state={state} toolCalls={toolCalls} filters={auditFilters} onFiltersChange={setAuditFilters} />
+      ) : null}
 
       <CommandPalette open={paletteOpen} commands={commands} onClose={() => setPaletteOpen(false)} />
     </AppShell>
@@ -712,7 +773,8 @@ function FleetView({
   stale,
   toolCalls,
   advanceAttention,
-  onSpawned
+  onSpawned,
+  onAuditKeySelect
 }: {
   state?: DashboardState;
   agents: AgentSummary[];
@@ -724,6 +786,7 @@ function FleetView({
   toolCalls: ReturnType<typeof buildToolCalls>;
   advanceAttention: () => void;
   onSpawned: () => void;
+  onAuditKeySelect: (keyHex: string) => void;
 }) {
   const [killingId, setKillingId] = useState("");
   const [killError, setKillError] = useState("");
@@ -779,7 +842,7 @@ function FleetView({
               killingId={killingId}
             />
           </Section>
-          <ToolActivity toolCalls={toolCalls} />
+          <ToolActivity toolCalls={toolCalls} onAuditKeySelect={onAuditKeySelect} />
           <Section
             title="Fleet Table"
             tier="drill-down"
@@ -812,7 +875,17 @@ function FleetView({
   );
 }
 
-function AgentView({ state, selectedAgent, toolCalls }: { state?: DashboardState; selectedAgent?: AgentSummary; toolCalls: ReturnType<typeof buildToolCalls> }) {
+function AgentView({
+  state,
+  selectedAgent,
+  toolCalls,
+  onAuditKeySelect
+}: {
+  state?: DashboardState;
+  selectedAgent?: AgentSummary;
+  toolCalls: ReturnType<typeof buildToolCalls>;
+  onAuditKeySelect: (keyHex: string) => void;
+}) {
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,0.42fr)_minmax(0,1fr)]">
       <Section
@@ -823,7 +896,7 @@ function AgentView({ state, selectedAgent, toolCalls }: { state?: DashboardState
         <AgentPeek agent={selectedAgent} />
       </Section>
       <div className="min-w-0">
-        <ToolActivity toolCalls={toolCalls} />
+        <ToolActivity toolCalls={toolCalls} onAuditKeySelect={onAuditKeySelect} />
         <TranscriptSamples state={state} />
       </div>
     </div>
@@ -1211,19 +1284,340 @@ function SystemTable({
   );
 }
 
-function AuditView({ state, toolCalls }: { state?: DashboardState; toolCalls: ReturnType<typeof buildToolCalls> }) {
+function AuditView({
+  state,
+  toolCalls,
+  filters,
+  onFiltersChange
+}: {
+  state?: DashboardState;
+  toolCalls: ReturnType<typeof buildToolCalls>;
+  filters: AuditQueryFilters;
+  onFiltersChange: (filters: AuditQueryFilters) => void;
+}) {
+  const [draft, setDraft] = useState<AuditQueryFilters>(() => sanitizeAuditFilters(filters));
+  const [selectedKey, setSelectedKey] = useState("");
+  const auditQuery = useQuery({
+    queryKey: ["dashboard-audit-query", filters],
+    queryFn: () => fetchAuditQuery(filters),
+    staleTime: 2000
+  });
+
+  useEffect(() => {
+    setDraft(sanitizeAuditFilters(filters));
+  }, [filters]);
+
+  const query = auditQuery.data;
+  const rows = query?.rows ?? [];
+  const selectedRow = rows.find((row) => row.key_hex === selectedKey) ?? rows[0];
+
+  useEffect(() => {
+    if (!selectedKey && rows[0]) {
+      setSelectedKey(rows[0].key_hex);
+    }
+    if (selectedKey && rows.length && !rows.some((row) => row.key_hex === selectedKey)) {
+      setSelectedKey(rows[0].key_hex);
+    }
+  }, [rows, selectedKey]);
+
+  const updateDraft = (field: keyof AuditQueryFilters, value: string) => {
+    setDraft((current) => ({ ...current, [field]: value }));
+  };
+
+  const applyFilters = (event: FormEvent) => {
+    event.preventDefault();
+    onFiltersChange(sanitizeAuditFilters(draft));
+  };
+
+  const continueFromPartial = () => {
+    const next = query?.next_start_key_hex;
+    if (!next) return;
+    onFiltersChange({ ...filters, cursor: next, start_ts_ns: "" });
+  };
+
+  const focusToolActivityRow = (keyHex: string) => {
+    setSelectedKey(keyHex);
+    onFiltersChange(auditCursorFilters(keyHex));
+  };
+
   return (
     <>
-      <ToolActivity toolCalls={toolCalls} />
+      <ToolActivity toolCalls={toolCalls} onAuditKeySelect={focusToolActivityRow} />
       <Section
-        title="Command Audit"
-        tier="drill-down"
-        questions={["Which audit rows are visible?", "Which row source backs the panel?", "Does raw detail stay collapsed?"]}
+        title="Audit Filters"
+        tier="triage"
+        questions={["Which bounded CF_ACTION_LOG window is scanned?", "Which filters are active?", "Is continuation explicit?"]}
+        actions={
+          <Button variant="secondary" size="sm" onClick={() => auditQuery.refetch()} disabled={auditQuery.isFetching}>
+            <RefreshCw aria-hidden="true" className="h-4 w-4" />
+            Refresh
+          </Button>
+        }
       >
-        <RawValue value={state?.command_audit} label="Command audit readback" />
+        <form onSubmit={applyFilters} className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <TextField label="Session" value={rawText(draft.session_id)} onChange={(value) => updateDraft("session_id", value)} mono placeholder="session id" />
+            <TextField label="Tool" value={rawText(draft.tool)} onChange={(value) => updateDraft("tool", value)} mono placeholder="act_run_shell" />
+            <TextField label="Status" value={rawText(draft.status)} onChange={(value) => updateDraft("status", value)} mono placeholder="ok / error / denied" />
+            <TextField label="Error Code" value={rawText(draft.error_code)} onChange={(value) => updateDraft("error_code", value)} mono placeholder="TOOL_PARAMS_INVALID" />
+            <TextField label="Start ns" value={rawText(draft.start_ts_ns)} onChange={(value) => updateDraft("start_ts_ns", value)} mono placeholder="inclusive timestamp" />
+            <TextField label="End ns" value={rawText(draft.end_ts_ns)} onChange={(value) => updateDraft("end_ts_ns", value)} mono placeholder="inclusive timestamp" />
+            <TextField label="Cursor" value={rawText(draft.cursor)} onChange={(value) => updateDraft("cursor", value)} mono placeholder="physical key hex" />
+            <label className="mt-3 block text-sm text-secondary">
+              <span className="mb-1 block text-label font-medium uppercase text-muted">Row Kind</span>
+              <select
+                className="h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+                value={rawText(draft.row_kind || "all")}
+                onChange={(event) => updateDraft("row_kind", event.target.value)}
+              >
+                <option value="all">All rows</option>
+                <option value="command_audit">Command audit</option>
+                <option value="action_audit">Action audit</option>
+              </select>
+            </label>
+            <TextField label="Returned Limit" value={rawText(draft.limit)} onChange={(value) => updateDraft("limit", value)} type="number" />
+            <TextField label="Scan Budget" value={rawText(draft.scan_limit)} onChange={(value) => updateDraft("scan_limit", value)} type="number" />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="submit" variant="primary" size="sm">
+              <Search aria-hidden="true" className="h-4 w-4" />
+              Apply
+            </Button>
+            <Button type="button" variant="secondary" size="sm" onClick={() => onFiltersChange(defaultAuditFilters())}>
+              <RefreshCw aria-hidden="true" className="h-4 w-4" />
+              Reset
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => onFiltersChange({ limit: "100", scan_limit: "1000", row_kind: "all" })}
+            >
+              <FileSearch aria-hidden="true" className="h-4 w-4" />
+              All Time
+            </Button>
+          </div>
+        </form>
+      </Section>
+
+      <Section
+        title="Audit Results"
+        tier="drill-down"
+        questions={["Which rows matched?", "Is truncation visible?", "Can I continue from the exact physical key?"]}
+      >
+        <div className="grid gap-4 md:grid-cols-4">
+          <StatCard label="Scanned" value={rawText(query?.scanned_rows || 0)} status={query?.partial ? "needs_input" : "done"} delta={`budget ${rawText(query?.scan_limit || rawText(filters.scan_limit || ""))}`} />
+          <StatCard label="Matched" value={rawText(query?.matched_rows || 0)} status={rows.length ? "working" : "idle"} delta={query?.cf_name || "CF_ACTION_LOG"} />
+          <StatCard label="Returned" value={rawText(query?.returned_count || rows.length)} status={query?.partial ? "needs_input" : "done"} delta={`limit ${rawText(query?.limit || rawText(filters.limit || ""))}`} />
+          <StatCard label="Corrupt" value={rawText(query?.corrupt_row_count || 0)} status={Number(query?.corrupt_row_count || 0) ? "stuck" : "done"} delta={query?.source_of_truth || "bounded scan"} />
+        </div>
+        {auditQuery.isError ? (
+          <div className="mt-4 rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{rawText(auditQuery.error)}</div>
+        ) : null}
+        {query?.partial ? (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-warning-border bg-warning-bg p-3 text-sm text-warning-fg">
+            <span>
+              Partial results: scanned {query.scanned_rows} rows, returned {query.returned_count}. Continue from {shortKey(query.next_start_key_hex)}.
+            </span>
+            <Button type="button" variant="secondary" size="sm" onClick={continueFromPartial} disabled={!query.next_start_key_hex}>
+              <SkipForward aria-hidden="true" className="h-4 w-4" />
+              Continue
+            </Button>
+          </div>
+        ) : null}
+        <div className="mt-4">
+          <AuditResultsTable rows={rows} selectedKey={selectedRow?.key_hex} onSelect={setSelectedKey} loading={auditQuery.isFetching} />
+        </div>
+      </Section>
+
+      <Section
+        title="Row Detail"
+        tier="drill-down"
+        questions={["Which exact physical row is selected?", "What complete structured record is stored?", "Which Source of Truth backs it?"]}
+      >
+        {selectedRow ? (
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,0.36fr)_minmax(0,1fr)]">
+            <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+              <MetricRow label="Key" value={<span className="font-mono">{shortKey(selectedRow.key_hex)}</span>} />
+              <MetricRow label="Kind" value={selectedRow.row_kind} />
+              <MetricRow label="Tool" value={selectedRow.tool} />
+              <MetricRow label="Status" value={auditRowStatus(selectedRow)} />
+              <MetricRow label="Session" value={selectedRow.actor_session_id || selectedRow.session_id || "none"} />
+              <MetricRow label="Bytes" value={rawText(selectedRow.value_len_bytes)} />
+              <RawValue value={selectedRow.source_of_truth} label="Physical storage key" />
+            </div>
+            <RawValue value={selectedRow.record} label="Full structured record" />
+          </div>
+        ) : (
+          <EmptyState title={auditQuery.isFetching ? "Loading audit rows" : "No matching audit rows"} />
+        )}
+        <div className="mt-4">
+          <RawValue value={{ query, snapshot: state?.command_audit }} label="Audit readback" />
+        </div>
       </Section>
     </>
   );
+}
+
+function AuditResultsTable({
+  rows,
+  selectedKey,
+  onSelect,
+  loading
+}: {
+  rows: AuditQueryRow[];
+  selectedKey?: string;
+  onSelect: (keyHex: string) => void;
+  loading: boolean;
+}) {
+  const [sorting, setSorting] = useState<SortingState>([{ id: "time", desc: true }]);
+  const [scrollTop, setScrollTop] = useState(0);
+  const columns = useMemo<ColumnDef<AuditQueryRow>[]>(
+    () => [
+      {
+        id: "time",
+        header: "Time",
+        accessorFn: (row) => rawText(row.ts_ns_text || row.ts_ns),
+        cell: ({ row }) => <span className="font-mono">{nsToTime(row.original.ts_ns_text || row.original.ts_ns)}</span>
+      },
+      {
+        id: "kind",
+        header: "Kind",
+        accessorFn: (row) => row.row_kind,
+        cell: ({ row }) => row.original.row_kind
+      },
+      {
+        id: "tool",
+        header: "Tool",
+        accessorFn: (row) => row.tool,
+        cell: ({ row }) => <span className="font-mono">{row.original.tool}</span>
+      },
+      {
+        id: "status",
+        header: "Status",
+        accessorFn: auditRowStatus,
+        cell: ({ row }) => auditRowStatus(row.original)
+      },
+      {
+        id: "session",
+        header: "Session",
+        accessorFn: (row) => row.actor_session_id || row.session_id || "",
+        cell: ({ row }) => <span className="font-mono">{shortKey(row.original.actor_session_id || row.original.session_id)}</span>
+      },
+      {
+        id: "error",
+        header: "Error",
+        accessorFn: (row) => row.error_code || "",
+        cell: ({ row }) => <span className="font-mono text-danger-fg">{row.original.error_code || ""}</span>
+      },
+      {
+        id: "key",
+        header: "Key",
+        accessorFn: (row) => row.key_hex,
+        cell: ({ row }) => <span className="font-mono">{shortKey(row.original.key_hex)}</span>
+      },
+      {
+        id: "detail",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button type="button" variant="ghost" size="sm" onClick={() => onSelect(row.original.key_hex)} aria-label={`Select audit row ${row.original.key_hex}`}>
+            <FileSearch aria-hidden="true" className="h-4 w-4" />
+            Detail
+          </Button>
+        )
+      }
+    ],
+    [onSelect]
+  );
+  const table = useReactTable({
+    data: rows,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getRowId: (row) => row.key_hex
+  });
+  const tableRows = table.getRowModel().rows;
+  const rowHeight = 48;
+  const viewportHeight = 460;
+  const overscan = 6;
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const endIndex = Math.min(tableRows.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan);
+  const visibleRows = tableRows.slice(startIndex, endIndex);
+  const topPad = startIndex * rowHeight;
+  const bottomPad = Math.max(0, (tableRows.length - endIndex) * rowHeight);
+  const columnCount = columns.length;
+
+  if (!rows.length) {
+    return <EmptyState title={loading ? "Loading audit rows" : "No audit rows match this bounded scan"} />;
+  }
+
+  return (
+    <div className="rounded-lg border border-border">
+      <div className="border-b border-border bg-surface-2 px-3 py-2 text-xs text-muted">
+        Showing {visibleRows.length} of {tableRows.length} sorted rows in the visible window.
+      </div>
+      <div className="max-h-[460px] overflow-auto" onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+        <table className="w-full min-w-[960px] border-collapse text-sm">
+          <thead className="sticky top-0 z-10 bg-surface-2">
+            {table.getHeaderGroups().map((headerGroup) => (
+              <tr key={headerGroup.id}>
+                {headerGroup.headers.map((header) => {
+                  const sorted = header.column.getIsSorted();
+                  return (
+                    <th key={header.id} className="border-b border-border px-3 py-2 text-left text-label font-medium uppercase text-muted">
+                      {header.isPlaceholder ? null : header.column.getCanSort() ? (
+                        <button type="button" className="inline-flex items-center gap-1" onClick={header.column.getToggleSortingHandler()}>
+                          {flexRender(header.column.columnDef.header, header.getContext())}
+                          {sorted ? <ChevronDown aria-hidden="true" className={cn("h-3 w-3", sorted === "asc" && "rotate-180")} /> : <ArrowUpDown aria-hidden="true" className="h-3 w-3" />}
+                        </button>
+                      ) : (
+                        flexRender(header.column.columnDef.header, header.getContext())
+                      )}
+                    </th>
+                  );
+                })}
+              </tr>
+            ))}
+          </thead>
+          <tbody>
+            {topPad ? (
+              <tr aria-hidden="true">
+                <td colSpan={columnCount} style={{ height: topPad }} />
+              </tr>
+            ) : null}
+            {visibleRows.map((row) => (
+              <tr
+                key={row.id}
+                aria-selected={row.original.key_hex === selectedKey}
+                className={cn(
+                  "h-12 border-b border-border-subtle last:border-b-0 hover:bg-surface-2",
+                  row.original.key_hex === selectedKey && "bg-surface-2"
+                )}
+              >
+                {row.getVisibleCells().map((cell) => (
+                  <td key={cell.id} className="max-w-72 px-3 py-2 align-middle text-secondary">
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </td>
+                ))}
+              </tr>
+            ))}
+            {bottomPad ? (
+              <tr aria-hidden="true">
+                <td colSpan={columnCount} style={{ height: bottomPad }} />
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function auditRowStatus(row: AuditQueryRow) {
+  return rawText(row.status || row.outcome || row.phase || "");
 }
 
 function OverviewBand({
@@ -1993,14 +2387,31 @@ function FleetTable({
   );
 }
 
-function ToolActivity({ toolCalls }: { toolCalls: ReturnType<typeof buildToolCalls> }) {
+function ToolActivity({
+  toolCalls,
+  onAuditKeySelect
+}: {
+  toolCalls: ReturnType<typeof buildToolCalls>;
+  onAuditKeySelect?: (keyHex: string) => void;
+}) {
   return (
     <Section title="Tool Activity" tier="triage" questions={["Which tools are still running?", "Which calls failed?", "Where is the verification detail?"]}>
       {toolCalls.length ? (
         <div className="grid gap-3 lg:grid-cols-2">
-          {toolCalls.slice(0, 6).map((call) => (
-            <ToolCallCard call={call} key={call.id} />
-          ))}
+          {toolCalls.slice(0, 6).map((call) => {
+            const keyHex = rawText(asRecord(call.raw).key_hex);
+            return (
+              <div key={call.id} className="space-y-2">
+                <ToolCallCard call={call} />
+                {onAuditKeySelect && keyHex ? (
+                  <Button type="button" variant="ghost" size="sm" onClick={() => onAuditKeySelect(keyHex)}>
+                    <FileSearch aria-hidden="true" className="h-4 w-4" />
+                    Audit
+                  </Button>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       ) : (
         <EmptyStateArt title="No command audit rows" />
