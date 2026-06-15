@@ -122,7 +122,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required. execution_mode controls routing: auto preserves compatibility and backgrounds when timeout_ms exceeds the inline await limit, inline waits only while timeout_ms fits inside the MCP client-call budget and otherwise returns a durable job handle, durable returns a job handle immediately. durable_timeout_ms is an explicit durable job lifetime cap only when a durable/background job is created; omit for an unbounded durable job. Poll act_run_shell_status and cancel with act_run_shell_cancel."
+        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required. execution_mode controls routing: auto preserves compatibility and backgrounds when timeout_ms exceeds the inline await limit, inline waits only while timeout_ms fits inside the MCP client-call budget and otherwise returns a durable job handle, durable returns a job handle immediately. durable_timeout_ms is an explicit durable job lifetime cap only when a durable/background job is created; it is ignored when execution completes inline. Omit it for an unbounded durable job. Poll act_run_shell_status and cancel with act_run_shell_cancel."
     )]
     pub async fn act_run_shell(
         &self,

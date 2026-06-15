@@ -127,6 +127,11 @@ instead of waiting. That handoff does not copy the inline budget into the
 durable job lifetime; the persisted job `status.json` records
 `"timeout_ms": null`.
 
+`act_run_shell.durable_timeout_ms` is applied only when that request creates a
+durable/background job. If the process completes inline, the durable cap is not
+part of the execution plan and the command-audit readback reports
+`"durable_timeout_policy": "ignored_inline_execution"`.
+
 `act_run_shell_start.timeout_ms` is different: it is an explicit lifetime cap
 for that one durable job. Omit it for an unbounded job that exits normally or is
 stopped by `act_run_shell_cancel` or session cleanup. Cancellation and timeout

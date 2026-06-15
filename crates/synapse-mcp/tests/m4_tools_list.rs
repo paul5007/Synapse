@@ -169,8 +169,10 @@ fn assert_act_run_shell_semantics_described(tools: &[Value]) -> anyhow::Result<(
     .context("act_run_shell durable_timeout_ms description missing")?;
     ensure!(
         durable_timeout_description.contains("Optional explicit durable job lifetime cap")
-            && durable_timeout_description.contains("Valid only when execution_mode=durable")
-            && durable_timeout_description.contains("omit for an unbounded durable job"),
+            && durable_timeout_description
+                .contains("Applied only if this request creates a durable/background job")
+            && durable_timeout_description.contains("ignored when execution completes inline")
+            && durable_timeout_description.contains("Omit for an unbounded durable job"),
         "act_run_shell durable_timeout_ms schema must describe durable lifetime semantics: {durable_timeout_description}"
     );
 

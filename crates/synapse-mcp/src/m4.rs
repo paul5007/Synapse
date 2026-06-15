@@ -436,7 +436,7 @@ pub struct ActRunShellParams {
     #[schemars(
         default,
         range(min = 1),
-        description = "Optional explicit durable job lifetime cap in milliseconds. Valid only when execution_mode=durable or when execution_mode=auto will background because timeout_ms exceeds the inline await limit; omit for an unbounded durable job."
+        description = "Optional explicit durable job lifetime cap in milliseconds. Applied only if this request creates a durable/background job; ignored when execution completes inline. Omit for an unbounded durable job."
     )]
     pub durable_timeout_ms: Option<u64>,
     pub idempotency_key: Option<String>,
@@ -1622,23 +1622,7 @@ pub fn validate_run_shell_execution_plan(
     params: &ActRunShellParams,
     inline_await_limit_ms: u64,
 ) -> Result<(), ErrorData> {
-    if params.durable_timeout_ms.is_some()
-        && direct_shell_background_reason(params, inline_await_limit_ms).is_none()
-    {
-        return Err(shell_tool_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "act_run_shell durable_timeout_ms applies only to durable/background execution; set execution_mode=\"durable\" or use execution_mode=\"auto\" with timeout_ms above inline_await_limit_ms",
-            json!({
-                "code": error_codes::TOOL_PARAMS_INVALID,
-                "reason": "durable_timeout_requires_background",
-                "execution_mode": params.execution_mode.as_str(),
-                "timeout_ms": params.timeout_ms,
-                "inline_await_limit_ms": inline_await_limit_ms,
-                "inline_client_call_budget_ms": DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS,
-                "durable_timeout_ms": params.durable_timeout_ms,
-            }),
-        ));
-    }
+    let _ = (params, inline_await_limit_ms);
     Ok(())
 }
 
@@ -1724,7 +1708,7 @@ pub fn run_shell_request_details(
         } else if will_background {
             "unbounded_until_exit_or_cancel"
         } else if params.durable_timeout_ms.is_some() {
-            "invalid_without_background"
+            "ignored_inline_execution"
         } else {
             "inline_timeout_only"
         },
@@ -11393,19 +11377,40 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn shell_rejects_durable_timeout_when_execution_stays_inline() {
-        let mut params = shell_params("cmd.exe", vec!["/c", "echo should-not-run"], 30_000);
+    async fn shell_inline_ignores_durable_timeout_when_execution_stays_inline() {
+        let mut params = shell_params(
+            "cmd.exe",
+            vec!["/c", "echo inline-durable-timeout-ignored"],
+            30_000,
+        );
         params.execution_mode = ActRunShellExecutionMode::Inline;
         params.durable_timeout_ms = Some(5_000);
         let config = shell_config_for(&params);
+        let details = run_shell_request_details(&params, config.run_shell_inline_await_limit_ms());
 
-        let error = match run_shell(&config, params).await {
-            Ok(response) => panic!("inline durable timeout should fail closed: {response:?}"),
-            Err(error) => error,
+        println!("readback=act_run_shell edge=inline_plus_durable_timeout before={details}");
+        assert_eq!(details["will_background"], false);
+        assert_eq!(
+            details["durable_timeout_policy"],
+            "ignored_inline_execution"
+        );
+        assert_eq!(details["durable_timeout_ms"], 5_000);
+        assert!(details["durable_timeout_ms_if_backgrounded"].is_null());
+
+        let response = match run_shell(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("inline durable timeout should be ignored inline: {error}"),
         };
 
-        println!("readback=act_run_shell edge=inline_plus_durable_timeout after_error={error}");
-        assert!(error.message.contains("durable_timeout_ms applies only"));
+        println!(
+            "readback=act_run_shell edge=inline_plus_durable_timeout after_response={response:?}"
+        );
+        assert!(!response.backgrounded);
+        assert_eq!(response.exit_code, Some(0));
+        assert!(response.stdout.contains("inline-durable-timeout-ignored"));
+        assert_eq!(response.durable_timeout_ms, None);
+        assert_eq!(response.job_id, None);
+        assert!(response.job.is_none());
     }
 
     #[cfg(windows)]
