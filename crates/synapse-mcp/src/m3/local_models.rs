@@ -60,6 +60,14 @@ pub enum LocalModelRuntimePreset {
     DeepSeekV4FlashNonThinking,
     #[serde(rename = "deepseek_v4_reasoning", alias = "deep_seek_v4_reasoning")]
     DeepSeekV4Reasoning,
+    /// The model has the full Synapse tool surface internalized in its weights
+    /// (a tool-internalization LoRA): it emits structured tool calls from a
+    /// near-empty prompt. The harness must inject NO tool catalog (that ~48k
+    /// token catalog is the context poison internalization exists to remove),
+    /// and the registration probe must not depend on a tool definition being
+    /// sent. Tool-call routing of the response is unchanged.
+    #[serde(rename = "internalized_no_catalog")]
+    InternalizedNoCatalog,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -934,7 +942,15 @@ async fn probe_row(
     };
 
     let nonce = format!("probe-{}", Uuid::now_v7().simple());
-    let mut body = probe_request(&row.model_id, &nonce);
+    let internalized = matches!(
+        row.runtime_preset,
+        LocalModelRuntimePreset::InternalizedNoCatalog
+    );
+    let mut body = if internalized {
+        internalized_probe_request(&row.model_id, &nonce)
+    } else {
+        probe_request(&row.model_id, &nonce)
+    };
     apply_runtime_preset(row, &mut body);
     let mut request = client.post(endpoint.clone()).json(&body);
     match resolve_local_model_api_key(db, row) {
@@ -1008,7 +1024,12 @@ async fn probe_row(
         );
     }
 
-    match validate_tool_call_response(&raw_text, &nonce) {
+    let validation = if internalized {
+        validate_internalized_probe_response(&raw_text, &nonce)
+    } else {
+        validate_tool_call_response(&raw_text, &nonce)
+    };
+    match validation {
         Ok(usage) => probe_report_success(
             observed_at_unix_ms,
             endpoint.as_str(),
@@ -1085,6 +1106,16 @@ fn apply_runtime_preset(row: &LocalModelRegistryRow, body: &mut serde_json::Valu
                 object.remove("tool_choice");
             }
         }
+        LocalModelRuntimePreset::InternalizedNoCatalog => {
+            // The model has the tool surface in its weights; do not send a tool
+            // definition or forced choice. It emits the synapse_probe tool call
+            // from the instruction alone, proving structured tool calling works
+            // without any catalog. Validation (nonce echo) is unchanged.
+            if let Some(object) = body.as_object_mut() {
+                object.remove("tools");
+                object.remove("tool_choice");
+            }
+        }
     }
 }
 
@@ -1142,6 +1173,103 @@ fn validate_tool_call_response(raw_text: &str, nonce: &str) -> Result<ProbeUsage
     if actual_nonce != nonce {
         return Err(format!(
             "probe tool nonce mismatch: expected {nonce:?}, got {actual_nonce:?}"
+        ));
+    }
+    let usage = value.get("usage");
+    Ok(ProbeUsage {
+        prompt_tokens: usage
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        completion_tokens: usage
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        total_tokens: usage
+            .and_then(|usage| usage.get("total_tokens"))
+            .and_then(serde_json::Value::as_u64),
+    })
+}
+
+/// The real, read-only Synapse tool an internalized model is asked to call
+/// during probing. It carries the full surface in its weights but does NOT know
+/// the synthetic `synapse_probe` tool, so we exercise a tool it actually learned
+/// and pass the nonce as the key it must echo back.
+const INTERNALIZED_PROBE_TOOL: &str = "workspace_get";
+
+/// Probe request for an internalized model: NO tool catalog is sent. The model
+/// must emit a structured call to a real read-only tool with the nonce as its
+/// key, proving (a) structured tool calling, (b) correct real-tool selection
+/// from weights, and (c) nonce echo / argument fidelity.
+fn internalized_probe_request(model_id: &str, nonce: &str) -> serde_json::Value {
+    json!({
+        "model": model_id,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return no prose. Emit exactly one tool call."
+            },
+            {
+                "role": "user",
+                "content": format!("Read the workspace blackboard entry whose key is {nonce:?}.")
+            }
+        ],
+        "stream": false,
+        "temperature": 0,
+        "max_tokens": 128
+    })
+}
+
+/// Validates an internalized model's probe response: it must call the real
+/// `workspace_get` tool with `key` echoing the nonce. No catalog/`synapse_probe`
+/// is involved.
+fn validate_internalized_probe_response(raw_text: &str, nonce: &str) -> Result<ProbeUsage, String> {
+    let value: serde_json::Value = serde_json::from_str(raw_text)
+        .map_err(|error| format!("probe response is not valid JSON: {error}"))?;
+    let choice = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| "probe response missing choices[0]".to_owned())?;
+    let message = choice
+        .get("message")
+        .ok_or_else(|| "probe response missing choices[0].message".to_owned())?;
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            "internalized probe response missing message.tool_calls array (model emitted no tool call from its weights)".to_owned()
+        })?;
+    let call = tool_calls
+        .iter()
+        .find(|call| {
+            call.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                == Some(INTERNALIZED_PROBE_TOOL)
+        })
+        .ok_or_else(|| {
+            format!("internalized probe did not call the real tool {INTERNALIZED_PROBE_TOOL:?}")
+        })?;
+    let arguments = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .ok_or_else(|| "internalized probe tool call missing function.arguments".to_owned())?;
+    let argument_value = match arguments {
+        serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| format!("probe tool arguments string is not valid JSON: {error}"))?,
+        value if value.is_object() => value.clone(),
+        _ => {
+            return Err(
+                "probe tool arguments must be a JSON object or JSON object string".to_owned(),
+            );
+        }
+    };
+    let actual_key = argument_value
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "internalized probe tool arguments missing key string".to_owned())?;
+    if actual_key != nonce {
+        return Err(format!(
+            "internalized probe nonce mismatch: expected key {nonce:?}, got {actual_key:?}"
         ));
     }
     let usage = value.get("usage");
@@ -1799,6 +1927,58 @@ mod tests {
                 .expect("runtime preset serializes"),
             json!("deepseek_v4_reasoning")
         );
+    }
+
+    #[test]
+    fn internalized_preset_serdes_to_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_value(LocalModelRuntimePreset::InternalizedNoCatalog)
+                .expect("runtime preset serializes"),
+            json!("internalized_no_catalog")
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalModelRuntimePreset>(json!("internalized_no_catalog"))
+                .expect("internalized preset deserializes"),
+            LocalModelRuntimePreset::InternalizedNoCatalog
+        );
+    }
+
+    #[test]
+    fn internalized_probe_validator_requires_real_tool_with_nonce_key() {
+        let nonce = "probe-internalized-xyz";
+        // An internalized model emits the REAL workspace_get tool with key=nonce
+        // (string-encoded arguments, exactly as serve.py returns them).
+        let good = json!({
+            "choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "workspace_get",
+                             "arguments": format!("{{\"key\": {nonce:?}}}")}
+            }]}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42}
+        })
+        .to_string();
+        let usage = validate_internalized_probe_response(&good, nonce)
+            .expect("internalized probe with workspace_get(key=nonce) is healthy");
+        assert_eq!(usage.total_tokens, Some(42));
+
+        // Wrong nonce echoed back -> rejected (proves it is not a canned reply).
+        let wrong_nonce = good.replace(nonce, "probe-tampered");
+        assert!(validate_internalized_probe_response(&wrong_nonce, nonce).is_err());
+
+        // Calling the synthetic synapse_probe (a tool the internalized model does
+        // NOT know) is exactly the failure we route around -> rejected.
+        let wrong_tool = json!({
+            "choices": [{"message": {"tool_calls": [{
+                "function": {"name": "synapse_probe", "arguments": format!("{{\"nonce\": {nonce:?}}}")}
+            }]}}]
+        })
+        .to_string();
+        assert!(validate_internalized_probe_response(&wrong_tool, nonce).is_err());
+
+        // No tool call at all (plain prose) -> rejected.
+        let no_call =
+            json!({"choices": [{"message": {"content": "I will read the entry."}}]}).to_string();
+        assert!(validate_internalized_probe_response(&no_call, nonce).is_err());
     }
 
     #[test]
