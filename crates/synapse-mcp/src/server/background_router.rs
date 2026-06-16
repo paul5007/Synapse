@@ -15,16 +15,20 @@ use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 use crate::m1::{
     CaptureScreenshotParams, CdpNavigateAction, CdpNavigateTabParams, ObserveParams, mcp_error,
 };
-use crate::m2::{ActSetFieldTextParams, default_verify_timeout_ms};
+use crate::m2::{ActClickParams, ActSetFieldTextParams, default_verify_timeout_ms};
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, service::RequestContext};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use synapse_core::{ElementId, error_codes};
 
 const DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS: u64 = 30_000;
+const TARGET_ACT_STATUS_OK: &str = "ok";
+const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
+const TARGET_ACT_STATUS_REFUSED: &str = "refused";
+const TARGET_ACT_STATUS_ERROR: &str = "error";
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +44,9 @@ pub enum TargetActVerb {
     /// tiers; the delegate refuses before input if only a foreground route
     /// exists and no break-glass lease is held.
     SetField,
+    /// Click a target element by element id through semantic/background tiers
+    /// first. Inconclusive post-state returns `verify_needed`.
+    Click,
     /// Run a shell command in the session workspace — background.
     RunShell,
 }
@@ -51,6 +58,7 @@ impl TargetActVerb {
             Self::Screenshot => "screenshot",
             Self::Navigate => "navigate",
             Self::SetField => "set_field",
+            Self::Click => "click",
             Self::RunShell => "run_shell",
         }
     }
@@ -73,6 +81,9 @@ pub struct TargetActParams {
     /// `set_field`: full replacement text (empty clears the field).
     #[serde(default)]
     pub text: Option<String>,
+    /// `click`: click count for target element clicks. Defaults to 1; valid range is 1..=3.
+    #[serde(default)]
+    pub clicks: Option<u8>,
     /// `run_shell`: executable/program name (arguments go in `args`).
     #[serde(default)]
     pub command: Option<String>,
@@ -91,6 +102,10 @@ pub struct TargetActParams {
 #[serde(deny_unknown_fields)]
 pub struct TargetActResponse {
     pub verb: String,
+    /// True only when the delegated primitive completed and its own postcondition accepted.
+    pub ok: bool,
+    /// `ok`, `verify_needed`, `refused`, or `error`.
+    pub status: String,
     /// The background primitive this verb routed to.
     pub delegated_tool: String,
     pub routing: String,
@@ -101,7 +116,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level background-first computer-use router (#1005). One verb, routed to the correct background-capable, session-targeted primitive — never the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via background tiers; verb=run_shell runs a command in the session workspace. Prefer this over raw act_* primitives: it inherits each delegate's target resolution, action audit, and lease/foreground guards, so a normal (leaseless) session can drive a background target but cannot seize the human foreground (the delegate fails closed before input). Bind a target first with set_target (discover one with window_list)."
+        description = "High-level background-first computer-use router (#1005/#1033). One verb, routed to the correct background-capable, session-targeted primitive — never the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via background tiers; verb=click clicks a target element by semantic/background tiers with verify_delta enabled; verb=run_shell runs a command in the session workspace. Prefer this over raw act_* primitives: it inherits each delegate's target resolution, action audit, and lease/foreground guards, so a normal (leaseless) session can drive a background target but cannot seize the human foreground (the delegate fails closed before input). Mutating delegated failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list)."
     )]
     pub async fn target_act(
         &self,
@@ -117,12 +132,17 @@ impl SynapseService {
             "tool.invocation kind=target_act"
         );
 
-        let (delegated_tool, result) = match verb {
+        let (delegated_tool, ok, status, result) = match verb {
             TargetActVerb::Read => {
                 let response = self
                     .observe(Parameters(ObserveParams::default()), request_context)
                     .await?;
-                ("observe", target_act_result(&response.0)?)
+                (
+                    "observe",
+                    true,
+                    TARGET_ACT_STATUS_OK,
+                    target_act_result(&response.0)?,
+                )
             }
             TargetActVerb::Screenshot => {
                 let path = require_param(params.path, "screenshot", "path")?;
@@ -137,7 +157,12 @@ impl SynapseService {
                         request_context,
                     )
                     .await?;
-                ("capture_screenshot", target_act_result(&response.0)?)
+                (
+                    "capture_screenshot",
+                    true,
+                    TARGET_ACT_STATUS_OK,
+                    target_act_result(&response.0)?,
+                )
             }
             TargetActVerb::Navigate => {
                 let url = require_param(params.url, "navigate", "url")?;
@@ -154,7 +179,12 @@ impl SynapseService {
                         request_context,
                     )
                     .await?;
-                ("cdp_navigate_tab", target_act_result(&response.0)?)
+                (
+                    "cdp_navigate_tab",
+                    true,
+                    TARGET_ACT_STATUS_OK,
+                    target_act_result(&response.0)?,
+                )
             }
             TargetActVerb::SetField => {
                 let element_id = require_param(params.element_id, "set_field", "element_id")?;
@@ -173,8 +203,23 @@ impl SynapseService {
                         }),
                         request_context,
                     )
-                    .await?;
-                ("act_set_field_text", target_act_result(&response.0)?)
+                    .await;
+                target_act_delegate_response("act_set_field_text", response)?
+            }
+            TargetActVerb::Click => {
+                let element_id = require_param(params.element_id, "click", "element_id")?;
+                let element_id = ElementId::parse(&element_id).map_err(|error| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!("target_act verb=click element_id is invalid: {error}"),
+                    )
+                })?;
+                let clicks = target_act_click_count(params.clicks)?;
+                let click_params = target_act_click_params(element_id, clicks)?;
+                let response = self
+                    .act_click(Parameters(click_params), request_context)
+                    .await;
+                target_act_delegate_response("act_click", response)?
             }
             TargetActVerb::RunShell => {
                 let command = require_param(params.command, "run_shell", "command")?;
@@ -195,12 +240,19 @@ impl SynapseService {
                         request_context,
                     )
                     .await?;
-                ("act_run_shell", target_act_result(&response.0)?)
+                (
+                    "act_run_shell",
+                    true,
+                    TARGET_ACT_STATUS_OK,
+                    target_act_result(&response.0)?,
+                )
             }
         };
 
         Ok(Json(TargetActResponse {
             verb: verb.as_str().to_owned(),
+            ok,
+            status: status.to_owned(),
             delegated_tool: delegated_tool.to_owned(),
             routing: "background-first; delegated to the session-targeted primitive, which inherits the action audit and lease/foreground guards and refuses the human foreground before input".to_owned(),
             result,
@@ -224,4 +276,181 @@ fn target_act_result<T: Serialize>(value: &T) -> Result<Value, ErrorData> {
             format!("target_act failed to encode delegated tool result: {error}"),
         )
     })
+}
+
+fn target_act_delegate_response<T: Serialize>(
+    delegated_tool: &'static str,
+    result: Result<Json<T>, ErrorData>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    match result {
+        Ok(response) => Ok((
+            delegated_tool,
+            true,
+            TARGET_ACT_STATUS_OK,
+            target_act_result(&response.0)?,
+        )),
+        Err(error) => {
+            let status = target_act_error_status(&error);
+            Ok((
+                delegated_tool,
+                false,
+                status,
+                target_act_error_result(delegated_tool, error),
+            ))
+        }
+    }
+}
+
+fn target_act_click_count(clicks: Option<u8>) -> Result<u8, ErrorData> {
+    let clicks = clicks.unwrap_or(1);
+    if !(1..=3).contains(&clicks) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb=click clicks must be in 1..=3, got {clicks}"),
+        ));
+    }
+    Ok(clicks)
+}
+
+fn target_act_click_params(element_id: ElementId, clicks: u8) -> Result<ActClickParams, ErrorData> {
+    serde_json::from_value(json!({
+        "target": {
+            "element_id": element_id.to_string()
+        },
+        "clicks": clicks,
+        "verify_delta": true,
+        "verify_timeout_ms": default_verify_timeout_ms()
+    }))
+    .map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("target_act failed to construct act_click params: {error}"),
+        )
+    })
+}
+
+fn target_act_error_result(delegated_tool: &'static str, error: ErrorData) -> Value {
+    let code = target_act_error_code(&error)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    json!({
+        "error": {
+            "delegated_tool": delegated_tool,
+            "code": code,
+            "message": error.message.to_string(),
+            "data": error.data,
+        }
+    })
+}
+
+fn target_act_error_status(error: &ErrorData) -> &'static str {
+    match target_act_error_code(error) {
+        Some(
+            error_codes::ACTION_NO_OBSERVED_DELTA
+            | error_codes::ACTION_FOREGROUND_LOST
+            | error_codes::ACTION_POSTCONDITION_FAILED
+            | error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE,
+        ) => TARGET_ACT_STATUS_VERIFY_NEEDED,
+        Some(
+            error_codes::ACTION_ELEMENT_NOT_RESOLVED
+            | error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
+            | error_codes::ACTION_ELEMENT_VALUE_READ_ONLY
+            | error_codes::ACTION_FOREGROUND_LEASE_BUSY
+            | error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD
+            | error_codes::ACTION_TARGET_INVALID
+            | error_codes::A11Y_ELEMENT_STALE
+            | error_codes::FOREGROUND_ACTIVATION_REFUSED
+            | error_codes::TARGET_CO_OWNED
+            | error_codes::TARGET_WINDOW_NOT_FOUND
+            | error_codes::TOOL_PARAMS_INVALID
+            | error_codes::TRANSIENT_ELEMENT_EXPIRED,
+        ) => TARGET_ACT_STATUS_REFUSED,
+        _ => TARGET_ACT_STATUS_ERROR,
+    }
+}
+
+fn target_act_error_code(error: &ErrorData) -> Option<&str> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_act_verb_click_deserializes() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "click",
+            "element_id": "0x2a:0000000000000001",
+            "clicks": 2
+        }))
+        .expect("click params should deserialize");
+
+        assert!(matches!(params.verb, TargetActVerb::Click));
+        assert_eq!(params.clicks, Some(2));
+        assert_eq!(TargetActVerb::Click.as_str(), "click");
+    }
+
+    #[test]
+    fn target_act_click_count_rejects_out_of_range() {
+        let error = target_act_click_count(Some(4)).expect_err("clicks=4 should fail");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    #[test]
+    fn target_act_errors_classify_verify_needed() {
+        for code in [
+            error_codes::ACTION_NO_OBSERVED_DELTA,
+            error_codes::ACTION_FOREGROUND_LOST,
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE,
+        ] {
+            let error = mcp_error(code, "synthetic delegated postcondition failure");
+            assert_eq!(
+                target_act_error_status(&error),
+                TARGET_ACT_STATUS_VERIFY_NEEDED
+            );
+        }
+    }
+
+    #[test]
+    fn target_act_errors_classify_refusal() {
+        for code in [
+            error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED,
+            error_codes::ACTION_ELEMENT_VALUE_READ_ONLY,
+            error_codes::FOREGROUND_ACTIVATION_REFUSED,
+        ] {
+            let error = mcp_error(code, "synthetic delegated refusal");
+            assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
+        }
+    }
+
+    #[test]
+    fn target_act_error_result_preserves_delegated_data() {
+        let error = mcp_error(error_codes::ACTION_POSTCONDITION_FAILED, "mismatch");
+        let result = target_act_error_result("act_set_field_text", error);
+
+        assert_eq!(
+            result.pointer("/error/code").and_then(Value::as_str),
+            Some(error_codes::ACTION_POSTCONDITION_FAILED)
+        );
+        assert_eq!(
+            result
+                .pointer("/error/delegated_tool")
+                .and_then(Value::as_str),
+            Some("act_set_field_text")
+        );
+        assert_eq!(
+            result.pointer("/error/data/code").and_then(Value::as_str),
+            Some(error_codes::ACTION_POSTCONDITION_FAILED)
+        );
+    }
 }

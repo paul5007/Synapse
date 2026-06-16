@@ -40,8 +40,9 @@ pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, act_cli
 pub(crate) use click::{
     ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA, CLICK_TIER_FOREGROUND,
     CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params, act_click_with_handle_and_lease,
-    attach_click_tier_attempts, click_params_can_route_background_first, click_target_root_hwnd,
-    click_tier_delivered, click_tier_failed,
+    attach_click_tier_attempts, click_params_can_route_background_first,
+    click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
+    click_tier_failed,
 };
 #[cfg(test)]
 pub use clipboard::{ActClipboardFormat, ActClipboardVerb};

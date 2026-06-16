@@ -551,6 +551,39 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
     }
 }
 
+pub(crate) fn click_target_foreground_guard_hwnds(
+    params: &ActClickParams,
+) -> Result<Option<(i64, i64)>, ErrorData> {
+    match &params.target {
+        ActClickTarget::Element(element) => {
+            let element_hwnd = element
+                .element_id
+                .parts()
+                .map_err(|error| {
+                    mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        format!(
+                            "act_click element id {} could not be parsed for foreground guard: {error}",
+                            element.element_id
+                        ),
+                    )
+                })?
+                .hwnd;
+            let root_hwnd = verified_top_level_hwnd(element_hwnd).map_err(|detail| {
+                mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "act_click element id {} HWND 0x{element_hwnd:x} could not be normalized for foreground guard: {detail}",
+                        element.element_id
+                    ),
+                )
+            })?;
+            Ok(Some((element_hwnd, root_hwnd)))
+        }
+        ActClickTarget::Point(_) => Ok(None),
+    }
+}
+
 #[cfg(windows)]
 fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
     let seed = HWND(hwnd as isize as *mut std::ffi::c_void);

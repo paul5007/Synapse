@@ -25,9 +25,9 @@ use crate::m2::{
     act_keymap_response_from_press, act_press_cdp_target, act_press_normalized_labels,
     act_press_postmessage_target, act_stroke_cdp_target, act_stroke_error_details,
     act_stroke_request_details, action_from_press_params, action_from_type_params,
-    attach_click_tier_attempts, click_params_can_route_background_first, click_target_root_hwnd,
-    click_tier_delivered, click_tier_failed, emitted_text, hwnd_keyboard_target_state,
-    resolve_keymap_press,
+    attach_click_tier_attempts, click_params_can_route_background_first,
+    click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
+    click_tier_failed, emitted_text, hwnd_keyboard_target_state, resolve_keymap_press,
 };
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -213,6 +213,27 @@ impl SynapseService {
         let foreground_click_policy = self.foreground_click_policy_for_request(&request_context)?;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
+        let foreground_guard = match act_click_target_foreground_guard(&params) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let result: Result<ActClickResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_click", &result, &request_context)?;
+                return result.map(Json);
+            }
+        };
+        let foreground_before = if foreground_guard.is_some() {
+            match self.current_audit_foreground() {
+                Ok(foreground) => Some(foreground),
+                Err(error) => {
+                    let result: Result<ActClickResponse, ErrorData> =
+                        Err(act_click_foreground_read_error("before", "unknown", &error));
+                    self.audit_action_result_for_request("act_click", &result, &request_context)?;
+                    return result.map(Json);
+                }
+            }
+        } else {
+            None
+        };
         let started = Instant::now();
         let result = if let Some(before) = before_delta_signature {
             self.act_click_with_verified_router(
@@ -229,6 +250,43 @@ impl SynapseService {
         } else {
             act_click_with_handle_and_lease(handle, recording, params, foreground_click_policy)
                 .await
+        };
+        let result = match result {
+            Ok(response) if response.required_foreground => Ok(response),
+            other => match (foreground_guard, foreground_before) {
+                (Some(guard), Some(before)) => {
+                    let action_source_of_truth = background_result_source_of_truth(
+                        &other,
+                        |response| {
+                            response
+                                .postcondition
+                                .source_of_truth
+                                .as_deref()
+                                .unwrap_or("act_click.background_target")
+                        },
+                        "act_click.background_target",
+                    );
+                    match self.current_audit_foreground() {
+                        Ok(after) => background_result_with_foreground_guard(
+                            "act_click",
+                            &action_source_of_truth,
+                            guard,
+                            &before,
+                            &after,
+                            other,
+                        ),
+                        Err(error) => background_result_with_foreground_read_error(
+                            other,
+                            act_click_foreground_read_error(
+                                "after",
+                                &action_source_of_truth,
+                                &error,
+                            ),
+                        ),
+                    }
+                }
+                _ => other,
+            },
         };
         self.audit_action_result_for_request("act_click", &result, &request_context)?;
         result.map(Json)
@@ -479,28 +537,33 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
-        let result = act_set_value(params).await;
-        let result = match result {
-            Ok(response) if !response.required_foreground => {
+        let result = match act_set_value(params).await {
+            Ok(response) if response.required_foreground => Ok(response),
+            other => {
+                let action_source_of_truth = background_result_source_of_truth(
+                    &other,
+                    |response| response.source_of_truth.as_str(),
+                    "act_set_value.background_tier",
+                );
                 match self.current_audit_foreground() {
-                    Ok(foreground_after) => match verify_background_target_not_activated(
+                    Ok(foreground_after) => background_result_with_foreground_guard(
                         "act_set_value",
-                        &response.source_of_truth,
+                        &action_source_of_truth,
                         foreground_guard,
                         &foreground_before,
                         &foreground_after,
-                    ) {
-                        Ok(()) => Ok(response),
-                        Err(error) => Err(error),
-                    },
-                    Err(error) => Err(act_set_value_foreground_read_error(
-                        "after",
-                        &response.source_of_truth,
-                        &error,
-                    )),
+                        other,
+                    ),
+                    Err(error) => background_result_with_foreground_read_error(
+                        other,
+                        act_set_value_foreground_read_error(
+                            "after",
+                            &action_source_of_truth,
+                            &error,
+                        ),
+                    ),
                 }
             }
-            other => other,
         };
         self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
         result.map(Json)
@@ -2478,18 +2541,26 @@ impl SynapseService {
         let foreground_before = self
             .current_audit_foreground()
             .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
-        let response = run(params).await?;
-        let foreground_after = self.current_audit_foreground().map_err(|error| {
-            act_set_value_foreground_read_error("after", &response.source_of_truth, &error)
-        })?;
-        verify_background_target_not_activated(
-            "act_set_field_text",
-            &response.source_of_truth,
-            foreground_guard,
-            &foreground_before,
-            &foreground_after,
-        )?;
-        Ok(response)
+        let result = run(params).await;
+        let action_source_of_truth = background_result_source_of_truth(
+            &result,
+            |response| response.source_of_truth.as_str(),
+            "act_set_field_text.background_tier",
+        );
+        match self.current_audit_foreground() {
+            Ok(foreground_after) => background_result_with_foreground_guard(
+                "act_set_field_text",
+                &action_source_of_truth,
+                foreground_guard,
+                &foreground_before,
+                &foreground_after,
+                result,
+            ),
+            Err(error) => background_result_with_foreground_read_error(
+                result,
+                act_set_value_foreground_read_error("after", &action_source_of_truth, &error),
+            ),
+        }
     }
 
     /// Leased foreground tier for Chromium UIA editable targets: click the
@@ -5978,6 +6049,19 @@ fn act_set_value_target_foreground_guard(
     })
 }
 
+fn act_click_target_foreground_guard(
+    params: &ActClickParams,
+) -> Result<Option<BackgroundTargetForegroundGuard>, ErrorData> {
+    Ok(
+        click_target_foreground_guard_hwnds(params)?.map(|(element_hwnd, root_hwnd)| {
+            BackgroundTargetForegroundGuard {
+                element_hwnd,
+                root_hwnd,
+            }
+        }),
+    )
+}
+
 fn act_scroll_target_foreground_guard(
     params: &ActScrollParams,
 ) -> Result<BackgroundTargetForegroundGuard, ErrorData> {
@@ -6026,12 +6110,20 @@ fn verify_background_target_not_activated(
         return Ok(());
     }
     if !target.contains(before.hwnd) && target.contains(after.hwnd) {
+        let foreground_restore = attempt_background_foreground_restore(
+            tool,
+            action_source_of_truth,
+            target,
+            before,
+            after,
+        );
         return Err(background_foreground_lost_error(
             tool,
             action_source_of_truth,
             target,
             before,
             after,
+            foreground_restore,
         ));
     }
     tracing::warn!(
@@ -6052,12 +6144,314 @@ fn verify_background_target_not_activated(
     Ok(())
 }
 
+fn background_result_source_of_truth<T>(
+    result: &Result<T, ErrorData>,
+    response_source_of_truth: impl FnOnce(&T) -> &str,
+    fallback: &'static str,
+) -> String {
+    match result {
+        Ok(response) => response_source_of_truth(response).to_owned(),
+        Err(error) => {
+            background_error_source_of_truth(error).unwrap_or_else(|| fallback.to_owned())
+        }
+    }
+}
+
+fn background_error_source_of_truth(error: &ErrorData) -> Option<String> {
+    let source = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("source_of_truth"))?;
+    if let Some(source) = source.as_str() {
+        return Some(source.to_owned());
+    }
+    if source.is_array() {
+        return Some(source.to_string());
+    }
+    None
+}
+
+fn background_result_with_foreground_guard<T>(
+    tool: &'static str,
+    action_source_of_truth: &str,
+    target: BackgroundTargetForegroundGuard,
+    before: &ForegroundContext,
+    after: &ForegroundContext,
+    result: Result<T, ErrorData>,
+) -> Result<T, ErrorData> {
+    match verify_background_target_not_activated(
+        tool,
+        action_source_of_truth,
+        target,
+        before,
+        after,
+    ) {
+        Ok(()) => result,
+        Err(foreground_error) => match result {
+            Ok(_) => Err(foreground_error),
+            Err(error) => Err(attach_background_foreground_guard_error(
+                error,
+                foreground_error,
+            )),
+        },
+    }
+}
+
+fn background_result_with_foreground_read_error<T>(
+    result: Result<T, ErrorData>,
+    foreground_error: ErrorData,
+) -> Result<T, ErrorData> {
+    match result {
+        Ok(_) => Err(foreground_error),
+        Err(error) => Err(attach_background_foreground_guard_error(
+            error,
+            foreground_error,
+        )),
+    }
+}
+
+fn attach_background_foreground_guard_error(
+    original: ErrorData,
+    foreground_error: ErrorData,
+) -> ErrorData {
+    let code = original.code;
+    let message = original.message.to_string();
+    let original_data = original.data;
+    let mut data = match original_data {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("original_data".to_owned(), other);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+    data.insert(
+        "background_foreground_guard".to_owned(),
+        json!({
+            "code": foreground_error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or(error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED),
+            "message": foreground_error.message.to_string(),
+            "data": foreground_error.data,
+        }),
+    );
+    ErrorData::new(code, message, Some(Value::Object(data)))
+}
+
+fn attempt_background_foreground_restore(
+    tool: &'static str,
+    action_source_of_truth: &str,
+    target: BackgroundTargetForegroundGuard,
+    before: &ForegroundContext,
+    after: &ForegroundContext,
+) -> Value {
+    #[cfg(test)]
+    {
+        let _ = (tool, action_source_of_truth, target, before, after);
+        return json!({
+            "attempted": false,
+            "status": "skipped",
+            "reason": "unit_test",
+        });
+    }
+
+    #[cfg(not(test))]
+    {
+        let prior = match synapse_a11y::foreground_context(before.hwnd) {
+            Ok(prior) => prior,
+            Err(error) => {
+                tracing::warn!(
+                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                    reason = "background_prior_foreground_read_failed",
+                    tool,
+                    source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+                    action_source_of_truth,
+                    target_element_hwnd = target.element_hwnd,
+                    target_root_hwnd = target.root_hwnd,
+                    prior_hwnd = before.hwnd,
+                    expected_pid = before.pid,
+                    target_hwnd = after.hwnd,
+                    target_pid = after.pid,
+                    restore_error = %error,
+                    "background action target activation restore skipped because the prior foreground HWND could not be reread"
+                );
+                return json!({
+                    "attempted": false,
+                    "status": "skipped",
+                    "reason": "background_prior_foreground_read_failed",
+                    "prior_hwnd": before.hwnd,
+                    "expected_pid": before.pid,
+                    "target_foreground": foreground_context_details(after),
+                    "read_error": {
+                        "code": error.code(),
+                        "message": error.to_string(),
+                    },
+                });
+            }
+        };
+
+        if prior.pid != before.pid {
+            tracing::warn!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                reason = "background_prior_foreground_pid_mismatch",
+                tool,
+                source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+                action_source_of_truth,
+                target_element_hwnd = target.element_hwnd,
+                target_root_hwnd = target.root_hwnd,
+                prior_hwnd = before.hwnd,
+                expected_pid = before.pid,
+                actual_pid = prior.pid,
+                actual_process_name = %prior.process_name,
+                actual_window_title = %prior.window_title,
+                target_hwnd = after.hwnd,
+                target_pid = after.pid,
+                "background action target activation restore skipped because the prior HWND now belongs to a different process"
+            );
+            return json!({
+                "attempted": false,
+                "status": "skipped",
+                "reason": "background_prior_foreground_pid_mismatch",
+                "prior_expected": foreground_context_details(before),
+                "prior_actual": foreground_context_details(&prior),
+                "target_foreground": foreground_context_details(after),
+            });
+        }
+
+        let intent = synapse_a11y::ForegroundActivationIntent::LeaseContextRestore { caller: tool };
+        if let Err(error) = synapse_a11y::focus_window_with_intent(before.hwnd, intent) {
+            tracing::error!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                reason = "background_prior_foreground_focus_failed",
+                tool,
+                source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+                action_source_of_truth,
+                target_element_hwnd = target.element_hwnd,
+                target_root_hwnd = target.root_hwnd,
+                prior_hwnd = before.hwnd,
+                prior_pid = before.pid,
+                target_hwnd = after.hwnd,
+                target_pid = after.pid,
+                restore_error = %error,
+                "background action target activation restore failed while returning foreground to the pre-action window"
+            );
+            return json!({
+                "attempted": true,
+                "status": "failed",
+                "reason": "background_prior_foreground_focus_failed",
+                "prior_expected": foreground_context_details(before),
+                "prior_actual": foreground_context_details(&prior),
+                "target_foreground": foreground_context_details(after),
+                "restore_error": {
+                    "code": error.code(),
+                    "message": error.to_string(),
+                },
+            });
+        }
+
+        match synapse_a11y::current_foreground_context() {
+            Ok(restored) if restored.hwnd == before.hwnd && restored.pid == before.pid => {
+                tracing::info!(
+                    code = "BACKGROUND_FOREGROUND_RESTORED_AFTER_TARGET_ACTIVATION",
+                    reason = "background_prior_foreground_restored",
+                    tool,
+                    source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+                    action_source_of_truth,
+                    target_element_hwnd = target.element_hwnd,
+                    target_root_hwnd = target.root_hwnd,
+                    prior_hwnd = before.hwnd,
+                    prior_pid = before.pid,
+                    target_hwnd = after.hwnd,
+                    target_pid = after.pid,
+                    restored_hwnd = restored.hwnd,
+                    restored_pid = restored.pid,
+                    restored_process_name = %restored.process_name,
+                    restored_window_title = %restored.window_title,
+                    "background action target activation was repaired by restoring the pre-action foreground window"
+                );
+                json!({
+                    "attempted": true,
+                    "status": "restored",
+                    "reason": "background_prior_foreground_restored",
+                    "prior_expected": foreground_context_details(before),
+                    "prior_actual": foreground_context_details(&prior),
+                    "target_foreground": foreground_context_details(after),
+                    "foreground_restored": foreground_context_details(&restored),
+                })
+            }
+            Ok(restored) => {
+                tracing::error!(
+                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                    reason = "background_prior_foreground_post_restore_mismatch",
+                    tool,
+                    source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+                    action_source_of_truth,
+                    target_element_hwnd = target.element_hwnd,
+                    target_root_hwnd = target.root_hwnd,
+                    prior_hwnd = before.hwnd,
+                    prior_pid = before.pid,
+                    target_hwnd = after.hwnd,
+                    target_pid = after.pid,
+                    restored_hwnd = restored.hwnd,
+                    restored_pid = restored.pid,
+                    restored_process_name = %restored.process_name,
+                    restored_window_title = %restored.window_title,
+                    "background action target activation restore did not return the expected foreground window"
+                );
+                json!({
+                    "attempted": true,
+                    "status": "failed",
+                    "reason": "background_prior_foreground_post_restore_mismatch",
+                    "prior_expected": foreground_context_details(before),
+                    "prior_actual": foreground_context_details(&prior),
+                    "target_foreground": foreground_context_details(after),
+                    "foreground_after_restore": foreground_context_details(&restored),
+                })
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                    reason = "background_prior_foreground_post_restore_read_failed",
+                    tool,
+                    source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+                    action_source_of_truth,
+                    target_element_hwnd = target.element_hwnd,
+                    target_root_hwnd = target.root_hwnd,
+                    prior_hwnd = before.hwnd,
+                    prior_pid = before.pid,
+                    target_hwnd = after.hwnd,
+                    target_pid = after.pid,
+                    restore_error = %error,
+                    "background action target activation restore could not read foreground after the restore attempt"
+                );
+                json!({
+                    "attempted": true,
+                    "status": "failed",
+                    "reason": "background_prior_foreground_post_restore_read_failed",
+                    "prior_expected": foreground_context_details(before),
+                    "prior_actual": foreground_context_details(&prior),
+                    "target_foreground": foreground_context_details(after),
+                    "read_error": {
+                        "code": error.code(),
+                        "message": error.to_string(),
+                    },
+                })
+            }
+        }
+    }
+}
+
 fn background_foreground_lost_error(
     tool: &'static str,
     action_source_of_truth: &str,
     target: BackgroundTargetForegroundGuard,
     before: &ForegroundContext,
     after: &ForegroundContext,
+    foreground_restore: Value,
 ) -> ErrorData {
     let detail = format!(
         "{tool} returned a background result but foreground changed from hwnd 0x{:x} ({}) to hwnd 0x{:x} ({})",
@@ -6096,6 +6490,42 @@ fn background_foreground_lost_error(
             "detail": detail,
             "foreground_before": foreground_context_details(before),
             "foreground_after": foreground_context_details(after),
+            "foreground_restore": foreground_restore,
+        })),
+    )
+}
+
+fn act_click_foreground_read_error(
+    stage: &'static str,
+    action_source_of_truth: &str,
+    error: &ErrorData,
+) -> ErrorData {
+    let detail = format!(
+        "act_click could not read foreground {stage} background dispatch: {}",
+        error.message
+    );
+    tracing::error!(
+        code = error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+        reason = "background_foreground_read_failed",
+        tool = "act_click",
+        source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+        action_source_of_truth,
+        stage,
+        read_error = %error.message,
+        "act_click background foreground guard could not read OS foreground Source of Truth"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            "reason": "background_foreground_read_failed",
+            "tool": "act_click",
+            "source_of_truth": BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+            "action_source_of_truth": action_source_of_truth,
+            "stage": stage,
+            "detail": detail,
+            "read_error": error.data.clone(),
         })),
     )
 }
@@ -6475,6 +6905,41 @@ mod tests {
         assert_eq!(
             data.get("action_source_of_truth").and_then(Value::as_str),
             Some("uia_scroll_pattern.scroll_state")
+        );
+    }
+
+    #[test]
+    fn act_click_background_guard_rejects_target_activation() {
+        let before = foreground_context(100, 10, "Code.exe", "before");
+        let after = foreground_context(200, 20, "notepad.exe", "after");
+        let target = BackgroundTargetForegroundGuard {
+            element_hwnd: 150,
+            root_hwnd: 200,
+        };
+
+        let error = verify_background_target_not_activated(
+            "act_click",
+            "target_window_ui_or_pixels",
+            target,
+            &before,
+            &after,
+        )
+        .expect_err("background click must fail if a UIA provider activates the target");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(data.get("tool").and_then(Value::as_str), Some("act_click"));
+        assert_eq!(
+            data.get("action_source_of_truth").and_then(Value::as_str),
+            Some("target_window_ui_or_pixels")
+        );
+        assert_eq!(
+            data.pointer("/foreground_restore/status")
+                .and_then(Value::as_str),
+            Some("skipped")
         );
     }
 
