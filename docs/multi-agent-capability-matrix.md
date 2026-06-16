@@ -96,6 +96,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | set_target | normal_agent | no | no | no | no | none - default-safe |
 | subscribe | break_glass | yes | no | no | no | observe_delta |
 | subscribe_cancel | break_glass | yes | no | no | no | observe_delta |
+| target_act | normal_agent | no | no | no | no | none - default-safe |
 | target_claim | normal_agent | no | no | no | no | none - default-safe |
 | target_claim_adopt | normal_agent | no | no | no | no | none - default-safe |
 | target_claim_status | normal_agent | no | no | no | no | none - default-safe |
@@ -189,6 +190,7 @@ Research basis:
 | set_target | target control | current MCP session id plus validated HWND or owned CDP target | per-session target registry set | no foreground lease | background-pass | #720 #797 | get_target readback, validated window title/process |
 | subscribe | perception control | SSE event bus and optional a11y bridge | per-subscription event queue | no foreground lease, but event bridge is process-global | gap-linked | #720 | subscription id, health subscriber count, event bus state |
 | subscribe_cancel | perception control | subscription id | event bus unsubscribe | no foreground lease | control | #720 | health subscriber count and cancellation readback |
+| target_act | perception | current MCP session target (set_target); never the human OS foreground | high-level background-first router: delegates read→observe, screenshot→capture_screenshot, navigate→cdp_navigate_tab, set_field→act_set_field_text, run_shell→act_run_shell, inheriting each delegate's background routing and lease/foreground guards | no foreground lease; delegates fail closed before input when only a foreground route exists | control | #1005 | delegated tool response, per-target DOM/UIA/window readback, and CF_ACTION_LOG backend tier of the delegate |
 | target_claim | target control | current MCP session active target or explicit window/CDP target | daemon-local target ownership registry mutation | no foreground lease; mutating actions by other sessions fail closed with TARGET_CO_OWNED | control | #720 #797 | target_claim_status/session_list before and after plus denied mutating action readback |
 | target_claim_adopt | target control | live target claim owner read from target_claim_status/session_list plus current MCP session identity | explicit same-agent recovery: old owner must be older, same client identity, no in-flight tool, and no input lease; then session lifecycle teardown terminates old owner before new claim generation is written | no foreground lease; fails closed with TARGET_CLAIM_ADOPT_REFUSED or TARGET_CLAIM_OWNER_ACTIVE | control | #813 #797 #801 | target_claim_status/session_list before and after, owner teardown report, terminated-session rejection, and denied active/different-agent edge readbacks |
 | target_claim_status | target control | target ownership registry | read-only target claim registry read | no foreground lease | control | #797 | target_claim_status response and session_list target_claims |

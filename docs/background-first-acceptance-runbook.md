@@ -156,16 +156,27 @@ already kept in sync by `multi_agent_capability_matrix.rs`).
 
 ---
 
-## 5. Remaining code work (tracked, not yet landed)
+## 5. #998 verify_delta preflight — verified by code audit (already satisfied)
 
-- **#1006** — enrich `CF_ACTION_LOG` rows with `backend_tier`, `required_foreground`,
-  `foreground_policy`, `lease_id`, allowed/denied, and emit a high-severity
-  escalation when a `normal_agent` session attempts a foreground tier. (Touches
-  the action-audit hot path; coordinate with the in-progress Codex work on that
-  file to avoid a shared-tree collision.)
+All four `act_type` verify paths read the exact postcondition Source-of-Truth
+*before* mutating and fail closed before sending input when it is unreadable, and
+emit a distinct error with before/after evidence when the readback is lost
+*after* mutation:
+
+| Verify mode | Preflight (fail closed before mutation) | Post-mutation-loss error |
+|---|---|---|
+| foreground focused-text | `capture_act_type_text_signature(require_focused_text_value=true)` errors `ACTION_VERIFY_SURFACE_UNAVAILABLE` before `act_type_with_handle` (m2_tools.rs:384,2384) | `act_type_verify_surface_unavailable_error` + before/after signatures (m2_tools.rs:5067) |
+| `expected_browser_url_regex` | `require_browser_url=true` → `cdp_selected_target_url`/bridge readback fail closed before input (m2_tools.rs:388,2298-2304) | `postcondition_failed_error` w/ before/after (m2_tools.rs:4966) |
+| chromium foreground fallback | `capture_act_type_text_signature(require_focused_text_value=true)` (m2_tools.rs:356) | same as foreground focused-text |
+| `into_element` CDP/bridge | `before` node-value read fails closed before `Input.insertText` (type_text.rs:153-163) | `verify_cdp_type_delta` distinct error + evidence (type_text.rs:183-192) |
+
+The #925 mutate-then-fail symptom was fixed by this preflight wiring +
+debugger-free Chrome bridge readback. Re-verify after the operator extension
+reload (§2): an `act_type` with `verify_delta` into a tab whose readback surface
+is blocked must refuse *before* input (SoT: target value unchanged).
+
+## 6. Remaining net-new work
+
 - **#1005** — a high-level background computer-use router (`navigate/click/
   set_field/read/screenshot/run_shell` by target capability) so models pick one
   safe verb instead of raw primitives. Net-new tool surface.
-- **#998** — `verify_delta` preflight: read the postcondition surface *before*
-  mutation and fail closed if unreadable; covered partly by the bridge
-  fail-closed path, full preflight wiring outstanding.
