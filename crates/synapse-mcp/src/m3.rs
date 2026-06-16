@@ -21,6 +21,7 @@ pub mod routine_miner_job;
 pub mod routines;
 pub mod storage;
 pub mod subscribe;
+pub mod suggestions;
 #[cfg(test)]
 mod tests;
 pub mod timeline;

@@ -435,7 +435,10 @@ fn load_all_state_rows(
 }
 
 /// Point lookup of one `CF_ROUTINE_STATE` row by routine id.
-fn load_state_row(db: &Db, routine_id: &str) -> Result<Option<RoutineStateRecord>, ErrorData> {
+pub(crate) fn load_state_row(
+    db: &Db,
+    routine_id: &str,
+) -> Result<Option<RoutineStateRecord>, ErrorData> {
     let key =
         routine_codec::routine_state_key(routine_id).map_err(|error| invalid(error.to_string()))?;
     let rows = db

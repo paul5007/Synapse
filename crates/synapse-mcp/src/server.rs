@@ -221,6 +221,7 @@ mod reality;
 mod routine_feedback;
 mod routine_labeling;
 mod schema_sanitize;
+mod suggestions;
 pub(crate) mod session_continuity;
 pub(crate) mod session_lifecycle;
 pub(crate) mod session_registry;
@@ -561,6 +562,7 @@ impl SynapseService {
             + Self::intent_tool_router()
             + Self::routine_labeling_tool_router()
             + Self::routine_feedback_tool_router()
+            + Self::suggestions_tool_router()
             + Self::timeline_query_tool_router()
             + Self::timeline_digest_tool_router()
             + Self::m4_tool_router()
