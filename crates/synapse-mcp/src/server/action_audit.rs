@@ -89,6 +89,34 @@ impl SynapseService {
         }
     }
 
+    pub(super) fn audit_action_denied_with_details_for_session(
+        &self,
+        tool: &'static str,
+        error: &ErrorData,
+        details: &Value,
+        session_id: &str,
+    ) {
+        if let Err(audit_error) = self.write_action_audit_row(
+            tool,
+            "denied",
+            error_data_code(error),
+            &json!({
+                "message": error.message.to_string(),
+                "data": error.data.clone(),
+                "request": details,
+            }),
+            Some(session_id),
+        ) {
+            tracing::warn!(
+                code = "ACTION_AUDIT_WRITE_FAILED",
+                tool,
+                status = "denied",
+                audit_error = %audit_error,
+                "action audit write failed after denied action"
+            );
+        }
+    }
+
     pub(super) fn audit_action_denied_with_details_for_request(
         &self,
         tool: &'static str,

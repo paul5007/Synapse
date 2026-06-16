@@ -1294,8 +1294,13 @@ impl SynapseService {
             "tool.invocation kind=cdp_target_info"
         );
         let session_id = require_target_session_id(&request_context)?;
-        let (window_hwnd, cdp_target_id) =
-            self.resolve_cdp_target_info_target(&session_id, &params.0)?;
+        let request_details = cdp_target_info_resolution_request_details(&session_id, &params.0);
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            self.resolve_cdp_target_info_target(&session_id, &params.0),
+        )?;
         let request_details = json!({
             "session_id": &session_id,
             "window_hwnd": window_hwnd,
@@ -1360,8 +1365,18 @@ impl SynapseService {
         let session_id = require_target_session_id(&request_context)?;
         let requested_url = validate_cdp_navigation_params(&params.0)?;
         let wait_timeout_ms = validate_cdp_navigation_wait_timeout(params.0.wait_timeout_ms)?;
-        let (window_hwnd, cdp_target_id) =
-            self.resolve_cdp_navigation_target(&session_id, &params.0)?;
+        let request_details = cdp_navigate_resolution_request_details(
+            &session_id,
+            &params.0,
+            requested_url.as_deref(),
+            wait_timeout_ms,
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            self.resolve_cdp_navigation_target(&session_id, &params.0),
+        )?;
         let request_details = json!({
             "session_id": &session_id,
             "window_hwnd": window_hwnd,
@@ -1404,11 +1419,19 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         let wait_timeout_ms = validate_cdp_navigation_wait_timeout(params.0.wait_timeout_ms)?;
-        let (window_hwnd, cdp_target_id) = self.resolve_cdp_tab_mutation_target(
+        let request_details =
+            cdp_activate_resolution_request_details(&session_id, &params.0, wait_timeout_ms);
+        let resolution = self.resolve_cdp_tab_mutation_target(
             TOOL,
             &session_id,
             params.0.window_hwnd,
             params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
         )?;
         let request_details = json!({
             "session_id": &session_id,
@@ -1687,7 +1710,7 @@ impl SynapseService {
         }
         let active_target = self.session_target(Some(session_id))?;
         let owner = cdp_target_id_param
-            .map(|target_id| self.cdp_target_owner_for_navigation(session_id, target_id))
+            .map(|target_id| self.cdp_target_owner_for_navigation(tool, session_id, target_id))
             .transpose()?
             .flatten();
         let target_id = match (cdp_target_id_param, active_target.as_ref()) {
@@ -1818,6 +1841,7 @@ impl SynapseService {
 
     fn cdp_target_owner_for_navigation(
         &self,
+        tool: &str,
         session_id: &str,
         target_id: &str,
     ) -> Result<Option<CdpTargetOwner>, ErrorData> {
@@ -1840,18 +1864,39 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "cdp_navigate_tab refused target {target_id:?}: owner_session_id(s)={owner_sessions:?}, requesting_session_id={session_id:?}",
+                    "{tool} refused target {target_id:?}: owner_session_id(s)={owner_sessions:?}, requesting_session_id={session_id:?}",
                 ),
             ));
         }
         select_cdp_owner_for_session(
-            "cdp_navigate_tab",
+            tool,
             session_id,
             target_id,
             active_target.as_ref(),
             owned_by_session,
         )
         .map(|(_key, owner)| Some(owner))
+    }
+
+    fn audit_cdp_target_resolution_result(
+        &self,
+        tool: &'static str,
+        session_id: &str,
+        request_details: &Value,
+        result: Result<(i64, String), ErrorData>,
+    ) -> Result<(i64, String), ErrorData> {
+        match result {
+            Ok(resolved) => Ok(resolved),
+            Err(error) => {
+                self.audit_action_denied_with_details_for_session(
+                    tool,
+                    &error,
+                    request_details,
+                    session_id,
+                );
+                Err(error)
+            }
+        }
     }
 
     fn cdp_target_owner_for_readback(
@@ -2928,6 +2973,66 @@ fn select_cdp_owner_for_session(
             "{tool} refused target {target_id:?}: target id is ambiguous for MCP session {session_id:?}; set this session's active CDP target or pass a target id that maps to one owned browser surface. matches={owner_surfaces}"
         ),
     ))
+}
+
+fn cdp_target_info_resolution_request_details(
+    session_id: &str,
+    params: &CdpTargetInfoParams,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "window_hwnd": params.window_hwnd,
+        "requested_cdp_target": cdp_target_id_audit_ref(params.cdp_target_id.as_deref()),
+        "required_foreground": false,
+        "phase": "target_resolution",
+    })
+}
+
+fn cdp_navigate_resolution_request_details(
+    session_id: &str,
+    params: &CdpNavigateTabParams,
+    requested_url: Option<&str>,
+    wait_timeout_ms: u64,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "window_hwnd": params.window_hwnd,
+        "requested_cdp_target": cdp_target_id_audit_ref(params.cdp_target_id.as_deref()),
+        "action": params.action,
+        "requested_url": requested_url,
+        "wait_timeout_ms": wait_timeout_ms,
+        "ignore_cache": params.ignore_cache.unwrap_or(false),
+        "required_foreground": false,
+        "phase": "target_resolution",
+    })
+}
+
+fn cdp_activate_resolution_request_details(
+    session_id: &str,
+    params: &CdpActivateTabParams,
+    wait_timeout_ms: u64,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "window_hwnd": params.window_hwnd,
+        "requested_cdp_target": cdp_target_id_audit_ref(params.cdp_target_id.as_deref()),
+        "wait_timeout_ms": wait_timeout_ms,
+        "required_foreground": false,
+        "phase": "target_resolution",
+    })
+}
+
+fn cdp_target_id_audit_ref(target_id: Option<&str>) -> Value {
+    match target_id {
+        Some(target_id) => json!({
+            "present": true,
+            "len": target_id.chars().count(),
+            "sha256": sha256_hex(target_id.as_bytes()),
+        }),
+        None => json!({
+            "present": false,
+        }),
+    }
 }
 
 fn target_wire(target: &SessionTarget) -> TargetWire {
@@ -4950,16 +5055,23 @@ fn escape_json_pointer(segment: &str) -> String {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        SessionTarget, TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
-        hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
-        page_text_info_from_parts, perception_window_hwnd, resolve_capture_target_window_context,
-        sha256_hex, target_wire, template_value, validate_target_window,
+        CdpTargetOwner, SessionTarget, SynapseService, TargetWire, attach_find_hygiene_annotations,
+        attach_ocr_hygiene_annotations, cdp_activate_resolution_request_details,
+        cdp_target_info_resolution_request_details, hidden_desktop_pip_ended_response,
+        hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
+        perception_window_hwnd, resolve_capture_target_window_context, sha256_hex, target_wire,
+        template_value, validate_target_window,
     };
     use crate::m1::{
-        FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
-        HiddenDesktopPipStreamStatus,
+        CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult, FindResultKind,
+        HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
     };
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
+    use std::{num::NonZeroUsize, path::Path};
     use synapse_core::{OcrResult, OcrWord, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Rect, error_codes};
+    use synapse_storage::cf;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn validate_target_window_rejects_dead_hwnd() {
@@ -5224,6 +5336,154 @@ mod tests {
             .expect("explicit window_hwnd remains an intentional override");
         assert_eq!(explicit, Some(0x9999));
     }
+
+    #[test]
+    fn cdp_target_info_resolution_denial_writes_session_audit_row() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let service = service_with_temp_db(dir.path())?;
+        let session_id = "issue1208-info-denied-session";
+        let target_id = "chrome-tab:missing-issue1208";
+        let params = CdpTargetInfoParams {
+            window_hwnd: Some(6_360_776),
+            cdp_target_id: Some(target_id.to_owned()),
+        };
+        let request_details = cdp_target_info_resolution_request_details(session_id, &params);
+        let before = action_log_count(&service)?;
+
+        let result = service.audit_cdp_target_resolution_result(
+            "cdp_target_info",
+            session_id,
+            &request_details,
+            service.resolve_cdp_target_info_target(session_id, &params),
+        );
+
+        let error = result.expect_err("invalid explicit target should fail resolution");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::ACTION_TARGET_INVALID))
+        );
+        let rows = action_log_tail(&service, 1)?;
+        let stored: serde_json::Value = serde_json::from_slice(&rows[0].1)?;
+        assert_eq!(action_log_count(&service)?, before + 1);
+        assert_eq!(stored["tool"], "cdp_target_info");
+        assert_eq!(stored["status"], "denied");
+        assert_eq!(stored["error_code"], error_codes::ACTION_TARGET_INVALID);
+        assert_eq!(stored["session_id"], session_id);
+        assert_eq!(stored["audit_context"]["session_id"], session_id);
+        assert_eq!(stored["details"]["request"]["phase"], "target_resolution");
+        assert_eq!(stored["details"]["request"]["window_hwnd"], 6_360_776);
+        assert_eq!(
+            stored["details"]["request"]["requested_cdp_target"]["sha256"],
+            sha256_hex(target_id.as_bytes())
+        );
+        assert_eq!(
+            stored["foreground_tier"]["required_foreground"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            stored["foreground_tier"]["allowed"],
+            serde_json::json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cdp_activate_resolution_denial_audits_actual_tool_name() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let service = service_with_temp_db(dir.path())?;
+        let session_id = "issue1208-activate-denied-session";
+        let target_id = "chrome-tab:owned-by-other-session";
+        service.register_cdp_target_owner(CdpTargetOwner {
+            session_id: "other-session".to_owned(),
+            window_hwnd: 0x7777,
+            endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+            cdp_target_id: target_id.to_owned(),
+            requested_url: "about:blank".to_owned(),
+            target_url: "about:blank".to_owned(),
+            created_at_unix_ms: 1,
+        })?;
+        let params = CdpActivateTabParams {
+            window_hwnd: Some(0x7777),
+            cdp_target_id: Some(target_id.to_owned()),
+            wait_timeout_ms: Some(1000),
+        };
+        let request_details = cdp_activate_resolution_request_details(session_id, &params, 1000);
+        let before = action_log_count(&service)?;
+
+        let result = service.audit_cdp_target_resolution_result(
+            "cdp_activate_tab",
+            session_id,
+            &request_details,
+            service.resolve_cdp_tab_mutation_target(
+                "cdp_activate_tab",
+                session_id,
+                params.window_hwnd,
+                params.cdp_target_id.as_deref(),
+            ),
+        );
+
+        let error = result.expect_err("target owned by another session should be denied");
+        assert!(error.message.contains("cdp_activate_tab refused target"));
+        assert!(!error.message.contains("cdp_navigate_tab refused target"));
+        let rows = action_log_tail(&service, 1)?;
+        let stored: serde_json::Value = serde_json::from_slice(&rows[0].1)?;
+        assert_eq!(action_log_count(&service)?, before + 1);
+        assert_eq!(stored["tool"], "cdp_activate_tab");
+        assert_eq!(stored["status"], "denied");
+        assert_eq!(stored["error_code"], error_codes::ACTION_TARGET_INVALID);
+        assert_eq!(
+            stored["details"]["request"]["requested_cdp_target"]["sha256"],
+            sha256_hex(target_id.as_bytes())
+        );
+        assert_eq!(
+            stored["foreground_tier"]["required_foreground"],
+            serde_json::json!(false)
+        );
+        Ok(())
+    }
+
+    fn service_with_temp_db(path: &Path) -> anyhow::Result<SynapseService> {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4).expect("nonzero"),
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+    }
+
+    fn action_log_count(service: &SynapseService) -> anyhow::Result<u64> {
+        let runtime = service.reflex_runtime()?;
+        let runtime = runtime
+            .lock()
+            .map_err(|_err| anyhow::anyhow!("reflex runtime lock poisoned"))?;
+        let counts = runtime.storage_cf_row_counts()?;
+        Ok(counts.get(cf::CF_ACTION_LOG).copied().unwrap_or(0))
+    }
+
+    fn action_log_tail(
+        service: &SynapseService,
+        rows: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let runtime = service.reflex_runtime()?;
+        let runtime = runtime
+            .lock()
+            .map_err(|_err| anyhow::anyhow!("reflex runtime lock poisoned"))?;
+        Ok(runtime.storage_cf_tail_rows(cf::CF_ACTION_LOG, rows)?)
+    }
+
     use crate::m1::{ReadTextCaptureSource, ResolvedReadTextRequest};
     use synapse_core::OcrBackend;
 
