@@ -1074,6 +1074,13 @@ fn health_record_to_host_snapshot(host: &ChromeBridgeHealthRecord) -> ChromeBrid
     }
 }
 
+fn reload_self_expected_loaded_build_id(snapshot: &ChromeBridgeHostSnapshot) -> Option<&str> {
+    snapshot
+        .extension_build_id
+        .as_deref()
+        .filter(|build_id| !build_id.trim().is_empty())
+}
+
 impl ChromeDebuggerBridge {
     fn register(&self, request: NativeRegisterRequest) -> Result<NativeRegisterResponse, String> {
         if request.bridge_protocol_version != BRIDGE_PROTOCOL_VERSION {
@@ -1400,15 +1407,15 @@ impl ChromeDebuggerBridge {
     ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
         let wait_timeout = Duration::from_millis(wait_timeout_ms);
         let before = self.active_host_snapshot()?;
+        let mut params = json!({
+            "expectedExtensionId": EXTENSION_ID,
+            "reloadDelayMs": 100u64,
+        });
+        if let Some(loaded_build_id) = reload_self_expected_loaded_build_id(&before) {
+            params["expectedBuildId"] = json!(loaded_build_id);
+        }
         let ack = self
-            .send_command(
-                "reloadSelf",
-                json!({
-                    "expectedExtensionId": EXTENSION_ID,
-                    "expectedBuildId": EXPECTED_EXTENSION_BUILD_ID,
-                    "reloadDelayMs": 100u64,
-                }),
-            )
+            .send_command("reloadSelf", params)
             .await
             .and_then(|result| {
                 serde_json::from_value::<ChromeBridgeReloadCommandAck>(result).map_err(|error| {
@@ -3207,6 +3214,41 @@ mod tests {
             .map(|capability| (*capability).to_owned())
             .collect();
         assert_eq!(bridge_command_stale_reason(&host, "reloadSelf"), None);
+    }
+
+    #[test]
+    fn reload_self_uses_loaded_build_id_as_command_guard() {
+        let mut snapshot = ChromeBridgeHostSnapshot {
+            host_id: "chrome-native-stale".to_owned(),
+            origin: format!("chrome-extension://{EXTENSION_ID}/"),
+            extension_id: Some(EXTENSION_ID.to_owned()),
+            extension_version: Some("0.1.0".to_owned()),
+            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
+            extension_build_id: Some("synapse-chrome-bridge-older-but-reload-capable".to_owned()),
+            extension_build_sha256: Some("old-sha".to_owned()),
+            extension_capabilities: vec!["reloadSelf".to_owned()],
+            extension_user_agent: Some("Chrome test".to_owned()),
+            pid: 0,
+            parent_window: None,
+            transport: Some("direct_http".to_owned()),
+            registered_unix_ms: 1000,
+            last_seen_unix_ms: 2000,
+            last_disconnect_detail: None,
+            last_detach_reason: None,
+            extension_stale: true,
+            extension_stale_reasons: vec!["build_id=old expected=new".to_owned()],
+        };
+
+        assert_eq!(
+            reload_self_expected_loaded_build_id(&snapshot),
+            Some("synapse-chrome-bridge-older-but-reload-capable")
+        );
+
+        snapshot.extension_build_id = Some(String::new());
+        assert_eq!(reload_self_expected_loaded_build_id(&snapshot), None);
+
+        snapshot.extension_build_id = None;
+        assert_eq!(reload_self_expected_loaded_build_id(&snapshot), None);
     }
 
     #[test]
