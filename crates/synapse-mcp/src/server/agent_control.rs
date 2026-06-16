@@ -78,6 +78,16 @@ const INTERRUPT_MAILBOX_KIND: &str = "interrupt";
 const TOOL_AGENT_INTERRUPT: &str = "agent_interrupt";
 const TOOL_AGENT_KILL: &str = "agent_kill";
 const TOOL_FLEET_STOP: &str = "fleet_stop";
+const TOOL_AGENT_STEER: &str = "agent_steer";
+
+/// TTL for a cooperative steering instruction. Long enough that an agent busy
+/// in a multi-minute turn still sees it when it next drains its inbox, short
+/// enough that a stale instruction does not haunt a later turn.
+const STEER_MESSAGE_TTL_MS: u64 = 600_000;
+/// Hard ceiling on a single steering instruction. The mailbox row caps the
+/// whole payload at 64 KiB; this bounds the human-authored text well under that
+/// so the envelope (control fields, from, reason) always fits.
+const MAX_STEER_INSTRUCTION_CHARS: usize = 16_000;
 const CODEX_APP_SERVER_INTERRUPT_SCRIPT: &str = include_str!("codex_app_server_interrupt.ps1");
 const CODEX_INTERRUPT_HELPER_TIMEOUT_MS: u64 = 8_000;
 
@@ -283,6 +293,57 @@ pub struct FleetStopResponse {
     pub agents: Vec<FleetStopAgentOutcome>,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSteerParams {
+    /// The agent to steer: its own MCP session id, or its `agent-spawn-*` id.
+    pub session_id: String,
+    /// The instruction to inject. Spliced into the agent's context at the next
+    /// safe point by the cooperative steering-inbox contract. Non-empty,
+    /// bounded to 16 000 chars.
+    pub instruction: String,
+    /// When true (default), the steering row requests a read receipt: when the
+    /// agent drains and applies the instruction it writes a receipt to the
+    /// caller's receipt box (readable via `agent_receipts`), turning delivery
+    /// into provable consumption. The `agent_steer` response always proves
+    /// *delivery* (the durable row) regardless of this flag.
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
+    pub request_receipt: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSteerResponse {
+    pub requested_id: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_id: Option<String>,
+    pub agent_kind: String,
+    pub lifecycle: String,
+    pub resolution_source: String,
+    /// True when at least one channel actually delivered the instruction.
+    pub delivered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_via: Option<String>,
+    /// Character count of the instruction that was delivered (the SoT for "what
+    /// was injected" is the persisted mailbox row referenced by `row_key`).
+    pub instruction_chars: usize,
+    /// Every ranked channel and its true outcome.
+    pub channels: Vec<ChannelAttempt>,
+    /// The `MessageSent` journal row written when a channel delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_event: Option<JournalReadback>,
+    /// Where a consumption receipt will appear once the agent applies the
+    /// instruction, when `request_receipt` was set. Poll `agent_receipts` for
+    /// proof of consumption (delivery is already proven by `delivered`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_box_session_id: Option<String>,
+    /// The OS process table at steer time (steering never kills; read once for
+    /// evidence the target is live).
+    pub process: ProcessReadback,
+}
+
 // ----------------------------------------------------------------------------
 // Resolved-target model
 // ----------------------------------------------------------------------------
@@ -363,6 +424,23 @@ impl SynapseService {
         self.fleet_stop_impl(params.0, caller.as_deref())
             .await
             .map(Json)
+    }
+
+    #[tool(
+        description = "Inject an instruction into ONE running spawned agent (#905) by its MCP session id or agent-spawn-* id, via ranked clean channels. The cooperative steering-inbox (durable `steer` mailbox row, #908) is the wired channel: well-behaved agents drain it between tool calls and splice it into context. Codex app-server mid-turn inject and claude stream-json stdin inject are reported unavailable (the daemon owns neither input pipe; mid-turn claude stdin messages are also dropped from history per anthropics/claude-code#41230); PTY stdin needs owned-PTY capture (#902). Reports each channel's real outcome plus a process-table readback; the durable row is the delivery source of truth and a read receipt (default on) proves consumption via agent_receipts. Errors if no channel can deliver."
+    )]
+    pub async fn agent_steer(
+        &self,
+        params: Parameters<AgentSteerParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<AgentSteerResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "agent_steer",
+            "tool.invocation kind=agent_steer"
+        );
+        let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
+        self.agent_steer_impl(params.0, caller.as_deref()).map(Json)
     }
 }
 
@@ -748,6 +826,282 @@ impl SynapseService {
             },
             Err(error) => ChannelAttempt {
                 channel: "mailbox_interrupt".to_owned(),
+                rank: 3,
+                status: "failed".to_owned(),
+                reason: format!("mailbox delivery failed: {}", error.message),
+                message_id: None,
+                row_key: None,
+            },
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // agent_steer (#905)
+    // ------------------------------------------------------------------
+
+    fn agent_steer_impl(
+        &self,
+        params: AgentSteerParams,
+        caller_session: Option<&str>,
+    ) -> Result<AgentSteerResponse, ErrorData> {
+        let lookup = validate_lookup_id(&params.session_id, TOOL_AGENT_STEER)?;
+        let instruction = params.instruction.trim();
+        if instruction.is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_STEER_EMPTY: instruction must be a non-empty string of guidance to inject",
+            ));
+        }
+        let instruction_chars = instruction.chars().count();
+        if instruction_chars > MAX_STEER_INSTRUCTION_CHARS {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_STEER_TOO_LONG: instruction is {instruction_chars} chars; the cooperative steering channel caps a single instruction at {MAX_STEER_INSTRUCTION_CHARS}"
+                ),
+            ));
+        }
+        let target = self.resolve_spawned_agent(&lookup, TOOL_AGENT_STEER)?;
+        if target.dead {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_ALREADY_DEAD: agent {} (session {}) is closed; steering targets a live agent",
+                    lookup, target.session_id
+                ),
+            ));
+        }
+        let process = process_readback_for_target(&target);
+
+        let payload = json!({
+            "requested_id": lookup,
+            "instruction_chars": instruction_chars,
+            "request_receipt": params.request_receipt,
+            "from": caller_session,
+        });
+        let before = json!({ "process": &process, "lifecycle": target.lifecycle });
+        self.command_audit_intent(
+            CommandAuditInput::mcp(
+                TOOL_AGENT_STEER,
+                "steer",
+                caller_session.map(ToOwned::to_owned),
+                Some(target.session_id.clone()),
+                payload.clone(),
+                before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_target(json!({ "spawn_id": target.spawn_id, "agent_kind": target.agent_kind })),
+        )?;
+
+        let response =
+            self.steer_core(&lookup, &target, instruction, params.request_receipt, caller_session)?;
+
+        let after = json!({
+            "delivered": response.delivered,
+            "delivered_via": response.delivered_via,
+            "channels": response.channels,
+        });
+        self.command_audit_final(
+            CommandAuditInput::mcp(
+                TOOL_AGENT_STEER,
+                "steer",
+                caller_session.map(ToOwned::to_owned),
+                Some(target.session_id.clone()),
+                payload,
+                before,
+                after,
+                if response.delivered { "ok" } else { "error" },
+            )
+            .with_target(json!({ "spawn_id": target.spawn_id, "agent_kind": target.agent_kind })),
+        )?;
+
+        if !response.delivered {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_STEER_NO_CHANNEL: no clean channel could inject an instruction into agent {} (session {}); see the per-channel `channels` report for why each was unavailable.",
+                    response.requested_id, response.session_id
+                ),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Builds a steer response (channels attempted + durable `MessageSent`
+    /// journal row on delivery) without auditing or erroring on non-delivery.
+    fn steer_core(
+        &self,
+        requested_id: &str,
+        target: &ResolvedAgent,
+        instruction: &str,
+        request_receipt: bool,
+        caller_session: Option<&str>,
+    ) -> Result<AgentSteerResponse, ErrorData> {
+        let process = process_readback_for_target(target);
+        let (channels, delivered_via) =
+            self.attempt_steer_channels(target, instruction, request_receipt, caller_session);
+        let delivered = delivered_via.is_some();
+        let instruction_chars = instruction.chars().count();
+        // Journal a durable `MessageSent` event only when a channel actually
+        // delivered — never claim an injection that did not happen. `MessageSent`
+        // is the #897 minimum-set kind for an orchestrator-to-agent message; the
+        // steer reason_code distinguishes it from peer mailbox traffic.
+        let journal_event = if delivered {
+            Some(self.journal_lifecycle_event(
+                AgentEventKind::MessageSent,
+                target,
+                "agent_steer",
+                None,
+                json!({
+                    "delivered_via": delivered_via,
+                    "instruction_chars": instruction_chars,
+                    "instruction_preview": compact_for_channel_reason(instruction),
+                    "process": &process,
+                }),
+            )?)
+        } else {
+            None
+        };
+        let receipt_box_session_id = if delivered && request_receipt {
+            caller_session.map(ToOwned::to_owned)
+        } else {
+            None
+        };
+        Ok(AgentSteerResponse {
+            requested_id: requested_id.to_owned(),
+            session_id: target.session_id.clone(),
+            spawn_id: target.spawn_id.clone(),
+            agent_kind: target.agent_kind.clone(),
+            lifecycle: target.lifecycle.clone(),
+            resolution_source: target.resolution_source.clone(),
+            delivered,
+            delivered_via,
+            instruction_chars,
+            channels,
+            journal_event,
+            receipt_box_session_id,
+            process,
+        })
+    }
+
+    /// Attempts each ranked steering channel and returns `(attempts,
+    /// delivered_via)`. Channels report true outcomes; unwired channels stay
+    /// unavailable with a precise reason instead of being faked.
+    fn attempt_steer_channels(
+        &self,
+        target: &ResolvedAgent,
+        instruction: &str,
+        request_receipt: bool,
+        caller_session: Option<&str>,
+    ) -> (Vec<ChannelAttempt>, Option<String>) {
+        let mut attempts = Vec::new();
+        let mut delivered_via = None;
+
+        attempts.push(ChannelAttempt {
+            channel: "codex_app_server_inject".to_owned(),
+            rank: 1,
+            status: "unavailable".to_owned(),
+            reason: "channel_not_wired: the codex app-server protocol exposes turn/interrupt \
+                     (cancel) but no mid-turn user-input inject RPC; a new turn would race the \
+                     running one"
+                .to_owned(),
+            message_id: None,
+            row_key: None,
+        });
+        attempts.push(ChannelAttempt {
+            channel: "claude_stream_json_input".to_owned(),
+            rank: 2,
+            status: "unavailable".to_owned(),
+            reason: "channel_not_wired: the daemon does not own the claude -p stream-json stdin \
+                     pipe; even where owned, mid-turn stdin messages are processed in-memory only \
+                     and dropped from session history (anthropics/claude-code#41230)"
+                .to_owned(),
+            message_id: None,
+            row_key: None,
+        });
+
+        // Rank 3: cooperative steering mailbox — the one wired channel.
+        let mailbox = self.deliver_mailbox_steer(target, instruction, request_receipt, caller_session);
+        if mailbox.status == "delivered" {
+            record_first_delivered_channel(&mut delivered_via, &mailbox);
+        }
+        attempts.push(mailbox);
+
+        attempts.push(ChannelAttempt {
+            channel: "pty_stdin".to_owned(),
+            rank: 4,
+            status: "unavailable".to_owned(),
+            reason: "channel_not_wired: writing an instruction to the agent's terminal stdin needs \
+                     owned-PTY capture (#902), which is not implemented yet"
+                .to_owned(),
+            message_id: None,
+            row_key: None,
+        });
+
+        (attempts, delivered_via)
+    }
+
+    /// Delivers a durable `steer` mailbox row to the target's steering inbox,
+    /// proving delivery by the persisted `CF_KV` row readback. The cooperative
+    /// steering contract (`STEER_KIND`) is the same channel `agent_send` uses;
+    /// the receipt (when requested) proves the agent actually applied it.
+    fn deliver_mailbox_steer(
+        &self,
+        target: &ResolvedAgent,
+        instruction: &str,
+        request_receipt: bool,
+        caller_session: Option<&str>,
+    ) -> ChannelAttempt {
+        let Some(caller) = caller_session else {
+            return ChannelAttempt {
+                channel: "mailbox_steer".to_owned(),
+                rank: 3,
+                status: "unavailable".to_owned(),
+                reason: "needs the caller's MCP session id (run the daemon in HTTP mode so each \
+                         agent has its own Mcp-Session-Id)"
+                    .to_owned(),
+                message_id: None,
+                row_key: None,
+            };
+        };
+        let send = self.agent_send_impl(
+            super::agent_mailbox::AgentSendParams {
+                to_session: target.session_id.clone(),
+                kind: super::agent_mailbox::STEER_KIND.to_owned(),
+                payload: json!({
+                    "control": "steer",
+                    "from": caller,
+                    "reason": "operator_steer",
+                    "instruction": instruction,
+                }),
+                artifact_handle: None,
+                ttl_ms: STEER_MESSAGE_TTL_MS,
+                request_receipt,
+            },
+            caller,
+        );
+        match send {
+            Ok(response) => ChannelAttempt {
+                channel: "mailbox_steer".to_owned(),
+                rank: 3,
+                status: "delivered".to_owned(),
+                reason: format!(
+                    "durable {} row persisted to CF_KV (queue_depth_after={}); cooperative agents \
+                     drain it between tool calls and splice it into context{}",
+                    super::agent_mailbox::STEER_KIND,
+                    response.queue_depth_after,
+                    if request_receipt {
+                        " (read receipt requested — poll agent_receipts for consumption proof)"
+                    } else {
+                        ""
+                    }
+                ),
+                message_id: Some(response.message_id),
+                row_key: Some(response.row_key),
+            },
+            Err(error) => ChannelAttempt {
+                channel: "mailbox_steer".to_owned(),
                 rank: 3,
                 status: "failed".to_owned(),
                 reason: format!("mailbox delivery failed: {}", error.message),

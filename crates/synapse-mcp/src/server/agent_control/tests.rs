@@ -669,6 +669,173 @@ async fn agent_kill_unknown_session_errors_structurally() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// agent_steer (#905) — deterministic param coverage + real-process FSV
+// ---------------------------------------------------------------------------
+
+#[test]
+fn steer_params_default_requests_receipt() {
+    let params: AgentSteerParams =
+        serde_json::from_value(json!({ "session_id": "s-1", "instruction": "tighten scope" }))
+            .expect("defaults parse");
+    assert!(
+        params.request_receipt,
+        "request_receipt defaults on so delivery becomes provable consumption"
+    );
+}
+
+#[test]
+fn steer_params_reject_unknown_fields() {
+    let result: Result<AgentSteerParams, _> = serde_json::from_value(
+        json!({ "session_id": "s-1", "instruction": "x", "grace_ms": 10 }),
+    );
+    assert!(
+        result.is_err(),
+        "agent_steer takes no grace_ms; unknown fields must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn steer_rejects_empty_and_oversized_instruction_before_resolution() {
+    // Instruction validation precedes agent resolution, so these error paths
+    // need no live process — they are deterministic default-gate coverage.
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+
+    let empty = service
+        .agent_steer_impl(
+            AgentSteerParams {
+                session_id: "session-steer-validation".to_owned(),
+                instruction: "   ".to_owned(),
+                request_receipt: true,
+            },
+            Some("operator-regression"),
+        )
+        .expect_err("empty instruction must error");
+    assert!(
+        empty.message.contains("AGENT_STEER_EMPTY"),
+        "unexpected error: {}",
+        empty.message
+    );
+
+    let huge = "x".repeat(MAX_STEER_INSTRUCTION_CHARS + 1);
+    let oversized = service
+        .agent_steer_impl(
+            AgentSteerParams {
+                session_id: "session-steer-validation".to_owned(),
+                instruction: huge,
+                request_receipt: true,
+            },
+            Some("operator-regression"),
+        )
+        .expect_err("oversized instruction must error");
+    assert!(
+        oversized.message.contains("AGENT_STEER_TOO_LONG"),
+        "unexpected error: {}",
+        oversized.message
+    );
+}
+
+#[tokio::test]
+#[ignore = "real-process FSV: spawns a real OS process victim; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
+async fn agent_steer_delivers_cooperative_mailbox_and_journals_message_sent() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let session = "session-regression-steer-1";
+    let spawn = "agent-spawn-regression-steer-1";
+    let pid = spawn_victim();
+    register_spawned_victim(&service, session, spawn, pid, "local-model");
+
+    let instruction = "Stop refactoring and write the failing test first.";
+    let response = service
+        .agent_steer_impl(
+            AgentSteerParams {
+                session_id: session.to_owned(),
+                instruction: instruction.to_owned(),
+                request_receipt: true,
+            },
+            Some("operator-regression"),
+        )
+        .expect("steer must deliver via the mailbox channel");
+
+    // Readback 1: delivery is via the one wired channel; the other three are
+    // honestly reported unavailable — never faked.
+    assert!(response.delivered, "steer must be delivered");
+    assert_eq!(response.delivered_via.as_deref(), Some("mailbox_steer"));
+    assert_eq!(response.instruction_chars, instruction.chars().count());
+    assert_eq!(response.channels.len(), 4, "all four ranked channels reported");
+    let delivered: Vec<&str> = response
+        .channels
+        .iter()
+        .filter(|c| c.status == "delivered")
+        .map(|c| c.channel.as_str())
+        .collect();
+    assert_eq!(delivered, vec!["mailbox_steer"]);
+    assert_eq!(
+        response
+            .channels
+            .iter()
+            .filter(|c| c.status == "unavailable")
+            .count(),
+        3,
+        "codex/claude/pty channels are unavailable"
+    );
+    assert_eq!(
+        response.receipt_box_session_id.as_deref(),
+        Some("operator-regression"),
+        "a receipt was requested, so the caller's receipt box is named"
+    );
+
+    // Readback 2: the durable steer mailbox row is physically present in CF_KV,
+    // and its persisted payload carries the exact instruction (the SoT for what
+    // was injected).
+    let db = service.agent_control_db().expect("open storage");
+    let mailbox_channel = response
+        .channels
+        .iter()
+        .find(|c| c.channel == "mailbox_steer")
+        .expect("mailbox channel present");
+    let row_key = mailbox_channel
+        .row_key
+        .as_ref()
+        .expect("delivered mailbox row has a key");
+    let (rows, _more) = db
+        .scan_cf_from(cf::CF_KV, row_key.as_bytes(), 1)
+        .expect("scan CF_KV for the mailbox row");
+    let (key, value) = rows.first().expect("the durable steer mailbox row must exist");
+    assert_eq!(key.as_slice(), row_key.as_bytes(), "row key matches at {row_key}");
+    let stored: Value = serde_json::from_slice(value).expect("steer row is JSON");
+    let stored_instruction = stored
+        .pointer("/payload/instruction")
+        .and_then(Value::as_str)
+        .expect("persisted steer row carries the instruction");
+    assert_eq!(
+        stored_instruction, instruction,
+        "the persisted instruction must be byte-identical to what was sent"
+    );
+
+    // Readback 3: exactly one MessageSent journal row exists for the steer.
+    assert_eq!(
+        journal_count_kind(&db, session, AgentEventKind::MessageSent),
+        1,
+        "exactly one MessageSent journal row must exist"
+    );
+
+    // Clean up the still-live victim deterministically.
+    let _ = service
+        .agent_kill_impl(
+            AgentKillParams {
+                session_id: session.to_owned(),
+                grace_ms: 0,
+                interrupt_first: false,
+            },
+            Some("operator-regression"),
+        )
+        .await
+        .expect("cleanup kill");
+    assert!(!crate::m4::process_exists(pid));
+}
+
 #[tokio::test]
 #[ignore = "real-process FSV: spawns a real OS process victim; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn agent_interrupt_delivers_cooperative_mailbox_and_journals_interrupted() {
