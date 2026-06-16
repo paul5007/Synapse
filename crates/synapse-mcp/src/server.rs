@@ -218,6 +218,7 @@ mod notify_tools;
 mod permission_gate;
 pub(crate) mod permission_policy;
 mod reality;
+mod routine_feedback;
 mod routine_labeling;
 mod schema_sanitize;
 pub(crate) mod session_continuity;
@@ -559,6 +560,7 @@ impl SynapseService {
             + Self::m3_tool_router()
             + Self::intent_tool_router()
             + Self::routine_labeling_tool_router()
+            + Self::routine_feedback_tool_router()
             + Self::timeline_query_tool_router()
             + Self::timeline_digest_tool_router()
             + Self::m4_tool_router()
