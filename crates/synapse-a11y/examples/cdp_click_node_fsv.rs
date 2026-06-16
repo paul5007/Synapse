@@ -5,6 +5,7 @@
 //! button's OWN frame, read separately after the click.
 //!
 //! args: endpoint, page targetId, button backendNodeId, window-counter var
+#![allow(clippy::expect_used)]
 
 #[cfg(not(windows))]
 fn main() {}

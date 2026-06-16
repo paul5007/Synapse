@@ -823,7 +823,7 @@ fn key_after(key: &[u8]) -> Vec<u8> {
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("audit query cursor must be even-length hex".to_owned());
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);

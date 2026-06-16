@@ -1236,6 +1236,7 @@ async fn dispatch_cdp_mouse_stroke_raw(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_raw_mouse_event(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     command_id: &mut u64,
@@ -1260,6 +1261,7 @@ async fn dispatch_raw_mouse_event(
     send_raw_mouse_event_payload(socket, payload, stage, sample_index).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_raw_mouse_event(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     command_id: &mut u64,
