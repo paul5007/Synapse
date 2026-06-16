@@ -1698,6 +1698,70 @@ mod scope_gate_tests {
     }
 
     #[test]
+    fn action_scope_gate_no_foreground_does_not_bypass_profile_scope() -> anyhow::Result<()> {
+        // The no-foreground degrade must relax ONLY the foreground requirement,
+        // never the profile scope gate. In strict posture with no active profile,
+        // a non-foreground tool is still denied (no_profile) — proving scope
+        // enforcement survives the no-foreground path (#1061).
+        let profiles = TempDir::new()?;
+        let service = service_with_profiles(profiles.path(), false)?;
+        {
+            let mut state = service
+                .m1_state
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("M1 service state lock poisoned"))?;
+            state.synthetic = None;
+            state.force_no_foreground = true;
+        }
+
+        let error = match service.ensure_supported_use_allows_action("act_run_shell") {
+            Ok(value) => {
+                anyhow::bail!("strict posture must still enforce profile scope, got {value:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("reason")),
+            Some(&json!("no_profile")),
+            "no-foreground degrade must not bypass the profile scope gate, got {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn action_scope_gate_no_foreground_degrade_is_scoped_to_a11y_no_foreground_only()
+    -> anyhow::Result<()> {
+        // The degrade must trigger ONLY on A11Y_NO_FOREGROUND. A forced
+        // no-perception condition (a different failure kind) must still fail
+        // closed even for an exempt non-foreground tool — the tolerance is never
+        // widened to other perception errors (#1061).
+        let profiles = TempDir::new()?;
+        let service = service_with_profiles(profiles.path(), true)?;
+        {
+            let mut state = service
+                .m1_state
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("M1 service state lock poisoned"))?;
+            state.synthetic = None;
+            state.force_no_foreground = false;
+            state.force_no_perception = true;
+        }
+
+        let error = match service.ensure_supported_use_allows_action("act_run_shell") {
+            Ok(value) => {
+                anyhow::bail!("forced no-perception must fail closed even for non-foreground tools, got {value:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!(error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE)),
+            "non-A11Y_NO_FOREGROUND errors must stay fail-closed, got {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn act_type_foreground_uses_preflight_instead_of_stale_observed_foreground()
     -> anyhow::Result<()> {
         let profiles = TempDir::new()?;
