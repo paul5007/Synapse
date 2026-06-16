@@ -17,4 +17,5 @@
 #![allow(dead_code)]
 
 pub(crate) mod asciicast;
+pub(crate) mod capture;
 pub(crate) mod shadow_screen;
