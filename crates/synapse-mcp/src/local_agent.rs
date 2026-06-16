@@ -153,6 +153,11 @@ struct Runner {
 enum ToolExposure {
     Direct,
     Routed,
+    /// Internalized model: the full tool surface lives in the model's weights,
+    /// so NO tool catalog is injected into the request. The model emits tool
+    /// calls from a near-empty prompt; the response is routed exactly like
+    /// Direct (every real tool is callable by name).
+    Internalized,
 }
 
 impl ToolExposure {
@@ -160,6 +165,7 @@ impl ToolExposure {
         match self {
             Self::Direct => "direct",
             Self::Routed => "routed",
+            Self::Internalized => "internalized",
         }
     }
 }
@@ -269,6 +275,8 @@ impl Runner {
         let openai_tools = match tool_exposure {
             ToolExposure::Direct => tools.iter().map(openai_tool_from_mcp).collect::<Vec<_>>(),
             ToolExposure::Routed => routed_harness_tools(),
+            // Internalized: surface is in the weights — inject ZERO tools.
+            ToolExposure::Internalized => Vec::new(),
         };
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(cli.timeout_ms))
@@ -762,7 +770,10 @@ impl Runner {
         let mut gate_args = Map::new();
         gate_args.insert("tool_name".to_owned(), Value::String(label));
         gate_args.insert("input".to_owned(), Value::Object(args.clone()));
-        gate_args.insert("tool_use_id".to_owned(), Value::String(tool_use_id.to_owned()));
+        gate_args.insert(
+            "tool_use_id".to_owned(),
+            Value::String(tool_use_id.to_owned()),
+        );
         gate_args.insert("spawn_id".to_owned(), Value::String(self.spawn_id.clone()));
 
         let verdict = match self
@@ -1392,6 +1403,12 @@ fn routed_harness_tools() -> Vec<Value> {
 }
 
 fn resolve_tool_exposure(row: &LocalModelRegistryRow, tool_count: usize) -> ToolExposure {
+    // Internalized models carry the surface in their weights — never inject a
+    // catalog, regardless of max_tools. This takes precedence over the routed
+    // fallback (which exists only for providers that cap tool count).
+    if registry_runtime_preset(row) == "internalized_no_catalog" {
+        return ToolExposure::Internalized;
+    }
     match row.max_tools {
         Some(max_tools) if tool_count > max_tools => ToolExposure::Routed,
         _ => ToolExposure::Direct,
@@ -1520,6 +1537,15 @@ fn apply_runtime_preset(row: &LocalModelRegistryRow, body: &mut Value) {
             body["thinking"] = json!({ "type": "enabled" });
             body["reasoning_effort"] = json!("max");
             if let Some(object) = body.as_object_mut() {
+                object.remove("tool_choice");
+            }
+        }
+        "internalized_no_catalog" => {
+            // Surface is in the weights: send NO tool catalog and no forced
+            // choice. The model emits tool calls from a near-empty prompt; the
+            // response is parsed/routed exactly like Direct exposure.
+            if let Some(object) = body.as_object_mut() {
+                object.remove("tools");
                 object.remove("tool_choice");
             }
         }
@@ -1910,6 +1936,10 @@ fn system_prompt(tool_exposure: ToolExposure, tools: &[Tool]) -> String {
                 call_tool = SYNAPSE_TOOL_CALL,
             )
         }
+        // Internalized: the surface is in the weights and the model was trained
+        // on bare user turns — keep the prompt to behavioral rules only, with no
+        // tool framing, to stay on-distribution and near-empty.
+        ToolExposure::Internalized => BASE.to_string(),
     }
 }
 
@@ -1925,7 +1955,9 @@ fn tool_failure_suggestion(fatal: bool, exposure: ToolExposure) -> &'static str 
         ToolExposure::Routed => {
             "Tool call failed. Read the message, re-check the tool's schema with synapse_tool_catalog, then retry with corrected arguments or pick a different tool."
         }
-        ToolExposure::Direct => {
+        // Direct and Internalized both carry the schemas (attached vs. in
+        // weights); neither has the routed catalog meta-tool to consult.
+        ToolExposure::Direct | ToolExposure::Internalized => {
             "Tool call failed. Read the message, re-check the tool's input schema, then retry with corrected arguments or pick a different tool."
         }
     }
@@ -2124,6 +2156,26 @@ mod tests {
     }
 
     #[test]
+    fn internalized_preset_never_injects_a_catalog_regardless_of_max_tools() {
+        // An internalized model carries the surface in its weights; the harness
+        // must inject ZERO tools even when the surface exceeds any cap.
+        let mut row = test_local_agent_row();
+        row.runtime_preset = Some("internalized_no_catalog".to_owned());
+        row.max_tools = Some(16);
+        assert_eq!(resolve_tool_exposure(&row, 141), ToolExposure::Internalized);
+        assert_eq!(resolve_tool_exposure(&row, 1), ToolExposure::Internalized);
+        // The behavioral prompt carries no tool framing (no catalog meta-tools).
+        let prompt = system_prompt(ToolExposure::Internalized, &[]);
+        assert!(!prompt.contains(SYNAPSE_TOOL_CATALOG));
+        assert!(!prompt.contains("attached directly"));
+        // The request body for an internalized session must drop tools+choice.
+        let mut body = json!({"tools": [], "tool_choice": "auto", "model": "x"});
+        apply_runtime_preset(&row, &mut body);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
     fn deepseek_runtime_presets_shape_chat_body() {
         let mut row = test_local_agent_row();
         row.runtime_preset = Some("deepseek_v4_flash_non_thinking".to_owned());
@@ -2178,7 +2230,10 @@ mod tests {
         for prompt in [&direct, &routed] {
             assert!(prompt.contains("Synapse agent"), "identity");
             assert!(prompt.contains("inspect and change state"), "capability");
-            assert!(prompt.contains("Never invent tool results"), "no-fabrication");
+            assert!(
+                prompt.contains("Never invent tool results"),
+                "no-fabrication"
+            );
             assert!(prompt.contains("read it back"), "read-back verification");
             assert!(
                 prompt.contains("Summarize only after the required tool calls succeed"),
@@ -2233,7 +2288,10 @@ mod tests {
         use crate::server::permission_policy::classify;
         // A hazardous action tool must gate; a read-only one must auto-allow —
         // proving the harness shares the daemon's single classification authority.
-        assert_eq!(gate_tool_label("act_run_shell"), "mcp__synapse__act_run_shell");
+        assert_eq!(
+            gate_tool_label("act_run_shell"),
+            "mcp__synapse__act_run_shell"
+        );
         assert!(
             classify(&gate_tool_label("act_run_shell"), &json!({})).is_gate(),
             "act_run_shell must be gated"
@@ -2254,8 +2312,8 @@ mod tests {
 
     #[test]
     fn parse_gate_verdict_allow_prefers_operator_edited_args() {
-        let fallback: JsonObject = serde_json::from_value(json!({"command": "original"}))
-            .expect("fallback object");
+        let fallback: JsonObject =
+            serde_json::from_value(json!({"command": "original"})).expect("fallback object");
         // Approve-with-edits (#1030): the edited args win.
         let edited = json!({"behavior": "allow", "updatedInput": {"command": "edited"}});
         match parse_gate_verdict(&edited, &fallback).expect("allow") {
