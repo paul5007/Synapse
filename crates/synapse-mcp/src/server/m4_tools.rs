@@ -1465,6 +1465,7 @@ impl SynapseService {
             .wait_for_spawned_agent_session(
                 &params,
                 agent_kind,
+                &spawn_id,
                 &before_session_ids,
                 launched_at_unix_ms,
                 launch_response.pid,
@@ -1737,6 +1738,7 @@ impl SynapseService {
         &self,
         params: &ActSpawnAgentParams,
         agent_kind: ActSpawnAgentCli,
+        spawn_id: &str,
         before_session_ids: &BTreeSet<String>,
         launched_at_unix_ms: u64,
         launcher_pid: u32,
@@ -1760,6 +1762,9 @@ impl SynapseService {
             let mut sessions_json = Vec::new();
             let mut readiness_reason_counts: BTreeMap<String, u64> = BTreeMap::new();
             let mut candidate_readiness = Vec::new();
+            let explicit_task_session_id = task_start_session_id_for_spawn(files, spawn_id);
+            let mut explicit_task_session_match = None;
+            let mut ready_candidates = Vec::new();
             // Sessions that are a new + in-window + CLI match for this spawn but
             // have not (yet) issued a daemon MCP tool call. They are identified
             // as ours; we bind one only with independent proof of task progress.
@@ -1781,10 +1786,22 @@ impl SynapseService {
                 if reason == "tool_call_not_observed" {
                     lenient_candidates.push(summary.registry.session_id.clone());
                 }
-                if matched_session.is_none()
-                    && readiness.get("ready").and_then(Value::as_bool) == Some(true)
+                if explicit_task_session_id.as_deref() == Some(summary.registry.session_id.as_str())
+                    && spawn_session_identity_matches(
+                        summary,
+                        agent_kind,
+                        before_session_ids,
+                        launched_at_unix_ms,
+                    )
                 {
-                    matched_session = Some(MatchedSpawnSession {
+                    explicit_task_session_match = Some(MatchedSpawnSession {
+                        session_id: summary.registry.session_id.clone(),
+                        registered_at_unix_ms: unix_time_ms_now(),
+                        agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
+                    });
+                }
+                if readiness.get("ready").and_then(Value::as_bool) == Some(true) {
+                    ready_candidates.push(MatchedSpawnSession {
                         session_id: summary.registry.session_id.clone(),
                         registered_at_unix_ms: unix_time_ms_now(),
                         agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
@@ -1812,10 +1829,18 @@ impl SynapseService {
                 "readiness_reason_counts": readiness_reason_counts,
                 "candidate_readiness_recorded": candidate_readiness.len(),
                 "candidate_readiness": candidate_readiness,
+                "explicit_task_session_id": explicit_task_session_id.clone(),
+                "ready_candidate_count": ready_candidates.len(),
                 "sessions": sessions_json,
                 "readiness_files": agent_spawn_readiness_file_readback(files),
             });
 
+            if let Some(matched) = explicit_task_session_match {
+                return Ok(matched);
+            }
+            if explicit_task_session_id.is_none() && ready_candidates.len() == 1 {
+                matched_session = ready_candidates.pop();
+            }
             if let Some(matched) = matched_session {
                 return Ok(matched);
             }
@@ -2162,7 +2187,7 @@ impl SynapseService {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct MatchedSpawnSession {
     session_id: String,
     registered_at_unix_ms: u64,
@@ -4651,6 +4676,30 @@ fn spawn_session_candidate_readiness(
     }
 }
 
+fn task_start_session_id_for_spawn(files: &AgentSpawnFiles, spawn_id: &str) -> Option<String> {
+    let value = read_json_file_lossy(&files.task_started_path)?;
+    let object_spawn_id = value.get("spawn_id").and_then(Value::as_str)?;
+    if object_spawn_id != spawn_id {
+        return None;
+    }
+    value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_owned)
+}
+
+fn spawn_session_identity_matches(
+    summary: &super::session_tools::SessionSummary,
+    agent_kind: ActSpawnAgentCli,
+    before_session_ids: &BTreeSet<String>,
+    launched_at_unix_ms: u64,
+) -> bool {
+    !before_session_ids.contains(&summary.registry.session_id)
+        && summary.registry.started_at_unix_ms + 2_000 >= launched_at_unix_ms
+        && summary_matches_cli(summary, agent_kind)
+}
+
 fn summary_matches_cli(
     summary: &super::session_tools::SessionSummary,
     cli: ActSpawnAgentCli,
@@ -5176,6 +5225,30 @@ mod tests {
         assert_eq!(
             agent_spawn_observed_task_progress(&files, ActSpawnAgentCli::LocalModel),
             Some("stdout_turn_activity")
+        );
+    }
+
+    #[test]
+    fn task_start_session_id_only_binds_matching_spawn() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let files = observed_progress_test_files(dir.path());
+        fs::write(
+            &files.task_started_path,
+            serde_json::to_vec(&json!({
+                "spawn_id": "agent-spawn-current",
+                "session_id": "session-current"
+            }))
+            .expect("encode task-start marker"),
+        )
+        .expect("write task-start marker");
+
+        assert_eq!(
+            task_start_session_id_for_spawn(&files, "agent-spawn-current").as_deref(),
+            Some("session-current")
+        );
+        assert_eq!(
+            task_start_session_id_for_spawn(&files, "agent-spawn-other"),
+            None
         );
     }
 
