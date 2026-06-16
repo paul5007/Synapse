@@ -30,7 +30,8 @@ use crate::{
         HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus,
         M1State, ObserveParams, ReadTextParams, SetCaptureTargetParams, SetCaptureTargetResponse,
         SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
-        SharedM1State, TargetResponse, TargetWire, apply_profile_runtime_config_in_state,
+        SharedM1State, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
+        WindowListResponse, apply_profile_runtime_config_in_state,
         build_find_input, current_input, empty_input_schema, enrich_input_with_browser_ocr,
         enrich_input_with_cdp_for_target, find_cdp_max_nodes, find_snapshot_depth,
         match_find_input, mcp_error, observe_include, observe_input, populate_clipboard_summary,
@@ -218,12 +219,13 @@ mod notify_tools;
 mod permission_gate;
 pub(crate) mod permission_policy;
 mod reality;
+mod routine_labeling;
 mod schema_sanitize;
 pub(crate) mod session_continuity;
 pub(crate) mod session_lifecycle;
 pub(crate) mod session_registry;
 mod session_tools;
-mod target_claims;
+pub(crate) mod target_claims;
 mod target_policy;
 #[cfg(test)]
 mod tests;
@@ -557,6 +559,7 @@ impl SynapseService {
             + Self::reality_tool_router()
             + Self::m3_tool_router()
             + Self::intent_tool_router()
+            + Self::routine_labeling_tool_router()
             + Self::timeline_query_tool_router()
             + Self::timeline_digest_tool_router()
             + Self::m4_tool_router()

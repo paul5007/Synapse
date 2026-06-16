@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 174,
+  "count": 177,
   "m4_defaults": [
     {
       "actual": 33,
@@ -241,6 +241,7 @@ expression: snapshot
     "agent_send",
     "agent_send_broadcast",
     "agent_stats",
+    "agent_steer",
     "agent_template_delete",
     "agent_template_get",
     "agent_template_list",
@@ -340,6 +341,7 @@ expression: snapshot
     "release_all",
     "replay_record",
     "routine_inspect",
+    "routine_label_export",
     "routine_list",
     "routine_mine",
     "routine_update",
@@ -379,6 +381,7 @@ expression: snapshot
     "timeline_stats",
     "tool_profile_set",
     "tool_profile_status",
+    "window_list",
     "workspace_get",
     "workspace_list",
     "workspace_put",

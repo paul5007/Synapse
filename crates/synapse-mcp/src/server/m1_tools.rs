@@ -8,7 +8,8 @@ use super::{
     HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters, ReadTextParams, SessionTarget,
     SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
     SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
-    TargetWire, empty_input_schema, mcp_error, observe_include, observe_input,
+    TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
+    mcp_error, observe_include, observe_input,
     populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
     populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
     set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
@@ -22,6 +23,7 @@ use crate::m3::activity_recorder::BrowserNavigationEvent;
 use rmcp::{RoleServer, service::RequestContext};
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -701,6 +703,127 @@ impl SynapseService {
             window_title: None,
             process_name: None,
         }))
+    }
+
+    #[tool(
+        description = "Enumerate visible top-level windows as a passive snapshot — no activation, no foregrounding, no debugger attach (same non-interference contract as observe). Each entry has hwnd, pid, process_name, process_path, window_title, bounds, monitor, minimized/foreground/fullscreen flags, a Chromium hint, and any target-claim owner. The `target` field round-trips directly into set_target so you can bind a background window without shelling out or foregrounding. `is_foreground` / `human_os_foreground_hwnd` mark the human's window so agents can avoid it. To enumerate Chrome tabs, bind the browser window then use the Chrome bridge / cdp_target_info. Filterable by title_contains / process_name_contains; minimized windows are included by default (they are valid background targets)."
+    )]
+    pub async fn window_list(
+        &self,
+        params: Parameters<WindowListParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<WindowListResponse>, ErrorData> {
+        const TOOL: &str = "window_list";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=window_list"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        self.window_list_impl(&session_id, params.0).map(Json)
+    }
+
+    fn window_list_impl(
+        &self,
+        session_id: &str,
+        params: WindowListParams,
+    ) -> Result<WindowListResponse, ErrorData> {
+        let now = super::session_registry::unix_time_ms_now();
+        let contexts = synapse_a11y::visible_top_level_window_contexts().map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("window_list could not enumerate top-level windows: {error}"),
+            )
+        })?;
+        let human_os_foreground_hwnd =
+            synapse_a11y::current_foreground_context().ok().map(|c| c.hwnd);
+
+        // Annotate each window with its owning session from the durable
+        // target-claim registry. A CDP claim still pins a window_hwnd, so both
+        // claim shapes collapse onto a window row.
+        let claims_by_owner = self.target_claim_reads_by_owner()?;
+        let mut claim_by_hwnd: HashMap<
+            i64,
+            (String, crate::server::target_claims::TargetClaimRead),
+        > = HashMap::new();
+        for (owner, claims) in &claims_by_owner {
+            for claim in claims {
+                let hwnd = match &claim.target {
+                    TargetWire::Window { window_hwnd } => *window_hwnd,
+                    TargetWire::Cdp { window_hwnd, .. } => *window_hwnd,
+                };
+                claim_by_hwnd
+                    .entry(hwnd)
+                    .or_insert_with(|| (owner.clone(), claim.clone()));
+            }
+        }
+
+        let title_filter = params.title_contains.as_deref().map(str::to_lowercase);
+        let process_filter = params
+            .process_name_contains
+            .as_deref()
+            .map(str::to_lowercase);
+
+        let mut windows = Vec::with_capacity(contexts.len());
+        for context in contexts {
+            if let Some(filter) = title_filter.as_deref() {
+                if !context.window_title.to_lowercase().contains(filter) {
+                    continue;
+                }
+            }
+            if let Some(filter) = process_filter.as_deref() {
+                if !context.process_name.to_lowercase().contains(filter) {
+                    continue;
+                }
+            }
+            let is_minimized = synapse_a11y::is_window_minimized(context.hwnd).unwrap_or(false);
+            if params.exclude_minimized && is_minimized {
+                continue;
+            }
+            let (claimed_by_session_id, target_claim) = match claim_by_hwnd.get(&context.hwnd) {
+                Some((owner, claim)) => (Some(owner.clone()), Some(claim.clone())),
+                None => (None, None),
+            };
+            windows.push(WindowListEntry {
+                hwnd: context.hwnd,
+                pid: context.pid,
+                process_name: context.process_name.clone(),
+                process_path: context.process_path.clone(),
+                window_title: context.window_title.clone(),
+                window_bounds: context.window_bounds,
+                monitor_index: context.monitor_index,
+                dpi_scale: context.dpi_scale,
+                is_minimized,
+                is_foreground: human_os_foreground_hwnd == Some(context.hwnd),
+                is_fullscreen: context.is_fullscreen,
+                is_dwm_composed: context.is_dwm_composed,
+                is_chromium: synapse_a11y::is_chromium_family(&context.process_name),
+                claimed_by_session_id,
+                target_claim,
+                target: TargetWire::Window {
+                    window_hwnd: context.hwnd,
+                },
+            });
+        }
+
+        tracing::info!(
+            code = "MCP_WINDOW_LIST_READBACK",
+            session_id = %session_id,
+            window_count = windows.len(),
+            human_os_foreground_hwnd = human_os_foreground_hwnd.unwrap_or(0),
+            "readback=window_list passive snapshot (no activation, no attach)"
+        );
+
+        Ok(WindowListResponse {
+            session_id: session_id.to_owned(),
+            now_unix_ms: now,
+            human_os_foreground_hwnd,
+            window_count: windows.len(),
+            windows,
+            source_of_truth:
+                "synapse_a11y::visible_top_level_window_contexts (EnumWindows + visibility filter) + CF target-claim registry"
+                    .to_owned(),
+        })
     }
 
     fn validate_target_window_for_session(

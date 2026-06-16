@@ -35,6 +35,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "agent_send",
     "agent_send_broadcast",
     "agent_stats",
+    "agent_steer",
     "agent_wait",
     "approval_decide",
     "approval_gate",
@@ -89,6 +90,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "timeline_stats",
     "tool_profile_set",
     "tool_profile_status",
+    "window_list",
     "workspace_get",
     "workspace_list",
     "workspace_put",
@@ -129,6 +131,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "target_release",
     "tool_profile_set",
     "tool_profile_status",
+    "window_list",
     "workspace_get",
     "workspace_list",
     "workspace_put",
@@ -447,6 +450,43 @@ impl SynapseService {
             }
         };
         let after = self.tool_profile_snapshot(Some(&session_id))?;
+
+        // #1020: the visible tool surface for this MCP session just changed.
+        // Push a `notifications/tools/list_changed` so the client refetches
+        // `tools/list` within the *same* session. Without this, newly-allowed
+        // break_glass tools stay uncallable until a full MCP reconnect, and a
+        // reconnect mints a new session id that drops the foreground input lease
+        // and any target claims acquired for the privileged action — defeating
+        // the entire break-glass workflow. The durable CF_SESSIONS row is the
+        // source of truth and is already committed above; this notification is a
+        // best-effort client cache invalidation, so a delivery failure is logged
+        // loudly but does not fail the (already-persisted) profile change.
+        if before.visible_tool_sha256 != after.visible_tool_sha256 {
+            match request_context.peer.notify_tool_list_changed().await {
+                Ok(()) => {
+                    tracing::info!(
+                        code = "MCP_TOOL_LIST_CHANGED_NOTIFIED",
+                        session_id = %session_id,
+                        before_profile = before.profile.as_str(),
+                        after_profile = after.profile.as_str(),
+                        before_visible_tool_count = before.visible_tool_count,
+                        after_visible_tool_count = after.visible_tool_count,
+                        "tool_profile_set pushed notifications/tools/list_changed after a visible tool-surface change"
+                    );
+                }
+                Err(notify_err) => {
+                    tracing::error!(
+                        code = "MCP_TOOL_LIST_CHANGED_NOTIFY_FAILED",
+                        session_id = %session_id,
+                        before_profile = before.profile.as_str(),
+                        after_profile = after.profile.as_str(),
+                        error = %notify_err,
+                        "tool_profile_set persisted the new profile but failed to push notifications/tools/list_changed; the client may need to reconnect to observe the updated tool surface"
+                    );
+                }
+            }
+        }
+
         let final_audit = audit_readback(self.command_audit_final(
             super::command_audit::CommandAuditInput::mcp(
                 "tool_profile_set",

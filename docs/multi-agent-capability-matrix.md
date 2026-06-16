@@ -56,6 +56,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | agent_send | normal_agent | no | no | no | no | none - default-safe |
 | agent_send_broadcast | normal_agent | no | no | no | no | none - default-safe |
 | agent_stats | normal_agent | no | no | no | no | none - default-safe |
+| agent_steer | normal_agent | no | no | no | no | none - default-safe |
 | agent_template_delete | normal_agent | no | no | no | no | none - default-safe |
 | agent_template_get | normal_agent | no | no | no | no | none - default-safe |
 | agent_template_list | normal_agent | no | no | no | no | none - default-safe |
@@ -101,6 +102,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | target_release | normal_agent | no | no | no | no | none - default-safe |
 | tool_profile_set | normal_agent | no | no | no | no | none - default-safe |
 | tool_profile_status | normal_agent | no | no | no | no | none - default-safe |
+| window_list | normal_agent | no | no | no | no | none - default-safe |
 | workspace_get | normal_agent | no | no | no | no | none - default-safe |
 | workspace_list | normal_agent | no | no | no | no | none - default-safe |
 | workspace_put | normal_agent | no | no | no | no | none - default-safe |
@@ -147,6 +149,7 @@ Research basis:
 | agent_send | session control | current MCP session id plus named live recipient session id | CF_KV durable recipient-prefix write with immediate exact-row readback and Notify wake | no foreground lease | control | none (#795) | session_list recipient lifecycle plus CF_KV row key/hash/depth after write |
 | agent_send_broadcast | session control | current MCP session id plus a broadcast selector over the live session registry | CF_KV durable per-recipient write fan-out returning a per-recipient delivered or skipped outcome | no foreground lease | control | none (#908) | session_list recipient lifecycle plus CF_KV rows written per recipient |
 | agent_stats | session control | the agent event journal | journal-authoritative metrics rollup with exact nearest-rank percentiles scanning CF_AGENT_EVENTS | no foreground lease | control | none (#903) | CF_AGENT_EVENTS rows plus the scanned_rows equals events_total readback |
+| agent_steer | session control | current MCP session id plus target agent MCP session id or agent-spawn-* id | resolves the agent in the live session registry then delivers a cooperative mailbox steer message and journals a message-sent event; never fabricates delivery on an unavailable channel | no foreground lease | control | none (#908) | CF_KV steer mailbox row, CF_AGENT_EVENTS message-sent row, session_list recipient lifecycle, and CF_ACTION_LOG command-audit rows |
 | agent_template_delete | session control | template id namespaced in CF_KV | CF_KV template-store row delete with flush and readback | no foreground lease | control | none (#909) | CF_KV template row absent after delete |
 | agent_template_get | session control | template id namespaced in CF_KV | CF_KV template-store row read | no foreground lease | control | none (#909) | CF_KV template row returned |
 | agent_template_list | session control | CF_KV template-store prefix | CF_KV template-store prefix scan | no foreground lease | control | none (#909) | CF_KV template rows returned |
@@ -192,6 +195,7 @@ Research basis:
 | target_release | target control | current MCP session active target or explicit window/CDP target | daemon-local target ownership registry mutation scoped to the owner session | no foreground lease | control | #797 | target_claim_status/session_list before and after |
 | tool_profile_set | session control | current MCP session id plus requested profile | durable CF_SESSIONS profile assignment controls the session-filtered tools/list surface; break_glass requires confirm_break_glass, non-empty reason, and owned foreground input lease | no foreground lease for normal_agent or browser_control; break_glass transition requires the foreground input lease proof | control | none (#1008) | CF_SESSIONS mcp/tool-profile row, health/tools-list names, and CF_ACTION_LOG profile_set rows |
 | tool_profile_status | session control | current MCP session id | reads the durable session profile row and recomputes visible tools/list names for the current profile | no foreground lease | control | none (#1008) | CF_SESSIONS mcp/tool-profile row plus visible_tool_names/count/hash readback |
+| window_list | perception | daemon top-level window enumeration (EnumWindows + visibility/cloak filter); never the human foreground as an implicit work surface | read-only EnumWindows snapshot with per-window target-claim ownership annotation; no activation, no foregrounding, no debugger attach | no foreground lease | control | #1021 | window_list windows[] round-tripped through set_target plus target_claim_status ownership cross-check; human_os_foreground_hwnd reported separately |
 | workspace_get | session control | current MCP session id plus run-scoped key | exact CF_KV workspace-blackboard row read and hash readback | no foreground lease | control | none (#796) | CF_KV workspace row key/hash plus returned value/artifact handle |
 | workspace_list | session control | current MCP session id plus run/prefix | CF_KV run-prefix scan with expired-row delete and corrupt-row isolation | no foreground lease | control | none (#796) | CF_KV workspace run prefix before/after, skipped corrupt row report, returned row hashes |
 | workspace_put | session control | current MCP session id plus run/key/value/artifact | CF_KV workspace row write with artifact path size/hash verification, exact row readback, and workspace.put SSE publish | no foreground lease | control | none (#796) | artifact file bytes/hash, CF_KV exact row hash, SSE publish report |

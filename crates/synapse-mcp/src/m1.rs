@@ -670,6 +670,74 @@ pub struct CdpTargetInfoResponse {
     pub active_element: Option<CdpActiveElementInfo>,
 }
 
+/// Parameters for `window_list` (#1021). All fields optional; an empty object
+/// returns every visible top-level window.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WindowListParams {
+    /// Case-insensitive substring filter on the window title. None = no filter.
+    #[serde(default)]
+    pub title_contains: Option<String>,
+    /// Case-insensitive substring filter on the process name (e.g. "chrome").
+    /// None = no filter.
+    #[serde(default)]
+    pub process_name_contains: Option<String>,
+    /// When true, omit minimized windows. They are still valid *background*
+    /// targets, so the default (false) includes them.
+    #[serde(default)]
+    pub exclude_minimized: bool,
+}
+
+/// One enumerated top-level window. `target` round-trips directly into
+/// `set_target { target }`. Snapshot-only: producing this row never activates,
+/// foregrounds, or attaches a debugger to the window.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WindowListEntry {
+    pub hwnd: i64,
+    pub pid: u32,
+    pub process_name: String,
+    pub process_path: String,
+    pub window_title: String,
+    pub window_bounds: synapse_core::Rect,
+    pub monitor_index: u32,
+    pub dpi_scale: f32,
+    pub is_minimized: bool,
+    /// True only for the single window that is the live human OS foreground at
+    /// snapshot time. This is `human_os_foreground`, NOT any agent target (#994).
+    pub is_foreground: bool,
+    pub is_fullscreen: bool,
+    pub is_dwm_composed: bool,
+    /// Heuristic (process-name family match): this window belongs to a Chromium
+    /// browser. Per-tab CDP/bridge targetIds are not enumerated here — bind the
+    /// window then use the Chrome bridge / `cdp_target_info` to read tabs.
+    pub is_chromium: bool,
+    /// Session id that currently holds a target claim on this window, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by_session_id: Option<String>,
+    /// Full target-claim row (ttl/expiry/generation) when claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_claim: Option<crate::server::target_claims::TargetClaimRead>,
+    /// Ready to paste into `set_target { target: <this> }`.
+    pub target: TargetWire,
+}
+
+/// Response for `window_list`. `human_os_foreground_hwnd` is reported separately
+/// from the per-entry rows so callers can explicitly avoid the human's window
+/// (the core #994 invariant: agent_active_target is distinct from
+/// human_os_foreground).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WindowListResponse {
+    pub session_id: String,
+    pub now_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_os_foreground_hwnd: Option<i64>,
+    pub window_count: usize,
+    pub windows: Vec<WindowListEntry>,
+    pub source_of_truth: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CdpBridgeReloadParams {
