@@ -36,8 +36,9 @@ use synapse_core::error_codes;
 use synapse_core::routines::{MiningDay, RoutineMiningConfig, mine_routines};
 use synapse_core::types::{
     ROUTINE_STATE_MAX_CONFIDENCE_POINTS, ROUTINE_STATE_MAX_TRANSITIONS,
-    ROUTINE_STATE_RECORD_VERSION, RoutineConfidencePoint, RoutineGranularity, RoutineLifecycle,
-    RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep, RoutineTransition,
+    ROUTINE_STATE_RECORD_VERSION, RoutineConfidencePoint, RoutineDowClass, RoutineGranularity,
+    RoutineLifecycle, RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep,
+    RoutineTransition,
 };
 use synapse_storage::{Db, cf, decode_json, encode_json, routines as routine_codec};
 
@@ -1289,6 +1290,256 @@ pub fn inspect_routine(
         state,
         tainted,
         taint,
+    })
+}
+
+/// Default and maximum sample occurrences carried in a label export.
+pub const DEFAULT_LABEL_EXPORT_SAMPLES: u32 = 3;
+pub const MAX_LABEL_EXPORT_SAMPLES: u32 = 10;
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineLabelExportParams {
+    /// Routine to export naming evidence for. Must be a mined routine present
+    /// in `CF_ROUTINES` (an operator-only state row with no mined template
+    /// cannot be labelled — there is nothing to name).
+    pub routine_id: String,
+    /// Recent sample occurrences to include (default 3, max 10), newest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_samples: Option<u32>,
+}
+
+pub fn required_permissions_label_export(
+    _params: &RoutineLabelExportParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelStep {
+    /// Zero-based template position.
+    pub index: u32,
+    pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    /// `app` or `app:document` machine identity for this step.
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelSample {
+    pub day_start_ns: u64,
+    pub minute_of_day: u32,
+    /// Rendered local start, e.g. `Mon 2026-06-09 08:47`.
+    pub local_start: String,
+    /// Stable episode ids of this occurrence; resolve full content (titles,
+    /// urls, keystrokes) via `episode_get`.
+    pub episode_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineLabelExportResponse {
+    pub routine_id: String,
+    /// Whether a `CF_ROUTINE_STATE` row already exists for this routine.
+    pub state_row_exists: bool,
+    pub lifecycle: RoutineLifecycle,
+    /// Current operator label, `None` if the routine was never named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_label: Option<String>,
+    pub granularity: RoutineGranularity,
+    /// Whole-routine machine identity, e.g.
+    /// `chrome:mail.google.com → excel:report.xlsx → teams`.
+    pub machine_identity: String,
+    pub schedule_label: String,
+    pub dow_class: RoutineDowClass,
+    pub mean_minute_of_day: u32,
+    pub support_days: u32,
+    pub occurrence_count: u32,
+    pub opportunity_days: u32,
+    pub confidence: f64,
+    pub steps: Vec<LabelStep>,
+    /// Newest-first sample occurrences (capped by `max_samples`).
+    pub samples: Vec<LabelSample>,
+    /// Total occurrences the mined record carries (samples are a suffix).
+    pub total_evidence_occurrences: u32,
+    /// Ready-to-use compact prompt block for an LLM to name/describe this
+    /// routine without any other context.
+    pub prompt: String,
+    /// Exact `routine_update` call to persist the agent's chosen label.
+    pub writeback_hint: String,
+    /// Character count of `prompt` (a coarse token-budget proxy).
+    pub prompt_chars: u32,
+}
+
+fn render_minute_of_day(minute_of_day: u32) -> String {
+    let minute = minute_of_day % 1440;
+    format!("{:02}:{:02}", minute / 60, minute % 60)
+}
+
+fn render_local_start(day_start_ns: u64, minute_of_day: u32) -> String {
+    let secs = i64::try_from(day_start_ns / 1_000_000_000).unwrap_or(0)
+        + i64::from(minute_of_day % 1440) * 60;
+    match Local.timestamp_opt(secs, 0) {
+        chrono::LocalResult::Single(dt) => dt.format("%a %Y-%m-%d %H:%M").to_string(),
+        _ => format!("ts {day_start_ns}+{minute_of_day}m"),
+    }
+}
+
+fn step_identity(step: &RoutineStep) -> String {
+    match &step.document {
+        Some(document) => format!("{}:{document}", step.app),
+        None => step.app.clone(),
+    }
+}
+
+fn render_dow_class(dow: &RoutineDowClass) -> String {
+    match dow {
+        RoutineDowClass::Daily => "daily".to_owned(),
+        RoutineDowClass::Weekdays => "weekdays".to_owned(),
+        RoutineDowClass::Weekend => "weekend".to_owned(),
+        RoutineDowClass::Days { days } => {
+            const NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            let list = days
+                .iter()
+                .map(|day| NAMES.get(usize::from(*day)).copied().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("days[{list}]")
+        }
+    }
+}
+
+/// Builds a compact, prompt-ready naming bundle for a mined routine (#851).
+///
+/// Read-only: it reuses the mined `CF_ROUTINES` template (the machine
+/// identity, schedule signature, and capped sample evidence) plus the current
+/// `CF_ROUTINE_STATE` label/lifecycle. The mined evidence already carries
+/// stable `episode_id`s, so an agent can pull richer per-episode content via
+/// `episode_get` if the compact bundle is not enough to name the routine.
+/// A routine with no mined record is an honest, structured refusal — there is
+/// no template to name.
+pub fn export_routine_label(
+    db: &Arc<Db>,
+    params: &RoutineLabelExportParams,
+) -> Result<RoutineLabelExportResponse, ErrorData> {
+    validate_routine_id_param("routine_label_export", &params.routine_id)?;
+    let max_samples = params.max_samples.unwrap_or(DEFAULT_LABEL_EXPORT_SAMPLES);
+    if max_samples == 0 || max_samples > MAX_LABEL_EXPORT_SAMPLES {
+        return Err(invalid(format!(
+            "routine_label_export max_samples must be between 1 and \
+             {MAX_LABEL_EXPORT_SAMPLES}; got {max_samples}"
+        )));
+    }
+
+    let Some(record) = load_routine_record(db, &params.routine_id)? else {
+        return Err(invalid(format!(
+            "ROUTINE_NOT_MINED: routine_id {} is not present in CF_ROUTINES, so it has no \
+             mined template (apps/documents/schedule) to name. Run routine_mine, or \
+             routine_list to see what currently exists",
+            params.routine_id
+        )));
+    };
+
+    let state = load_state_row(db, &params.routine_id)?;
+    let state_row_exists = state.is_some();
+    let (lifecycle, current_label) = match &state {
+        Some(state) => (state.lifecycle, state.label.clone()),
+        None => (RoutineLifecycle::Candidate, None),
+    };
+
+    let steps: Vec<LabelStep> = record
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| LabelStep {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            app: step.app.clone(),
+            document: step.document.clone(),
+            identity: step_identity(step),
+        })
+        .collect();
+
+    // `evidence` is newest-last; take the most recent `max_samples`, newest first.
+    let samples: Vec<LabelSample> = record
+        .evidence
+        .iter()
+        .rev()
+        .take(max_samples as usize)
+        .map(|evidence| LabelSample {
+            day_start_ns: evidence.day_start_ns,
+            minute_of_day: evidence.minute_of_day,
+            local_start: render_local_start(evidence.day_start_ns, evidence.minute_of_day),
+            episode_ids: evidence.episode_ids.clone(),
+        })
+        .collect();
+
+    let machine_identity = record
+        .steps
+        .iter()
+        .map(step_identity)
+        .collect::<Vec<_>>()
+        .join(" → ");
+    let dow = render_dow_class(&record.dow_class);
+
+    let mut prompt = String::new();
+    prompt.push_str("Name and describe this recurring computer routine for its operator.\n");
+    prompt.push_str(&format!("Machine identity: {machine_identity}\n"));
+    prompt.push_str(&format!(
+        "Schedule: {} ({dow}), typically around {}.\n",
+        record.schedule_label,
+        render_minute_of_day(record.mean_minute_of_day)
+    ));
+    prompt.push_str(&format!(
+        "Seen on {} of {} eligible days (confidence {:.2}); {} occurrences total.\n",
+        record.support_days, record.opportunity_days, record.confidence, record.occurrence_count
+    ));
+    prompt.push_str("Steps in order:\n");
+    for step in &steps {
+        prompt.push_str(&format!("  {}. {}\n", step.index + 1, step.identity));
+    }
+    if !samples.is_empty() {
+        prompt.push_str("Recent occurrences:\n");
+        for sample in &samples {
+            prompt.push_str(&format!("  - {}\n", sample.local_start));
+        }
+    }
+    if let Some(label) = &current_label {
+        prompt.push_str(&format!("Current label: {label}\n"));
+    }
+    prompt.push_str(
+        "Reply with a short human name (<=120 chars) and a one-sentence description.\n",
+    );
+
+    let writeback_hint = format!(
+        "routine_update {{ \"routine_id\": \"{}\", \"action\": \"rename\", \
+         \"label\": \"<chosen name>\", \"note\": \"<optional one-sentence description>\" }}",
+        params.routine_id
+    );
+    let prompt_chars = u32::try_from(prompt.chars().count()).unwrap_or(u32::MAX);
+
+    Ok(RoutineLabelExportResponse {
+        routine_id: params.routine_id.clone(),
+        state_row_exists,
+        lifecycle,
+        current_label,
+        granularity: record.granularity,
+        machine_identity,
+        schedule_label: record.schedule_label.clone(),
+        dow_class: record.dow_class.clone(),
+        mean_minute_of_day: record.mean_minute_of_day,
+        support_days: record.support_days,
+        occurrence_count: record.occurrence_count,
+        opportunity_days: record.opportunity_days,
+        confidence: record.confidence,
+        steps,
+        samples,
+        total_evidence_occurrences: u32::try_from(record.evidence.len()).unwrap_or(u32::MAX),
+        prompt,
+        writeback_hint,
+        prompt_chars,
     })
 }
 
