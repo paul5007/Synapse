@@ -17,11 +17,12 @@ use super::{
     ErrorData, Json, Parameters, SessionTarget, SynapseService, TargetWire,
     agent_state::{AgentLifecycleState, AgentStateRead},
     mcp_error,
-    session_registry::SessionRegistryRead,
-    session_registry::unix_time_ms_now,
+    session_registry::{SessionRegistryRead, SpawnedAgentRead, unix_time_ms_now},
     target_claims::TargetClaimRead,
     tool, tool_router,
 };
+
+const ATTACHED_AGENT_REGISTRY_SOURCE_OF_TRUTH: &str = "session_registry spawned_agent rows + agent_state tracker rows + OS process table live-pid probe + visible top-level window enumeration";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -95,6 +96,10 @@ pub struct SessionListResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_lease_owner_session_id: Option<String>,
     pub sessions: Vec<SessionSummary>,
+    /// #1035 K1: authoritative live attached-terminal/agent registry. The
+    /// exact count is OS-probed live process rows only; observed ambient rows
+    /// without a process handle stay visible but cannot inflate the count.
+    pub attached_agent_registry: AttachedAgentRegistryReadback,
     /// #898: agents tracked by the state machine that have no MCP session
     /// (in-flight spawns and active attention rows before registration).
     /// Terminal/dead history is split out below so default consumers do not
@@ -116,6 +121,92 @@ pub struct SessionUnboundAgentFilterReadback {
     pub terminal_unbound_agent_count: usize,
     pub terminal_states: Vec<&'static str>,
     pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedAgentRegistryReadback {
+    pub source_of_truth: &'static str,
+    pub count_basis: &'static str,
+    pub generated_at_unix_ms: u64,
+    pub exact_live_count: usize,
+    pub row_count: usize,
+    pub killable_live_count: usize,
+    pub unprobeable_observed_count: usize,
+    pub rows: Vec<AttachedAgentRegistryRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_lookup_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedAgentRegistryRow {
+    pub registry_id: String,
+    pub kind: String,
+    pub source: String,
+    pub lifecycle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    pub counts_as_live: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_counted_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms_ago: Option<u64>,
+    pub process: AttachedAgentProcessReadback,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_window: Option<AttachedAgentWindowReadback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controlling_terminal_window: Option<AttachedAgentWindowReadback>,
+    pub kill_handle: AttachedAgentKillHandleReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedAgentProcessReadback {
+    pub probeable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub process_tree_ids: Vec<u32>,
+    pub live_process_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedAgentWindowReadback {
+    pub window_hwnd: i64,
+    pub process_id: u32,
+    pub process_name: String,
+    pub window_title: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedAgentKillHandleReadback {
+    pub available: bool,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -321,6 +412,8 @@ impl SynapseService {
         let raw_unbound_agent_states = super::agent_state::unbound_reads(now_unix_ms);
         let (unbound_agent_states, terminal_unbound_agent_states, unbound_agent_filter) =
             split_unbound_agent_states(raw_unbound_agent_states);
+        let attached_agent_registry =
+            build_attached_agent_registry(&sessions, &unbound_agent_states, now_unix_ms);
         Ok(SessionListResponse {
             now_unix_ms,
             stale_after_ms,
@@ -330,6 +423,7 @@ impl SynapseService {
             input_lease_held: lease_status.held,
             input_lease_owner_session_id: lease_status.owner_session_id.clone(),
             sessions,
+            attached_agent_registry,
             unbound_agent_states,
             terminal_unbound_agent_states,
             unbound_agent_filter,
@@ -434,6 +528,578 @@ fn split_unbound_agent_states(
 
 fn unbound_agent_row_is_terminal(row: &AgentStateRead) -> bool {
     matches!(row.state, AgentLifecycleState::Dead)
+}
+
+fn build_attached_agent_registry(
+    sessions: &[SessionSummary],
+    unbound_agent_states: &[AgentStateRead],
+    now_unix_ms: u64,
+) -> AttachedAgentRegistryReadback {
+    let (windows_by_pid, window_lookup_error) = attached_agent_window_index();
+    let ambient_process_candidates =
+        ambient_agent_process_candidates(&windows_by_pid, &BTreeSet::new());
+    build_attached_agent_registry_with_process_probe(
+        sessions,
+        unbound_agent_states,
+        now_unix_ms,
+        &|pid| crate::m4::owned_process_tree_ids(pid),
+        &|process_ids| crate::m4::owned_live_process_ids(process_ids),
+        &windows_by_pid,
+        window_lookup_error,
+        ambient_process_candidates,
+    )
+}
+
+fn build_attached_agent_registry_with_process_probe(
+    sessions: &[SessionSummary],
+    unbound_agent_states: &[AgentStateRead],
+    now_unix_ms: u64,
+    process_tree_ids: &dyn Fn(u32) -> Vec<u32>,
+    live_process_ids: &dyn Fn(&[u32]) -> Vec<u32>,
+    windows_by_pid: &BTreeMap<u32, AttachedAgentWindowReadback>,
+    window_lookup_error: Option<String>,
+    ambient_process_candidates: Vec<AmbientAgentProcessCandidate>,
+) -> AttachedAgentRegistryReadback {
+    let mut rows = BTreeMap::<String, AttachedAgentRegistryRow>::new();
+    for summary in sessions {
+        if let Some(spawned) = summary.registry.spawned_agent.as_ref() {
+            insert_attached_agent_row(
+                &mut rows,
+                attached_row_from_spawned_session(
+                    &summary.registry,
+                    spawned,
+                    summary.agent_state.as_ref(),
+                    process_tree_ids,
+                    live_process_ids,
+                    windows_by_pid,
+                ),
+            );
+        } else if let Some(agent_state) = summary.agent_state.as_ref()
+            && agent_state_has_process_handle(agent_state)
+        {
+            insert_attached_agent_row(
+                &mut rows,
+                attached_row_from_agent_state(
+                    agent_state,
+                    Some(&summary.registry),
+                    "session_agent_state",
+                    process_tree_ids,
+                    live_process_ids,
+                    windows_by_pid,
+                ),
+            );
+        }
+    }
+    for agent_state in unbound_agent_states {
+        if !agent_state_has_process_handle(agent_state) && !agent_state_is_ambient(agent_state) {
+            continue;
+        }
+        insert_attached_agent_row(
+            &mut rows,
+            attached_row_from_agent_state(
+                agent_state,
+                None,
+                if agent_state_is_ambient(agent_state) {
+                    "ambient_transcript"
+                } else {
+                    "unbound_agent_state"
+                },
+                process_tree_ids,
+                live_process_ids,
+                windows_by_pid,
+            ),
+        );
+    }
+    let represented_process_ids = rows
+        .values()
+        .flat_map(|row| {
+            row.process
+                .process_tree_ids
+                .iter()
+                .chain(row.process.live_process_ids.iter())
+                .copied()
+        })
+        .collect::<BTreeSet<_>>();
+    insert_ambient_agent_process_rows(
+        &mut rows,
+        ambient_process_candidates
+            .into_iter()
+            .filter(|candidate| !represented_process_ids.contains(&candidate.process_id))
+            .collect(),
+    );
+
+    let rows = rows.into_values().collect::<Vec<_>>();
+    let exact_live_count = rows.iter().filter(|row| row.counts_as_live).count();
+    let killable_live_count = rows
+        .iter()
+        .filter(|row| row.counts_as_live && row.kill_handle.available)
+        .count();
+    let unprobeable_observed_count = rows.iter().filter(|row| !row.process.probeable).count();
+    AttachedAgentRegistryReadback {
+        source_of_truth: ATTACHED_AGENT_REGISTRY_SOURCE_OF_TRUTH,
+        count_basis: "exact_live_count counts only rows whose live_process_ids are non-empty in the OS process table",
+        generated_at_unix_ms: now_unix_ms,
+        exact_live_count,
+        row_count: rows.len(),
+        killable_live_count,
+        unprobeable_observed_count,
+        rows,
+        window_lookup_error,
+    }
+}
+
+fn attached_row_from_spawned_session(
+    registry: &SessionRegistryRead,
+    spawned: &SpawnedAgentRead,
+    agent_state: Option<&AgentStateRead>,
+    process_tree_ids: &dyn Fn(u32) -> Vec<u32>,
+    live_process_ids: &dyn Fn(&[u32]) -> Vec<u32>,
+    windows_by_pid: &BTreeMap<u32, AttachedAgentWindowReadback>,
+) -> AttachedAgentRegistryRow {
+    let process = attached_process_readback(
+        Some(spawned.launcher_process_id),
+        spawned.agent_process_id,
+        process_tree_ids,
+        live_process_ids,
+    );
+    let visible_window = attached_visible_window(&process, windows_by_pid);
+    let state = agent_state.map(|row| row.state.as_str().to_owned());
+    let reason_code = agent_state.and_then(|row| row.reason_code.clone());
+    let (counts_as_live, not_counted_reason) = attached_count_decision(&process);
+    let target_id = Some(spawned.spawn_id.clone());
+    AttachedAgentRegistryRow {
+        registry_id: spawned.spawn_id.clone(),
+        kind: spawned.cli.clone(),
+        source: "session_registry.spawned_agent".to_owned(),
+        lifecycle: registry.lifecycle.clone(),
+        state,
+        reason_code,
+        counts_as_live,
+        not_counted_reason,
+        session_id: Some(registry.session_id.clone()),
+        spawn_id: Some(spawned.spawn_id.clone()),
+        spawn_dir: Some(spawned.log_dir.clone()),
+        last_seen_unix_ms: Some(registry.last_seen_unix_ms),
+        last_seen_ms_ago: Some(registry.last_seen_ms_ago),
+        process,
+        visible_window: visible_window.clone(),
+        controlling_terminal_window: visible_window,
+        kill_handle: attached_kill_handle(counts_as_live, target_id, true),
+    }
+}
+
+fn attached_row_from_agent_state(
+    row: &AgentStateRead,
+    registry: Option<&SessionRegistryRead>,
+    source: &str,
+    process_tree_ids: &dyn Fn(u32) -> Vec<u32>,
+    live_process_ids: &dyn Fn(&[u32]) -> Vec<u32>,
+    windows_by_pid: &BTreeMap<u32, AttachedAgentWindowReadback>,
+) -> AttachedAgentRegistryRow {
+    let process = attached_process_readback(
+        row.launcher_process_id,
+        row.agent_process_id,
+        process_tree_ids,
+        live_process_ids,
+    );
+    let visible_window = attached_visible_window(&process, windows_by_pid);
+    let (counts_as_live, not_counted_reason) = attached_count_decision(&process);
+    let target_id = row
+        .spawn_id
+        .clone()
+        .or_else(|| row.session_id.clone())
+        .or_else(|| (!agent_state_is_ambient(row)).then(|| row.anchor.clone()));
+    let agent_kill_can_resolve = row.session_id.is_some() || registry.is_some();
+    AttachedAgentRegistryRow {
+        registry_id: row
+            .spawn_id
+            .clone()
+            .or_else(|| row.session_id.clone())
+            .unwrap_or_else(|| row.anchor.clone()),
+        kind: row
+            .agent_kind
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned()),
+        source: source.to_owned(),
+        lifecycle: registry
+            .map(|registry| registry.lifecycle.clone())
+            .unwrap_or_else(|| "unbound".to_owned()),
+        state: Some(row.state.as_str().to_owned()),
+        reason_code: row.reason_code.clone(),
+        counts_as_live,
+        not_counted_reason,
+        session_id: row.session_id.clone(),
+        spawn_id: row.spawn_id.clone(),
+        spawn_dir: row.log_dir.clone(),
+        last_seen_unix_ms: Some(row.last_event_unix_ms),
+        last_seen_ms_ago: Some(row.silent_ms),
+        process,
+        visible_window: visible_window.clone(),
+        controlling_terminal_window: visible_window,
+        kill_handle: attached_kill_handle(counts_as_live, target_id, agent_kill_can_resolve),
+    }
+}
+
+fn attached_process_readback(
+    launcher_process_id: Option<u32>,
+    agent_process_id: Option<u32>,
+    process_tree_ids: &dyn Fn(u32) -> Vec<u32>,
+    live_process_ids: &dyn Fn(&[u32]) -> Vec<u32>,
+) -> AttachedAgentProcessReadback {
+    let launcher_process_id = non_zero_pid(launcher_process_id);
+    let agent_process_id = non_zero_pid(agent_process_id);
+    let mut seed_pids = Vec::new();
+    if let Some(pid) = launcher_process_id {
+        seed_pids.push(pid);
+    }
+    if let Some(pid) = agent_process_id {
+        seed_pids.push(pid);
+    }
+    seed_pids.sort_unstable();
+    seed_pids.dedup();
+    let mut tree = Vec::new();
+    for pid in &seed_pids {
+        tree.extend(process_tree_ids(*pid));
+    }
+    tree.sort_unstable();
+    tree.dedup();
+    let live = live_process_ids(&tree);
+    AttachedAgentProcessReadback {
+        probeable: !seed_pids.is_empty(),
+        launcher_process_id,
+        agent_process_id,
+        parent_process_id: None,
+        process_name: None,
+        command_line: None,
+        cwd: None,
+        process_tree_ids: tree,
+        live_process_ids: live,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AmbientAgentProcessCandidate {
+    cli: &'static str,
+    process_id: u32,
+    parent_process_id: Option<u32>,
+    process_name: String,
+    command_line: String,
+    cwd: Option<String>,
+    controlling_terminal_window: Option<AttachedAgentWindowReadback>,
+}
+
+fn insert_ambient_agent_process_rows(
+    rows: &mut BTreeMap<String, AttachedAgentRegistryRow>,
+    candidates: Vec<AmbientAgentProcessCandidate>,
+) {
+    for candidate in candidates {
+        let mut process_ids = vec![candidate.process_id];
+        if let Some(parent) = candidate.parent_process_id {
+            process_ids.push(parent);
+        }
+        if let Some(window) = candidate.controlling_terminal_window.as_ref() {
+            process_ids.push(window.process_id);
+        }
+        process_ids.sort_unstable();
+        process_ids.dedup();
+        let process = AttachedAgentProcessReadback {
+            probeable: true,
+            launcher_process_id: candidate
+                .controlling_terminal_window
+                .as_ref()
+                .map(|window| window.process_id)
+                .or(candidate.parent_process_id),
+            agent_process_id: Some(candidate.process_id),
+            parent_process_id: candidate.parent_process_id,
+            process_name: Some(candidate.process_name),
+            command_line: Some(candidate.command_line),
+            cwd: candidate.cwd,
+            process_tree_ids: process_ids.clone(),
+            live_process_ids: process_ids,
+        };
+        let visible_window = candidate.controlling_terminal_window;
+        insert_attached_agent_row(
+            rows,
+            AttachedAgentRegistryRow {
+                registry_id: format!(
+                    "agent-spawn-ambient-process-{}-{}",
+                    candidate.cli, candidate.process_id
+                ),
+                kind: "ambient".to_owned(),
+                source: format!("ambient_process_scan:{}", candidate.cli),
+                lifecycle: "live".to_owned(),
+                state: Some("working".to_owned()),
+                reason_code: Some("ambient_process_observed".to_owned()),
+                counts_as_live: true,
+                not_counted_reason: None,
+                session_id: None,
+                spawn_id: None,
+                spawn_dir: process.cwd.clone(),
+                last_seen_unix_ms: None,
+                last_seen_ms_ago: Some(0),
+                process,
+                visible_window: visible_window.clone(),
+                controlling_terminal_window: visible_window,
+                kill_handle: AttachedAgentKillHandleReadback {
+                    available: false,
+                    kind: "process_tree_pending_k2".to_owned(),
+                    target_id: Some(format!("pid:{}", candidate.process_id)),
+                    reason: "ambient live process has no linked Synapse spawn/session; hard process-tree kill lands with #1036".to_owned(),
+                },
+            },
+        );
+    }
+}
+
+fn ambient_agent_process_candidates(
+    windows_by_pid: &BTreeMap<u32, AttachedAgentWindowReadback>,
+    represented_process_ids: &BTreeSet<u32>,
+) -> Vec<AmbientAgentProcessCandidate> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always),
+    );
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let process_id = pid.as_u32();
+            if represented_process_ids.contains(&process_id) {
+                return None;
+            }
+            let process_name = process.name().to_string_lossy().into_owned();
+            let command_line = process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let cli = ambient_agent_cli(&process_name, &command_line)?;
+            let parent_process_id = process.parent().map(|parent| parent.as_u32());
+            if parent_process_id
+                .and_then(|parent| system.process(sysinfo::Pid::from_u32(parent)))
+                .is_some_and(|parent| {
+                    let parent_name = parent.name().to_string_lossy();
+                    let parent_command_line = parent
+                        .cmd()
+                        .iter()
+                        .map(|part| part.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ambient_agent_child_is_covered_by_parent(
+                        cli,
+                        &process_name,
+                        parent_name.as_ref(),
+                        &parent_command_line,
+                    )
+                })
+            {
+                return None;
+            }
+            let controlling_terminal_window =
+                ambient_controlling_window(&system, process_id, windows_by_pid);
+            Some(AmbientAgentProcessCandidate {
+                cli,
+                process_id,
+                parent_process_id,
+                process_name,
+                command_line,
+                cwd: process.cwd().map(|path| path.display().to_string()),
+                controlling_terminal_window,
+            })
+        })
+        .collect()
+}
+
+fn ambient_agent_cli(process_name: &str, command_line: &str) -> Option<&'static str> {
+    let name = ambient_process_name(process_name);
+    if name == "claude" {
+        return Some("claude");
+    }
+    if name == "codex" || name == "codex-cli" {
+        return Some("codex");
+    }
+    if name != "node" {
+        return None;
+    }
+    let cmd = ambient_command_line(command_line);
+    if ambient_command_line_is_claude_entrypoint(&cmd) {
+        return Some("claude");
+    }
+    if ambient_command_line_is_codex_entrypoint(&cmd) {
+        return Some("codex");
+    }
+    None
+}
+
+fn ambient_agent_child_is_covered_by_parent(
+    cli: &str,
+    process_name: &str,
+    parent_process_name: &str,
+    parent_command_line: &str,
+) -> bool {
+    if cli != "codex" || ambient_process_name(process_name) != "codex" {
+        return false;
+    }
+    ambient_agent_cli(parent_process_name, parent_command_line) == Some("codex")
+}
+
+fn ambient_process_name(process_name: &str) -> String {
+    process_name
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+fn ambient_command_line(command_line: &str) -> String {
+    let mut normalized = command_line.replace('\\', "/").to_ascii_lowercase();
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    normalized
+}
+
+fn ambient_command_line_is_claude_entrypoint(cmd: &str) -> bool {
+    cmd.contains("@anthropic-ai/claude-code/bin/claude")
+        || cmd.contains("@anthropic-ai/claude-code/cli.js")
+}
+
+fn ambient_command_line_is_codex_entrypoint(cmd: &str) -> bool {
+    cmd.contains("@openai/codex/bin/codex.js") || cmd.contains("openai-codex/bin/codex.js")
+}
+
+fn ambient_controlling_window(
+    system: &sysinfo::System,
+    process_id: u32,
+    windows_by_pid: &BTreeMap<u32, AttachedAgentWindowReadback>,
+) -> Option<AttachedAgentWindowReadback> {
+    let mut current = Some(process_id);
+    let mut visited = BTreeSet::new();
+    while let Some(pid) = current {
+        if !visited.insert(pid) {
+            break;
+        }
+        if let Some(window) = windows_by_pid.get(&pid) {
+            return Some(window.clone());
+        }
+        current = system
+            .process(sysinfo::Pid::from_u32(pid))
+            .and_then(|process| process.parent())
+            .map(|parent| parent.as_u32());
+    }
+    None
+}
+
+fn attached_visible_window(
+    process: &AttachedAgentProcessReadback,
+    windows_by_pid: &BTreeMap<u32, AttachedAgentWindowReadback>,
+) -> Option<AttachedAgentWindowReadback> {
+    for pid in &process.live_process_ids {
+        if let Some(window) = windows_by_pid.get(pid) {
+            return Some(window.clone());
+        }
+    }
+    None
+}
+
+fn attached_agent_window_index() -> (BTreeMap<u32, AttachedAgentWindowReadback>, Option<String>) {
+    match synapse_a11y::visible_top_level_window_contexts() {
+        Ok(contexts) => (
+            contexts
+                .into_iter()
+                .map(|context| {
+                    (
+                        context.pid,
+                        AttachedAgentWindowReadback {
+                            window_hwnd: context.hwnd,
+                            process_id: context.pid,
+                            process_name: context.process_name,
+                            window_title: context.window_title,
+                        },
+                    )
+                })
+                .collect(),
+            None,
+        ),
+        Err(error) => (BTreeMap::new(), Some(error.to_string())),
+    }
+}
+
+fn attached_count_decision(process: &AttachedAgentProcessReadback) -> (bool, Option<String>) {
+    if !process.probeable {
+        return (false, Some("no_process_handle".to_owned()));
+    }
+    if process.live_process_ids.is_empty() {
+        return (false, Some("os_process_not_live".to_owned()));
+    }
+    (true, None)
+}
+
+fn attached_kill_handle(
+    counts_as_live: bool,
+    target_id: Option<String>,
+    agent_kill_can_resolve: bool,
+) -> AttachedAgentKillHandleReadback {
+    if !counts_as_live {
+        return AttachedAgentKillHandleReadback {
+            available: false,
+            kind: "unavailable".to_owned(),
+            target_id,
+            reason: "no live OS process to kill".to_owned(),
+        };
+    }
+    if agent_kill_can_resolve {
+        return AttachedAgentKillHandleReadback {
+            available: true,
+            kind: "agent_kill".to_owned(),
+            target_id,
+            reason: "agent_kill can resolve this session/spawn id and owns the process tree"
+                .to_owned(),
+        };
+    }
+    AttachedAgentKillHandleReadback {
+        available: false,
+        kind: "process_tree_pending_k2".to_owned(),
+        target_id,
+        reason: "live process tree is known, but no MCP session is linked for agent_kill yet"
+            .to_owned(),
+    }
+}
+
+fn insert_attached_agent_row(
+    rows: &mut BTreeMap<String, AttachedAgentRegistryRow>,
+    row: AttachedAgentRegistryRow,
+) {
+    match rows.get(&row.registry_id) {
+        Some(existing)
+            if existing.counts_as_live
+                || (!row.counts_as_live && existing.kill_handle.available) => {}
+        _ => {
+            rows.insert(row.registry_id.clone(), row);
+        }
+    }
+}
+
+fn agent_state_has_process_handle(row: &AgentStateRead) -> bool {
+    non_zero_pid(row.launcher_process_id).is_some() || non_zero_pid(row.agent_process_id).is_some()
+}
+
+fn agent_state_is_ambient(row: &AgentStateRead) -> bool {
+    row.spawn_id
+        .as_deref()
+        .unwrap_or(row.anchor.as_str())
+        .starts_with("agent-spawn-ambient-")
+}
+
+fn non_zero_pid(pid: Option<u32>) -> Option<u32> {
+    pid.filter(|pid| *pid != 0)
 }
 
 fn build_session_summary(
@@ -605,6 +1271,211 @@ mod tests {
         assert!(filter.reason.contains("not actionable attention"));
     }
 
+    #[test]
+    fn attached_registry_counts_only_os_live_process_rows() {
+        let live_session = spawned_summary(
+            "session-live",
+            "agent-spawn-live",
+            "local-model",
+            100,
+            Some(101),
+        );
+        let dead_session =
+            spawned_summary("session-dead", "agent-spawn-dead", "local-model", 200, None);
+        let ambient = agent_read(
+            "agent-spawn-ambient-claude-test",
+            AgentLifecycleState::Idle,
+            Some("ambient_turn_finished"),
+        );
+        let process_tree_ids = |pid| match pid {
+            100 => vec![100, 101],
+            101 => vec![101],
+            200 => vec![200],
+            other => vec![other],
+        };
+        let live_process_ids = |ids: &[u32]| {
+            ids.iter()
+                .copied()
+                .filter(|pid| matches!(pid, 100 | 101))
+                .collect::<Vec<_>>()
+        };
+        let windows = BTreeMap::from([(
+            100,
+            AttachedAgentWindowReadback {
+                window_hwnd: 0x1234,
+                process_id: 100,
+                process_name: "WindowsTerminal.exe".to_owned(),
+                window_title: "agent terminal".to_owned(),
+            },
+        )]);
+
+        let registry = build_attached_agent_registry_with_process_probe(
+            &[live_session, dead_session],
+            &[ambient],
+            2_000,
+            &process_tree_ids,
+            &live_process_ids,
+            &windows,
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(registry.exact_live_count, 1);
+        assert_eq!(registry.row_count, 3);
+        assert_eq!(registry.killable_live_count, 1);
+        assert_eq!(registry.unprobeable_observed_count, 1);
+        let live = registry
+            .rows
+            .iter()
+            .find(|row| row.registry_id == "agent-spawn-live")
+            .expect("live spawned row");
+        assert!(live.counts_as_live);
+        assert!(live.kill_handle.available);
+        assert_eq!(
+            live.visible_window
+                .as_ref()
+                .map(|window| window.window_hwnd),
+            Some(0x1234)
+        );
+        assert_eq!(
+            live.controlling_terminal_window
+                .as_ref()
+                .map(|window| window.window_hwnd),
+            Some(0x1234)
+        );
+        let dead = registry
+            .rows
+            .iter()
+            .find(|row| row.registry_id == "agent-spawn-dead")
+            .expect("dead spawned row");
+        assert!(!dead.counts_as_live);
+        assert_eq!(
+            dead.not_counted_reason.as_deref(),
+            Some("os_process_not_live")
+        );
+        let ambient = registry
+            .rows
+            .iter()
+            .find(|row| row.registry_id == "agent-spawn-ambient-claude-test")
+            .expect("ambient row");
+        assert!(!ambient.counts_as_live);
+        assert_eq!(
+            ambient.not_counted_reason.as_deref(),
+            Some("no_process_handle")
+        );
+        assert!(!ambient.kill_handle.available);
+    }
+
+    #[test]
+    fn ambient_process_rows_are_live_but_not_agent_killable() {
+        let terminal_window = AttachedAgentWindowReadback {
+            window_hwnd: 0x7777,
+            process_id: 300,
+            process_name: "WindowsTerminal.exe".to_owned(),
+            window_title: "ambient claude".to_owned(),
+        };
+        let mut rows = BTreeMap::new();
+        insert_ambient_agent_process_rows(
+            &mut rows,
+            vec![AmbientAgentProcessCandidate {
+                cli: "claude",
+                process_id: 333,
+                parent_process_id: Some(322),
+                process_name: "node.exe".to_owned(),
+                command_line: "node C:\\Users\\hotra\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.js".to_owned(),
+                cwd: Some("C:\\code\\Synapse".to_owned()),
+                controlling_terminal_window: Some(terminal_window),
+            }],
+        );
+
+        let row = rows
+            .get("agent-spawn-ambient-process-claude-333")
+            .expect("ambient process row");
+        assert_eq!(row.kind, "ambient");
+        assert_eq!(row.source, "ambient_process_scan:claude");
+        assert!(row.counts_as_live);
+        assert_eq!(row.spawn_dir.as_deref(), Some("C:\\code\\Synapse"));
+        assert_eq!(row.process.agent_process_id, Some(333));
+        assert_eq!(row.process.parent_process_id, Some(322));
+        assert_eq!(row.process.process_name.as_deref(), Some("node.exe"));
+        assert_eq!(row.process.live_process_ids, vec![300, 322, 333]);
+        assert_eq!(
+            row.controlling_terminal_window
+                .as_ref()
+                .map(|window| window.window_hwnd),
+            Some(0x7777)
+        );
+        assert!(!row.kill_handle.available);
+        assert_eq!(row.kill_handle.kind, "process_tree_pending_k2");
+        assert_eq!(
+            ambient_agent_cli("node.exe", "node @anthropic-ai/claude-code/bin/claude.js"),
+            Some("claude")
+        );
+        assert_eq!(
+            ambient_agent_cli("powershell.exe", "powershell.exe -NoProfile"),
+            None
+        );
+    }
+
+    #[test]
+    fn ambient_agent_cli_ignores_helper_process_false_positives() {
+        assert_eq!(
+            ambient_agent_cli(
+                "claude.exe",
+                "\"C:\\Users\\hotra\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\" --resume"
+            ),
+            Some("claude")
+        );
+        assert_eq!(
+            ambient_agent_cli(
+                "node.exe",
+                "\"C:\\Program Files\\nodejs\\node.exe\" C:\\Users\\hotra\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js resume --yolo"
+            ),
+            Some("codex")
+        );
+        assert_eq!(
+            ambient_agent_cli(
+                "codex.exe",
+                "C:\\Users\\hotra\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe resume --yolo"
+            ),
+            Some("codex")
+        );
+        assert!(ambient_agent_child_is_covered_by_parent(
+            "codex",
+            "codex.exe",
+            "node.exe",
+            "node C:\\Users\\hotra\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js resume --yolo",
+        ));
+        assert_eq!(
+            ambient_agent_cli(
+                "node.exe",
+                "node C:\\Users\\hotra\\.claude\\tools\\claude-image-gen\\mcp-server\\build\\bundle.js",
+            ),
+            None
+        );
+        assert_eq!(
+            ambient_agent_cli(
+                "cmd.exe",
+                "cmd /c C:\\Users\\hotra\\.claude\\tools\\claude-image-gen\\launch-mcp.cmd",
+            ),
+            None
+        );
+        assert_eq!(
+            ambient_agent_cli(
+                "pwsh.exe",
+                "pwsh -File C:\\Users\\hotra\\.claude\\statusline.ps1",
+            ),
+            None
+        );
+        assert_eq!(
+            ambient_agent_cli(
+                "bash.exe",
+                "bash -c source /c/Users/hotra/.claude/shell-snapshots/snapshot.sh && codex",
+            ),
+            None
+        );
+    }
+
     fn agent_read(
         anchor: &str,
         state: AgentLifecycleState,
@@ -628,6 +1499,77 @@ mod tests {
             launcher_process_id: None,
             agent_process_id: None,
             log_dir: None,
+        }
+    }
+
+    fn spawned_summary(
+        session_id: &str,
+        spawn_id: &str,
+        cli: &str,
+        launcher_process_id: u32,
+        agent_process_id: Option<u32>,
+    ) -> SessionSummary {
+        let registry = SessionRegistryRead {
+            session_id: session_id.to_owned(),
+            transport: "http".to_owned(),
+            client_name: Some(format!("synapse-{cli}-agent")),
+            client_version: Some("test".to_owned()),
+            protocol_version: Some("test".to_owned()),
+            agent_kind: cli.to_owned(),
+            lifecycle: "live".to_owned(),
+            started_at_unix_ms: 1_000,
+            last_seen_unix_ms: 1_900,
+            last_seen_ms_ago: 100,
+            stale_after_ms: 300_000,
+            closed_at_unix_ms: None,
+            last_action: None,
+            last_reason_code: None,
+            spawned_agent: Some(SpawnedAgentRead {
+                spawn_id: spawn_id.to_owned(),
+                cli: cli.to_owned(),
+                launcher_process_id,
+                agent_process_id,
+                started_by_session_id: Some("caller".to_owned()),
+                launched_at_unix_ms: 1_000,
+                launch_target: "background".to_owned(),
+                log_dir: format!("C:\\test\\{spawn_id}"),
+                template_id: None,
+                template_version: None,
+                control: None,
+            }),
+        };
+        SessionSummary {
+            registry,
+            active_target: None,
+            target_claims: Vec::new(),
+            lease: SessionLeaseReadback {
+                held: false,
+                owner_session_id: None,
+                is_owner: false,
+                acquired_at_ms_ago: None,
+                renewed_at_ms_ago: None,
+                ttl_ms: None,
+                expires_in_ms: None,
+            },
+            agent_state: Some(AgentStateRead {
+                anchor: spawn_id.to_owned(),
+                spawn_id: Some(spawn_id.to_owned()),
+                session_id: Some(session_id.to_owned()),
+                agent_kind: Some(cli.to_owned()),
+                state: AgentLifecycleState::Working,
+                reason_code: Some("spawn_ready".to_owned()),
+                since_unix_ms: 1_000,
+                last_event_unix_ms: 1_900,
+                last_event_kind: AgentEventKind::SpawnReady,
+                silent_ms: 100,
+                waiting_for: None,
+                runaway: false,
+                consecutive_identical_tool_calls: 0,
+                last_tool_name: None,
+                launcher_process_id: Some(launcher_process_id),
+                agent_process_id,
+                log_dir: Some(format!("C:\\test\\{spawn_id}")),
+            }),
         }
     }
 }

@@ -1892,9 +1892,7 @@ impl SynapseService {
                     // "not started", check whether the daemon can OBSERVE the agent
                     // already executing — a capable agent often does the work but
                     // skips the bookkeeping helper. Observed liveness is real proof.
-                    if let Some(evidence) =
-                        agent_spawn_observed_task_progress(files, agent_kind)
-                    {
+                    if let Some(evidence) = agent_spawn_observed_task_progress(files, agent_kind) {
                         return Ok(AgentSpawnTaskStartRead {
                             started_at_unix_ms: unix_time_ms_now(),
                             readiness_source: evidence,
@@ -4178,6 +4176,18 @@ function Write-SpawnCompletionStatus([string]$Status, [int]$ExitCode, [string]$E
     $statusObject | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $spawnCompletionStatusPath -Encoding UTF8\n\
 }}\n\
 \n\
+function Invoke-SpawnHoldOpen {{\n\
+    if ($requestedHoldOpenMs -le 0) {{ return }}\n\
+    while ($true) {{\n\
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n\
+        $elapsed = [int64]($now - $spawnStartedAtUnixMs)\n\
+        $remaining = [int64]($requestedHoldOpenMs - $elapsed)\n\
+        if ($remaining -le 0) {{ return }}\n\
+        $sleepMs = [int][Math]::Min($remaining, 60000)\n\
+        Start-Sleep -Milliseconds $sleepMs\n\
+    }}\n\
+}}\n\
+\n\
 try {{\n\
     Write-SpawnCompletionStatus -Status 'running' -ExitCode -1 -ErrorMessage $null -FallbackFinalMessageWritten:$false\n\
     Set-Location -LiteralPath {working_dir}\n\
@@ -4218,6 +4228,7 @@ try {{\n\
         Write-SpawnFallbackFinalMessage -Status $finalStatus -ExitCode $spawnExitCode -ErrorMessage $spawnErrorMessage\n\
         $fallbackWritten = $true\n\
     }}\n\
+    Invoke-SpawnHoldOpen\n\
     Write-SpawnCompletionStatus -Status $finalStatus -ExitCode $spawnExitCode -ErrorMessage $spawnErrorMessage -FallbackFinalMessageWritten:$fallbackWritten\n\
 }}\n\
 exit $spawnExitCode\n",
@@ -5432,6 +5443,13 @@ mod tests {
         assert!(script.contains("wrapper_process_id = $spawnWrapperProcessId"));
         assert!(script.contains("$spawnTaskStartedPath"));
         assert!(script.contains("task_started_present"));
+        assert!(script.contains("function Invoke-SpawnHoldOpen"));
+        assert!(script.contains("Start-Sleep -Milliseconds $sleepMs"));
+        assert!(
+            script.find("Invoke-SpawnHoldOpen")
+                < script.find("Write-SpawnCompletionStatus -Status $finalStatus"),
+            "wrapper must enforce hold_open before writing terminal status: {script}"
+        );
         assert!(script.contains("Get-Content -Raw -LiteralPath $spawnPromptPath -Encoding UTF8"));
         assert!(
             script.contains("codex-app-server-runner.ps1"),

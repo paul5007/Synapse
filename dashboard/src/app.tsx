@@ -60,6 +60,7 @@ import {
 import {
   buildAgents,
   buildToolCalls,
+  attachedAgentRegistry,
   claimDashboardAssetReload,
   dashboardAssetReloadDecision,
   dashboardAssetReloadUrl,
@@ -2797,14 +2798,16 @@ function OverviewBand({
 }) {
   const health = asRecord(panelData(state?.daemon));
   const storage = asRecord(panelData(state?.storage));
+  const registry = attachedAgentRegistry(state);
   const storagePressure = rawText(asRecord(storage.pressure_level).name || asRecord(storage.pressure_level).value || "unknown");
-  const liveAgents = agents.filter((agent) => agent.lifecycle === "live").length;
+  const liveAgents = Number(registry?.exact_live_count ?? agents.filter((agent) => agent.lifecycle === "live").length);
+  const totalRows = Number(registry?.row_count ?? agents.length);
   const toolCount = Number(health.tool_count || 0);
   return (
     <Section title="Overview" tier="overview" questions={["Is anything wrong?", "How many agents are live?", "Is the daemon stale?"]}>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Attention" value={attentionCount} status={attentionCount ? "needs_input" : "done"} delta={attentionCount ? "human review queued" : "quiet"} />
-        <StatCard label="Live Agents" value={liveAgents} status={liveAgents ? "working" : "idle"} delta={`${agents.length} total rows`} />
+        <StatCard label="Live Agents" value={liveAgents} status={liveAgents ? "working" : "idle"} delta={`${totalRows} registry rows`} />
         <StatCard label="Tools" value={toolCount} status={toolCount ? "done" : "stuck"} delta="strict client surface" />
         <StatCard label="Freshness" value={stale ? "stale" : "live"} status={stale ? "stuck" : "working"} delta={storagePressure} />
       </div>

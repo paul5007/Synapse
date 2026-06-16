@@ -75,6 +75,63 @@ export interface AgentSummary {
   raw: unknown;
 }
 
+export interface AttachedAgentRegistry {
+  source_of_truth?: string;
+  count_basis?: string;
+  generated_at_unix_ms?: number;
+  exact_live_count?: number;
+  row_count?: number;
+  killable_live_count?: number;
+  unprobeable_observed_count?: number;
+  rows?: AttachedAgentRegistryRow[];
+  window_lookup_error?: string;
+}
+
+export interface AttachedAgentRegistryRow {
+  registry_id?: string;
+  kind?: string;
+  source?: string;
+  lifecycle?: string;
+  state?: string;
+  reason_code?: string;
+  counts_as_live?: boolean;
+  not_counted_reason?: string;
+  session_id?: string;
+  spawn_id?: string;
+  spawn_dir?: string;
+  last_seen_unix_ms?: number;
+  last_seen_ms_ago?: number;
+  process?: {
+    probeable?: boolean;
+    launcher_process_id?: number;
+    agent_process_id?: number;
+    parent_process_id?: number;
+    process_name?: string;
+    command_line?: string;
+    cwd?: string;
+    process_tree_ids?: number[];
+    live_process_ids?: number[];
+  };
+  visible_window?: {
+    window_hwnd?: number;
+    process_id?: number;
+    process_name?: string;
+    window_title?: string;
+  };
+  controlling_terminal_window?: {
+    window_hwnd?: number;
+    process_id?: number;
+    process_name?: string;
+    window_title?: string;
+  };
+  kill_handle?: {
+    available?: boolean;
+    kind?: string;
+    target_id?: string;
+    reason?: string;
+  };
+}
+
 export type FleetStatus =
   | "working"
   | "idle"
@@ -743,6 +800,8 @@ export function panelData<T = Record<string, unknown>>(panel?: DashboardPanel): 
 export function buildAgents(state?: DashboardState): AgentSummary[] {
   if (!state) return [];
   const sessionData = asRecord(state.sessions.data);
+  const attachedRegistry = attachedAgentRegistry(state);
+  const attachedRows = asArray<Record<string, unknown>>(attachedRegistry?.rows);
   const sessionRows = asArray<Record<string, unknown>>(sessionData.sessions);
   const unbound = asArray<Record<string, unknown>>(sessionData.unbound_agent_states);
   const transcripts = asArray<Record<string, unknown>>(asRecord(state.agent_transcripts.data).rows);
@@ -761,6 +820,47 @@ export function buildAgents(state?: DashboardState): AgentSummary[] {
     for (const id of [target, actor]) {
       if (id) actionCounts.set(id, (actionCounts.get(id) ?? 0) + 1);
     }
+  }
+
+  if (attachedRegistry) {
+    return attachedRows
+      .map((row) => {
+        const process = asRecord(row.process);
+        const killHandle = asRecord(row.kill_handle);
+        const visibleWindow = asRecord(row.controlling_terminal_window || row.visible_window);
+        const id = rawText(row.registry_id || row.spawn_id || row.session_id);
+        const spawnId = rawText(row.spawn_id);
+        const sessionId = rawText(row.session_id);
+        const stateName = rawText(row.state || row.lifecycle);
+        const reason = rawText(row.reason_code || row.not_counted_reason);
+        const lastSeenMs = Number(row.last_seen_ms_ago);
+        const liveProcessIds = asArray(process.live_process_ids).map(rawText).filter(Boolean);
+        const processSummary = liveProcessIds.length ? `pids ${liveProcessIds.join(", ")}` : rawText(row.not_counted_reason || "no live pid");
+        const windowTitle = rawText(visibleWindow.window_title);
+        const source = rawText(row.source);
+        const countsAsLive = Boolean(row.counts_as_live);
+        return {
+          id,
+          spawnId: spawnId || undefined,
+          killId: rawText(killHandle.target_id) || spawnId || sessionId || id,
+          killable: Boolean(killHandle.available),
+          kind: rawText(row.kind || "agent"),
+          lifecycle: countsAsLive ? "live" : rawText(row.lifecycle || "observed"),
+          status: statusFromAgentState(stateName, reason),
+          summary: [processSummary, windowTitle, source].filter(Boolean).join(" / "),
+          lastSeenMs: Number.isFinite(lastSeenMs) ? lastSeenMs : undefined,
+          lastAction: source,
+          target: windowTitle,
+          reason,
+          diffStats: {
+            events: 1,
+            transcripts: transcriptCounts.get(spawnId || id) ?? 0,
+            actions: actionCounts.get(sessionId || id) ?? 0
+          },
+          raw: row
+        } satisfies AgentSummary;
+      })
+      .filter((agent) => agent.id);
   }
 
   const live = sessionRows.map((row) => {
@@ -848,6 +948,13 @@ export function buildAgents(state?: DashboardState): AgentSummary[] {
   });
 
   return [...live, ...historical].filter((agent) => agent.id);
+}
+
+export function attachedAgentRegistry(state?: DashboardState): AttachedAgentRegistry | null {
+  if (!state) return null;
+  const registry = asRecord(asRecord(state.sessions.data).attached_agent_registry);
+  if (!registry || Object.keys(registry).length === 0) return null;
+  return registry as unknown as AttachedAgentRegistry;
 }
 
 export function buildToolCalls(state?: DashboardState): ToolCallSummary[] {
