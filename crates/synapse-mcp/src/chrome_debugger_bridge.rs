@@ -39,9 +39,9 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-17-csp-evaluate-debugger-v3";
+    "synapse-chrome-bridge-2026-06-17-hwnd-bounds-open-tab-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "de1c08fc48f48763f93b4f64296556b8401e575ec0e39356a3e69a51c8d1b12c";
+    "922a68569c4bdf9f75c822b4af02b385af522a3c97f4e4339c6814877f94a179";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "activateTab",
     "closeTab",
@@ -2302,6 +2302,7 @@ pub(crate) async fn open_tab(
     hwnd: i64,
     url: &str,
     agent_session_id: Option<&str>,
+    expected_window_bounds: Option<Rect>,
 ) -> Result<ChromeDebuggerOpenTabResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_popup_safe(hwnd, "openTab")?;
     let result = bridge()
@@ -2311,6 +2312,12 @@ pub(crate) async fn open_tab(
                 "hwnd": hwnd,
                 "url": url,
                 "agentSessionId": agent_session_id,
+                "expectedWindowBounds": expected_window_bounds.map(|bounds| json!({
+                    "x": bounds.x,
+                    "y": bounds.y,
+                    "w": bounds.w,
+                    "h": bounds.h,
+                })),
             }),
         )
         .await?;

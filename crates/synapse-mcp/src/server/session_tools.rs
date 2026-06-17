@@ -94,6 +94,7 @@ pub struct SessionListResponse {
     pub now_unix_ms: u64,
     pub stale_after_ms: u64,
     pub human_os_foreground: HumanOsForegroundReadback,
+    pub foreground_lane_capacity: ForegroundLaneCapacityReadback,
     pub registry_entry_count: usize,
     pub target_session_count: usize,
     pub returned_count: usize,
@@ -246,6 +247,8 @@ pub struct ForegroundLaneReadback {
     pub source_of_truth: String,
     pub session_id: String,
     pub status: String,
+    pub capacity_model: String,
+    pub capacity_exhausted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +263,25 @@ pub struct ForegroundLaneReadback {
     pub no_human_os_foreground_fallback: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForegroundLaneCapacityReadback {
+    pub source_of_truth: &'static str,
+    pub capacity_model: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_lane_pool_limit: Option<usize>,
+    pub active_agent_logical_foreground_count: usize,
+    pub active_foreground_lane_count: usize,
+    pub claimed_target_lane_count: usize,
+    pub explicit_real_foreground_lease_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_daemon_lane_slots: Option<usize>,
+    pub capacity_exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_reason: Option<String>,
+    pub target_backed_lane_kinds: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -292,7 +314,7 @@ pub struct SessionEndResponse {
 #[tool_router(router = session_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "List all known MCP sessions as a non-blocking cross-session read model: session id, client kind, liveness, heartbeat, agent_logical_foreground, foreground_lane, human_os_foreground, target claims, input-lease ownership, and last JSON-RPC tool action. Stale sessions are reported rather than hidden; agent logical foreground never falls back to the human OS foreground."
+        description = "List all known MCP sessions as a non-blocking cross-session read model: session id, client kind, liveness, heartbeat, agent_logical_foreground, foreground_lane, foreground_lane_capacity, human_os_foreground, target claims, input-lease ownership, and last JSON-RPC tool action. Stale sessions are reported rather than hidden; agent logical foreground never falls back to the human OS foreground."
     )]
     pub async fn session_list(
         &self,
@@ -481,6 +503,8 @@ impl SynapseService {
         }
         sessions.sort_by(|a, b| a.registry.session_id.cmp(&b.registry.session_id));
         let returned_count = sessions.len();
+        let foreground_lane_capacity =
+            build_foreground_lane_capacity(&sessions, &all_target_claims, &lease_status);
         let raw_unbound_agent_states = super::agent_state::unbound_reads(now_unix_ms);
         let (unbound_agent_states, terminal_unbound_agent_states, unbound_agent_filter) =
             split_unbound_agent_states(raw_unbound_agent_states);
@@ -490,6 +514,7 @@ impl SynapseService {
             now_unix_ms,
             stale_after_ms,
             human_os_foreground: self.human_os_foreground_readback(),
+            foreground_lane_capacity,
             registry_entry_count,
             target_session_count: targets.len(),
             returned_count,
@@ -1319,6 +1344,8 @@ fn build_foreground_lane(
             source_of_truth: "daemon session target registry + CF_SESSIONS session-target row + daemon target-claim registry + synapse_action input lease".to_owned(),
             session_id: session_id.to_owned(),
             status: status.to_owned(),
+            capacity_model: "target_owned_lane_not_daemon_pool_limited".to_owned(),
+            capacity_exhausted: false,
             lane_kind: Some(match target {
                 SessionTarget::Window { .. } => "owned_window_target".to_owned(),
                 SessionTarget::Cdp { .. } => "owned_chrome_tab_target".to_owned(),
@@ -1340,6 +1367,8 @@ fn build_foreground_lane(
                     .to_owned(),
             session_id: session_id.to_owned(),
             status: "explicit_real_foreground_lease".to_owned(),
+            capacity_model: "serialized_real_os_foreground_singleton".to_owned(),
+            capacity_exhausted: false,
             lane_kind: Some("real_os_foreground_lease".to_owned()),
             target_key: None,
             target: None,
@@ -1357,6 +1386,8 @@ fn build_foreground_lane(
                 .to_owned(),
         session_id: session_id.to_owned(),
         status: "missing".to_owned(),
+        capacity_model: "no_lane_acquired".to_owned(),
+        capacity_exhausted: false,
         lane_kind: None,
         target_key: None,
         target: None,
@@ -1367,6 +1398,36 @@ fn build_foreground_lane(
         missing_reason: Some(
             "no agent logical foreground target and no explicit real foreground lease".to_owned(),
         ),
+    }
+}
+
+fn build_foreground_lane_capacity(
+    sessions: &[SessionSummary],
+    all_target_claims: &[TargetClaimRead],
+    lease_status: &synapse_action::LeaseStatus,
+) -> ForegroundLaneCapacityReadback {
+    let active_agent_logical_foreground_count = sessions
+        .iter()
+        .filter(|session| session.agent_logical_foreground.status == "set")
+        .count();
+    let active_foreground_lane_count = sessions
+        .iter()
+        .filter(|session| session.foreground_lane.status != "missing")
+        .count();
+    let explicit_real_foreground_lease_count = usize::from(lease_status.held);
+
+    ForegroundLaneCapacityReadback {
+        source_of_truth: "session_list read model over CF_SESSIONS session-target rows, daemon session target registry, daemon target-claim registry, and synapse_action input lease",
+        capacity_model: "target_owned_lanes_not_daemon_pool_limited; real_os_foreground_lease_is_singleton_break_glass",
+        daemon_lane_pool_limit: None,
+        active_agent_logical_foreground_count,
+        active_foreground_lane_count,
+        claimed_target_lane_count: all_target_claims.len(),
+        explicit_real_foreground_lease_count,
+        remaining_daemon_lane_slots: None,
+        capacity_exhausted: false,
+        exhausted_reason: None,
+        target_backed_lane_kinds: vec!["owned_window_target", "owned_chrome_tab_target"],
     }
 }
 
@@ -1481,6 +1542,11 @@ mod tests {
             summary.foreground_lane.status,
             "explicit_real_foreground_lease"
         );
+        assert_eq!(
+            summary.foreground_lane.capacity_model,
+            "serialized_real_os_foreground_singleton"
+        );
+        assert!(!summary.foreground_lane.capacity_exhausted);
         assert!(summary.foreground_lane.explicit_real_foreground_lease);
         assert!(summary.foreground_lane.no_human_os_foreground_fallback);
     }
@@ -1530,6 +1596,11 @@ mod tests {
                 .no_human_os_foreground_fallback
         );
         assert_eq!(summary.foreground_lane.status, "claimed_by_session");
+        assert_eq!(
+            summary.foreground_lane.capacity_model,
+            "target_owned_lane_not_daemon_pool_limited"
+        );
+        assert!(!summary.foreground_lane.capacity_exhausted);
         assert_eq!(
             summary.foreground_lane.lane_kind.as_deref(),
             Some("owned_window_target")
@@ -1582,12 +1653,68 @@ mod tests {
 
         assert_eq!(summary.foreground_lane.status, "conflicting_owner");
         assert_eq!(
+            summary.foreground_lane.capacity_model,
+            "target_owned_lane_not_daemon_pool_limited"
+        );
+        assert!(!summary.foreground_lane.capacity_exhausted);
+        assert_eq!(
             summary.foreground_lane.lane_kind.as_deref(),
             Some("owned_chrome_tab_target")
         );
         assert_eq!(
             summary.foreground_lane.owner_session_id.as_deref(),
             Some(other_session_id)
+        );
+    }
+
+    #[test]
+    fn foreground_lane_capacity_reports_target_backed_unbounded_model() {
+        let session_id = "session-a";
+        let target = SessionTarget::Window { hwnd: 0x1234 };
+        let claim = TargetClaimRead {
+            target_key: "window:0x1234".to_owned(),
+            target: TargetWire::Window {
+                window_hwnd: 0x1234,
+            },
+            owner_session_id: session_id.to_owned(),
+            claimed_at_unix_ms: 1_000,
+            renewed_at_unix_ms: 1_000,
+            ttl_ms: 120_000,
+            expires_at_unix_ms: 121_000,
+            expires_in_ms: 120_000,
+            generation: 1,
+            source_of_truth: "test target claim registry".to_owned(),
+        };
+        let lease_status = synapse_action::LeaseStatus::unheld();
+        let summary = build_session_summary(
+            session_id,
+            None,
+            Some(target),
+            vec![claim.clone()],
+            std::slice::from_ref(&claim),
+            &lease_status,
+            1_000,
+            500,
+        )
+        .unwrap();
+
+        let capacity =
+            build_foreground_lane_capacity(&[summary], std::slice::from_ref(&claim), &lease_status);
+
+        assert_eq!(
+            capacity.capacity_model,
+            "target_owned_lanes_not_daemon_pool_limited; real_os_foreground_lease_is_singleton_break_glass"
+        );
+        assert_eq!(capacity.daemon_lane_pool_limit, None);
+        assert_eq!(capacity.remaining_daemon_lane_slots, None);
+        assert!(!capacity.capacity_exhausted);
+        assert_eq!(capacity.active_agent_logical_foreground_count, 1);
+        assert_eq!(capacity.active_foreground_lane_count, 1);
+        assert_eq!(capacity.claimed_target_lane_count, 1);
+        assert_eq!(capacity.explicit_real_foreground_lease_count, 0);
+        assert_eq!(
+            capacity.target_backed_lane_kinds,
+            vec!["owned_window_target", "owned_chrome_tab_target"]
         );
     }
 

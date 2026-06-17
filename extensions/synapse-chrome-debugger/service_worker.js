@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-csp-evaluate-debugger-v3";
-const BRIDGE_BUILD_SHA256 = "de1c08fc48f48763f93b4f64296556b8401e575ec0e39356a3e69a51c8d1b12c";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-hwnd-bounds-open-tab-v1";
+const BRIDGE_BUILD_SHA256 = "922a68569c4bdf9f75c822b4af02b385af522a3c97f4e4339c6814877f94a179";
 const COMMAND_CAPABILITIES = Object.freeze([
   "openTab",
   "closeTab",
@@ -42,6 +42,7 @@ const DISCONNECTED_KEEPALIVE_MS = 20000;
 const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
 const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
+const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
 
 let hostId = null;
 let bridgeToken = null;
@@ -1137,8 +1138,36 @@ async function selectOpenWindowForHwndHint(params) {
       id: windowInfo.id,
       focused: Boolean(windowInfo.focused),
       state: String(windowInfo.state || ""),
-      type: String(windowInfo.type || "")
+      type: String(windowInfo.type || ""),
+      bounds: chromeWindowBounds(windowInfo)
     }));
+  const expectedBounds = normalizeExpectedWindowBounds(params.expectedWindowBounds);
+  if (expectedBounds) {
+    const boundsMatches = candidates
+      .map((windowInfo) => ({
+        windowInfo,
+        score: windowBoundsDeltaScore(windowInfo.bounds, expectedBounds)
+      }))
+      .filter((candidate) => Number.isFinite(candidate.score) && candidate.score <= OPEN_WINDOW_BOUNDS_TOLERANCE_PX)
+      .sort((left, right) => left.score - right.score);
+    if (boundsMatches.length === 1 || (boundsMatches.length > 1 && boundsMatches[0].score < boundsMatches[1].score)) {
+      const selected = boundsMatches[0].windowInfo;
+      return {
+        windowId: selected.id,
+        focused: selected.focused,
+        state: selected.state,
+        selectionReason: "passive_window_bounds_match_for_hwnd_hint",
+        candidateCount: candidates.length,
+        nonFocusedCount: candidates.filter((windowInfo) => !windowInfo.focused).length
+      };
+    }
+    if (boundsMatches.length > 1) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `openTab refused hwnd hint ${String(params.hwnd)}: expected_window_bounds matched ${boundsMatches.length} Chrome windows within ${OPEN_WINDOW_BOUNDS_TOLERANCE_PX}px`
+      );
+    }
+  }
   const nonFocused = candidates.filter((windowInfo) => !windowInfo.focused);
   if (nonFocused.length === 1) {
     return {
@@ -1163,6 +1192,43 @@ async function selectOpenWindowForHwndHint(params) {
   throw bridgeError(
     ERROR_AXTREE_FAILED,
     `openTab refused hwnd hint ${String(params.hwnd)}: candidate_count=${candidates.length} non_focused_count=${nonFocused.length}; OS HWND cannot be mapped inside the normal extension bridge`
+  );
+}
+
+function normalizeExpectedWindowBounds(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const x = Number(raw.x);
+  const y = Number(raw.y);
+  const w = Number(raw.w);
+  const h = Number(raw.h);
+  if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) {
+    return null;
+  }
+  return { x, y, w, h };
+}
+
+function chromeWindowBounds(windowInfo) {
+  const left = Number(windowInfo.left);
+  const top = Number(windowInfo.top);
+  const width = Number(windowInfo.width);
+  const height = Number(windowInfo.height);
+  if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+    return null;
+  }
+  return { x: left, y: top, w: width, h: height };
+}
+
+function windowBoundsDeltaScore(actual, expected) {
+  if (!actual || !expected) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.max(
+    Math.abs(actual.x - expected.x),
+    Math.abs(actual.y - expected.y),
+    Math.abs(actual.w - expected.w),
+    Math.abs(actual.h - expected.h)
   );
 }
 

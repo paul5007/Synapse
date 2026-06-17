@@ -1375,7 +1375,9 @@ impl SynapseService {
         let session_id = require_target_session_id(&request_context)?;
         validate_cdp_tab_url(&params.0.url)?;
         let window_hwnd = self.resolve_cdp_context_window(&session_id, params.0.window_hwnd)?;
-        let (window_title, process_name) = validate_target_window(window_hwnd)?;
+        let window_context = validate_target_window_context(window_hwnd)?;
+        let window_title = window_context.window_title.clone();
+        let process_name = window_context.process_name.clone();
         let endpoint = cdp_endpoint_for_action_log(window_hwnd);
         let request_details = json!({
             "session_id": &session_id,
@@ -1384,12 +1386,14 @@ impl SynapseService {
             "requested_url": &params.0.url,
             "background": true,
             "required_foreground": false,
+            "expected_window_bounds": &window_context.window_bounds,
         });
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .cdp_open_tab_impl(
                 &session_id,
                 window_hwnd,
+                window_context.window_bounds,
                 &params.0.url,
                 &window_title,
                 &process_name,
@@ -2880,6 +2884,7 @@ impl SynapseService {
         &self,
         session_id: &str,
         window_hwnd: i64,
+        window_bounds: Rect,
         requested_url: &str,
         window_title: &str,
         process_name: &str,
@@ -2897,18 +2902,22 @@ impl SynapseService {
                 .await;
         }
 
-        let opened =
-            crate::chrome_debugger_bridge::open_tab(window_hwnd, requested_url, Some(session_id))
-                .await
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "cdp_open_tab Chrome debugger chrome.tabs.create/readback failed: {}",
-                            error.detail()
-                        ),
-                    )
-                })?;
+        let opened = crate::chrome_debugger_bridge::open_tab(
+            window_hwnd,
+            requested_url,
+            Some(session_id),
+            Some(window_bounds),
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "cdp_open_tab Chrome debugger chrome.tabs.create/readback failed: {}",
+                    error.detail()
+                ),
+            )
+        })?;
         let endpoint = opened
             .extension_id
             .as_deref()
@@ -4861,21 +4870,25 @@ fn unix_ms_now() -> u64 {
 /// (title, process_name) so the response confirms exactly which window was bound.
 /// Fail-loud: a dead/invalid/unresolvable HWND is `TARGET_WINDOW_NOT_FOUND`.
 pub(crate) fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
+    let context = validate_target_window_context(hwnd)?;
+    Ok((context.window_title, context.process_name))
+}
+
+fn validate_target_window_context(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
     synapse_capture::validate_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
             format!("set_target window_hwnd {hwnd:#x} is not a live window: {error}"),
         )
     })?;
-    let context = synapse_a11y::foreground_context(hwnd).map_err(|error| {
+    synapse_a11y::foreground_context(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
             format!(
                 "set_target window_hwnd {hwnd:#x} could not be resolved for perception: {error}"
             ),
         )
-    })?;
-    Ok((context.window_title, context.process_name))
+    })
 }
 
 fn hidden_worker_target_miss(error: &ErrorData) -> bool {
