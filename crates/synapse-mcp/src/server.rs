@@ -529,6 +529,16 @@ impl SynapseService {
         self.restore_session_target_if_needed(session_id)
     }
 
+    /// Resolves the foreground-equivalent target owned by one MCP session.
+    /// This never falls back to the human OS foreground window; callers that
+    /// need the real OS foreground must ask for it explicitly.
+    pub(crate) fn agent_logical_foreground(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionTarget>, ErrorData> {
+        self.session_target(Some(session_id))
+    }
+
     /// Resolves the effective target for an ACTION call (#984): an explicit
     /// per-call `window_hwnd` / `cdp_target_id` override wins over the session's
     /// bound target, mirroring how `observe` / `capture_screenshot` accept an

@@ -327,6 +327,7 @@ impl SynapseService {
         let profile_schema_version = audit_context.profile_schema_version;
         let foreground_tier =
             self.action_audit_foreground_tier(tool, status, session_id.as_deref(), details);
+        let human_os_foreground = self.action_audit_foreground();
         let value = json!({
             "schema_version": 1,
             "audit_id": format!("{ts_ns:020}-{seq:010}"),
@@ -340,7 +341,10 @@ impl SynapseService {
             "tool": tool,
             "status": status,
             "error_code": error_code,
-            "foreground": self.action_audit_foreground(),
+            "foreground": human_os_foreground.clone(),
+            "human_os_foreground": human_os_foreground,
+            "agent_logical_foreground": self.action_audit_agent_logical_foreground(session_id.as_deref()),
+            "foreground_lane": self.action_audit_foreground_lane(session_id.as_deref()),
             "foreground_tier": foreground_tier,
             "active_profile_id": active_profile.profile_id,
             "active_profile_schema_version": active_profile.schema_version,
@@ -391,6 +395,129 @@ impl SynapseService {
                 })
             }
             Err(error) => json!({
+                "read_error_code": error_data_code(&error),
+                "read_error_message": error.message.to_string(),
+            }),
+        }
+    }
+
+    fn action_audit_agent_logical_foreground(&self, session_id: Option<&str>) -> Value {
+        let Some(session_id) = session_id else {
+            return json!({
+                "source_of_truth": "MCP session id + CF_SESSIONS session-target row + daemon session target registry",
+                "status": "missing_session",
+                "no_human_os_foreground_fallback": true,
+                "missing_reason": "action audit row has no MCP session id",
+            });
+        };
+        let persisted_row_key = format!("mcp/session-target/v1/{session_id}");
+        match self.agent_logical_foreground(session_id) {
+            Ok(Some(target)) => json!({
+                "source_of_truth": format!("CF_SESSIONS row {persisted_row_key} + daemon session target registry; never human OS foreground fallback"),
+                "session_id": session_id,
+                "status": "set",
+                "target": super::target_claims::target_wire(&target),
+                "persisted_row_key": persisted_row_key,
+                "no_human_os_foreground_fallback": true,
+            }),
+            Ok(None) => json!({
+                "source_of_truth": format!("CF_SESSIONS row {persisted_row_key} + daemon session target registry; never human OS foreground fallback"),
+                "session_id": session_id,
+                "status": "missing",
+                "persisted_row_key": persisted_row_key,
+                "no_human_os_foreground_fallback": true,
+                "missing_reason": "no session-owned logical foreground target is set",
+            }),
+            Err(error) => json!({
+                "source_of_truth": format!("CF_SESSIONS row {persisted_row_key} + daemon session target registry; never human OS foreground fallback"),
+                "session_id": session_id,
+                "status": "read_error",
+                "persisted_row_key": persisted_row_key,
+                "no_human_os_foreground_fallback": true,
+                "read_error_code": error_data_code(&error),
+                "read_error_message": error.message.to_string(),
+            }),
+        }
+    }
+
+    fn action_audit_foreground_lane(&self, session_id: Option<&str>) -> Value {
+        let Some(session_id) = session_id else {
+            return json!({
+                "source_of_truth": "MCP session id + CF_SESSIONS session-target row + daemon target-claim registry + synapse_action input lease",
+                "status": "missing_session",
+                "explicit_real_foreground_lease": false,
+                "no_human_os_foreground_fallback": true,
+                "missing_reason": "action audit row has no MCP session id",
+            });
+        };
+        match self.agent_logical_foreground(session_id) {
+            Ok(Some(target)) => {
+                let target_key = super::target_claims::target_key(&target);
+                let target_wire = super::target_claims::target_wire(&target);
+                let target_claim = self
+                    .target_claim_status_snapshot()
+                    .ok()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .claims
+                            .into_iter()
+                            .find(|claim| claim.target_key == target_key)
+                    });
+                let owner_session_id = target_claim
+                    .as_ref()
+                    .map(|claim| claim.owner_session_id.clone())
+                    .unwrap_or_else(|| session_id.to_owned());
+                let status = match target_claim.as_ref() {
+                    Some(claim) if claim.owner_session_id != session_id => "conflicting_owner",
+                    Some(_) => "claimed_by_session",
+                    None => "unclaimed_session_target",
+                };
+                let lane_kind = match target {
+                    super::SessionTarget::Window { .. } => "owned_window_target",
+                    super::SessionTarget::Cdp { .. } => "owned_chrome_tab_target",
+                };
+                json!({
+                    "source_of_truth": "daemon session target registry + CF_SESSIONS session-target row + daemon target-claim registry + synapse_action input lease",
+                    "session_id": session_id,
+                    "status": status,
+                    "lane_kind": lane_kind,
+                    "target_key": target_key,
+                    "target": target_wire,
+                    "target_claim": target_claim,
+                    "owner_session_id": owner_session_id,
+                    "explicit_real_foreground_lease": false,
+                    "no_human_os_foreground_fallback": true,
+                })
+            }
+            Ok(None) => {
+                let lease = synapse_action::lease::status();
+                if lease.owner_session_id.as_deref() == Some(session_id) {
+                    json!({
+                        "source_of_truth": "synapse_action input lease; explicit real OS foreground lease only, no implicit fallback",
+                        "session_id": session_id,
+                        "status": "explicit_real_foreground_lease",
+                        "lane_kind": "real_os_foreground_lease",
+                        "owner_session_id": session_id,
+                        "explicit_real_foreground_lease": true,
+                        "no_human_os_foreground_fallback": true,
+                    })
+                } else {
+                    json!({
+                        "source_of_truth": "CF_SESSIONS session-target row + daemon session target registry + synapse_action input lease",
+                        "session_id": session_id,
+                        "status": "missing",
+                        "explicit_real_foreground_lease": false,
+                        "no_human_os_foreground_fallback": true,
+                        "missing_reason": "no agent logical foreground target and no explicit real foreground lease",
+                    })
+                }
+            }
+            Err(error) => json!({
+                "source_of_truth": "CF_SESSIONS session-target row + daemon session target registry + synapse_action input lease",
+                "session_id": session_id,
+                "status": "read_error",
+                "explicit_real_foreground_lease": false,
+                "no_human_os_foreground_fallback": true,
                 "read_error_code": error_data_code(&error),
                 "read_error_message": error.message.to_string(),
             }),
@@ -708,5 +835,32 @@ mod tests {
             &json!({ "required_foreground": true }),
         );
         assert_eq!(denied["foreground_policy_violation"], false);
+    }
+
+    #[test]
+    fn audit_rows_separate_human_and_agent_foreground_concepts() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let session_id = "issue1216-session";
+
+        let agent = service.action_audit_agent_logical_foreground(Some(session_id));
+        assert_eq!(agent["status"], "missing");
+        assert_eq!(agent["no_human_os_foreground_fallback"], true);
+        assert_eq!(
+            agent["persisted_row_key"],
+            format!("mcp/session-target/v1/{session_id}")
+        );
+
+        let lane = service.action_audit_foreground_lane(Some(session_id));
+        assert_eq!(lane["status"], "missing");
+        assert_eq!(lane["explicit_real_foreground_lease"], false);
+        assert_eq!(lane["no_human_os_foreground_fallback"], true);
+
+        let no_session_agent = service.action_audit_agent_logical_foreground(None);
+        assert_eq!(no_session_agent["status"], "missing_session");
+        assert_eq!(
+            no_session_agent["missing_reason"],
+            "action audit row has no MCP session id"
+        );
     }
 }

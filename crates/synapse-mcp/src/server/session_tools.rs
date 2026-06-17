@@ -18,11 +18,12 @@ use super::{
     agent_state::{AgentLifecycleState, AgentStateRead},
     mcp_error,
     session_registry::{SessionRegistryRead, SpawnedAgentRead, unix_time_ms_now},
-    target_claims::TargetClaimRead,
+    target_claims::{self, TargetClaimRead},
     tool, tool_router,
 };
 
 const ATTACHED_AGENT_REGISTRY_SOURCE_OF_TRUTH: &str = "session_registry spawned_agent rows + agent_state tracker rows + OS process table live-pid probe + visible top-level window enumeration";
+const SESSION_TARGET_ROW_PREFIX: &str = "mcp/session-target/v1/";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -73,8 +74,11 @@ pub struct SessionLeaseReadback {
 pub struct SessionSummary {
     #[serde(flatten)]
     pub registry: SessionRegistryRead,
+    /// Legacy alias for agent_logical_foreground.target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_target: Option<TargetWire>,
+    pub agent_logical_foreground: AgentLogicalForegroundReadback,
+    pub foreground_lane: ForegroundLaneReadback,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_claims: Vec<TargetClaimRead>,
     pub lease: SessionLeaseReadback,
@@ -89,6 +93,7 @@ pub struct SessionSummary {
 pub struct SessionListResponse {
     pub now_unix_ms: u64,
     pub stale_after_ms: u64,
+    pub human_os_foreground: HumanOsForegroundReadback,
     pub registry_entry_count: usize,
     pub target_session_count: usize,
     pub returned_count: usize,
@@ -214,9 +219,68 @@ pub struct AttachedAgentKillHandleReadback {
 pub struct SessionStatusResponse {
     pub now_unix_ms: u64,
     pub stale_after_ms: u64,
+    pub human_os_foreground: HumanOsForegroundReadback,
     pub found: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLogicalForegroundReadback {
+    pub source_of_truth: String,
+    pub session_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persisted_row_key: Option<String>,
+    pub no_human_os_foreground_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForegroundLaneReadback {
+    pub source_of_truth: String,
+    pub session_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_claim: Option<TargetClaimRead>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    pub explicit_real_foreground_lease: bool,
+    pub no_human_os_foreground_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HumanOsForegroundReadback {
+    pub source_of_truth: &'static str,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwnd: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -228,7 +292,7 @@ pub struct SessionEndResponse {
 #[tool_router(router = session_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "List all known MCP sessions as a non-blocking cross-session read model: session id, client kind, liveness, heartbeat, active target, input-lease ownership, and last JSON-RPC tool action. Stale sessions are reported rather than hidden."
+        description = "List all known MCP sessions as a non-blocking cross-session read model: session id, client kind, liveness, heartbeat, agent_logical_foreground, foreground_lane, human_os_foreground, target claims, input-lease ownership, and last JSON-RPC tool action. Stale sessions are reported rather than hidden; agent logical foreground never falls back to the human OS foreground."
     )]
     pub async fn session_list(
         &self,
@@ -243,7 +307,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Return one MCP session's registry row joined with active target and input-lease state. Unknown sessions return found=false instead of blocking or scanning external state."
+        description = "Return one MCP session's registry row joined with agent_logical_foreground, foreground_lane, human_os_foreground, target claims, and input-lease state. Unknown sessions return found=false instead of blocking or scanning external state; missing agent logical foreground is reported explicitly and never replaced with the human OS foreground."
     )]
     pub async fn session_status(
         &self,
@@ -374,17 +438,24 @@ impl SynapseService {
         let now_unix_ms = unix_time_ms_now();
         let (registry_reads, stale_after_ms, registry_entry_count) =
             self.session_registry_reads(now_unix_ms)?;
-        let targets = self.session_target_wires()?;
-        let target_claims_by_owner = self.target_claim_reads_by_owner()?;
+        let memory_targets = self.session_targets()?;
+        let all_target_claims = self.target_claim_status_snapshot()?.claims;
+        let target_claims_by_owner = target_claim_reads_by_owner(&all_target_claims);
         let lease_status = lease::status();
         let mut session_ids = registry_reads
             .keys()
-            .chain(targets.keys())
+            .chain(memory_targets.keys())
             .chain(target_claims_by_owner.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
         if let Some(owner) = lease_status.owner_session_id.as_ref() {
             session_ids.insert(owner.clone());
+        }
+        let mut targets = BTreeMap::new();
+        for session_id in &session_ids {
+            if let Some(target) = self.agent_logical_foreground(session_id)? {
+                targets.insert(session_id.clone(), target);
+            }
         }
         let mut sessions = Vec::new();
         for session_id in session_ids {
@@ -396,6 +467,7 @@ impl SynapseService {
                     .get(&session_id)
                     .cloned()
                     .unwrap_or_default(),
+                &all_target_claims,
                 &lease_status,
                 now_unix_ms,
                 stale_after_ms,
@@ -417,6 +489,7 @@ impl SynapseService {
         Ok(SessionListResponse {
             now_unix_ms,
             stale_after_ms,
+            human_os_foreground: self.human_os_foreground_readback(),
             registry_entry_count,
             target_session_count: targets.len(),
             returned_count,
@@ -437,12 +510,9 @@ impl SynapseService {
         let now_unix_ms = unix_time_ms_now();
         let (registry_reads, stale_after_ms, _registry_entry_count) =
             self.session_registry_reads(now_unix_ms)?;
-        let active_target = self
-            .session_target(Some(session_id))?
-            .as_ref()
-            .map(session_target_wire);
-        let target_claims = self
-            .target_claim_reads_by_owner()?
+        let active_target = self.agent_logical_foreground(session_id)?;
+        let all_target_claims = self.target_claim_status_snapshot()?.claims;
+        let target_claims = target_claim_reads_by_owner(&all_target_claims)
             .remove(session_id)
             .unwrap_or_default();
         let lease_status = lease::status();
@@ -451,6 +521,7 @@ impl SynapseService {
             registry_reads.get(session_id).cloned(),
             active_target,
             target_claims,
+            &all_target_claims,
             &lease_status,
             now_unix_ms,
             stale_after_ms,
@@ -458,6 +529,7 @@ impl SynapseService {
         Ok(SessionStatusResponse {
             now_unix_ms,
             stale_after_ms,
+            human_os_foreground: self.human_os_foreground_readback(),
             found: session.is_some(),
             session,
         })
@@ -484,7 +556,7 @@ impl SynapseService {
         Ok((reads, stale_after_ms, count))
     }
 
-    fn session_target_wires(&self) -> Result<BTreeMap<String, TargetWire>, ErrorData> {
+    fn session_targets(&self) -> Result<BTreeMap<String, SessionTarget>, ErrorData> {
         let guard = self.session_targets_ref().lock().map_err(|_error| {
             mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
@@ -493,10 +565,42 @@ impl SynapseService {
         })?;
         let targets = guard
             .iter()
-            .map(|(session_id, target)| (session_id.clone(), session_target_wire(target)))
+            .map(|(session_id, target)| (session_id.clone(), target.clone()))
             .collect::<BTreeMap<_, _>>();
         drop(guard);
         Ok(targets)
+    }
+
+    pub(crate) fn human_os_foreground_readback(&self) -> HumanOsForegroundReadback {
+        match self.current_audit_foreground() {
+            Ok(foreground) => HumanOsForegroundReadback {
+                source_of_truth: "GetForegroundWindow + foreground process/window context; human OS foreground only",
+                status: "observed".to_owned(),
+                hwnd: Some(foreground.hwnd),
+                pid: Some(foreground.pid),
+                process_name: Some(foreground.process_name),
+                process_path: Some(foreground.process_path),
+                window_title: Some(foreground.window_title),
+                read_error_code: None,
+                read_error_message: None,
+            },
+            Err(error) => HumanOsForegroundReadback {
+                source_of_truth: "GetForegroundWindow + foreground process/window context; human OS foreground only",
+                status: "read_error".to_owned(),
+                hwnd: None,
+                pid: None,
+                process_name: None,
+                process_path: None,
+                window_title: None,
+                read_error_code: error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                read_error_message: Some(error.message.to_string()),
+            },
+        }
     }
 }
 
@@ -1105,21 +1209,33 @@ fn non_zero_pid(pid: Option<u32>) -> Option<u32> {
 fn build_session_summary(
     session_id: &str,
     registry: Option<SessionRegistryRead>,
-    active_target: Option<TargetWire>,
+    active_target: Option<SessionTarget>,
     target_claims: Vec<TargetClaimRead>,
+    all_target_claims: &[TargetClaimRead],
     lease_status: &synapse_action::LeaseStatus,
     now_unix_ms: u64,
     stale_after_ms: u64,
 ) -> Option<SessionSummary> {
+    let active_target_wire = active_target.as_ref().map(session_target_wire);
     let registry = registry.or_else(|| {
-        (active_target.is_some()
+        (active_target_wire.is_some()
             || !target_claims.is_empty()
             || lease_status.owner_session_id.as_deref() == Some(session_id))
         .then(|| synthetic_registry_read(session_id, now_unix_ms, stale_after_ms))
     })?;
     Some(SessionSummary {
         registry,
-        active_target,
+        active_target: active_target_wire,
+        agent_logical_foreground: build_agent_logical_foreground(
+            session_id,
+            active_target.as_ref(),
+        ),
+        foreground_lane: build_foreground_lane(
+            session_id,
+            active_target.as_ref(),
+            all_target_claims,
+            lease_status,
+        ),
         target_claims,
         lease: SessionLeaseReadback {
             held: lease_status.held,
@@ -1132,6 +1248,130 @@ fn build_session_summary(
         },
         agent_state: super::agent_state::read_for_session(session_id, now_unix_ms),
     })
+}
+
+fn target_claim_reads_by_owner(
+    claims: &[TargetClaimRead],
+) -> BTreeMap<String, Vec<TargetClaimRead>> {
+    let mut by_owner = BTreeMap::new();
+    for claim in claims {
+        by_owner
+            .entry(claim.owner_session_id.clone())
+            .or_insert_with(Vec::new)
+            .push(claim.clone());
+    }
+    by_owner
+}
+
+fn build_agent_logical_foreground(
+    session_id: &str,
+    active_target: Option<&SessionTarget>,
+) -> AgentLogicalForegroundReadback {
+    let persisted_row_key = session_target_row_key(session_id);
+    match active_target {
+        Some(target) => AgentLogicalForegroundReadback {
+            source_of_truth: format!(
+                "CF_SESSIONS row {persisted_row_key} + daemon session target registry; never human OS foreground fallback"
+            ),
+            session_id: session_id.to_owned(),
+            status: "set".to_owned(),
+            target: Some(session_target_wire(target)),
+            persisted_row_key: Some(persisted_row_key),
+            no_human_os_foreground_fallback: true,
+            missing_reason: None,
+        },
+        None => AgentLogicalForegroundReadback {
+            source_of_truth: format!(
+                "CF_SESSIONS row {persisted_row_key} + daemon session target registry; never human OS foreground fallback"
+            ),
+            session_id: session_id.to_owned(),
+            status: "missing".to_owned(),
+            target: None,
+            persisted_row_key: Some(persisted_row_key),
+            no_human_os_foreground_fallback: true,
+            missing_reason: Some("no session-owned logical foreground target is set".to_owned()),
+        },
+    }
+}
+
+fn build_foreground_lane(
+    session_id: &str,
+    active_target: Option<&SessionTarget>,
+    all_target_claims: &[TargetClaimRead],
+    lease_status: &synapse_action::LeaseStatus,
+) -> ForegroundLaneReadback {
+    if let Some(target) = active_target {
+        let target_key = target_claims::target_key(target);
+        let target_claim = all_target_claims
+            .iter()
+            .find(|claim| claim.target_key == target_key)
+            .cloned();
+        let owner_session_id = target_claim
+            .as_ref()
+            .map(|claim| claim.owner_session_id.clone())
+            .unwrap_or_else(|| session_id.to_owned());
+        let status = match target_claim.as_ref() {
+            Some(claim) if claim.owner_session_id != session_id => "conflicting_owner",
+            Some(_) => "claimed_by_session",
+            None => "unclaimed_session_target",
+        };
+        return ForegroundLaneReadback {
+            source_of_truth: "daemon session target registry + CF_SESSIONS session-target row + daemon target-claim registry + synapse_action input lease".to_owned(),
+            session_id: session_id.to_owned(),
+            status: status.to_owned(),
+            lane_kind: Some(match target {
+                SessionTarget::Window { .. } => "owned_window_target".to_owned(),
+                SessionTarget::Cdp { .. } => "owned_chrome_tab_target".to_owned(),
+            }),
+            target_key: Some(target_key),
+            target: Some(session_target_wire(target)),
+            target_claim,
+            owner_session_id: Some(owner_session_id),
+            explicit_real_foreground_lease: false,
+            no_human_os_foreground_fallback: true,
+            missing_reason: None,
+        };
+    }
+
+    if lease_status.owner_session_id.as_deref() == Some(session_id) {
+        return ForegroundLaneReadback {
+            source_of_truth:
+                "synapse_action input lease; explicit real OS foreground lease only, no implicit fallback"
+                    .to_owned(),
+            session_id: session_id.to_owned(),
+            status: "explicit_real_foreground_lease".to_owned(),
+            lane_kind: Some("real_os_foreground_lease".to_owned()),
+            target_key: None,
+            target: None,
+            target_claim: None,
+            owner_session_id: Some(session_id.to_owned()),
+            explicit_real_foreground_lease: true,
+            no_human_os_foreground_fallback: true,
+            missing_reason: None,
+        };
+    }
+
+    ForegroundLaneReadback {
+        source_of_truth:
+            "CF_SESSIONS session-target row + daemon session target registry + synapse_action input lease"
+                .to_owned(),
+        session_id: session_id.to_owned(),
+        status: "missing".to_owned(),
+        lane_kind: None,
+        target_key: None,
+        target: None,
+        target_claim: None,
+        owner_session_id: None,
+        explicit_real_foreground_lease: false,
+        no_human_os_foreground_fallback: true,
+        missing_reason: Some(
+            "no agent logical foreground target and no explicit real foreground lease".to_owned(),
+        ),
+    }
+}
+
+fn session_target_row_key(session_id: &str) -> String {
+    format!("{SESSION_TARGET_ROW_PREFIX}{session_id}")
 }
 
 fn synthetic_registry_read(
@@ -1225,6 +1465,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            &[],
             &lease_status,
             1_000,
             500,
@@ -1232,6 +1473,122 @@ mod tests {
         .unwrap();
         assert_eq!(summary.registry.lifecycle, "unregistered");
         assert!(summary.lease.is_owner);
+        assert_eq!(
+            summary.agent_logical_foreground.status, "missing",
+            "a real foreground lease must not be reported as an agent target"
+        );
+        assert_eq!(
+            summary.foreground_lane.status,
+            "explicit_real_foreground_lease"
+        );
+        assert!(summary.foreground_lane.explicit_real_foreground_lease);
+        assert!(summary.foreground_lane.no_human_os_foreground_fallback);
+    }
+
+    #[test]
+    fn session_summary_exposes_agent_logical_foreground_lane() {
+        let session_id = "session-a";
+        let target = SessionTarget::Window { hwnd: 0x1234 };
+        let claim = TargetClaimRead {
+            target_key: "window:0x1234".to_owned(),
+            target: TargetWire::Window {
+                window_hwnd: 0x1234,
+            },
+            owner_session_id: session_id.to_owned(),
+            claimed_at_unix_ms: 1_000,
+            renewed_at_unix_ms: 1_000,
+            ttl_ms: 120_000,
+            expires_at_unix_ms: 121_000,
+            expires_in_ms: 120_000,
+            generation: 1,
+            source_of_truth: "test target claim registry".to_owned(),
+        };
+        let lease_status = synapse_action::LeaseStatus::unheld();
+        let summary = build_session_summary(
+            session_id,
+            None,
+            Some(target),
+            vec![claim.clone()],
+            &[claim],
+            &lease_status,
+            1_000,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(summary.agent_logical_foreground.status, "set");
+        assert_eq!(
+            summary
+                .agent_logical_foreground
+                .persisted_row_key
+                .as_deref(),
+            Some("mcp/session-target/v1/session-a")
+        );
+        assert!(
+            summary
+                .agent_logical_foreground
+                .no_human_os_foreground_fallback
+        );
+        assert_eq!(summary.foreground_lane.status, "claimed_by_session");
+        assert_eq!(
+            summary.foreground_lane.lane_kind.as_deref(),
+            Some("owned_window_target")
+        );
+        assert_eq!(
+            summary.foreground_lane.target_key.as_deref(),
+            Some("window:0x1234")
+        );
+        assert_eq!(
+            summary.foreground_lane.owner_session_id.as_deref(),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn session_summary_reports_conflicting_foreground_lane_owner() {
+        let session_id = "session-a";
+        let other_session_id = "session-b";
+        let target = SessionTarget::Cdp {
+            window_hwnd: 0x2222,
+            cdp_target_id: "target-1".to_owned(),
+        };
+        let claim = TargetClaimRead {
+            target_key: "cdp:0x2222:target-1".to_owned(),
+            target: TargetWire::Cdp {
+                window_hwnd: 0x2222,
+                cdp_target_id: "target-1".to_owned(),
+            },
+            owner_session_id: other_session_id.to_owned(),
+            claimed_at_unix_ms: 1_000,
+            renewed_at_unix_ms: 1_000,
+            ttl_ms: 120_000,
+            expires_at_unix_ms: 121_000,
+            expires_in_ms: 120_000,
+            generation: 1,
+            source_of_truth: "test target claim registry".to_owned(),
+        };
+        let lease_status = synapse_action::LeaseStatus::unheld();
+        let summary = build_session_summary(
+            session_id,
+            None,
+            Some(target),
+            Vec::new(),
+            &[claim],
+            &lease_status,
+            1_000,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(summary.foreground_lane.status, "conflicting_owner");
+        assert_eq!(
+            summary.foreground_lane.lane_kind.as_deref(),
+            Some("owned_chrome_tab_target")
+        );
+        assert_eq!(
+            summary.foreground_lane.owner_session_id.as_deref(),
+            Some(other_session_id)
+        );
     }
 
     #[test]
@@ -1541,6 +1898,13 @@ mod tests {
         SessionSummary {
             registry,
             active_target: None,
+            agent_logical_foreground: build_agent_logical_foreground(session_id, None),
+            foreground_lane: build_foreground_lane(
+                session_id,
+                None,
+                &[],
+                &synapse_action::LeaseStatus::unheld(),
+            ),
             target_claims: Vec::new(),
             lease: SessionLeaseReadback {
                 held: false,
