@@ -361,6 +361,31 @@ impl SynapseService {
         // ---- Lifecycle state, reconstructed from the same scanned rows. ----
         let lifecycle: Option<AgentStateRead> =
             super::agent_state::read_from_journal_records(&scan.matched, &lookup_id, now_unix_ms);
+        if let Some(read) = &lifecycle {
+            if read.spawn_id.is_some() {
+                spawn_id.clone_from(&read.spawn_id);
+            }
+            if read.session_id.is_some() {
+                session_id.clone_from(&read.session_id);
+            }
+        }
+
+        let session_read_id = session_id
+            .as_deref()
+            .or_else(|| (!lookup_id.starts_with("agent-spawn-")).then_some(lookup_id.as_str()));
+        let session_summary = session_read_id
+            .and_then(|id| self.session_status_impl(id).ok())
+            .and_then(|status| status.session);
+        if let Some(summary) = &session_summary {
+            if session_id.is_none() {
+                session_id = Some(summary.registry.session_id.clone());
+            }
+            if let Some(agent_state) = &summary.agent_state {
+                if spawn_id.is_none() {
+                    spawn_id.clone_from(&agent_state.spawn_id);
+                }
+            }
+        }
 
         // ---- Transcripts (spawn-only): tokens + activity summary. ----
         let (turn, context_window_estimate_tokens, activity_summary, transcript_rows_scanned) =
@@ -370,7 +395,7 @@ impl SynapseService {
                 (None, None, None, 0)
             };
 
-        let found = lifecycle.is_some() || !scan.matched.is_empty();
+        let found = lifecycle.is_some() || !scan.matched.is_empty() || session_summary.is_some();
 
         if !found {
             return Ok(empty_response(
@@ -393,17 +418,17 @@ impl SynapseService {
             .or_else(|| session_id.clone())
             .unwrap_or_else(|| lookup_id.clone());
 
-        // Prefer the lifecycle read's resolved ids (they reflect the reducer's
-        // session↔spawn linkage); fall back to what the scan saw.
-        if let Some(read) = &lifecycle {
-            if read.spawn_id.is_some() {
-                spawn_id.clone_from(&read.spawn_id);
-            }
-            if read.session_id.is_some() {
-                session_id.clone_from(&read.session_id);
-            }
-        }
-        let agent_kind = lifecycle.as_ref().and_then(|read| read.agent_kind.clone());
+        let agent_kind = lifecycle
+            .as_ref()
+            .and_then(|read| read.agent_kind.clone())
+            .or_else(|| {
+                session_summary
+                    .as_ref()
+                    .and_then(|summary| summary.agent_state.as_ref())
+                    .and_then(|read| read.agent_kind.clone())
+            });
+        let attention_class =
+            agent_query_attention_class(lifecycle.as_ref(), session_summary.as_ref());
 
         // ---- Optional cooperative answer (deep mode). ----
         let cooperative = if params.deep {
@@ -428,10 +453,7 @@ impl SynapseService {
             agent_kind,
             state: lifecycle.as_ref().map(|read| read.state),
             reason_code: lifecycle.as_ref().and_then(|read| read.reason_code.clone()),
-            attention_class: lifecycle
-                .as_ref()
-                .map(|read| read.attention_class)
-                .filter(|attention_class| !attention_class.is_none()),
+            attention_class,
             since_unix_ms: lifecycle.as_ref().map(|read| read.since_unix_ms),
             silent_ms: lifecycle.as_ref().map(|read| read.silent_ms),
             runaway: lifecycle.as_ref().is_some_and(|read| read.runaway),
@@ -1067,7 +1089,6 @@ fn sources_map() -> BTreeMap<String, String> {
     for field in [
         "state",
         "reason_code",
-        "attention_class",
         "since_unix_ms",
         "silent_ms",
         "runaway",
@@ -1077,6 +1098,13 @@ fn sources_map() -> BTreeMap<String, String> {
     ] {
         map.insert(field.to_owned(), lifecycle.to_owned());
     }
+    map.insert(
+        "attention_class".to_owned(),
+        format!(
+            "{lifecycle}; cleanup_required is overlaid from session_status/session_list cleanup \
+             read model over CF_SESSIONS session-target rows, target claims, and input lease"
+        ),
+    );
     for field in ["current_tool_call", "last_tool_call", "recent_events"] {
         map.insert(
             field.to_owned(),
@@ -1111,6 +1139,20 @@ fn key_after(key: &[u8]) -> Vec<u8> {
 
 fn unix_time_ms_now() -> u64 {
     unix_time_ns_now() / 1_000_000
+}
+
+fn agent_query_attention_class(
+    lifecycle: Option<&AgentStateRead>,
+    session_summary: Option<&super::session_tools::SessionSummary>,
+) -> Option<AgentAttentionClass> {
+    if session_summary
+        .is_some_and(|summary| summary.attention_class == AgentAttentionClass::CleanupRequired)
+    {
+        return Some(AgentAttentionClass::CleanupRequired);
+    }
+    lifecycle
+        .map(|read| read.attention_class)
+        .filter(|attention_class| !attention_class.is_none())
 }
 
 #[cfg(test)]

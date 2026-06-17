@@ -561,6 +561,15 @@ impl SynapseService {
         Ok(guard.get(session_id).cloned())
     }
 
+    pub(super) fn persisted_session_target_read_model(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionTarget>, ErrorData> {
+        Ok(self
+            .read_persisted_session_target(session_id)?
+            .map(|persisted| persisted.target))
+    }
+
     fn read_persisted_session_target(
         &self,
         session_id: &str,

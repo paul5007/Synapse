@@ -79,6 +79,26 @@ fn write_event(
         .expect("write journal row");
 }
 
+fn write_session_target(db: &Db, session_id: &str, hwnd: u64) {
+    let row = json!({
+        "schema_version": 1,
+        "session_id": session_id,
+        "stored_at_unix_ms": unix_time_ms_now(),
+        "target": {
+            "kind": "window",
+            "hwnd": hwnd,
+        }
+    });
+    db.put_batch_pressure_bypass(
+        cf::CF_SESSIONS,
+        [(
+            format!("mcp/session-target/v1/{session_id}").into_bytes(),
+            serde_json::to_vec(&row).expect("serialize session target row"),
+        )],
+    )
+    .expect("write session target row");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_transcript(
     db: &Db,
@@ -311,6 +331,64 @@ async fn working_agent_snapshot_reconstructs_state_tool_events_and_tokens() {
     );
     assert!(response.cooperative.is_none());
     assert_eq!(response.scan.events_matched, 6);
+}
+
+#[tokio::test]
+async fn cleanup_required_attention_overlays_retained_session_target() {
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+
+    let base = recent_base_ns();
+    write_event(
+        &db,
+        base + 1,
+        0,
+        AgentEventKind::SpawnReady,
+        Some(SPAWN),
+        Some(SESSION),
+        |_| {},
+    );
+    write_event(
+        &db,
+        base + 2,
+        0,
+        AgentEventKind::Exited,
+        Some(SPAWN),
+        Some(SESSION),
+        |record| {
+            record.reason_code = Some("process_gone_without_exit_event".to_owned());
+        },
+    );
+
+    let terminal = service
+        .agent_query_impl(params(SPAWN), None)
+        .await
+        .expect("agent_query succeeds");
+    assert_eq!(
+        terminal.attention_class,
+        Some(AgentAttentionClass::TerminalRuntimeFailure)
+    );
+
+    write_session_target(&db, SESSION, 0x1234);
+
+    let cleanup = service
+        .agent_query_impl(params(SPAWN), None)
+        .await
+        .expect("agent_query succeeds");
+    assert_eq!(cleanup.spawn_id.as_deref(), Some(SPAWN));
+    assert_eq!(cleanup.session_id.as_deref(), Some(SESSION));
+    assert_eq!(
+        cleanup.attention_class,
+        Some(AgentAttentionClass::CleanupRequired)
+    );
+    assert!(
+        cleanup
+            .sources
+            .get("attention_class")
+            .expect("attention source")
+            .contains("CF_SESSIONS session-target rows")
+    );
 }
 
 #[tokio::test]

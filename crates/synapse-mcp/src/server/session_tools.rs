@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use synapse_action::lease;
 use synapse_core::error_codes;
+use synapse_storage::cf;
 
 use super::{
     ErrorData, Json, Parameters, SessionTarget, SynapseService, TargetWire,
@@ -350,7 +351,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Explicitly end this MCP session and atomically reclaim all resources owned by it: held inputs, input lease, active target, virtual clipboard buffer, CDP targets, durable shell jobs, launched process resources, event subscriptions, persisted session row, and registry lifecycle. The optional session_id must equal the current caller session."
+        description = "Explicitly end this MCP session and atomically reclaim all resources owned by it: held inputs, input lease, active target, virtual clipboard buffer, CDP targets, durable shell jobs, launched process resources, event subscriptions, persisted session row, and registry lifecycle. The optional session_id may target this caller's session, or a stale/non-live session_status row whose attention_class is cleanup_required; live or terminal-no-resource peer sessions fail closed."
     )]
     pub async fn session_end(
         &self,
@@ -377,15 +378,12 @@ impl SynapseService {
             Some(session_id) => {
                 validate_session_id(&session_id)?;
                 if session_id != current_session_id {
-                    return Err(ErrorData::new(
-                        ErrorCode(-32099),
-                        "session_end can only end the current MCP session",
-                        Some(json!({
-                            "code": error_codes::TOOL_PARAMS_INVALID,
-                            "current_session_id": current_session_id,
-                            "requested_session_id": session_id,
-                        })),
-                    ));
+                    let status = self.session_status_impl(&session_id)?;
+                    ensure_cross_session_cleanup_allowed(
+                        &current_session_id,
+                        &session_id,
+                        &status,
+                    )?;
                 }
                 session_id
             }
@@ -465,12 +463,14 @@ impl SynapseService {
         let (registry_reads, stale_after_ms, registry_entry_count) =
             self.session_registry_reads(now_unix_ms)?;
         let memory_targets = self.session_targets()?;
+        let persisted_target_session_ids = self.persisted_session_target_session_ids()?;
         let all_target_claims = self.target_claim_status_snapshot()?.claims;
         let target_claims_by_owner = target_claim_reads_by_owner(&all_target_claims);
         let lease_status = lease::status();
         let mut session_ids = registry_reads
             .keys()
             .chain(memory_targets.keys())
+            .chain(persisted_target_session_ids.iter())
             .chain(target_claims_by_owner.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -479,7 +479,7 @@ impl SynapseService {
         }
         let mut targets = BTreeMap::new();
         for session_id in &session_ids {
-            if let Some(target) = self.agent_logical_foreground(session_id)? {
+            if let Some(target) = self.agent_logical_foreground_read_model(session_id)? {
                 targets.insert(session_id.clone(), target);
             }
         }
@@ -539,7 +539,7 @@ impl SynapseService {
         let now_unix_ms = unix_time_ms_now();
         let (registry_reads, stale_after_ms, _registry_entry_count) =
             self.session_registry_reads(now_unix_ms)?;
-        let active_target = self.agent_logical_foreground(session_id)?;
+        let active_target = self.agent_logical_foreground_read_model(session_id)?;
         let all_target_claims = self.target_claim_status_snapshot()?.claims;
         let target_claims = target_claim_reads_by_owner(&all_target_claims)
             .remove(session_id)
@@ -598,6 +598,30 @@ impl SynapseService {
             .collect::<BTreeMap<_, _>>();
         drop(guard);
         Ok(targets)
+    }
+
+    fn agent_logical_foreground_read_model(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionTarget>, ErrorData> {
+        if let Some(target) = self.memory_session_target(session_id)? {
+            return Ok(Some(target));
+        }
+        self.persisted_session_target_read_model(session_id)
+    }
+
+    fn persisted_session_target_session_ids(&self) -> Result<BTreeSet<String>, ErrorData> {
+        let db = self.m3_storage()?;
+        let rows = db
+            .scan_cf_prefix(cf::CF_SESSIONS, SESSION_TARGET_ROW_PREFIX.as_bytes())
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let mut session_ids = BTreeSet::new();
+        for (row_key, _value) in rows {
+            if let Some(session_id) = session_id_from_target_row_key(&row_key)? {
+                session_ids.insert(session_id);
+            }
+        }
+        Ok(session_ids)
     }
 
     pub(crate) fn human_os_foreground_readback(&self) -> HumanOsForegroundReadback {
@@ -1343,6 +1367,42 @@ fn session_attention_class(
         .unwrap_or_default()
 }
 
+fn ensure_cross_session_cleanup_allowed(
+    current_session_id: &str,
+    requested_session_id: &str,
+    status: &SessionStatusResponse,
+) -> Result<(), ErrorData> {
+    let Some(summary) = status.session.as_ref() else {
+        return Err(ErrorData::new(
+            ErrorCode(-32099),
+            "session_end cross-session cleanup target was not found",
+            Some(json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "current_session_id": current_session_id,
+                "requested_session_id": requested_session_id,
+                "required_attention_class": "cleanup_required",
+            })),
+        ));
+    };
+    if summary.registry.lifecycle == "live"
+        || summary.attention_class != AgentAttentionClass::CleanupRequired
+    {
+        return Err(ErrorData::new(
+            ErrorCode(-32099),
+            "session_end cross-session cleanup is allowed only for non-live cleanup_required sessions",
+            Some(json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "current_session_id": current_session_id,
+                "requested_session_id": requested_session_id,
+                "target_lifecycle": summary.registry.lifecycle,
+                "target_attention_class": summary.attention_class,
+                "required_attention_class": "cleanup_required",
+            })),
+        ));
+    }
+    Ok(())
+}
+
 fn target_claim_reads_by_owner(
     claims: &[TargetClaimRead],
 ) -> BTreeMap<String, Vec<TargetClaimRead>> {
@@ -1503,6 +1563,28 @@ fn session_target_row_key(session_id: &str) -> String {
     format!("{SESSION_TARGET_ROW_PREFIX}{session_id}")
 }
 
+fn session_id_from_target_row_key(row_key: &[u8]) -> Result<Option<String>, ErrorData> {
+    let key = std::str::from_utf8(row_key).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("CF_SESSIONS session-target row key is not UTF-8: {error}"),
+        )
+    })?;
+    let Some(session_id) = key.strip_prefix(SESSION_TARGET_ROW_PREFIX) else {
+        return Ok(None);
+    };
+    if session_id.is_empty()
+        || session_id.chars().count() > 512
+        || !session_id.chars().all(|ch| ('!'..='~').contains(&ch))
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("CF_SESSIONS session-target row key has invalid session id: {key}"),
+        ));
+    }
+    Ok(Some(session_id.to_owned()))
+}
+
 fn synthetic_registry_read(
     session_id: &str,
     now_unix_ms: u64,
@@ -1568,7 +1650,12 @@ pub(crate) fn validate_session_id(session_id: &str) -> Result<(), ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
     use synapse_core::AgentEventKind;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
 
     #[test]
     fn session_status_rejects_empty_or_non_visible_ascii_ids() {
@@ -1684,6 +1771,66 @@ mod tests {
     }
 
     #[test]
+    fn session_list_includes_persisted_target_only_session() -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        let session_id = "persisted-target-only";
+        let db_path = profiles.path().join("db");
+        {
+            let db = synapse_storage::Db::open(&db_path, synapse_core::SCHEMA_VERSION)?;
+            let row = json!({
+                "schema_version": 1,
+                "session_id": session_id,
+                "stored_at_unix_ms": 1_000,
+                "target": {
+                    "kind": "window",
+                    "hwnd": 0x1234
+                }
+            });
+            db.put_batch_pressure_bypass(
+                cf::CF_SESSIONS,
+                [(
+                    session_target_row_key(session_id).into_bytes(),
+                    synapse_storage::encode_json(&row)?,
+                )],
+            )?;
+        }
+        let service = test_service_with_profiles(profiles.path())?;
+
+        let list = service.session_list_impl(true)?;
+
+        assert_eq!(list.target_session_count, 1);
+        assert_eq!(
+            list.foreground_lane_capacity
+                .active_agent_logical_foreground_count,
+            1
+        );
+        let summary = list
+            .sessions
+            .iter()
+            .find(|summary| summary.registry.session_id == session_id)
+            .expect("persisted target-only session should be listed");
+        assert_eq!(summary.registry.lifecycle, "unregistered");
+        assert_eq!(
+            summary.attention_class,
+            AgentAttentionClass::CleanupRequired
+        );
+        assert_eq!(summary.agent_logical_foreground.status, "set");
+        assert_eq!(
+            summary
+                .agent_logical_foreground
+                .persisted_row_key
+                .as_deref(),
+            Some("mcp/session-target/v1/persisted-target-only")
+        );
+        assert_eq!(summary.foreground_lane.status, "unclaimed_session_target");
+        assert_eq!(
+            summary.foreground_lane.target_key.as_deref(),
+            Some("window:0x1234")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn session_summary_reports_conflicting_foreground_lane_owner() {
         let session_id = "session-a";
         let other_session_id = "session-b";
@@ -1783,6 +1930,101 @@ mod tests {
         assert_eq!(
             capacity.target_backed_lane_kinds,
             vec!["owned_window_target", "owned_chrome_tab_target"]
+        );
+    }
+
+    #[test]
+    fn target_row_key_parser_rejects_corrupt_session_ids() {
+        assert_eq!(
+            session_id_from_target_row_key(b"mcp/session-target/v1/session-a")
+                .unwrap()
+                .as_deref(),
+            Some("session-a")
+        );
+        assert!(
+            session_id_from_target_row_key(b"other/session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(session_id_from_target_row_key(b"mcp/session-target/v1/").is_err());
+        assert!(session_id_from_target_row_key(b"mcp/session-target/v1/bad session").is_err());
+        assert!(session_id_from_target_row_key(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn cross_session_end_policy_allows_only_cleanup_required_rows() {
+        let lease_status = synapse_action::LeaseStatus::unheld();
+        let cleanup_summary = build_session_summary(
+            "cleanup-target",
+            None,
+            Some(SessionTarget::Window { hwnd: 0x1234 }),
+            Vec::new(),
+            &[],
+            &lease_status,
+            1_000,
+            500,
+        )
+        .expect("cleanup summary");
+        assert_eq!(
+            cleanup_summary.attention_class,
+            AgentAttentionClass::CleanupRequired
+        );
+        assert!(
+            ensure_cross_session_cleanup_allowed(
+                "caller",
+                "cleanup-target",
+                &status_response(Some(cleanup_summary))
+            )
+            .is_ok()
+        );
+
+        let mut live_registry = synthetic_registry_read("live-peer", 1_000, 500);
+        live_registry.lifecycle = "live".to_owned();
+        let live_summary = build_session_summary(
+            "live-peer",
+            Some(live_registry),
+            Some(SessionTarget::Window { hwnd: 0x1234 }),
+            Vec::new(),
+            &[],
+            &lease_status,
+            1_000,
+            500,
+        )
+        .expect("live summary");
+        assert!(
+            ensure_cross_session_cleanup_allowed(
+                "caller",
+                "live-peer",
+                &status_response(Some(live_summary))
+            )
+            .is_err()
+        );
+
+        let mut closed_registry = synthetic_registry_read("closed-no-resource", 1_000, 500);
+        closed_registry.lifecycle = "closed".to_owned();
+        let closed_summary = build_session_summary(
+            "closed-no-resource",
+            Some(closed_registry),
+            None,
+            Vec::new(),
+            &[],
+            &lease_status,
+            1_000,
+            500,
+        )
+        .expect("closed summary");
+        assert!(
+            ensure_cross_session_cleanup_allowed(
+                "caller",
+                "closed-no-resource",
+                &status_response(Some(closed_summary))
+            )
+            .is_err()
+        );
+
+        assert!(
+            ensure_cross_session_cleanup_allowed("caller", "missing", &status_response(None))
+                .is_err()
         );
     }
 
@@ -1968,6 +2210,49 @@ mod tests {
             Some("no_process_handle")
         );
         assert!(!ambient.kill_handle.available);
+    }
+
+    fn test_service_with_profiles(profile_dir: &std::path::Path) -> anyhow::Result<SynapseService> {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(profile_dir.join("db")),
+                Some(profile_dir.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4)
+                    .ok_or_else(|| anyhow::anyhow!("max subscriptions must be nonzero"))?,
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+    }
+
+    fn status_response(session: Option<SessionSummary>) -> SessionStatusResponse {
+        SessionStatusResponse {
+            now_unix_ms: 1_000,
+            stale_after_ms: 500,
+            human_os_foreground: HumanOsForegroundReadback {
+                source_of_truth: "test",
+                status: "not_observed".to_owned(),
+                hwnd: None,
+                pid: None,
+                process_name: None,
+                process_path: None,
+                window_title: None,
+                read_error_code: None,
+                read_error_message: None,
+            },
+            found: session.is_some(),
+            session,
+        }
     }
 
     #[test]
