@@ -39,9 +39,9 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-17-target-screenshot-debugger-v2";
+    "synapse-chrome-bridge-2026-06-17-csp-evaluate-debugger-v2";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "7e35f9d0e81f41eca7f49a5378ca5f2a33fe49778ad6fc79f261aad1e859c9e6";
+    "79ea872303b48bf8e2690bc1d078b66e68c85a60ae49f86bd62f615893ea3b0e";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "activateTab",
     "closeTab",
@@ -69,7 +69,7 @@ const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the normal end-user bridge uses chrome.tabs over direct localhost WebSocket without nativeMessaging, never creates helper Chrome windows, and chrome.debugger is limited to inactive session-owned capturePageScreenshot while other attach-capable debugger commands are disabled in the normal bridge; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the normal end-user bridge uses chrome.tabs over direct localhost WebSocket without nativeMessaging, never creates helper Chrome windows, and chrome.debugger is limited to session-owned capturePageScreenshot and evaluateScript Runtime.evaluate; other attach-capable debugger commands are disabled in the normal bridge; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
@@ -229,7 +229,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "normal Synapse Chrome Bridge refused attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=the normal end-user bridge exposes chrome.debugger only for guarded session-owned capturePageScreenshot and contains no daemon-side DOM/action attach transport{external_surface_hint} remediation=use raw CDP from a dedicated Synapse-launched automation profile started with --silent-debugger-extension-api for DOM/action CDP; Synapse never modifies Chrome policy or disables the user's extensions, so the user's normal Chrome profile is left untouched"
+                "normal Synapse Chrome Bridge refused attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=the normal end-user bridge exposes chrome.debugger only for guarded session-owned capturePageScreenshot and evaluateScript Runtime.evaluate and contains no daemon-side DOM/action attach transport{external_surface_hint} remediation=use raw CDP from a dedicated Synapse-launched automation profile started with --silent-debugger-extension-api for DOM/action CDP; Synapse never modifies Chrome policy or disables the user's extensions, so the user's normal Chrome profile is left untouched"
             ),
         }
     }

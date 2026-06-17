@@ -1642,7 +1642,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Evaluate JavaScript in the calling session's owned background browser tab, returning the JSON value plus Runtime.RemoteObject-like type metadata read back from the same target. Raw CDP uses Runtime.evaluate / Runtime.callFunctionOn. The normal Chrome bridge uses chrome.scripting.executeScript for page-scope evaluation only and never attaches the debugger. Page scope (default): `expression` is evaluated directly; pass `args` to invoke it as a function with those args. Element scope requires raw CDP: pass `element_id` and a function `expression`, called Playwright-style as fn(element, ...args) via Runtime.callFunctionOn. Requires an active session CDP target or an explicit cdp_target_id/element owned by this session; never uses the human foreground tab as a fallback. JS exceptions are surfaced loudly. Background-safe: never activates the tab or uses OS foreground input. This is the keystone for page content / element introspection / state queries / web-first assertions."
+        description = "Evaluate JavaScript in the calling session's owned browser tab, returning the JSON value plus Runtime.RemoteObject-like type metadata read back from the same target. Raw CDP uses Runtime.evaluate / Runtime.callFunctionOn. The normal Chrome bridge uses guarded chrome.debugger Runtime.evaluate for page-scope evaluation on session-owned chrome-tab targets, detaches in a finally path, and does not reject a target merely because it is active/highlighted in a focused Chrome window. Page scope (default): `expression` is evaluated directly; pass `args` to invoke it as a function with those args. Element scope requires raw CDP: pass `element_id` and a function `expression`, called Playwright-style as fn(element, ...args) via Runtime.callFunctionOn. Requires an active session CDP target or an explicit cdp_target_id/element owned by this session; never uses an unrelated human foreground tab as a fallback. JS exceptions are surfaced loudly. Target-scoped: never changes tab activation or uses OS foreground input. This is the keystone for page content / element introspection / state queries / web-first assertions."
     )]
     pub async fn browser_evaluate(
         &self,
@@ -3208,7 +3208,7 @@ impl SynapseService {
                 return Err(mcp_error(
                     error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
                     format!(
-                        "browser_evaluate element scope requires raw CDP for window {window_hwnd:#x}; the normal Chrome bridge exposes page-scope chrome.scripting.executeScript only and never attaches the debugger"
+                        "browser_evaluate element scope requires raw CDP for window {window_hwnd:#x}; the normal Chrome bridge exposes only page-scope guarded chrome.debugger Runtime.evaluate on session-owned tabs"
                     ),
                 ));
             }
@@ -3225,7 +3225,7 @@ impl SynapseService {
                 mcp_error(
                     error.code(),
                     format!(
-                        "browser_evaluate Chrome bridge chrome.scripting.executeScript failed: {}",
+                        "browser_evaluate Chrome bridge Runtime.evaluate failed: {}",
                         error.detail()
                     ),
                 )
@@ -3247,7 +3247,7 @@ impl SynapseService {
                 result_type = %evaluated.result_type,
                 returned_by_value = evaluated.returned_by_value,
                 target_url = %evaluated.url,
-                "readback=chrome.scripting.executeScript outcome=evaluated"
+                "readback=chrome.debugger.Runtime.evaluate outcome=evaluated"
             );
             return Ok(BrowserEvaluateResponse {
                 session_id: session_id.to_owned(),
@@ -3271,7 +3271,7 @@ impl SynapseService {
                 description: evaluated.description,
                 unserializable_value: evaluated.unserializable_value,
                 readback_backend: if evaluated.readback_backend.trim().is_empty() {
-                    "chrome.scripting.executeScript".to_owned()
+                    "chrome.debugger.Runtime.evaluate".to_owned()
                 } else {
                     evaluated.readback_backend
                 },

@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-target-screenshot-debugger-v2";
-const BRIDGE_BUILD_SHA256 = "7e35f9d0e81f41eca7f49a5378ca5f2a33fe49778ad6fc79f261aad1e859c9e6";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-csp-evaluate-debugger-v2";
+const BRIDGE_BUILD_SHA256 = "79ea872303b48bf8e2690bc1d078b66e68c85a60ae49f86bd62f615893ea3b0e";
 const COMMAND_CAPABILITIES = Object.freeze([
   "openTab",
   "closeTab",
@@ -672,37 +672,90 @@ async function handleEvaluateScript(params) {
   if (!expression.trim()) {
     throw bridgeError(ERROR_ATTACH_FAILED, "evaluateScript requires a non-empty expression");
   }
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+  const before = await tabPageState(selected.tabId, selected.target);
+  const windowId = before.chrome_window_id || selected.target.chromeWindowId;
+  if (!Number.isInteger(windowId)) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+      `evaluateScript could not resolve chrome window id for target ${JSON.stringify(selected.target.id)}`
     );
   }
-  let results;
+  if (!chrome.debugger || typeof chrome.debugger.attach !== "function" || typeof chrome.debugger.sendCommand !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.debugger unavailable; extension is missing debugger permission for Runtime.evaluate"
+    );
+  }
+  let runtimeExpression;
   try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId: selected.tabId },
-      func: evaluateScriptInPage,
-      args: [{ expression, args, awaitPromise, returnByValue }]
-    });
+    runtimeExpression = runtimeEvaluateExpression(expression, args);
   } catch (error) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `chrome.scripting.executeScript evaluateScript(${selected.tabId}) failed: ${errorMessage(error)}`
+      `evaluateScript parameter serialization failed: ${errorMessage(error)}`
     );
   }
-  const first = Array.isArray(results) ? results[0] : null;
-  const evaluated = first?.result;
-  if (!evaluated || typeof evaluated !== "object") {
+  const debuggee = { tabId: selected.tabId };
+  let attached = false;
+  let evaluated;
+  let detachError = null;
+  try {
+    await withTimeout(
+      chrome.debugger.attach(debuggee, "1.3"),
+      5000,
+      `chrome.debugger.attach(tabId=${selected.tabId})`
+    );
+    attached = true;
+    await withTimeout(
+      chrome.debugger.sendCommand(debuggee, "Runtime.enable", {}),
+      5000,
+      `chrome.debugger.sendCommand(Runtime.enable, tabId=${selected.tabId})`
+    );
+    evaluated = await withTimeout(
+      chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+        expression: `${runtimeExpression}\n//# sourceURL=synapse://browser_evaluate`,
+        objectGroup: "synapse_browser_evaluate",
+        awaitPromise,
+        returnByValue,
+        allowUnsafeEvalBlockedByCSP: true
+      }),
+      15000,
+      `chrome.debugger.sendCommand(Runtime.evaluate, tabId=${selected.tabId})`
+    );
+  } catch (error) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      "chrome.scripting.executeScript evaluateScript returned no structured result"
+      `Runtime.evaluate failed for target ${selected.target.id}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await withTimeout(
+          chrome.debugger.detach(debuggee),
+          5000,
+          `chrome.debugger.detach(tabId=${selected.tabId})`
+        );
+      } catch (error) {
+        detachError = errorMessage(error);
+      }
+    }
+  }
+  if (detachError) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `Runtime.evaluate completed for target ${selected.target.id} but failed to detach debugger from tab ${selected.tabId}: ${detachError}`
     );
   }
-  if (!evaluated.ok) {
+  if (evaluated?.exceptionDetails) {
     throw bridgeError(
-      String(evaluated.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
-      `evaluateScript failed: ${String(evaluated.error_detail || "")}`
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `Runtime.evaluate threw for target ${selected.target.id}: ${formatRuntimeException(evaluated.exceptionDetails)}`
+    );
+  }
+  if (!evaluated?.result || typeof evaluated.result !== "object") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "Runtime.evaluate returned no remote object result"
     );
   }
   const state = await tabPageState(selected.tabId, selected.target);
@@ -715,10 +768,10 @@ async function handleEvaluateScript(params) {
     title: state.title || "",
     ready_state: state.ready_state || "",
     scope: "page",
-    readback_backend: "chrome.scripting.executeScript+chrome.tabs.get",
+    readback_backend: "chrome.debugger.Runtime.evaluate+chrome.tabs.get",
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason,
-    ...evaluated
+    ...runtimeRemoteObjectResult(evaluated.result, returnByValue)
   };
 }
 
@@ -1580,167 +1633,62 @@ function readPageVitalsInPage() {
   }
 }
 
-async function evaluateScriptInPage(request) {
-  const expression = String((request && request.expression) || "");
-  const args = Array.isArray(request && request.args) ? request.args : [];
-  const awaitPromise = !request || request.awaitPromise !== false;
-  const returnByValue = !request || request.returnByValue !== false;
-  if (!expression.trim()) {
-    return {
-      ok: false,
-      error_code: "CHROME_SCRIPT_EXPRESSION_EMPTY",
-      error_detail: "evaluateScript expression is empty"
-    };
+function runtimeEvaluateExpression(expression, args) {
+  if (args.length === 0) {
+    return expression;
   }
-  try {
-    let value;
-    if (args.length > 0) {
-      const fn = (0, eval)(`(${expression})`);
-      if (typeof fn !== "function") {
-        return {
-          ok: false,
-          error_code: "CHROME_SCRIPT_EXPRESSION_NOT_FUNCTION",
-          error_detail: "evaluateScript with args requires expression to evaluate to a function"
-        };
-      }
-      value = fn(...args);
-    } else {
-      value = (0, eval)(expression);
-    }
-    if (
-      awaitPromise &&
-      value &&
-      (typeof value === "object" || typeof value === "function") &&
-      typeof value.then === "function"
-    ) {
-      value = await value;
-    }
-    return {
-      ok: true,
-      ...serializeScriptValue(value, returnByValue)
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error_code: "CHROME_SCRIPT_EVALUATE_THROWN",
-      error_detail: error && error.stack ? String(error.stack) : error && error.message ? String(error.message) : String(error)
-    };
+  const serializedArgs = JSON.stringify(args);
+  if (serializedArgs === undefined) {
+    throw new Error("evaluateScript args could not be serialized to JSON");
   }
+  return `((__synapseFn, __synapseArgs) => {
+  if (typeof __synapseFn !== "function") {
+    throw new TypeError("evaluateScript with args requires expression to evaluate to a function");
+  }
+  return __synapseFn(...__synapseArgs);
+})((${expression}), ${serializedArgs})`;
+}
 
-  function serializeScriptValue(value, wantValue) {
-    const type = remoteObjectType(value);
-    const subtype = remoteObjectSubtype(value);
-    const description = remoteObjectDescription(value, type, subtype);
-    const unserializable = unserializableValue(value);
-    if (!wantValue || unserializable !== null || type === "undefined" || type === "function" || type === "symbol" || subtype === "node") {
-      return {
-        result_type: type,
-        result_subtype: subtype,
-        returned_by_value: wantValue,
-        value: null,
-        description,
-        unserializable_value: unserializable
-      };
-    }
-    try {
-      const json = JSON.stringify(value);
-      if (json === undefined) {
-        return {
-          result_type: type,
-          result_subtype: subtype,
-          returned_by_value: wantValue,
-          value: null,
-          description,
-          unserializable_value: null
-        };
-      }
-      return {
-        result_type: type,
-        result_subtype: subtype,
-        returned_by_value: wantValue,
-        value: JSON.parse(json),
-        description,
-        unserializable_value: null
-      };
-    } catch (error) {
-      return {
-        result_type: type,
-        result_subtype: subtype,
-        returned_by_value: false,
-        value: null,
-        description: `${description}; JSON serialization failed: ${error && error.message ? String(error.message) : String(error)}`,
-        unserializable_value: null
-      };
-    }
-  }
+function runtimeRemoteObjectResult(remote, returnByValue) {
+  const resultType = String(remote.type || "");
+  const resultSubtype = typeof remote.subtype === "string" ? remote.subtype : null;
+  const description = typeof remote.description === "string"
+    ? remote.description
+    : remote.value === undefined
+      ? resultType || "undefined"
+      : String(remote.value);
+  return {
+    ok: true,
+    result_type: resultType,
+    result_subtype: resultSubtype,
+    returned_by_value: Boolean(returnByValue),
+    value: remote.value === undefined ? null : remote.value,
+    description,
+    unserializable_value: typeof remote.unserializableValue === "string"
+      ? remote.unserializableValue
+      : null
+  };
+}
 
-  function remoteObjectType(value) {
-    if (value === null) {
-      return "object";
-    }
-    const type = typeof value;
-    return type || "undefined";
+function formatRuntimeException(details) {
+  const parts = [];
+  if (typeof details.text === "string" && details.text) {
+    parts.push(details.text);
   }
-
-  function remoteObjectSubtype(value) {
-    if (value === null) {
-      return "null";
-    }
-    if (Array.isArray(value)) {
-      return "array";
-    }
-    if (typeof Node !== "undefined" && value instanceof Node) {
-      return "node";
-    }
-    if (value instanceof Date) {
-      return "date";
-    }
-    if (value instanceof RegExp) {
-      return "regexp";
-    }
-    if (value instanceof Error) {
-      return "error";
-    }
-    return null;
-  }
-
-  function remoteObjectDescription(value, type, subtype) {
-    if (subtype === "node" && value && value.nodeType === 1) {
-      const tag = String(value.tagName || "").toLowerCase();
-      const id = value.id ? `#${value.id}` : "";
-      return `<${tag}${id}>`;
-    }
-    if (type === "undefined") {
-      return "undefined";
-    }
-    if (type === "symbol" || type === "function" || type === "bigint") {
-      return String(value);
-    }
-    if (subtype === "error") {
-      return value && value.stack ? String(value.stack) : String(value);
-    }
-    try {
-      return String(value);
-    } catch (_) {
-      return type;
+  const exception = details.exception;
+  if (exception && typeof exception === "object") {
+    if (typeof exception.description === "string" && exception.description) {
+      parts.push(exception.description);
+    } else if (exception.value !== undefined) {
+      parts.push(String(exception.value));
     }
   }
-
-  function unserializableValue(value) {
-    if (typeof value === "number" && !Number.isFinite(value)) {
-      if (Number.isNaN(value)) {
-        return "NaN";
-      }
-      return value > 0 ? "Infinity" : "-Infinity";
-    }
-    if (Object.is(value, -0)) {
-      return "-0";
-    }
-    if (typeof value === "bigint") {
-      return `${String(value)}n`;
-    }
-    return null;
+  const line = Number.isInteger(details.lineNumber) ? details.lineNumber : null;
+  const column = Number.isInteger(details.columnNumber) ? details.columnNumber : null;
+  if (line !== null || column !== null) {
+    parts.push(`line=${line ?? "?"} column=${column ?? "?"}`);
   }
+  return parts.length > 0 ? parts.join(" | ") : JSON.stringify(details);
 }
 
 function readActiveElementInPage() {
