@@ -15,7 +15,7 @@ use synapse_core::error_codes;
 
 use super::{
     ErrorData, Json, Parameters, SessionTarget, SynapseService, TargetWire,
-    agent_state::{AgentLifecycleState, AgentStateRead},
+    agent_state::{AgentAttentionClass, AgentLifecycleState, AgentStateRead},
     mcp_error,
     session_registry::{SessionRegistryRead, SpawnedAgentRead, unix_time_ms_now},
     target_claims::{self, TargetClaimRead},
@@ -86,6 +86,8 @@ pub struct SessionSummary {
     /// reason code, heartbeat, waiting_for detail, runaway flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<AgentStateRead>,
+    #[serde(default, skip_serializing_if = "AgentAttentionClass::is_none")]
+    pub attention_class: AgentAttentionClass,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -155,6 +157,8 @@ pub struct AttachedAgentRegistryRow {
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "AgentAttentionClass::is_none")]
+    pub attention_class: AgentAttentionClass,
     pub counts_as_live: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_counted_reason: Option<String>,
@@ -656,7 +660,7 @@ fn split_unbound_agent_states(
 }
 
 fn unbound_agent_row_is_terminal(row: &AgentStateRead) -> bool {
-    matches!(row.state, AgentLifecycleState::Dead)
+    matches!(row.state, AgentLifecycleState::Dead) || row.attention_class.is_terminal_history()
 }
 
 fn build_attached_agent_registry(
@@ -795,6 +799,8 @@ fn attached_row_from_spawned_session(
     let state = agent_state.map(|row| row.state.as_str().to_owned());
     let reason_code = agent_state.and_then(|row| row.reason_code.clone());
     let (counts_as_live, not_counted_reason) = attached_count_decision(&process);
+    let attention_class =
+        attached_attention_class(agent_state, &registry.lifecycle, counts_as_live);
     let target_id = Some(spawned.spawn_id.clone());
     AttachedAgentRegistryRow {
         registry_id: spawned.spawn_id.clone(),
@@ -803,6 +809,7 @@ fn attached_row_from_spawned_session(
         lifecycle: registry.lifecycle.clone(),
         state,
         reason_code,
+        attention_class,
         counts_as_live,
         not_counted_reason,
         session_id: Some(registry.session_id.clone()),
@@ -833,6 +840,10 @@ fn attached_row_from_agent_state(
     );
     let visible_window = attached_visible_window(&process, windows_by_pid);
     let (counts_as_live, not_counted_reason) = attached_count_decision(&process);
+    let lifecycle = registry
+        .map(|registry| registry.lifecycle.clone())
+        .unwrap_or_else(|| "unbound".to_owned());
+    let attention_class = attached_attention_class(Some(row), &lifecycle, counts_as_live);
     let target_id = row
         .spawn_id
         .clone()
@@ -850,11 +861,10 @@ fn attached_row_from_agent_state(
             .clone()
             .unwrap_or_else(|| "unknown".to_owned()),
         source: source.to_owned(),
-        lifecycle: registry
-            .map(|registry| registry.lifecycle.clone())
-            .unwrap_or_else(|| "unbound".to_owned()),
+        lifecycle,
         state: Some(row.state.as_str().to_owned()),
         reason_code: row.reason_code.clone(),
+        attention_class,
         counts_as_live,
         not_counted_reason,
         session_id: row.session_id.clone(),
@@ -959,6 +969,7 @@ fn insert_ambient_agent_process_rows(
                 lifecycle: "live".to_owned(),
                 state: Some("working".to_owned()),
                 reason_code: Some("ambient_process_observed".to_owned()),
+                attention_class: AgentAttentionClass::None,
                 counts_as_live: true,
                 not_counted_reason: None,
                 session_id: None,
@@ -1171,6 +1182,36 @@ fn attached_count_decision(process: &AttachedAgentProcessReadback) -> (bool, Opt
     (true, None)
 }
 
+fn attached_attention_class(
+    agent_state: Option<&AgentStateRead>,
+    lifecycle: &str,
+    counts_as_live: bool,
+) -> AgentAttentionClass {
+    if counts_as_live && !matches!(lifecycle, "live" | "unbound") {
+        return AgentAttentionClass::CleanupRequired;
+    }
+    let Some(agent_state) = agent_state else {
+        return AgentAttentionClass::None;
+    };
+    match agent_state.attention_class {
+        AgentAttentionClass::TerminalSetupFailure | AgentAttentionClass::TerminalRuntimeFailure
+            if counts_as_live =>
+        {
+            AgentAttentionClass::CleanupRequired
+        }
+        AgentAttentionClass::ActionableLiveStuck if counts_as_live => {
+            AgentAttentionClass::ActionableLiveStuck
+        }
+        AgentAttentionClass::TerminalSetupFailure | AgentAttentionClass::TerminalRuntimeFailure => {
+            agent_state.attention_class
+        }
+        AgentAttentionClass::CleanupRequired => AgentAttentionClass::CleanupRequired,
+        AgentAttentionClass::ActionableLiveStuck | AgentAttentionClass::None => {
+            AgentAttentionClass::None
+        }
+    }
+}
+
 fn attached_kill_handle(
     counts_as_live: bool,
     target_id: Option<String>,
@@ -1248,6 +1289,23 @@ fn build_session_summary(
             || lease_status.owner_session_id.as_deref() == Some(session_id))
         .then(|| synthetic_registry_read(session_id, now_unix_ms, stale_after_ms))
     })?;
+    let agent_state = super::agent_state::read_for_session(session_id, now_unix_ms);
+    let lease = SessionLeaseReadback {
+        held: lease_status.held,
+        owner_session_id: lease_status.owner_session_id.clone(),
+        is_owner: lease_status.owner_session_id.as_deref() == Some(session_id),
+        acquired_at_ms_ago: lease_status.acquired_at_ms_ago,
+        renewed_at_ms_ago: lease_status.renewed_at_ms_ago,
+        ttl_ms: lease_status.ttl_ms,
+        expires_in_ms: lease_status.expires_in_ms,
+    };
+    let attention_class = session_attention_class(
+        &registry,
+        active_target_wire.as_ref(),
+        &target_claims,
+        &lease,
+        agent_state.as_ref(),
+    );
     Some(SessionSummary {
         registry,
         active_target: active_target_wire,
@@ -1262,17 +1320,27 @@ fn build_session_summary(
             lease_status,
         ),
         target_claims,
-        lease: SessionLeaseReadback {
-            held: lease_status.held,
-            owner_session_id: lease_status.owner_session_id.clone(),
-            is_owner: lease_status.owner_session_id.as_deref() == Some(session_id),
-            acquired_at_ms_ago: lease_status.acquired_at_ms_ago,
-            renewed_at_ms_ago: lease_status.renewed_at_ms_ago,
-            ttl_ms: lease_status.ttl_ms,
-            expires_in_ms: lease_status.expires_in_ms,
-        },
-        agent_state: super::agent_state::read_for_session(session_id, now_unix_ms),
+        lease,
+        agent_state,
+        attention_class,
     })
+}
+
+fn session_attention_class(
+    registry: &SessionRegistryRead,
+    active_target: Option<&TargetWire>,
+    target_claims: &[TargetClaimRead],
+    lease: &SessionLeaseReadback,
+    agent_state: Option<&AgentStateRead>,
+) -> AgentAttentionClass {
+    let owns_cleanup_resource =
+        active_target.is_some() || !target_claims.is_empty() || lease.is_owner;
+    if registry.lifecycle != "live" && owns_cleanup_resource {
+        return AgentAttentionClass::CleanupRequired;
+    }
+    agent_state
+        .map(|read| read.attention_class)
+        .unwrap_or_default()
 }
 
 fn target_claim_reads_by_owner(
@@ -1750,6 +1818,17 @@ mod tests {
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].anchor, "dead-local-model");
         assert_eq!(terminal[0].state, AgentLifecycleState::Dead);
+        assert_eq!(
+            terminal[0].attention_class,
+            AgentAttentionClass::TerminalSetupFailure
+        );
+        assert_eq!(
+            active
+                .iter()
+                .find(|row| row.anchor == "active-stuck")
+                .map(|row| row.attention_class),
+            Some(AgentAttentionClass::ActionableLiveStuck)
+        );
         assert_eq!(filter.active_unbound_agent_count, 3);
         assert_eq!(filter.terminal_unbound_agent_count, 1);
         assert!(filter.reason.contains("not actionable attention"));
@@ -1757,15 +1836,37 @@ mod tests {
 
     #[test]
     fn attached_registry_counts_only_os_live_process_rows() {
-        let live_session = spawned_summary(
+        let mut live_session = spawned_summary(
             "session-live",
             "agent-spawn-live",
             "local-model",
             100,
             Some(101),
         );
-        let dead_session =
+        let mut dead_session =
             spawned_summary("session-dead", "agent-spawn-dead", "local-model", 200, None);
+        let mut cleanup_session = spawned_summary(
+            "session-cleanup",
+            "agent-spawn-cleanup",
+            "local-model",
+            300,
+            None,
+        );
+        if let Some(agent_state) = live_session.agent_state.as_mut() {
+            agent_state.state = AgentLifecycleState::Stuck;
+            agent_state.reason_code = Some("silent_timeout".to_owned());
+            agent_state.attention_class = AgentAttentionClass::ActionableLiveStuck;
+        }
+        if let Some(agent_state) = dead_session.agent_state.as_mut() {
+            agent_state.state = AgentLifecycleState::Dead;
+            agent_state.reason_code = Some("process_gone_without_exit_event".to_owned());
+            agent_state.attention_class = AgentAttentionClass::TerminalRuntimeFailure;
+        }
+        if let Some(agent_state) = cleanup_session.agent_state.as_mut() {
+            agent_state.state = AgentLifecycleState::Dead;
+            agent_state.reason_code = Some("process_gone_without_exit_event".to_owned());
+            agent_state.attention_class = AgentAttentionClass::TerminalRuntimeFailure;
+        }
         let ambient = agent_read(
             "agent-spawn-ambient-claude-test",
             AgentLifecycleState::Idle,
@@ -1775,12 +1876,13 @@ mod tests {
             100 => vec![100, 101],
             101 => vec![101],
             200 => vec![200],
+            300 => vec![300],
             other => vec![other],
         };
         let live_process_ids = |ids: &[u32]| {
             ids.iter()
                 .copied()
-                .filter(|pid| matches!(pid, 100 | 101))
+                .filter(|pid| matches!(pid, 100 | 101 | 300))
                 .collect::<Vec<_>>()
         };
         let windows = BTreeMap::from([(
@@ -1794,7 +1896,7 @@ mod tests {
         )]);
 
         let registry = build_attached_agent_registry_with_process_probe(
-            &[live_session, dead_session],
+            &[live_session, dead_session, cleanup_session],
             &[ambient],
             2_000,
             &process_tree_ids,
@@ -1804,9 +1906,9 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(registry.exact_live_count, 1);
-        assert_eq!(registry.row_count, 3);
-        assert_eq!(registry.killable_live_count, 1);
+        assert_eq!(registry.exact_live_count, 2);
+        assert_eq!(registry.row_count, 4);
+        assert_eq!(registry.killable_live_count, 2);
         assert_eq!(registry.unprobeable_observed_count, 1);
         let live = registry
             .rows
@@ -1815,6 +1917,10 @@ mod tests {
             .expect("live spawned row");
         assert!(live.counts_as_live);
         assert!(live.kill_handle.available);
+        assert_eq!(
+            live.attention_class,
+            AgentAttentionClass::ActionableLiveStuck
+        );
         assert_eq!(
             live.visible_window
                 .as_ref()
@@ -1836,6 +1942,20 @@ mod tests {
         assert_eq!(
             dead.not_counted_reason.as_deref(),
             Some("os_process_not_live")
+        );
+        assert_eq!(
+            dead.attention_class,
+            AgentAttentionClass::TerminalRuntimeFailure
+        );
+        let cleanup = registry
+            .rows
+            .iter()
+            .find(|row| row.registry_id == "agent-spawn-cleanup")
+            .expect("cleanup spawned row");
+        assert!(cleanup.counts_as_live);
+        assert_eq!(
+            cleanup.attention_class,
+            AgentAttentionClass::CleanupRequired
         );
         let ambient = registry
             .rows
@@ -1972,6 +2092,7 @@ mod tests {
             agent_kind: Some("test-agent".to_owned()),
             state,
             reason_code: reason_code.map(str::to_owned),
+            attention_class: AgentAttentionClass::for_lifecycle(state, reason_code),
             since_unix_ms: 1_000,
             last_event_unix_ms: 1_000,
             last_event_kind: AgentEventKind::StateChanged,
@@ -2049,6 +2170,7 @@ mod tests {
                 agent_kind: Some(cli.to_owned()),
                 state: AgentLifecycleState::Working,
                 reason_code: Some("spawn_ready".to_owned()),
+                attention_class: AgentAttentionClass::None,
                 since_unix_ms: 1_000,
                 last_event_unix_ms: 1_900,
                 last_event_kind: AgentEventKind::SpawnReady,
@@ -2061,6 +2183,7 @@ mod tests {
                 agent_process_id,
                 log_dir: Some(format!("C:\\test\\{spawn_id}")),
             }),
+            attention_class: AgentAttentionClass::None,
         }
     }
 }

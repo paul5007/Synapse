@@ -41,7 +41,7 @@ use synapse_storage::{
 
 use rmcp::{RoleServer, service::RequestContext};
 
-use super::agent_state::{AgentLifecycleState, AgentStateRead};
+use super::agent_state::{AgentAttentionClass, AgentLifecycleState, AgentStateRead};
 use super::{
     ErrorData, Json, Parameters, SynapseService, agent_events::unix_time_ns_now, mcp_error, tool,
     tool_router,
@@ -250,6 +250,8 @@ pub struct AgentQueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_class: Option<AgentAttentionClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub since_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silent_ms: Option<u64>,
@@ -426,6 +428,10 @@ impl SynapseService {
             agent_kind,
             state: lifecycle.as_ref().map(|read| read.state),
             reason_code: lifecycle.as_ref().and_then(|read| read.reason_code.clone()),
+            attention_class: lifecycle
+                .as_ref()
+                .map(|read| read.attention_class)
+                .filter(|attention_class| !attention_class.is_none()),
             since_unix_ms: lifecycle.as_ref().map(|read| read.since_unix_ms),
             silent_ms: lifecycle.as_ref().map(|read| read.silent_ms),
             runaway: lifecycle.as_ref().is_some_and(|read| read.runaway),
@@ -1028,6 +1034,7 @@ fn empty_response(
         agent_kind: None,
         state: None,
         reason_code: None,
+        attention_class: None,
         since_unix_ms: None,
         silent_ms: None,
         runaway: false,
@@ -1060,6 +1067,7 @@ fn sources_map() -> BTreeMap<String, String> {
     for field in [
         "state",
         "reason_code",
+        "attention_class",
         "since_unix_ms",
         "silent_ms",
         "runaway",

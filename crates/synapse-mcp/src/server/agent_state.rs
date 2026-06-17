@@ -150,6 +150,74 @@ impl AgentLifecycleState {
     }
 }
 
+/// Fleet/dashboard attention class for agent lifecycle rows. This is separate
+/// from lifecycle state: `dead` remains the durable terminal state, while the
+/// attention class tells dashboards whether that state is actionable now.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AgentAttentionClass {
+    #[default]
+    None,
+    ActionableLiveStuck,
+    TerminalSetupFailure,
+    TerminalRuntimeFailure,
+    CleanupRequired,
+}
+
+impl AgentAttentionClass {
+    pub(crate) const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(crate) const fn is_terminal_history(self) -> bool {
+        matches!(
+            self,
+            Self::TerminalSetupFailure | Self::TerminalRuntimeFailure
+        )
+    }
+
+    pub(crate) fn for_lifecycle(state: AgentLifecycleState, reason_code: Option<&str>) -> Self {
+        match state {
+            AgentLifecycleState::Stuck => Self::ActionableLiveStuck,
+            AgentLifecycleState::Dead if terminal_setup_failure_reason(reason_code) => {
+                Self::TerminalSetupFailure
+            }
+            AgentLifecycleState::Dead => Self::TerminalRuntimeFailure,
+            AgentLifecycleState::Spawning
+            | AgentLifecycleState::Working
+            | AgentLifecycleState::Idle
+            | AgentLifecycleState::NeedsInput
+            | AgentLifecycleState::AwaitingApproval
+            | AgentLifecycleState::ReadyForReview => Self::None,
+        }
+    }
+}
+
+fn terminal_setup_failure_reason(reason_code: Option<&str>) -> bool {
+    matches!(
+        reason_code,
+        Some(
+            "local_model_model_ref_missing"
+                | "local_model_registry_row_missing"
+                | "local_model_registry_row_disabled"
+                | "local_model_api_shape_unsupported"
+                | "local_model_registry_row_unprobed"
+                | "local_model_registry_row_unhealthy"
+                | "local_model_api_key_decrypt_failed"
+                | "local_model_api_key_missing"
+                | "session_registry_readback_timeout"
+                | "task_start_readiness_readback_failed"
+                | "process_history_record_failed"
+                | "agent_spawn_shell_env_not_unicode"
+                | "agent_spawn_shell_env_empty"
+                | "agent_spawn_shell_env_target_missing"
+                | "agent_spawn_shell_target_missing"
+                | "agent_spawn_shell_not_found"
+                | "agent_spawn_shell_not_executable"
+        )
+    )
+}
+
 /// One agent's state as exposed on `session_list` / `session_status` rows.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -166,6 +234,8 @@ pub(crate) struct AgentStateRead {
     pub state: AgentLifecycleState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "AgentAttentionClass::is_none")]
+    pub attention_class: AgentAttentionClass,
     pub since_unix_ms: u64,
     pub last_event_unix_ms: u64,
     pub last_event_kind: AgentEventKind,
@@ -231,6 +301,10 @@ impl AgentEntry {
             agent_kind: self.agent_kind.clone(),
             state: self.state,
             reason_code: self.reason_code.clone(),
+            attention_class: AgentAttentionClass::for_lifecycle(
+                self.state,
+                self.reason_code.as_deref(),
+            ),
             since_unix_ms: self.since_unix_ms,
             last_event_unix_ms: self.last_event_unix_ms,
             last_event_kind: self.last_event_kind,

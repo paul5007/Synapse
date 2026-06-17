@@ -3530,6 +3530,7 @@ fn dashboard_primary_session_list_data(
             "acknowledged_unbound_agent_count": acknowledged_count,
             "terminal_unbound_agent_count": terminal_count,
             "terminal_states": ["dead", "done", "exited", "closed"],
+            "terminal_attention_classes": ["terminal_setup_failure", "terminal_runtime_failure"],
             "acknowledged_attention_statuses": ["acked"],
             "acknowledged_attention_anchor_count": acked_anchors.len(),
             "acknowledged_attention_read_error": acked_anchor_error,
@@ -3540,6 +3541,15 @@ fn dashboard_primary_session_list_data(
 }
 
 fn dashboard_agent_row_is_terminal(row: &serde_json::Value) -> bool {
+    if let Some(attention_class) = row
+        .get("attention_class")
+        .and_then(serde_json::Value::as_str)
+    {
+        return matches!(
+            attention_class,
+            "terminal_setup_failure" | "terminal_runtime_failure"
+        );
+    }
     row.get("state")
         .and_then(serde_json::Value::as_str)
         .map(|state| matches!(state, "dead" | "done" | "exited" | "closed"))
@@ -4146,7 +4156,15 @@ mod tests {
                     "anchor": "agent-spawn-dead",
                     "spawn_id": "agent-spawn-dead",
                     "state": "dead",
-                    "reason_code": "local_model_registry_row_missing"
+                    "reason_code": "local_model_registry_row_missing",
+                    "attention_class": "terminal_setup_failure"
+                },
+                {
+                    "anchor": "agent-spawn-cleanup",
+                    "spawn_id": "agent-spawn-cleanup",
+                    "state": "dead",
+                    "reason_code": "process_gone_without_exit_event",
+                    "attention_class": "cleanup_required"
                 },
                 {
                     "anchor": "agent-spawn-stuck",
@@ -4184,10 +4202,12 @@ mod tests {
             .as_array()
             .expect("terminal rows");
 
-        assert_eq!(primary.len(), 3);
-        assert_eq!(primary[0]["state"], "stuck");
-        assert_eq!(primary[1]["state"], "needs_input");
-        assert_eq!(primary[2], "malformed-row");
+        assert_eq!(primary.len(), 4);
+        assert_eq!(primary[0]["anchor"], "agent-spawn-cleanup");
+        assert_eq!(primary[0]["attention_class"], "cleanup_required");
+        assert_eq!(primary[1]["state"], "stuck");
+        assert_eq!(primary[2]["state"], "needs_input");
+        assert_eq!(primary[3], "malformed-row");
         assert_eq!(acknowledged.len(), 1);
         assert_eq!(acknowledged[0]["anchor"], "agent-spawn-acked-stuck");
         assert_eq!(
@@ -4196,6 +4216,7 @@ mod tests {
         );
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0]["anchor"], "agent-spawn-dead");
+        assert_eq!(terminal[0]["attention_class"], "terminal_setup_failure");
         assert_eq!(
             data["dashboard_unbound_agent_filter"]["acknowledged_unbound_agent_count"],
             1

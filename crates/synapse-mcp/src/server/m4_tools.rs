@@ -4994,6 +4994,7 @@ mod tests {
                 expires_in_ms: None,
             },
             agent_state: None,
+            attention_class: crate::server::agent_state::AgentAttentionClass::None,
         }
     }
 
