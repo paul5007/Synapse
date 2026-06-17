@@ -1048,6 +1048,127 @@ pub struct BrowserEvaluateResponse {
     pub required_foreground: bool,
 }
 
+/// Parameters for `browser_content` (#1158): return the full serialized HTML of
+/// the calling session's owned CDP page target.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserContentParams {
+    /// CDP TargetID to read. Defaults to the active session CDP target. Must be
+    /// owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Maximum HTML bytes to return (UTF-16 length cap, default 2 MiB). The HTML
+    /// is truncated in-page; `truncated`/`html_len` report the original size.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+/// Response for `browser_content`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserContentResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    /// Serialized `document.documentElement.outerHTML` (possibly truncated).
+    pub html: String,
+    /// Full original length of the serialized HTML (before truncation).
+    pub html_len: usize,
+    pub truncated: bool,
+    pub max_bytes: usize,
+    pub readback_backend: String,
+    pub required_foreground: bool,
+}
+
+/// Parameters for `browser_inspect` (#1160/#1161/#1162/#1163): typed
+/// introspection of a single DOM element.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserInspectParams {
+    /// Element id (from `find`/`observe`) of a CDP web element to introspect.
+    pub element_id: String,
+    /// CDP TargetID; defaults to the element's embedded target. When supplied it
+    /// must match the element's target.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only when the active session
+    /// target is absent.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Maximum bytes per HTML/text field (UTF-16 length cap, default 256 KiB).
+    #[serde(default)]
+    pub max_html_bytes: Option<usize>,
+}
+
+/// An element's page-relative bounding rectangle (#1163). `x`/`y` include scroll
+/// offset (page coordinates, the Playwright `boundingBox` semantics);
+/// `viewport_x`/`viewport_y` are the unscrolled viewport coordinates. All values
+/// are CSS pixels; multiply by `device_pixel_ratio` for device pixels.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserBoundingBox {
+    pub x: f64,
+    pub y: f64,
+    pub viewport_x: f64,
+    pub viewport_y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// The in-page introspection payload for one element (deserialized from the
+/// element-scoped evaluation, re-serialized to the caller).
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ElementInspection {
+    pub tag_name: String,
+    pub outer_html: String,
+    pub inner_html: String,
+    pub inner_text: String,
+    pub text_content: String,
+    /// True when any of the html/text fields exceeded `max_html_bytes`.
+    pub html_truncated: bool,
+    pub max_html_bytes: usize,
+    /// Live attribute name → value map (string values).
+    pub attributes: serde_json::Map<String, serde_json::Value>,
+    /// The element's `value` property when it has one (inputs/textarea/select);
+    /// `null` otherwise.
+    pub input_value: Option<String>,
+    pub is_visible: bool,
+    pub is_enabled: bool,
+    pub is_checked: bool,
+    pub is_editable: bool,
+    pub bounding_box: BrowserBoundingBox,
+    pub device_pixel_ratio: f64,
+}
+
+/// Response for `browser_inspect`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserInspectResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub element_id: String,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub element: ElementInspection,
+    pub readback_backend: String,
+    pub required_foreground: bool,
+}
+
 pub fn empty_input_schema() -> Arc<JsonObject> {
     common::schema_for_type::<EmptyParams>()
 }

@@ -1,5 +1,6 @@
 use super::{
-    BrowserEvaluateParams, BrowserEvaluateResponse, CaptureScreenshotFormat,
+    BrowserContentParams, BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse,
+    BrowserInspectParams, BrowserInspectResponse, CaptureScreenshotFormat, ElementInspection,
     CaptureScreenshotParams, CaptureScreenshotResponse,
     CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
     CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
@@ -1535,6 +1536,147 @@ impl SynapseService {
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
     }
+
+    #[tool(
+        description = "Return the full serialized HTML of the calling session's owned background browser tab (document.documentElement.outerHTML) via raw CDP, plus url/title/readyState read back from the same target. Requires an active session CDP target or an explicit cdp_target_id owned by this session; never the human foreground tab. Read-only, background-safe: never activates the tab or uses OS foreground input. The HTML is truncated in-page to max_bytes; html_len/truncated report the original size. Raw CDP only; the popup-safe extension bridge fails closed."
+    )]
+    pub async fn browser_content(
+        &self,
+        params: Parameters<BrowserContentParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserContentResponse>, ErrorData> {
+        const TOOL: &str = "browser_content";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_content"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        if let Some(target_id) = params.0.cdp_target_id.as_deref() {
+            validate_cdp_target_id(target_id)?;
+        }
+        let max_bytes = params
+            .0
+            .max_bytes
+            .unwrap_or(DEFAULT_BROWSER_CONTENT_MAX_BYTES)
+            .min(MAX_BROWSER_CONTENT_BYTES);
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "max_bytes": max_bytes,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "max_bytes": max_bytes,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_content_impl(&session_id, window_hwnd, &cdp_target_id, max_bytes)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Typed introspection of a single DOM element in the calling session's owned background browser tab via raw CDP: tag_name, outer_html/inner_html/inner_text/text_content, the live attribute map, input value, the boolean state queries (is_visible/is_enabled/is_checked/is_editable), and the page-relative bounding_box. The element id (from find/observe) carries its CDP target, which must be owned by this session; never the human foreground tab. Read-only, background-safe. HTML/text fields are truncated to max_html_bytes. Raw CDP only."
+    )]
+    pub async fn browser_inspect(
+        &self,
+        params: Parameters<BrowserInspectParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserInspectResponse>, ErrorData> {
+        const TOOL: &str = "browser_inspect";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_inspect"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        if params.0.element_id.trim().is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "browser_inspect requires a non-empty element_id",
+            ));
+        }
+        let (backend_node_id, element_target) =
+            parse_browser_evaluate_element(&params.0.element_id)?;
+        if let Some(explicit) = params.0.cdp_target_id.as_deref() {
+            validate_cdp_target_id(explicit)?;
+            if !element_target.eq_ignore_ascii_case(explicit) {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "browser_inspect element_id resolves to CDP target {element_target:?} but cdp_target_id {explicit:?} was also supplied; they must match"
+                    ),
+                ));
+            }
+        }
+        let max_html_bytes = params
+            .0
+            .max_html_bytes
+            .unwrap_or(DEFAULT_BROWSER_INSPECT_HTML_BYTES)
+            .min(MAX_BROWSER_INSPECT_HTML_BYTES);
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "element_id": &params.0.element_id,
+            "requested_cdp_target": cdp_target_id_audit_ref(Some(element_target.as_str())),
+            "max_html_bytes": max_html_bytes,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            Some(element_target.as_str()),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "element_id": &params.0.element_id,
+            "max_html_bytes": max_html_bytes,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_inspect_impl(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                &params.0.element_id,
+                backend_node_id,
+                max_html_bytes,
+            )
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
 }
 
 /// Resolves the calling session id for target tools, failing loud when absent
@@ -2581,6 +2723,170 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_content_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        max_bytes: usize,
+    ) -> Result<BrowserContentResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error("browser_content", window_hwnd));
+        };
+        let expression = format!(
+            r#"(() => {{
+                const max = {max_bytes};
+                const html = (document.documentElement && typeof document.documentElement.outerHTML === "string")
+                    ? document.documentElement.outerHTML
+                    : "";
+                return {{ html: html.slice(0, max), html_len: html.length, truncated: html.length > max }};
+            }})()"#
+        );
+        let evaluated = synapse_a11y::cdp_evaluate_expression(
+            &endpoint,
+            cdp_target_id,
+            &expression,
+            false,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_content raw CDP Runtime.evaluate failed: {error}"),
+            )
+        })?;
+        let payload: BrowserContentPayload =
+            serde_json::from_value(evaluated.value).map_err(|error| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    format!("browser_content payload decode failed: {error}"),
+                )
+            })?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_CONTENT",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %evaluated.target_id,
+            html_len = payload.html_len,
+            truncated = payload.truncated,
+            target_url = %evaluated.url,
+            "readback=Runtime.evaluate(document.documentElement.outerHTML) outcome=content_read"
+        );
+        Ok(BrowserContentResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: evaluated.target_id,
+            url: evaluated.url,
+            title: evaluated.title,
+            ready_state: evaluated.ready_state,
+            html: payload.html,
+            html_len: payload.html_len,
+            truncated: payload.truncated,
+            max_bytes,
+            readback_backend: "Runtime.evaluate(document.documentElement.outerHTML)".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_content_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _max_bytes: usize,
+    ) -> Result<BrowserContentResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_content is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
+    async fn browser_inspect_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        element_id: &str,
+        backend_node_id: i64,
+        max_html_bytes: usize,
+    ) -> Result<BrowserInspectResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error("browser_inspect", window_hwnd));
+        };
+        let evaluated = synapse_a11y::cdp_evaluate_on_element(
+            &endpoint,
+            cdp_target_id,
+            backend_node_id,
+            BROWSER_INSPECT_FUNCTION,
+            std::slice::from_ref(&json!(max_html_bytes)),
+            false,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_inspect raw CDP Runtime.callFunctionOn failed: {error}"),
+            )
+        })?;
+        let inspection: ElementInspection =
+            serde_json::from_value(evaluated.value).map_err(|error| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    format!("browser_inspect payload decode failed: {error}"),
+                )
+            })?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_INSPECT",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %evaluated.target_id,
+            element_id = element_id,
+            tag_name = %inspection.tag_name,
+            is_visible = inspection.is_visible,
+            target_url = %evaluated.url,
+            "readback=Runtime.callFunctionOn outcome=element_inspected"
+        );
+        Ok(BrowserInspectResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: evaluated.target_id,
+            element_id: element_id.to_owned(),
+            url: evaluated.url,
+            title: evaluated.title,
+            ready_state: evaluated.ready_state,
+            element: inspection,
+            readback_backend: "Runtime.callFunctionOn".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_inspect_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _element_id: &str,
+        _backend_node_id: i64,
+        _max_html_bytes: usize,
+    ) -> Result<BrowserInspectResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_inspect is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn cdp_open_tab_raw_impl(
         &self,
         session_id: &str,
@@ -3394,6 +3700,94 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
 }
 
 const BROWSER_EVALUATE_MAX_ARGS: usize = 64;
+
+const DEFAULT_BROWSER_CONTENT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BROWSER_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_BROWSER_INSPECT_HTML_BYTES: usize = 256 * 1024;
+const MAX_BROWSER_INSPECT_HTML_BYTES: usize = 4 * 1024 * 1024;
+
+/// In-page payload returned by `browser_content`'s evaluation.
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+struct BrowserContentPayload {
+    html: String,
+    html_len: usize,
+    truncated: bool,
+}
+
+/// Shared error for browser introspection tools when the owned target has no
+/// raw CDP debugging endpoint (the popup-safe extension bridge cannot serve it).
+#[cfg(windows)]
+fn browser_raw_cdp_required_error(tool: &str, window_hwnd: i64) -> ErrorData {
+    mcp_error(
+        error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+        format!(
+            "{tool} requires a raw CDP debugging endpoint for window {window_hwnd:#x}; the popup-safe normal Chrome extension bridge does not expose page/element introspection over CDP (it never attaches the debugger). Open the target in a raw-CDP Chrome (launched with --remote-debugging-port) and retry."
+        ),
+    )
+}
+
+/// Element-scoped introspection function (called Playwright-style as
+/// `fn(element, maxBytes)`). Returns the typed [`super::ElementInspection`]
+/// payload computed entirely in-page in a single round trip.
+#[cfg(windows)]
+const BROWSER_INSPECT_FUNCTION: &str = r#"(el, maxBytes) => {
+    const max = (typeof maxBytes === "number" && maxBytes >= 0) ? maxBytes : 0;
+    const str = v => String(v == null ? "" : v);
+    const outer = str(el.outerHTML);
+    const inner = str(el.innerHTML);
+    const innerText = str(el.innerText);
+    const textContent = str(el.textContent);
+    const truncated = outer.length > max || inner.length > max || innerText.length > max || textContent.length > max;
+    const attrs = {};
+    if (el.attributes) { for (const a of el.attributes) { attrs[a.name] = a.value; } }
+    const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 0, top: 0, width: 0, height: 0 };
+    const cs = (el.nodeType === 1 && el.ownerDocument && el.ownerDocument.defaultView)
+        ? el.ownerDocument.defaultView.getComputedStyle(el) : null;
+    const hasLayout = !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length));
+    const visible = hasLayout && (!cs || (cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0"));
+    const tag = str(el.tagName);
+    const tagU = tag.toUpperCase();
+    const getAttr = name => (el.getAttribute ? str(el.getAttribute(name)) : "");
+    const inputType = (getAttr("type") || "text").toLowerCase();
+    const textTypes = new Set(["text","search","url","tel","email","password","number","date","datetime-local","month","time","week","color"]);
+    const ariaDisabled = getAttr("aria-disabled").toLowerCase() === "true";
+    const enabled = !(("disabled" in el) ? !!el.disabled : false) && !ariaDisabled;
+    const readOnly = ("readOnly" in el) ? !!el.readOnly : false;
+    const editable = (tagU === "TEXTAREA" && enabled && !readOnly) ||
+        (tagU === "INPUT" && textTypes.has(inputType) && enabled && !readOnly) ||
+        (!!el.isContentEditable && enabled) ||
+        (getAttr("role").toLowerCase() === "textbox" && enabled);
+    let checked;
+    if ("checked" in el) { checked = !!el.checked; }
+    else { checked = getAttr("aria-checked").toLowerCase() === "true"; }
+    const sx = (typeof window !== "undefined" && window.scrollX) || 0;
+    const sy = (typeof window !== "undefined" && window.scrollY) || 0;
+    return {
+        tag_name: tag,
+        outer_html: outer.slice(0, max),
+        inner_html: inner.slice(0, max),
+        inner_text: innerText.slice(0, max),
+        text_content: textContent.slice(0, max),
+        html_truncated: truncated,
+        max_html_bytes: max,
+        attributes: attrs,
+        input_value: ("value" in el) ? str(el.value) : null,
+        is_visible: visible,
+        is_enabled: enabled,
+        is_checked: checked,
+        is_editable: editable,
+        bounding_box: {
+            x: rect.left + sx,
+            y: rect.top + sy,
+            viewport_x: rect.left,
+            viewport_y: rect.top,
+            width: rect.width,
+            height: rect.height
+        },
+        device_pixel_ratio: (typeof window !== "undefined" && window.devicePixelRatio) || 1
+    };
+}"#;
 
 /// Parses a browser `element_id` into its `(backendNodeId, cdp_target_id)` for
 /// element-scoped evaluation, failing loud when it is not a CDP web element.
