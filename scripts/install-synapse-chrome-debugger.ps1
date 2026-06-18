@@ -270,7 +270,20 @@ function Set-SynapseChromeExternalDebuggerPolicy {
         $settings = Read-ChromeExtensionSettingsPolicy -Hive 'HKCU'
     } catch {
         $acl = Get-RegistryAclDiagnostic -Path $policyRoot
-        throw "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED hive=HKCU path=$policyRoot phase=read_or_create error=$($_.Exception.Message) acl=$acl remediation=run scripts\install-synapse-chrome-debugger.ps1 from an elevated PowerShell, or repair HKCU\Software\Policies\Google\Chrome ACL so the current user can write ExtensionSettings; until this succeeds Synapse must treat this normal Chrome profile as not popup-free"
+        return [pscustomobject]@{
+            hive = 'HKCU'
+            path = $policyRoot
+            changed = $false
+            reason = 'external_popup_shield_write_denied_warning'
+            warning_code = 'SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED'
+            blocking = $false
+            phase = 'read_or_create'
+            error = $_.Exception.Message
+            acl = $acl
+            remediation = 'repair HKCU\Software\Policies\Google\Chrome ACL or run from elevated PowerShell if you want Synapse to apply the optional external debugger/nativeMessaging popup shield; popup-free Synapse tabs/scripting bridge commands remain usable because Synapse does not request or call chrome.debugger/nativeMessaging'
+            shielded_entries = @()
+            unchanged_entries = @()
+        }
     }
     $changed = $false
     $shieldedEntries = @()
@@ -328,7 +341,20 @@ function Set-SynapseChromeExternalDebuggerPolicy {
             New-ItemProperty -LiteralPath $policyRoot -Name ExtensionSettings -PropertyType String -Value $json -Force | Out-Null
         } catch {
             $acl = Get-RegistryAclDiagnostic -Path $policyRoot
-            throw "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED hive=HKCU path=$policyRoot phase=write_extension_settings error=$($_.Exception.Message) acl=$acl remediation=run scripts\install-synapse-chrome-debugger.ps1 from an elevated PowerShell, or repair HKCU\Software\Policies\Google\Chrome ACL so the current user can write ExtensionSettings; until this succeeds Synapse must treat this normal Chrome profile as not popup-free"
+            return [pscustomobject]@{
+                hive = 'HKCU'
+                path = $policyRoot
+                changed = $false
+                reason = 'external_popup_shield_write_denied_warning'
+                warning_code = 'SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED'
+                blocking = $false
+                phase = 'write_extension_settings'
+                error = $_.Exception.Message
+                acl = $acl
+                remediation = 'repair HKCU\Software\Policies\Google\Chrome ACL or run from elevated PowerShell if you want Synapse to apply the optional external debugger/nativeMessaging popup shield; popup-free Synapse tabs/scripting bridge commands remain usable because Synapse does not request or call chrome.debugger/nativeMessaging'
+                shielded_entries = @($shieldedEntries)
+                unchanged_entries = @($unchangedEntries)
+            }
         }
     }
 
@@ -714,9 +740,11 @@ $externalHazardExtensionIds = @(
 
 # External extensions and native-messaging hosts that use debugger/nativeMessaging
 # can surface layout-changing Chrome popups independently of Synapse's tabs-only
-# bridge. Setup therefore applies a reversible HKCU ExtensionSettings shield for
-# those permissions by default. The marker is Synapse-authored and can be removed
-# with -RemoveExternalDebuggerPolicyOnly.
+# bridge. Setup tries to apply a reversible HKCU ExtensionSettings shield for
+# those permissions by default. Failure to write the optional shield is reported
+# with ACL/readback details, but it does not block Synapse's popup-free
+# tabs/scripting bridge because that bridge never requests or calls
+# debugger/nativeMessaging.
 #
 # As a one-way remediation we remove any debugger/nativeMessaging blockers that
 # an earlier Synapse version wrote into Chrome ExtensionSettings, so running the
@@ -771,6 +799,8 @@ $chromePolicyPopupShield = if ($PreserveExternalDebuggerExtensions) {
     current_chrome_processes = $chromeProcesses
     chrome_policy_cleanup = $chromePolicyCleanup
     chrome_policy_popup_shield = $chromePolicyPopupShield
+    external_popup_risk_blocks_popup_free_commands = $false
+    external_popup_risk_scope = 'reported_for_operator_attribution_and_optional_policy_shield_only'
     synapse_chrome_profile_readback = $synapseChromeProfileReadback
     external_hazard_extension_ids = $externalHazardExtensionIds
     external_debugger_or_native_extensions = $externalDebuggerOrNativeExtensions

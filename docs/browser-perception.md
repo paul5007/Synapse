@@ -26,14 +26,11 @@ Chrome extension direct-localhost WebSocket bridge for background tab control
 through `chrome.tabs`. DOM attach through the debugger API is intentionally
 unavailable in the normal end-user bridge. If no CDP endpoint is available, the
 UIA tree is still returned, but it is the browser shell, not the page DOM.
-The normal-profile `chrome.tabs` bridge is also refused at runtime when the
-current Chrome profile/process readback shows any external extension or native
-host with `debugger` or `nativeMessaging`, because those surfaces can create the
-same operator-visible debugger/native-host popup when tab events occur.
-On unsafe hosts, the daemon refuses the direct bridge registration itself with
-`A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED`, and the extension stays dormant until
-Chrome or the extension restarts instead of repeatedly waking the normal Chrome
-profile.
+External extensions or native hosts with `debugger` / `nativeMessaging` are
+reported in health/diagnostics for popup attribution and optional policy
+shielding, but they do not block Synapse's own popup-free `chrome.tabs` /
+`chrome.scripting` bridge. Attach-capable debugger commands still fail closed
+with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before any Chrome work is queued.
 
 ## Diagnostics
 
@@ -74,8 +71,8 @@ The intended strategy ladder is:
    loopback debug endpoint exists.
 2. Non-attach Chrome extension `chrome.tabs` navigation for normal-profile
    background tab open, close, navigate, reload, back, and forward over the
-   direct localhost WebSocket bridge, only after the live profile/process
-   Source of Truth is popup-free.
+   direct localhost WebSocket bridge. External popup-risk surfaces are reported
+   separately; they do not disable Synapse's safe tabs/scripting commands.
 3. OCR/capture over tiled browser content when CDP is down or attach fails.
 4. Explicit `uia_only` for browser chrome/native UI when neither DOM nor OCR
    produced page content.
@@ -197,10 +194,9 @@ Chrome session, the supported attach path is:
    `scripts\install-synapse-chrome-debugger.ps1 -RemoveExternalDebuggerPolicyOnly`
    to remove only Synapse-authored popup shields. Use
    `-PreserveExternalDebuggerExtensions` only as an explicit emergency opt-out.
-   If `HKCU\Software\Policies\Google\Chrome` is ACL-locked, the verifier fails
-   closed with `SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED` and ACL
-   readback; run the verifier from elevated PowerShell or repair that key's ACL
-   before treating the normal Chrome profile as popup-free.
+   If `HKCU\Software\Policies\Google\Chrome` is ACL-locked, the verifier reports
+   `SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED` and ACL readback as a
+   non-blocking warning for the optional external shield.
    Runtime `observe` diagnostics also include a live
    `external_chrome_popup_risk` profile/process summary when Synapse refuses a
    normal-profile attach-capable command, so remaining popups are attributed to
