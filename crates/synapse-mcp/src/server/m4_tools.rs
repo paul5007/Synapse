@@ -747,7 +747,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Spawn a fully capable primary Codex, Claude, or local_model agent as a hidden background process, wire it to the configured Synapse HTTP MCP daemon, require real MCP session registration, optionally bind a per-session target, and return only after session_list readback plus a validated task-start readiness artifact prove the spawned prompt began executing. Pass cli/kind for a direct spawn, or template_id (+ template_params) to render the spawn from a durable agent_template; a template-rendered spawn records the exact (template_id, version, config_hash) used and rejects passing cli/kind/model/model_ref/prompt/working_dir/target alongside the template."
+        description = "Spawn a fully capable primary Codex, Claude, or local_model agent as a hidden background process, wire it to the configured Synapse HTTP MCP daemon, require real MCP session registration, optionally bind a per-session target, and return only after session_list readback plus a validated task-start readiness artifact prove the spawned prompt began executing. Pass cli/kind plus a non-empty prompt for a direct spawn, or template_id (+ template_params) to render the spawn from a durable agent_template; a template-rendered spawn records the exact (template_id, version, config_hash) used and rejects passing cli/kind/model/model_ref/prompt/working_dir/target alongside the template."
     )]
     pub async fn act_spawn_agent(
         &self,
@@ -1388,7 +1388,7 @@ impl SynapseService {
                     template_version: None,
                     template_config_hash: None,
                 };
-                params.effective_cli()?;
+                validate_agent_spawn_params(&params)?;
                 Ok(params)
             }
         }
@@ -3993,13 +3993,20 @@ fn build_agent_spawn_prompt(
         }
     };
     let assigned_prompt = params.prompt.as_deref().unwrap_or("").trim();
-    let assigned_block = if assigned_prompt.is_empty() {
-        "No additional task was provided; perform only the provisioning checks above.".to_owned()
-    } else {
-        format!(
-            "After the provisioning checks pass, perform this assigned task:\n{assigned_prompt}"
-        )
-    };
+    if assigned_prompt.is_empty() {
+        let mode = if params.template_id.is_some() {
+            "template"
+        } else {
+            "direct spawn"
+        };
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("act_spawn_agent {mode} prompt must not be empty"),
+        ));
+    }
+    let assigned_block = format!(
+        "After the provisioning checks pass, perform this assigned task:\n{assigned_prompt}"
+    );
     let hold_instruction = if params.hold_open_ms == 0 {
         "Do not add an artificial hold-open sleep after completing the provisioning checks and assigned task.".to_owned()
     } else {
@@ -6237,6 +6244,62 @@ mod tests {
             "{}",
             error.message
         );
+    }
+
+    #[test]
+    fn direct_spawn_prompt_builder_rejects_blank_prompt() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let task_started_path = dir.path().join("task-started.json");
+        let task_started_script_path = dir.path().join("write-task-started.ps1");
+
+        for prompt in [None, Some(""), Some("  \r\n\t ")] {
+            let mut params = test_spawn_params();
+            params.prompt = prompt.map(str::to_owned);
+            let error = build_agent_spawn_prompt(
+                "agent-spawn-test",
+                &params,
+                dir.path(),
+                &task_started_path,
+                &task_started_script_path,
+            )
+            .expect_err("blank direct spawn prompt must fail closed");
+
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&json!(error_codes::TOOL_PARAMS_INVALID))
+            );
+            assert!(
+                error
+                    .message
+                    .contains("direct spawn prompt must not be empty"),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn template_rendered_prompt_builder_accepts_template_prompt() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let task_started_path = dir.path().join("task-started.json");
+        let task_started_script_path = dir.path().join("write-task-started.ps1");
+        let mut params = test_spawn_params();
+        params.template_id = Some("issue1245-template".to_owned());
+        params.template_version = Some(1);
+        params.template_config_hash = Some("sha256:test".to_owned());
+        params.prompt = Some("template-provided task".to_owned());
+
+        let prompt = build_agent_spawn_prompt(
+            "agent-spawn-test",
+            &params,
+            dir.path(),
+            &task_started_path,
+            &task_started_script_path,
+        )
+        .expect("template prompt builds");
+
+        assert!(prompt.contains("template-provided task"));
+        assert!(prompt.contains("task-start readiness artifact"));
     }
 
     #[test]

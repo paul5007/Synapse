@@ -935,9 +935,11 @@ pub struct ActSpawnAgentParams {
     #[serde(default)]
     #[schemars(default)]
     pub model_ref: Option<String>,
-    /// Optional work prompt for the spawned primary agent. Synapse prepends a
-    /// mandatory provisioning preflight that calls health/tools through the real
-    /// client MCP surface and binds the requested target.
+    /// Work prompt for the spawned primary agent. Direct spawns require a
+    /// non-empty prompt; template spawns render this from the durable template
+    /// row. Synapse prepends a mandatory provisioning preflight that calls
+    /// health/tools through the real client MCP surface and binds the requested
+    /// target.
     #[serde(default)]
     #[schemars(default)]
     pub prompt: Option<String>,
@@ -1038,7 +1040,8 @@ pub struct ActSpawnAgentRequest {
     #[serde(default)]
     #[schemars(default)]
     pub model_ref: Option<String>,
-    /// Direct-spawn work prompt. Must be omitted when `template_id` is set.
+    /// Direct-spawn work prompt. Required and non-empty when `template_id` is
+    /// omitted; must be omitted when `template_id` is set.
     #[serde(default)]
     #[schemars(default)]
     pub prompt: Option<String>,
@@ -1228,15 +1231,20 @@ pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), E
             format!("act_spawn_agent wait_timeout_ms must be <= {MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS}"),
         ));
     }
-    if agent_kind.is_local_model()
-        && params
-            .prompt
-            .as_deref()
-            .is_none_or(|prompt| prompt.trim().is_empty())
-    {
+    let prompt_missing_or_blank = params
+        .prompt
+        .as_deref()
+        .is_none_or(|prompt| prompt.trim().is_empty());
+    if agent_kind.is_local_model() && prompt_missing_or_blank {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "act_spawn_agent local_model prompt must not be empty",
+        ));
+    }
+    if params.template_id.is_none() && prompt_missing_or_blank {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent direct spawn prompt must not be empty",
         ));
     }
     if let Some(prompt) = &params.prompt {
@@ -9810,11 +9818,15 @@ mod tests {
     }
 
     fn local_model_spawn_params(prompt: Option<&str>) -> ActSpawnAgentParams {
+        spawn_params(ActSpawnAgentCli::LocalModel, prompt)
+    }
+
+    fn spawn_params(cli: ActSpawnAgentCli, prompt: Option<&str>) -> ActSpawnAgentParams {
         ActSpawnAgentParams {
-            cli: Some(ActSpawnAgentCli::LocalModel),
-            kind: Some(ActSpawnAgentCli::LocalModel),
+            cli: Some(cli),
+            kind: Some(cli),
             model: None,
-            model_ref: Some("qwen8v2-tool-live".to_owned()),
+            model_ref: cli.is_local_model().then(|| "qwen8v2-tool-live".to_owned()),
             prompt: prompt.map(str::to_owned),
             target: None,
             working_dir: Some(r"C:\code\Synapse".to_owned()),
@@ -9830,7 +9842,7 @@ mod tests {
 
     #[test]
     fn local_model_spawn_empty_prompt_errors_before_launch() {
-        for prompt in [None, Some("   \n\t   ")] {
+        for prompt in [None, Some(""), Some("   \n\t   ")] {
             let params = local_model_spawn_params(prompt);
             let error = validate_agent_spawn_params(&params)
                 .expect_err("blank local-model prompts must fail before launch");
@@ -9849,6 +9861,42 @@ mod tests {
 
         validate_agent_spawn_params(&local_model_spawn_params(Some("call health once")))
             .expect("nonblank local-model prompt remains valid");
+    }
+
+    #[test]
+    fn direct_primary_spawn_empty_prompt_errors_before_launch() {
+        for cli in [ActSpawnAgentCli::Codex, ActSpawnAgentCli::Claude] {
+            for prompt in [None, Some(""), Some("  \r\n\t  ")] {
+                let params = spawn_params(cli, prompt);
+                let error = validate_agent_spawn_params(&params)
+                    .expect_err("blank direct primary-agent prompts must fail before launch");
+                assert_eq!(
+                    error.data.as_ref().and_then(|data| data.get("code")),
+                    Some(&json!(error_codes::TOOL_PARAMS_INVALID))
+                );
+                assert!(
+                    error
+                        .message
+                        .contains("direct spawn prompt must not be empty"),
+                    "{}",
+                    error.message
+                );
+            }
+
+            validate_agent_spawn_params(&spawn_params(cli, Some("call health once")))
+                .expect("nonblank direct primary-agent prompt remains valid");
+        }
+    }
+
+    #[test]
+    fn template_rendered_primary_spawn_prompt_remains_template_governed() {
+        let mut params = spawn_params(ActSpawnAgentCli::Codex, Some("template task"));
+        params.template_id = Some("issue1245-template".to_owned());
+        params.template_version = Some(1);
+        params.template_config_hash = Some("sha256:test".to_owned());
+
+        validate_agent_spawn_params(&params)
+            .expect("template-rendered nonblank prompt remains valid");
     }
 
     fn foreground_for_launch_selection(
