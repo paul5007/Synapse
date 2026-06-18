@@ -38,9 +38,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v3";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v4";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "d24f1d218007f4db52b08bfe8d0b3b838e105593b7f6424b169b11d416c3b49b";
+    "9a977c14087e4ecaf5c4807be7c164083366c2c7f30969f308caaf4fe43ed6f4";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
     "activateTab",

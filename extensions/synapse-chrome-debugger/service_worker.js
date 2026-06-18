@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v3";
-const BRIDGE_BUILD_SHA256 = "d24f1d218007f4db52b08bfe8d0b3b838e105593b7f6424b169b11d416c3b49b";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v4";
+const BRIDGE_BUILD_SHA256 = "9a977c14087e4ecaf5c4807be7c164083366c2c7f30969f308caaf4fe43ed6f4";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "openTab",
@@ -34,6 +34,7 @@ const ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED = "CHROME_DOM_ACTION_POSTCOND
 const TAB_TARGET_PREFIX = "chrome-tab:";
 const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
 const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
+const WINDOW_BOUNDS_SCALE_CANDIDATES = Object.freeze([1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]);
 const WEBSOCKET_KEEPALIVE_MS = 20000;
 const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
@@ -1143,12 +1144,19 @@ function windowBoundsDeltaScore(actual, expected) {
   if (!actual || !expected) {
     return Number.POSITIVE_INFINITY;
   }
-  return Math.max(
-    Math.abs(actual.x - expected.x),
-    Math.abs(actual.y - expected.y),
-    Math.abs(actual.w - expected.w),
-    Math.abs(actual.h - expected.h)
-  );
+  let best = Number.POSITIVE_INFINITY;
+  for (const scale of WINDOW_BOUNDS_SCALE_CANDIDATES) {
+    const score = Math.max(
+      Math.abs((actual.x * scale) - expected.x),
+      Math.abs((actual.y * scale) - expected.y),
+      Math.abs((actual.w * scale) - expected.w),
+      Math.abs((actual.h * scale) - expected.h)
+    );
+    if (score < best) {
+      best = score;
+    }
+  }
+  return best;
 }
 
 async function chromeWindowState(windowId) {
