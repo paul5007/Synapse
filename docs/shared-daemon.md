@@ -104,10 +104,11 @@ both exit **4** instead of failing later inside a tool call.
   If another setup owns the lock, the script fails closed with
   `SYNAPSE_SETUP_MAINTENANCE_LOCK_HELD` and explicitly forbids clearing it by
   closing terminal windows.
-- The daemon's default Streamable HTTP session idle timeout is 5 minutes
-  (`SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS` overrides it). This bounds zombie
-  session memory and stale client accounting when a client disappears without
-  sending MCP `DELETE`.
+- The daemon's default Streamable HTTP session idle timeout is 24 hours
+  (`SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS` overrides it). This prevents
+  normal unattended orchestrator idle periods from expiring the controlling MCP
+  session while still bounding zombie session memory and stale client
+  accounting when a client disappears without sending MCP `DELETE`.
 - The Windows auto-start daemon task must not launch through `cmd.exe` at any
   point. `scripts/synapse-setup.ps1` writes
   `synapse-daemon-launch-hidden.vbs` and registers
@@ -154,8 +155,8 @@ attached process; pair it with process/socket readback for restart decisions.
 HTTP MCP session state is persisted in `CF_KV` under `mcp/session/v1/<session>`.
 Rows include `stored_at_unix_ms` and expire on the same idle timeout as the
 in-memory session manager (`SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS`, default
-300 seconds). Legacy rows without this TTL metadata are deleted on load and are
-not accepted as live session proof.
+86400 seconds). Legacy rows without this TTL metadata are deleted on load and
+are not accepted as live session proof.
 
 ## Troubleshooting
 

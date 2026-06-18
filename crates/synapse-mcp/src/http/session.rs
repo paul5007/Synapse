@@ -11,7 +11,7 @@ use axum::{
 use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, SessionConfig};
 
 const SESSION_IDLE_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS";
-const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
+const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const MAX_MCP_REQUEST_BYTES: usize = 1024 * 1024;
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
@@ -393,8 +393,8 @@ fn session_registry_failed() -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURRENT_MCP_SESSION_ID, current_mcp_session_id, jsonrpc_action_label,
-        jsonrpc_method_is_initialize, parse_idle_timeout,
+        CURRENT_MCP_SESSION_ID, DEFAULT_SESSION_IDLE_TIMEOUT_SECS, current_mcp_session_id,
+        jsonrpc_action_label, jsonrpc_method_is_initialize, parse_idle_timeout,
     };
 
     #[test]
@@ -435,6 +435,11 @@ mod tests {
         assert_eq!(parse_idle_timeout("1").unwrap_or_default(), 1);
         assert!(parse_idle_timeout("0").is_err());
         assert!(parse_idle_timeout("abc").is_err());
+    }
+
+    #[test]
+    fn default_idle_timeout_covers_unattended_orchestrator_idle_window() {
+        assert_eq!(DEFAULT_SESSION_IDLE_TIMEOUT_SECS, 24 * 60 * 60);
     }
 
     #[tokio::test]
