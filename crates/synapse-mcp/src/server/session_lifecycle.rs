@@ -37,6 +37,9 @@ const MCP_SESSION_STORE_PREFIX: &str = "mcp/session/v1/";
 const PROCESS_JOB_CLOSE_WAIT: Duration = Duration::from_secs(5);
 const ACT_SPAWN_AGENT_TOOL_NAME: &str = "act_spawn_agent";
 const AGENT_SPAWN_COMPLETION_GRACE: Duration = Duration::from_secs(30);
+pub(crate) const HTTP_STALE_REASON: &str = "http_stale";
+pub(crate) const SPAWN_COMPLETED_REASON: &str = "spawn_completed";
+pub(crate) const SPAWNED_AGENT_PROCESS_EXITED_REASON: &str = "spawned_agent_process_exited";
 
 pub(crate) type SharedSessionProcessResources =
     Arc<Mutex<BTreeMap<String, BTreeMap<u32, SessionProcessResource>>>>;
@@ -1091,7 +1094,7 @@ impl SessionLifecycleState {
     pub(crate) fn stale_session_candidates(
         &self,
         active_sessions: &BTreeSet<String>,
-    ) -> BTreeSet<String> {
+    ) -> BTreeMap<String, &'static str> {
         // #1238: liveness for a spawned agent is an OS-process fact, never an
         // "MCP-request recency" fact. An agent doing native Read/Write/Bash
         // work makes zero Synapse calls for minutes, so the daemon legitimately
@@ -1121,51 +1124,61 @@ impl SessionLifecycleState {
             .chain(live_spawn_sessions)
             .collect();
 
-        let mut candidates = BTreeSet::new();
+        let mut candidates = BTreeMap::new();
         if let Ok(snapshot) = self.action_handle.session_inputs_snapshot() {
             for session in snapshot.sessions {
-                add_if_stale(&mut candidates, &live, &session.session_id);
+                add_if_stale(
+                    &mut candidates,
+                    &live,
+                    &session.session_id,
+                    HTTP_STALE_REASON,
+                );
             }
         }
         let lease_status = synapse_action::lease::status();
         if let Some(owner) = lease_status.owner_session_id.as_ref()
             && owner != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID
         {
-            add_if_stale(&mut candidates, &live, owner);
+            add_if_stale(&mut candidates, &live, owner, HTTP_STALE_REASON);
         }
         if let Ok(targets) = self.session_targets.lock() {
             for session_id in targets.keys() {
-                add_if_stale(&mut candidates, &live, session_id);
+                add_if_stale(&mut candidates, &live, session_id, HTTP_STALE_REASON);
             }
         }
         if let Ok(state) = self.m3_state.lock() {
             for session_id in state.mcp_audit_sessions.keys() {
-                add_if_stale(&mut candidates, &live, session_id);
+                add_if_stale(&mut candidates, &live, session_id, HTTP_STALE_REASON);
             }
         }
         if let Ok(owners) = self.cdp_target_owners.lock() {
             for owner in owners.values() {
-                add_if_stale(&mut candidates, &live, &owner.session_id);
+                add_if_stale(&mut candidates, &live, &owner.session_id, HTTP_STALE_REASON);
             }
         }
         if let Ok(claims) = self.target_claims.lock() {
             for read in claims.reads(unix_time_ms_now()) {
-                add_if_stale(&mut candidates, &live, &read.owner_session_id);
+                add_if_stale(
+                    &mut candidates,
+                    &live,
+                    &read.owner_session_id,
+                    HTTP_STALE_REASON,
+                );
             }
         }
         if let Ok(clipboards) = self.session_clipboards.lock() {
             for session_id in clipboards.keys() {
-                add_if_stale(&mut candidates, &live, session_id);
+                add_if_stale(&mut candidates, &live, session_id, HTTP_STALE_REASON);
             }
         }
         if let Ok(processes) = self.session_processes.lock() {
             for session_id in processes.keys() {
-                add_if_stale(&mut candidates, &live, session_id);
+                add_if_stale(&mut candidates, &live, session_id, HTTP_STALE_REASON);
             }
         }
         if let Ok(session_ids) = self.sse_state.subscription_owner_session_ids() {
             for session_id in session_ids {
-                add_if_stale(&mut candidates, &live, &session_id);
+                add_if_stale(&mut candidates, &live, &session_id, HTTP_STALE_REASON);
             }
         }
         // Non-spawn (operator/human) sessions still reap on MCP-idle staleness
@@ -1174,14 +1187,16 @@ impl SessionLifecycleState {
         // process probe (protected above when alive, reaped below when gone).
         for read in &registry_reads {
             if read.lifecycle == "stale" && read.spawned_agent.is_none() {
-                add_if_stale(&mut candidates, &live, &read.session_id);
+                add_if_stale(&mut candidates, &live, &read.session_id, HTTP_STALE_REASON);
             }
         }
         for read in exited_spawn_sessions {
-            if candidates.insert(read.session_id.clone()) {
+            let reason = spawned_agent_exit_reason(read);
+            if candidates.insert(read.session_id.clone(), reason) != Some(reason) {
                 tracing::warn!(
                     code = "MCP_SESSION_SPAWNED_AGENT_PROCESS_EXITED",
                     session_id = %read.session_id,
+                    reason,
                     spawned_agent = ?read.spawned_agent,
                     active_session_count = active_sessions.len(),
                     "readback=session_registry edge=spawned_primary_process_gone before=session_teardown_candidate"
@@ -1859,48 +1874,56 @@ fn owned_input_count(snapshot: &synapse_action::SessionInputSnapshot, session_id
 }
 
 fn add_if_stale(
-    candidates: &mut BTreeSet<String>,
+    candidates: &mut BTreeMap<String, &'static str>,
     active_sessions: &BTreeSet<String>,
     session_id: &str,
+    reason: &'static str,
 ) {
     if !active_sessions.contains(session_id) {
-        candidates.insert(session_id.to_owned());
+        candidates.entry(session_id.to_owned()).or_insert(reason);
     }
 }
 
-/// The OS pid that proves a spawned agent is alive: its own process when the
-/// daemon learned it (e.g. the Claude/Codex CLI pid), else the launcher pid.
-/// `None` for closed sessions and non-spawn sessions; neither has a spawned
-/// child to liveness-probe.
-fn spawned_agent_probe_pid(read: &super::session_registry::SessionRegistryRead) -> Option<u32> {
+/// The OS pids that prove a spawned agent is alive.
+///
+/// The inner agent process can exit before the launcher wrapper writes the
+/// terminal `completion-status.json`. Treat either process as live so cleanup
+/// cannot race ahead of the wrapper's final artifact.
+fn spawned_agent_probe_pids(read: &super::session_registry::SessionRegistryRead) -> Vec<u32> {
     if read.closed_at_unix_ms.is_some() {
-        return None;
+        return Vec::new();
     }
-    let spawned_agent = read.spawned_agent.as_ref()?;
-    Some(
-        spawned_agent
-            .agent_process_id
-            .unwrap_or(spawned_agent.launcher_process_id),
-    )
+    let Some(spawned_agent) = read.spawned_agent.as_ref() else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    if let Some(agent_process_id) = spawned_agent.agent_process_id
+        && agent_process_id != 0
+    {
+        pids.push(agent_process_id);
+    }
+    if spawned_agent.launcher_process_id != 0 && !pids.contains(&spawned_agent.launcher_process_id)
+    {
+        pids.push(spawned_agent.launcher_process_id);
+    }
+    pids
 }
 
 #[cfg(test)]
 fn spawned_agent_process_exited(read: &super::session_registry::SessionRegistryRead) -> bool {
-    match spawned_agent_probe_pid(read) {
-        Some(pid) => !m4::process_exists(pid),
-        None => false,
-    }
+    let pids = spawned_agent_probe_pids(read);
+    !pids.is_empty() && pids.iter().all(|pid| !m4::process_exists(*pid))
 }
 
 /// Partitions spawned-agent registry sessions by a real liveness probe (#1238).
 ///
 /// Returns `(live, exited)`: `live` is the set of session ids whose spawned
-/// process is still running. These are protected from idle-driven teardown so
-/// the daemon never kills an agent that is mid-work but quiet on the MCP wire.
-/// `exited` are sessions whose spawned process is gone, still reap candidates
-/// even if no exit event reached the journal. `process_alive` is injected so
-/// the rule is unit-testable without real processes; production passes the OS
-/// process-table probe.
+/// agent or launcher process is still running. These are protected from
+/// idle-driven teardown so the daemon never kills an agent that is mid-work but
+/// quiet on the MCP wire. `exited` are sessions whose spawned processes are
+/// gone, still reap candidates even if no exit event reached the journal.
+/// `process_alive` is injected so the rule is unit-testable without real
+/// processes; production passes the OS process-table probe.
 fn partition_spawned_sessions<'a>(
     reads: &'a [super::session_registry::SessionRegistryRead],
     process_alive: &dyn Fn(u32) -> bool,
@@ -1911,16 +1934,37 @@ fn partition_spawned_sessions<'a>(
     let mut live = BTreeSet::new();
     let mut exited = Vec::new();
     for read in reads {
-        let Some(pid) = spawned_agent_probe_pid(read) else {
+        let pids = spawned_agent_probe_pids(read);
+        if pids.is_empty() {
             continue;
-        };
-        if process_alive(pid) {
+        }
+        if pids.iter().any(|pid| process_alive(*pid)) {
             live.insert(read.session_id.clone());
         } else {
             exited.push(read);
         }
     }
     (live, exited)
+}
+
+fn spawned_agent_exit_reason(read: &super::session_registry::SessionRegistryRead) -> &'static str {
+    let Some(spawned) = read.spawned_agent.as_ref() else {
+        return SPAWNED_AGENT_PROCESS_EXITED_REASON;
+    };
+    if spawned_agent_completion_status(&spawned.log_dir).as_deref() == Some("ok") {
+        SPAWN_COMPLETED_REASON
+    } else {
+        SPAWNED_AGENT_PROCESS_EXITED_REASON
+    }
+}
+
+fn spawned_agent_completion_status(log_dir: &str) -> Option<String> {
+    let bytes = fs::read(Path::new(log_dir).join("completion-status.json")).ok()?;
+    let status = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    status
+        .get("status")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
 }
 
 fn session_store_db(m3_state: &SharedM3State) -> Result<Arc<Db>, String> {
@@ -2022,6 +2066,12 @@ mod tests {
         }
     }
 
+    fn spawned_read_with_log_dir(session_id: &str, log_dir: &Path) -> SessionRegistryRead {
+        let mut read = spawned_read(session_id, Some(1234), 0, false);
+        read.spawned_agent.as_mut().expect("spawned agent").log_dir = log_dir.display().to_string();
+        read
+    }
+
     fn exited_child_pid() -> u32 {
         #[cfg(windows)]
         let mut command = {
@@ -2098,6 +2148,31 @@ mod tests {
     }
 
     #[test]
+    fn dead_agent_process_with_live_launcher_is_protected_until_completion_artifact() {
+        let reads = vec![spawned_read("launcher-live", Some(111), 222, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|pid| pid == 222);
+
+        assert!(
+            live.contains("launcher-live"),
+            "the launcher still writes final completion-status artifacts"
+        );
+        assert!(
+            exited.is_empty(),
+            "the inner agent pid alone going away is not a terminal verdict"
+        );
+    }
+
+    #[test]
+    fn dead_agent_and_launcher_processes_are_exit_candidate() {
+        let reads = vec![spawned_read("both-dead", Some(111), 222, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| false);
+
+        assert!(live.is_empty());
+        assert_eq!(exited.len(), 1);
+        assert_eq!(exited[0].session_id, "both-dead");
+    }
+
+    #[test]
     fn closed_spawned_session_is_neither_live_nor_exit() {
         let reads = vec![spawned_read("closed", Some(1234), 0, true)];
         let (live, exited) = partition_spawned_sessions(&reads, &|_pid| false);
@@ -2119,6 +2194,54 @@ mod tests {
         let (live, exited) = partition_spawned_sessions(&reads, &|_pid| true);
         assert!(live.is_empty());
         assert!(exited.is_empty());
+    }
+
+    #[test]
+    fn completed_spawn_exit_uses_normal_terminal_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("completion-status.json"),
+            r#"{"status":"ok"}"#,
+        )
+        .expect("write completion status");
+        let read = spawned_read_with_log_dir("completed", temp.path());
+
+        assert_eq!(spawned_agent_exit_reason(&read), SPAWN_COMPLETED_REASON);
+    }
+
+    #[test]
+    fn failed_spawn_exit_stays_process_exited_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("completion-status.json"),
+            r#"{"status":"error"}"#,
+        )
+        .expect("write completion status");
+        let read = spawned_read_with_log_dir("failed", temp.path());
+
+        assert_eq!(
+            spawned_agent_exit_reason(&read),
+            SPAWNED_AGENT_PROCESS_EXITED_REASON
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_completion_status_stays_process_exited_reason() {
+        let missing = tempfile::tempdir().expect("tempdir");
+        let missing_read = spawned_read_with_log_dir("missing", missing.path());
+        assert_eq!(
+            spawned_agent_exit_reason(&missing_read),
+            SPAWNED_AGENT_PROCESS_EXITED_REASON
+        );
+
+        let invalid = tempfile::tempdir().expect("tempdir");
+        fs::write(invalid.path().join("completion-status.json"), b"not-json")
+            .expect("write invalid status");
+        let invalid_read = spawned_read_with_log_dir("invalid", invalid.path());
+        assert_eq!(
+            spawned_agent_exit_reason(&invalid_read),
+            SPAWNED_AGENT_PROCESS_EXITED_REASON
+        );
     }
 
     // Regression evidence against the real OS process table (#1238): no

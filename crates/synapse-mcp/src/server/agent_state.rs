@@ -182,6 +182,7 @@ impl AgentAttentionClass {
             AgentLifecycleState::Dead if terminal_setup_failure_reason(reason_code) => {
                 Self::TerminalSetupFailure
             }
+            AgentLifecycleState::Dead if normal_terminal_reason(reason_code) => Self::None,
             AgentLifecycleState::Dead => Self::TerminalRuntimeFailure,
             AgentLifecycleState::Spawning
             | AgentLifecycleState::Working
@@ -191,6 +192,10 @@ impl AgentAttentionClass {
             | AgentLifecycleState::ReadyForReview => Self::None,
         }
     }
+}
+
+fn normal_terminal_reason(reason_code: Option<&str>) -> bool {
+    matches!(reason_code, Some("spawn_completed"))
 }
 
 fn terminal_setup_failure_reason(reason_code: Option<&str>) -> bool {
@@ -1590,6 +1595,21 @@ mod tests {
                 .expect("interactive session tracked")
                 .state,
             AgentLifecycleState::Idle
+        );
+    }
+
+    #[test]
+    fn completed_spawn_dead_state_is_not_actionable_attention() {
+        assert_eq!(
+            AgentAttentionClass::for_lifecycle(AgentLifecycleState::Dead, Some("spawn_completed")),
+            AgentAttentionClass::None
+        );
+        assert_eq!(
+            AgentAttentionClass::for_lifecycle(
+                AgentLifecycleState::Dead,
+                Some("spawned_agent_process_exited")
+            ),
+            AgentAttentionClass::TerminalRuntimeFailure
         );
     }
 

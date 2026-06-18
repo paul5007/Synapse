@@ -740,15 +740,16 @@ async fn cleanup_stale_session_resources_once(
     let active_sessions = active_http_session_ids(session_manager).await;
     session_lifecycle.cleanup_expired_lease_inputs_once().await;
     let stale_sessions = session_lifecycle.stale_session_candidates(&active_sessions);
-    for session_id in stale_sessions {
+    for (session_id, reason) in stale_sessions {
         match session_lifecycle
-            .teardown_session(&session_id, "http_stale")
+            .teardown_session(&session_id, reason)
             .await
         {
             Ok(report) => {
                 tracing::info!(
                     code = "MCP_HTTP_SESSION_STALE_LIFECYCLE_CLEANUP",
                     session_id = %session_id,
+                    reason,
                     active_session_count = active_sessions.len(),
                     report = ?report,
                     "readback=session_lifecycle edge=http_session_gone after_cleanup"
@@ -758,6 +759,7 @@ async fn cleanup_stale_session_resources_once(
                 tracing::error!(
                     code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
                     session_id = %session_id,
+                    reason,
                     active_session_count = active_sessions.len(),
                     detail = %error.message,
                     data = ?error.data,
