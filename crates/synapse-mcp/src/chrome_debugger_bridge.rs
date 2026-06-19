@@ -541,27 +541,44 @@ fn external_chrome_profile_surfaces() -> Vec<String> {
                 } else if let Some(preferences_runtime_state) = runtime_by_id.get(extension_id) {
                     runtime_state = preferences_runtime_state.clone();
                 }
-                let permissions = active_api_permissions(setting);
-                let has_debugger = permissions
-                    .iter()
-                    .any(|permission| permission == "debugger");
-                let has_native = permissions
-                    .iter()
-                    .any(|permission| permission == "nativeMessaging");
-                if !has_debugger && !has_native {
+                let active_permissions = active_api_permissions(setting);
+                let manifest_permissions = manifest_api_permissions(setting);
+                let granted_permissions = granted_api_permissions(setting);
+                let active_or_manifest_hazards = hazard_api_permissions(
+                    active_permissions
+                        .iter()
+                        .chain(manifest_permissions.iter())
+                        .map(String::as_str),
+                );
+                let granted_hazards =
+                    hazard_api_permissions(granted_permissions.iter().map(String::as_str));
+                if active_or_manifest_hazards.is_empty() && granted_hazards.is_empty() {
                     continue;
                 }
-                if !runtime_state.runtime_enabled {
+                if !external_popup_risk_enabled(
+                    &runtime_state,
+                    !active_or_manifest_hazards.is_empty(),
+                    !granted_hazards.is_empty(),
+                ) {
                     continue;
                 }
+                let risk_basis = if active_or_manifest_hazards.is_empty() {
+                    "state_enabled_granted_hazard"
+                } else if runtime_state.state == Some(1) {
+                    "state_enabled_active_or_manifest_hazard"
+                } else {
+                    "active_or_manifest_hazard_without_disable_reason"
+                };
                 let name = setting
                     .get("manifest")
                     .and_then(|manifest| manifest.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("<unnamed>");
                 rows.push(format!(
-                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={} runtime_enabled=true state={} active_bit={} disable_reasons={}",
-                    permissions.join(","),
+                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={} manifest_api={} granted_hazard_api={} popup_risk=true risk_basis={risk_basis} state={} active_bit={} disable_reasons={}",
+                    active_permissions.join(","),
+                    manifest_permissions.join(","),
+                    granted_hazards.join(","),
                     runtime_state
                         .state
                         .map(|value| value.to_string())
@@ -579,10 +596,27 @@ fn external_chrome_profile_surfaces() -> Vec<String> {
 }
 
 fn active_api_permissions(setting: &Value) -> Vec<String> {
-    let mut permissions = setting
-        .get("active_permissions")
-        .and_then(|value| value.get("api"))
-        .and_then(Value::as_array)
+    api_permissions(setting, &["active_permissions", "api"])
+}
+
+fn granted_api_permissions(setting: &Value) -> Vec<String> {
+    api_permissions(setting, &["granted_permissions", "api"])
+}
+
+fn manifest_api_permissions(setting: &Value) -> Vec<String> {
+    api_permissions(setting, &["manifest", "permissions"])
+}
+
+fn api_permissions(setting: &Value, path: &[&str]) -> Vec<String> {
+    let mut cursor = setting;
+    for segment in path {
+        let Some(next) = cursor.get(*segment) else {
+            return Vec::new();
+        };
+        cursor = next;
+    }
+    let mut permissions = cursor
+        .as_array()
         .map(|values| {
             values
                 .iter()
@@ -594,6 +628,35 @@ fn active_api_permissions(setting: &Value) -> Vec<String> {
     permissions.sort();
     permissions.dedup();
     permissions
+}
+
+fn hazard_api_permissions<'a>(permissions: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut hazards = permissions
+        .into_iter()
+        .filter(|permission| *permission == "debugger" || *permission == "nativeMessaging")
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    hazards.sort();
+    hazards.dedup();
+    hazards
+}
+
+fn external_popup_risk_enabled(
+    runtime_state: &ChromeExtensionRuntimeState,
+    has_active_or_manifest_hazard: bool,
+    has_granted_hazard: bool,
+) -> bool {
+    if !runtime_state.disable_reasons.is_empty() || runtime_state.state == Some(0) {
+        return false;
+    }
+    if runtime_state.state == Some(1) {
+        return has_active_or_manifest_hazard || has_granted_hazard;
+    }
+    // State can be absent in Secure Preferences for active unpacked/profile
+    // rows. Do not treat granted-only residue as active, but an external
+    // manifest/active debugger permission with no disable reason can still
+    // produce Chrome's layout-shifting debugger infobar.
+    has_active_or_manifest_hazard
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4248,6 +4311,108 @@ mod tests {
         assert_eq!(runtime_state.active_bit, None);
         assert!(runtime_state.disable_reasons.is_empty());
         assert!(!runtime_state.runtime_enabled);
+    }
+
+    #[test]
+    fn external_popup_risk_treats_active_manifest_absent_state_as_enabled_risk() {
+        let setting = json!({
+            "active_bit": false,
+            "active_permissions": {
+                "api": ["debugger", "nativeMessaging"]
+            },
+            "granted_permissions": {
+                "api": ["debugger", "nativeMessaging"]
+            },
+            "manifest": {
+                "permissions": ["debugger", "nativeMessaging"]
+            }
+        });
+        let runtime_state = chrome_extension_runtime_state(&setting);
+        let active_or_manifest_hazards = hazard_api_permissions(
+            active_api_permissions(&setting)
+                .iter()
+                .chain(manifest_api_permissions(&setting).iter())
+                .map(String::as_str),
+        );
+        let granted_hazards =
+            hazard_api_permissions(granted_api_permissions(&setting).iter().map(String::as_str));
+
+        assert_eq!(runtime_state.state, None);
+        assert_eq!(runtime_state.active_bit, Some(false));
+        assert!(runtime_state.disable_reasons.is_empty());
+        assert!(!runtime_state.runtime_enabled);
+        assert_eq!(
+            active_or_manifest_hazards,
+            vec!["debugger".to_owned(), "nativeMessaging".to_owned()]
+        );
+        assert!(external_popup_risk_enabled(
+            &runtime_state,
+            !active_or_manifest_hazards.is_empty(),
+            !granted_hazards.is_empty()
+        ));
+    }
+
+    #[test]
+    fn external_popup_risk_ignores_absent_state_granted_only_residue() {
+        let setting = json!({
+            "active_permissions": {
+                "api": ["alarms", "tabs"]
+            },
+            "granted_permissions": {
+                "api": ["debugger", "nativeMessaging"]
+            },
+            "manifest": {
+                "permissions": ["alarms", "tabs"]
+            }
+        });
+        let runtime_state = chrome_extension_runtime_state(&setting);
+        let active_or_manifest_hazards = hazard_api_permissions(
+            active_api_permissions(&setting)
+                .iter()
+                .chain(manifest_api_permissions(&setting).iter())
+                .map(String::as_str),
+        );
+        let granted_hazards =
+            hazard_api_permissions(granted_api_permissions(&setting).iter().map(String::as_str));
+
+        assert_eq!(runtime_state.state, None);
+        assert!(active_or_manifest_hazards.is_empty());
+        assert_eq!(
+            granted_hazards,
+            vec!["debugger".to_owned(), "nativeMessaging".to_owned()]
+        );
+        assert!(!external_popup_risk_enabled(
+            &runtime_state,
+            !active_or_manifest_hazards.is_empty(),
+            !granted_hazards.is_empty()
+        ));
+    }
+
+    #[test]
+    fn external_popup_risk_respects_disable_reasons() {
+        let setting = json!({
+            "disable_reasons": [65536],
+            "active_permissions": {
+                "api": ["nativeMessaging"]
+            },
+            "manifest": {
+                "permissions": ["nativeMessaging"]
+            }
+        });
+        let runtime_state = chrome_extension_runtime_state(&setting);
+        let active_or_manifest_hazards = hazard_api_permissions(
+            active_api_permissions(&setting)
+                .iter()
+                .chain(manifest_api_permissions(&setting).iter())
+                .map(String::as_str),
+        );
+
+        assert_eq!(runtime_state.disable_reasons, vec![65536]);
+        assert!(!external_popup_risk_enabled(
+            &runtime_state,
+            !active_or_manifest_hazards.is_empty(),
+            false
+        ));
     }
 
     #[test]

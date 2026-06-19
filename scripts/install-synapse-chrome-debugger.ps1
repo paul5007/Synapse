@@ -615,6 +615,28 @@ function Get-ChromeExtensionRuntimeState {
         runtime_enabled = $runtimeEnabled
     }
 }
+
+function Test-ExternalPopupRiskEnabled {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$RuntimeState,
+        [Parameter(Mandatory = $true)]
+        [bool]$HasActiveOrManifestHazard,
+        [Parameter(Mandatory = $true)]
+        [bool]$HasGrantedHazard
+    )
+
+    if ($RuntimeState.disable_reasons.Count -gt 0 -or $RuntimeState.state -eq 0) {
+        return $false
+    }
+    if ($RuntimeState.state -eq 1) {
+        return ($HasActiveOrManifestHazard -or $HasGrantedHazard)
+    }
+    # Stale granted-only residue is advisory, but an external active/manifest
+    # debugger permission with no disable reason can still surface Chrome's
+    # layout-shifting "started debugging this browser" infobar.
+    return $HasActiveOrManifestHazard
+}
 if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
     $profileDirs = @(Get-ChildItem -LiteralPath $chromeUserDataRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ne 'Snapshots' })
@@ -693,16 +715,28 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                         $staleSynapseGrantedPermissions += $row
                     }
                 } else {
-                    $hazardApi = @(
+                    $activeOrManifestHazardApi = @(
                         @($activeApi)
-                        @($grantedApi)
                         @($manifestApi)
+                    ) | Where-Object {
+                        $_ -eq 'debugger' -or $_ -eq 'nativeMessaging'
+                    } | Sort-Object -Unique
+                    $grantedHazardApi = @($grantedApi | Where-Object {
+                        $_ -eq 'debugger' -or $_ -eq 'nativeMessaging'
+                    } | Sort-Object -Unique)
+                    $hazardApi = @(
+                        @($activeOrManifestHazardApi)
+                        @($grantedApi)
                     ) | Where-Object {
                         $_ -eq 'debugger' -or $_ -eq 'nativeMessaging'
                     } | Sort-Object -Unique
                     if ($hazardApi.Count -eq 0) {
                         continue
                     }
+                    $popupRiskEnabled = Test-ExternalPopupRiskEnabled `
+                        -RuntimeState $runtimeState `
+                        -HasActiveOrManifestHazard ($activeOrManifestHazardApi.Count -gt 0) `
+                        -HasGrantedHazard ($grantedHazardApi.Count -gt 0)
                     $externalRow = [pscustomobject]@{
                         profile = $profileDir.Name
                         pref_file = $prefFileName
@@ -713,13 +747,27 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                         active_api = $activeApi
                         granted_api = $grantedApi
                         manifest_api = $manifestApi
+                        active_or_manifest_hazard_api = $activeOrManifestHazardApi
+                        granted_hazard_api = $grantedHazardApi
                         hazard_api = $hazardApi
                         state = $runtimeState.state
                         active_bit = $runtimeState.active_bit
                         disable_reasons = $runtimeState.disable_reasons
                         runtime_enabled = $runtimeState.runtime_enabled
+                        popup_risk_enabled = $popupRiskEnabled
+                        risk_basis = if ($popupRiskEnabled) {
+                            if ($runtimeState.state -eq 1) {
+                                'state_enabled_hazard'
+                            } elseif ($activeOrManifestHazardApi.Count -gt 0) {
+                                'active_or_manifest_hazard_without_disable_reason'
+                            } else {
+                                'state_enabled_granted_hazard'
+                            }
+                        } else {
+                            'disabled_or_granted_only_stale'
+                        }
                     }
-                    if ($runtimeState.runtime_enabled) {
+                    if ($popupRiskEnabled) {
                         $externalDebuggerOrNativeExtensions += $externalRow
                         if ($hazardApi -contains 'debugger') {
                             $externalDebuggerExtensions += $externalRow
