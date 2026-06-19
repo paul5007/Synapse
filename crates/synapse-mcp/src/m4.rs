@@ -3986,10 +3986,12 @@ fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(),
     let loads_extensions = params.args.iter().any(|arg| {
         is_switch_arg(arg, "--load-extension") || is_switch_arg(arg, "--disable-extensions-except")
     });
+    let layout_infobar_flags = chromium_layout_infobar_flags(&params.args);
 
     if silent_debugger
         && disable_extensions
         && !loads_extensions
+        && layout_infobar_flags.is_empty()
         && matches!(user_data_dir_state, ChromiumUserDataDirSafety::Dedicated)
     {
         return Ok(());
@@ -4008,7 +4010,9 @@ fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(),
             "has_silent_debugger_extension_api": silent_debugger,
             "has_disable_extensions": disable_extensions,
             "has_extension_loading_flags": loads_extensions,
-            "required_invariant": "remote-debugging Chromium launches must use a non-default dedicated user-data-dir, --silent-debugger-extension-api, --disable-extensions, and no extension-loading flags",
+            "has_layout_shifting_infobar_flags": !layout_infobar_flags.is_empty(),
+            "layout_shifting_infobar_flags": layout_infobar_flags,
+            "required_invariant": "remote-debugging Chromium launches must use a non-default dedicated user-data-dir, --silent-debugger-extension-api, --disable-extensions, no extension-loading flags, and no known layout-shifting Chrome warning flags such as --disable-blink-features=AutomationControlled",
             "remediation": "omit caller-supplied remote-debugging/profile flags so Synapse injects its isolated automation profile, or pass the required flags against a non-default automation profile; never debug the user's normal Chrome profile",
         }),
     ))
@@ -4047,6 +4051,15 @@ fn has_remote_debugging_arg(args: &[String]) -> bool {
         is_switch_arg(arg, "--remote-debugging-port")
             || is_switch_arg(arg, "--remote-debugging-pipe")
     })
+}
+
+fn chromium_layout_infobar_flags(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| {
+            is_switch_arg(arg, "--disable-blink-features") && arg.contains("AutomationControlled")
+        })
+        .cloned()
+        .collect()
 }
 
 fn user_data_dir_arg(args: &[String]) -> Option<String> {
@@ -10295,6 +10308,31 @@ mod tests {
             safe_remote_debug.args
         );
         validate_launch_params(&safe_remote_debug).expect("popup-safe caller CDP launch");
+
+        let banner_profile = cdp_automation_profile_dir();
+        let banner_profile_arg = format!("--user-data-dir={}", banner_profile.display());
+        let banner_remote_debug = launch_params(
+            "chrome.exe",
+            vec![
+                "--remote-debugging-pipe",
+                banner_profile_arg.as_str(),
+                "--silent-debugger-extension-api",
+                "--disable-extensions",
+                "--disable-blink-features=AutomationControlled",
+                "about:blank",
+            ],
+            10_000,
+        );
+        let error = validate_launch_params(&banner_remote_debug)
+            .expect_err("layout-shifting Chrome warning flags must fail closed");
+        assert_eq!(
+            extract_error_code(&error),
+            error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED
+        );
+        assert!(error.message.contains("remote-debugging launch"));
+        let error_text = format!("{error:?}");
+        assert!(error_text.contains("has_layout_shifting_infobar_flags"));
+        assert!(error_text.contains("AutomationControlled"));
     }
 
     #[test]

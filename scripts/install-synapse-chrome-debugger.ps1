@@ -545,12 +545,33 @@ if (Test-Path -LiteralPath $hostManifestPath -PathType Leaf) {
 
 $chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
     $commandLine = [string]$_.CommandLine
+    $hasRemoteDebuggingPipe = $commandLine -match '(^|\s)--remote-debugging-pipe(\s|=|$)'
+    $hasRemoteDebuggingPort = $commandLine -match '(^|\s)--remote-debugging-port(\s|=|$)'
+    $hasSilentDebuggerSwitch = $commandLine -match '(^|\s)--silent-debugger-extension-api(\s|=|$)'
+    $hasAutomationControlledFlag = $commandLine -match '(^|\s)--disable-blink-features=([^\s]*,)?AutomationControlled(,|\s|$)'
+    $hasMsPlaywrightMcpDir = $commandLine -match 'ms-playwright-mcp'
+    $layoutInfobarReasons = @()
+    if ($hasAutomationControlledFlag) {
+        $layoutInfobarReasons += 'unsupported_flag_disable_blink_features_automation_controlled'
+    }
+    if (($hasRemoteDebuggingPipe -or $hasRemoteDebuggingPort) -and -not $hasSilentDebuggerSwitch) {
+        $layoutInfobarReasons += 'remote_debugging_without_silent_debugger_extension_api'
+    }
+    if ($hasMsPlaywrightMcpDir -and $hasAutomationControlledFlag) {
+        $layoutInfobarReasons += 'headed_ms_playwright_mcp_layout_banner'
+    }
     [pscustomobject]@{
         pid = [int]$_.ProcessId
         parent_pid = [int]$_.ParentProcessId
         creation_date = [string]$_.CreationDate
         command_line_readable = -not [string]::IsNullOrWhiteSpace($commandLine)
-        has_silent_debugger_switch = $commandLine -match '(^|\s)--silent-debugger-extension-api(\s|=|$)'
+        has_silent_debugger_switch = $hasSilentDebuggerSwitch
+        has_remote_debugging_pipe = $hasRemoteDebuggingPipe
+        has_remote_debugging_port = $hasRemoteDebuggingPort
+        has_automation_controlled_flag = $hasAutomationControlledFlag
+        has_ms_playwright_mcp_dir = $hasMsPlaywrightMcpDir
+        layout_infobar_risk = ($layoutInfobarReasons.Count -gt 0)
+        layout_infobar_reasons = $layoutInfobarReasons
     }
 })
 
@@ -724,6 +745,20 @@ $externalNativeMessagingProcessRows = @($externalNativeMessagingProcesses | ForE
         }
     }
 })
+$externalLayoutInfobarProcesses = @($chromeProcesses | Where-Object {
+    $_.layout_infobar_risk
+} | ForEach-Object {
+    [pscustomobject]@{
+        pid = $_.pid
+        parent_pid = $_.parent_pid
+        reasons = @($_.layout_infobar_reasons)
+        has_remote_debugging_pipe = $_.has_remote_debugging_pipe
+        has_remote_debugging_port = $_.has_remote_debugging_port
+        has_silent_debugger_switch = $_.has_silent_debugger_switch
+        has_automation_controlled_flag = $_.has_automation_controlled_flag
+        has_ms_playwright_mcp_dir = $_.has_ms_playwright_mcp_dir
+    }
+})
 $allExternalDebuggerOrNativeExtensions = @(
     @($externalDebuggerOrNativeExtensions | ForEach-Object {
         $_ | Add-Member -NotePropertyName source -NotePropertyValue 'chrome_profile_active' -Force -PassThru
@@ -807,4 +842,5 @@ $chromePolicyPopupShield = if ($PreserveExternalDebuggerExtensions) {
     external_disabled_debugger_or_native_extensions = $externalDisabledDebuggerOrNativeExtensions
     external_debugger_extensions = $externalDebuggerExtensions
     external_native_messaging_processes = $externalNativeMessagingProcesses
+    external_layout_infobar_processes = $externalLayoutInfobarProcesses
 }

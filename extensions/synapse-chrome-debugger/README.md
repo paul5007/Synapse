@@ -133,13 +133,16 @@ setup reports the denied write as a non-blocking warning for the optional shield
 Runtime Chrome observations follow the same rule. If raw CDP is unavailable and
 Synapse refuses a normal-profile attach-capable command, the diagnostic detail
 includes any external Chrome `debugger` or `nativeMessaging` profile/process
-surface found at that moment. A remaining end-user debugger/native-host popup is
-therefore attributed to a concrete extension or process instead of being
-reported as an ambiguous Synapse bridge failure. Background normal-profile tab
-and typed DOM commands use the same warning as attribution only; they remain
-available through the safe bridge. Use raw CDP on a dedicated Synapse-launched
-automation profile started with `--silent-debugger-extension-api` only for
-attach-capable CDP work.
+surface found at that moment. Health/setup also report visible automation Chrome
+processes whose flags are known to show layout-shifting browser banners, such as
+headed Playwright MCP launches with `--disable-blink-features=AutomationControlled`
+or remote debugging without `--silent-debugger-extension-api`. A remaining
+end-user debugger/native-host/banner popup is therefore attributed to a concrete
+extension or process instead of being reported as an ambiguous Synapse bridge
+failure. Background normal-profile tab and typed DOM commands use these warnings
+as attribution only; they remain available through the safe bridge. Use raw CDP
+on a dedicated Synapse-launched automation profile started with
+`--silent-debugger-extension-api` only for attach-capable CDP work.
 
 The full Windows setup script runs the same verifier and applies the same
 reversible HKCU popup shield by default:

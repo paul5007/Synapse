@@ -201,6 +201,11 @@ Chrome session, the supported attach path is:
    `external_chrome_popup_risk` profile/process summary when Synapse refuses a
    normal-profile attach-capable command, so remaining popups are attributed to
    the exact external browser surface instead of to Synapse's tabs-only bridge.
+   Health/setup also report `external_chrome_layout_infobar_risk` for visible
+   automation Chrome processes whose flags are known to show layout-shifting
+   browser banners, including headed Playwright MCP Chrome with
+   `--disable-blink-features=AutomationControlled` or remote debugging without
+   `--silent-debugger-extension-api`.
 11. If the current browser session still exposes no endpoint or extension bridge,
    fail closed with
    `web_path = "uia_only"` or `ocr`; do not claim DOM/control readback. Relaunch

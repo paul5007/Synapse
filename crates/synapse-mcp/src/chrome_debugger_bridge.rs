@@ -275,6 +275,17 @@ fn external_chrome_popup_risk_warning(rows: &[String]) -> String {
     )
 }
 
+fn external_chrome_layout_infobar_warning(rows: &[String]) -> String {
+    if rows.is_empty() {
+        return "external_chrome_layout_infobar_risk_warning=false layout_risk_count=0".to_owned();
+    }
+    format!(
+        "external_chrome_layout_infobar_risk_warning=true external_chrome_layout_infobar_risk_scope=external_automation_chrome_layout_shift layout_risk_count={} external_chrome_layout_infobar_risk={}",
+        rows.len(),
+        rows.join(";")
+    )
+}
+
 fn note_normal_bridge_external_popup_risk(hwnd: i64, command_kind: &'static str) {
     let risks = external_chrome_popup_risks();
     if risks.is_empty() {
@@ -485,6 +496,74 @@ fn external_chrome_native_messaging_processes() -> Vec<String> {
                 "native_messaging_process pid={} name={} extension_id={extension_id}",
                 pid.as_u32(),
                 process.name().to_string_lossy()
+            ))
+        })
+        .collect()
+}
+
+fn external_chrome_layout_infobar_processes() -> Vec<String> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let name = process.name().to_string_lossy();
+            if !name.eq_ignore_ascii_case("chrome.exe") {
+                return None;
+            }
+            let command_line = process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if command_line.is_empty() {
+                return None;
+            }
+
+            let has_automation_controlled = command_line.contains("--disable-blink-features")
+                && command_line.contains("AutomationControlled");
+            let has_remote_debugging_pipe = command_line.contains("--remote-debugging-pipe");
+            let has_remote_debugging_port = command_line.contains("--remote-debugging-port");
+            let has_silent_debugger =
+                command_line.contains("--silent-debugger-extension-api");
+            let has_ms_playwright_mcp = command_line.contains("ms-playwright-mcp");
+
+            let mut reasons = Vec::new();
+            if has_automation_controlled {
+                reasons.push("unsupported_flag_disable_blink_features_automation_controlled");
+            }
+            if (has_remote_debugging_pipe || has_remote_debugging_port) && !has_silent_debugger {
+                reasons.push("remote_debugging_without_silent_debugger_extension_api");
+            }
+            if has_ms_playwright_mcp && has_automation_controlled {
+                reasons.push("headed_ms_playwright_mcp_layout_banner");
+            }
+            if reasons.is_empty() {
+                return None;
+            }
+
+            let parent_pid = process
+                .parent()
+                .map(|parent| parent.as_u32().to_string())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            Some(format!(
+                "chrome_process pid={} parent_pid={} name={} reasons={} has_remote_debugging_pipe={} has_remote_debugging_port={} has_silent_debugger_extension_api={} has_ms_playwright_mcp_dir={}",
+                pid.as_u32(),
+                parent_pid,
+                name,
+                reasons.join(","),
+                has_remote_debugging_pipe,
+                has_remote_debugging_port,
+                has_silent_debugger,
+                has_ms_playwright_mcp
             ))
         })
         .collect()
@@ -1979,6 +2058,7 @@ fn bridge() -> &'static ChromeDebuggerBridge {
 
 pub(crate) fn health_subsystem() -> SubsystemHealth {
     let popup_risks = external_chrome_popup_risks();
+    let layout_infobar_risks = external_chrome_layout_infobar_processes();
     let snapshot = match bridge().inner.lock() {
         Ok(inner) => {
             let active_host = inner
@@ -2026,6 +2106,7 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
         snapshot.2,
         snapshot.3,
         &popup_risks,
+        &layout_infobar_risks,
     )
 }
 
@@ -2035,14 +2116,16 @@ fn chrome_bridge_health_from_snapshot(
     queued_count: usize,
     pending_count: usize,
     popup_risks: &[String],
+    layout_infobar_risks: &[String],
 ) -> SubsystemHealth {
     let risk_warning = external_chrome_popup_risk_warning(popup_risks);
+    let layout_warning = external_chrome_layout_infobar_warning(layout_infobar_risks);
 
     let Some(host) = active_host else {
         return SubsystemHealth {
             status: "unavailable".to_owned(),
             detail: Some(format!(
-                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} repair_guidance={} {} install_guidance={}",
+                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} repair_guidance={} {} {} install_guidance={}",
                 host_count,
                 queued_count,
                 pending_count,
@@ -2050,6 +2133,7 @@ fn chrome_bridge_health_from_snapshot(
                 chrome_debugger_health_endpoint(EXTENSION_ID),
                 NO_ACTIVE_HOST_REPAIR_GUIDANCE,
                 risk_warning,
+                layout_warning,
                 INSTALL_GUIDANCE
             )),
             ..SubsystemHealth::default()
@@ -2094,7 +2178,7 @@ fn chrome_bridge_health_from_snapshot(
     SubsystemHealth {
         status: status.to_owned(),
         detail: Some(format!(
-            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_build_sha256={} expected_extension_build_sha256={} extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} {} install_guidance={}",
+            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_build_sha256={} expected_extension_build_sha256={} extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} {} {} install_guidance={}",
             tab_control_available,
             extension_stale,
             extension_stale_reasons,
@@ -2123,6 +2207,7 @@ fn chrome_bridge_health_from_snapshot(
             detach_reason,
             extension_user_agent,
             risk_warning,
+            layout_warning,
             INSTALL_GUIDANCE
         )),
         ..SubsystemHealth::default()
@@ -3513,7 +3598,7 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_reports_unavailable_without_active_host() {
-        let health = chrome_bridge_health_from_snapshot(None, 0, 0, 0, &[]);
+        let health = chrome_bridge_health_from_snapshot(None, 0, 0, 0, &[], &[]);
 
         assert_eq!(health.status, "unavailable");
         let detail = health.detail.as_deref().expect("health detail");
@@ -3551,7 +3636,7 @@ mod tests {
             last_detach_reason: None,
         };
 
-        let health = chrome_bridge_health_from_snapshot(Some(&host), 1, 2, 3, &[]);
+        let health = chrome_bridge_health_from_snapshot(Some(&host), 1, 2, 3, &[], &[]);
 
         assert_eq!(health.status, "ok");
         let detail = health.detail.as_deref().expect("health detail");
@@ -3596,6 +3681,7 @@ mod tests {
             0,
             0,
             &["profile=Default extension_id=external active_api=debugger".to_owned()],
+            &[],
         );
 
         assert_eq!(health.status, "ok");
@@ -3608,6 +3694,50 @@ mod tests {
             )
         );
         assert!(detail.contains("extension_id=external"));
+    }
+
+    #[test]
+    fn chrome_bridge_health_reports_external_layout_infobar_risk_as_warning() {
+        let host = ChromeBridgeHealthRecord {
+            host_id: "chrome-native-test".to_owned(),
+            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            extension_version: Some("0.1.0".to_owned()),
+            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
+            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
+            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
+            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            extension_user_agent: Some("Chrome test".to_owned()),
+            pid: 42,
+            parent_window: None,
+            transport: Some("direct_http".to_owned()),
+            registered_unix_ms: 1000,
+            last_seen_unix_ms: 2000,
+            last_disconnect_detail: None,
+            last_detach_reason: None,
+        };
+
+        let health = chrome_bridge_health_from_snapshot(
+            Some(&host),
+            1,
+            0,
+            0,
+            &[],
+            &[
+                "chrome_process pid=66452 reasons=headed_ms_playwright_mcp_layout_banner"
+                    .to_owned(),
+            ],
+        );
+
+        assert_eq!(health.status, "ok");
+        let detail = health.detail.as_deref().expect("health detail");
+        assert!(detail.contains("tab_control_available=true"));
+        assert!(detail.contains("external_chrome_layout_infobar_risk_warning=true"));
+        assert!(detail.contains("layout_risk_count=1"));
+        assert!(detail.contains("headed_ms_playwright_mcp_layout_banner"));
     }
 
     #[test]
