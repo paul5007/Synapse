@@ -60,7 +60,10 @@ fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Result<
         "model": params.model_for_spawn_manifest(agent_kind),
         "model_ref": params.local_model_ref(),
         "require_approval_gate": params.require_approval_gate,
-        "local_model_trusted_unattended_exact_contract": agent_kind.is_local_model() && !params.require_approval_gate,
+        "approval_gate_effective": params.require_approval_gate && agent_kind.uses_approval_gate(),
+        "local_model_autonomous_tool_calls": agent_kind.is_local_model(),
+        "local_model_approval_gate_used": false,
+        "local_model_trusted_unattended_exact_contract": agent_kind.is_local_model(),
         // Spawn-template provenance (#909): the exact template version + config
         // hash this spawn was rendered from, or null for a direct spawn. The
         // manifest is the physical source of truth for run reproducibility.
@@ -4251,12 +4254,12 @@ fn agent_spawn_powershell_script(
                 .as_deref()
                 .map(|model| format!(",'--model',{}", ps_single_quote(model)))
                 .unwrap_or_default();
-            // #927: by default route risky tool calls through the human
-            // Approvals inbox. `--permission-mode default` consults the
-            // static `permissions.allow` rules in the --settings file first
-            // (so safe tools never pause), then delegates anything unmatched to
-            // the approval_gate MCP tool, which blocks until a human decides.
-            // The legacy auto-approve-everything behavior is opt-in via
+            // #927: by default route Claude risky tool calls through the human
+            // Approvals inbox. `--permission-mode default` consults the static
+            // `permissions.allow` rules in the --settings file first (so safe
+            // tools never pause), then delegates anything unmatched to the
+            // approval_gate MCP tool, which blocks until a human decides.
+            // The auto-approve-everything behavior is opt-in via
             // require_approval_gate=false (trusted unattended automation).
             let permission_args = if params.require_approval_gate {
                 "'--permission-mode','default','--permission-prompt-tool','mcp__synapse__approval_gate'"
@@ -4322,11 +4325,8 @@ $prompt | & claude @claudeArgs 1> {stdout_path} 2> {stderr_path}\n\
             } else {
                 local_args = format!("$localArgs = {local_args}", local_args = local_args);
             }
-            if !params.require_approval_gate {
-                local_args.push_str(
-                    "\n$localArgs += @('--local-agent-trusted-unattended-exact-contract')",
-                );
-            }
+            local_args
+                .push_str("\n$localArgs += @('--local-agent-trusted-unattended-exact-contract')");
             format!(
                 "{local_args}\n& {exe} @localArgs 1> {stdout_path} 2> {stderr_path}\n",
                 local_args = local_args,
@@ -6210,7 +6210,7 @@ mod tests {
         assert!(script.contains("--local-agent-task-file"));
         assert!(script.contains("--local-agent-spawn-id"));
         assert!(script.contains("--local-agent-log-dir"));
-        assert!(!script.contains("--local-agent-trusted-unattended-exact-contract"));
+        assert!(script.contains("--local-agent-trusted-unattended-exact-contract"));
         assert!(!script.contains("& codex"));
         assert!(!script.contains("& claude"));
 
@@ -6221,9 +6221,12 @@ mod tests {
         assert_eq!(manifest["model"], "ollama-gemma4-e4b");
         assert_eq!(manifest["model_ref"], "ollama-gemma4-e4b");
         assert_eq!(manifest["require_approval_gate"], true);
+        assert_eq!(manifest["approval_gate_effective"], false);
+        assert_eq!(manifest["local_model_autonomous_tool_calls"], true);
+        assert_eq!(manifest["local_model_approval_gate_used"], false);
         assert_eq!(
             manifest["local_model_trusted_unattended_exact_contract"],
-            false
+            true
         );
 
         params.require_approval_gate = false;
@@ -6233,6 +6236,9 @@ mod tests {
         let trusted_manifest =
             build_spawn_manifest("agent-spawn-manifest-local", &params).expect("manifest");
         assert_eq!(trusted_manifest["require_approval_gate"], false);
+        assert_eq!(trusted_manifest["approval_gate_effective"], false);
+        assert_eq!(trusted_manifest["local_model_autonomous_tool_calls"], true);
+        assert_eq!(trusted_manifest["local_model_approval_gate_used"], false);
         assert_eq!(
             trusted_manifest["local_model_trusted_unattended_exact_contract"],
             true

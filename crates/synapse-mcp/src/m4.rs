@@ -892,6 +892,11 @@ impl ActSpawnAgentCli {
     pub const fn is_local_model(self) -> bool {
         matches!(self, Self::LocalModel)
     }
+
+    #[must_use]
+    pub const fn uses_approval_gate(self) -> bool {
+        matches!(self, Self::Claude)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -972,15 +977,13 @@ pub struct ActSpawnAgentParams {
     #[serde(default = "default_agent_spawn_hold_open_ms")]
     #[schemars(default = "default_agent_spawn_hold_open_ms", range(min = 0))]
     pub hold_open_ms: u64,
-    /// Gate the spawned agent's risky tool calls through the human Approvals
-    /// inbox (#927). When true (the default) Claude uses
-    /// `mcp__synapse__approval_gate`, and local-model workers gate risky tools
-    /// after exact-contract prevalidation. Set false only for trusted
-    /// unattended automation: Claude uses `bypassPermissions`; local-model
-    /// workers may bypass approval only for exact-contract tool calls whose
-    /// tool name/order/arguments match the inferred contract and whose tool is
-    /// not a raw foreground, approval-control, operator-control, or fleet
-    /// control primitive.
+    /// Gate spawned Claude risky tool calls through the human Approvals inbox
+    /// (#927). When true (the default) Claude uses
+    /// `mcp__synapse__approval_gate`; when false Claude uses
+    /// `bypassPermissions` for trusted unattended automation. Local-model
+    /// workers ignore this knob: they execute autonomously after prompt/exact
+    /// contract prevalidation, with target/lease/tool-level invariants still
+    /// failing closed.
     #[serde(default = "default_require_approval_gate")]
     #[schemars(default = "default_require_approval_gate")]
     pub require_approval_gate: bool,

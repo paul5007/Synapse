@@ -806,11 +806,9 @@ impl Runner {
             return Ok(());
         }
 
-        // #1028: gate hazardous tool calls through the shared approval queue
-        // before dispatch. Safe (read-only/low-consequence) calls pass through
-        // instantly; risky calls block on the in-daemon approval_gate and may be
-        // denied (no dispatch) or approved-with-edits (dispatch the operator's
-        // edited args). Fail-closed: a gate that cannot answer denies the action.
+        // Local-model agents are trusted autonomous workers. Prompt/exact-tool
+        // contracts and tool-level invariants are the control surfaces; do not
+        // pause normal local-model Synapse calls on a human approval queue.
         let args = match self.gate_tool_call(&tool_name, args, &call.id).await? {
             ToolGate::Allow(effective_args) => effective_args,
             ToolGate::Deny(reason) => {
@@ -1211,14 +1209,12 @@ impl Runner {
         Ok(())
     }
 
-    /// #1028: route a hazardous tool call through the shared approval queue
-    /// before dispatch. Read-only / low-consequence calls (per the SAME
-    /// `permission_policy` the daemon's Claude gate uses) skip the gate entirely;
-    /// risky calls block on the in-daemon `approval_gate`, which creates a Pending
-    /// `AgentPermission` row attributed to this spawn and returns the operator's
-    /// verdict (allow / approve-with-edits / deny). Fail-closed: a gate that
-    /// cannot answer denies the action — the risky tool is never dispatched on a
-    /// gate failure.
+    /// Audit local-model calls that would be gated for Claude, then dispatch
+    /// autonomously. The pre-gate above still rejects unknown tools, off-contract
+    /// calls, and runner/operator-control tools before this point; target/lease
+    /// and tool-level policies still fail closed during dispatch. What must not
+    /// happen is a normal local-model tool call creating an `agent_permission`
+    /// row or blocking on `approval_gate`.
     async fn gate_tool_call(
         &mut self,
         tool_name: &str,
@@ -1232,101 +1228,28 @@ impl Runner {
             return Ok(ToolGate::Allow(args));
         }
 
-        if self.cli.trusted_unattended_exact_contract
+        let exact_contract_authorized = self.cli.trusted_unattended_exact_contract
             && local_agent_exact_contract_gate_bypass_allowed(
                 tool_name,
                 &args,
                 self.task_tool_contract.as_ref(),
-            )
-        {
-            self.write_line(json!({
-                "type": "local.tool_call.gate_bypassed",
-                "conversation_id": self.conversation_id,
-                "model": self.registry.model_id,
-                "turn_index": self.turn_count,
-                "tool_name": tool_name,
-                "tool_call_id": tool_use_id,
-                "reason_code": "trusted_unattended_exact_contract",
-            }))?;
-            self.post_event(json!({
-                "event": "state_changed",
-                "session_id": self.mcp_session_id,
-                "conversation_id": self.conversation_id,
-                "model": self.registry.model_id,
-                "registry_name": self.registry.name,
-                "state_to": "live",
-                "reason_code": "local_tool_gate_bypassed_exact_contract",
-                "tool_name": tool_name,
-                "tool_call_id": tool_use_id,
-            }))
-            .await?;
-            return Ok(ToolGate::Allow(args));
-        }
-
-        // The agent is now waiting on a human — surface it to the fleet inbox /
-        // escalation pipeline via the state machine.
-        self.post_event(json!({
-            "event": "state_changed",
-            "session_id": self.mcp_session_id,
-            "conversation_id": self.conversation_id,
-            "model": self.registry.model_id,
-            "registry_name": self.registry.name,
-            "state_to": "awaiting_approval",
-            "reason_code": "local_tool_gate",
-            "tool_name": tool_name,
-            "tool_call_id": tool_use_id,
-        }))
-        .await?;
+            );
+        let reason_code = if exact_contract_authorized {
+            "trusted_unattended_exact_contract"
+        } else {
+            "local_model_autonomous_tool_call"
+        };
         self.write_line(json!({
-            "type": "local.tool_call.gate_blocking",
+            "type": "local.tool_call.gate_bypassed",
             "conversation_id": self.conversation_id,
             "model": self.registry.model_id,
             "turn_index": self.turn_count,
             "tool_name": tool_name,
             "tool_call_id": tool_use_id,
+            "reason_code": reason_code,
+            "approval_gate_used": false,
+            "exact_contract_authorized": exact_contract_authorized,
         }))?;
-
-        let mut gate_args = Map::new();
-        gate_args.insert("tool_name".to_owned(), Value::String(label));
-        gate_args.insert("input".to_owned(), Value::Object(args.clone()));
-        gate_args.insert(
-            "tool_use_id".to_owned(),
-            Value::String(tool_use_id.to_owned()),
-        );
-        gate_args.insert("spawn_id".to_owned(), Value::String(self.spawn_id.clone()));
-
-        let wait_started = Instant::now();
-        let gate_result = self
-            .mcp
-            .peer()
-            .call_tool(CallToolRequestParams::new("approval_gate").with_arguments(gate_args))
-            .await;
-        let wait_elapsed = wait_started.elapsed();
-        self.approval_wait_elapsed = self.approval_wait_elapsed.saturating_add(wait_elapsed);
-
-        let verdict = match gate_result {
-            Ok(result) => parse_gate_verdict(&tool_result_value(&result), &args)?,
-            Err(error) => {
-                if tool_call_error_is_terminal(&error) {
-                    bail!("APPROVAL_GATE_TRANSPORT_DEAD: approval_gate transport lost: {error}");
-                }
-                tracing::error!(
-                    code = "LOCAL_AGENT_APPROVAL_GATE_FAILED",
-                    tool = tool_name,
-                    spawn_id = %self.spawn_id,
-                    detail = %error,
-                    "approval_gate call failed; denying the action fail-closed"
-                );
-                ToolGate::Deny(format!(
-                    "approval gate unavailable ({error}); action blocked, not executed"
-                ))
-            }
-        };
-
-        let reason_code = match &verdict {
-            ToolGate::Allow(_) => "local_tool_gate_approved",
-            ToolGate::Deny(_) => "local_tool_gate_denied",
-        };
         self.post_event(json!({
             "event": "state_changed",
             "session_id": self.mcp_session_id,
@@ -1339,7 +1262,7 @@ impl Runner {
             "tool_call_id": tool_use_id,
         }))
         .await?;
-        Ok(verdict)
+        Ok(ToolGate::Allow(args))
     }
 
     async fn record_model_tool_call_invalid(
@@ -3754,8 +3677,9 @@ fn tool_failure_suggestion(fatal: bool, exposure: ToolExposure) -> &'static str 
     }
 }
 
-/// Verdict the in-daemon `approval_gate` returned to the harness for a gated
-/// tool call (#1028).
+/// Local-model dispatch verdict. Production currently only returns `Allow`;
+/// `Deny` remains for parser/unit coverage of legacy approval verdicts.
+#[allow(dead_code)]
 enum ToolGate {
     /// Approved (by the operator or by auto-allow). Carries the EFFECTIVE
     /// arguments — the operator's edited args when they approved-with-edits
@@ -3777,6 +3701,7 @@ fn gate_tool_label(tool_name: &str) -> String {
 /// Parse the `approval_gate` verdict value (`{"behavior":"allow","updatedInput":…}`
 /// or `{"behavior":"deny","message":…}`). Fail-closed: an unknown/!object/missing
 /// behavior is an error the caller turns into a denial — never a silent allow.
+#[cfg(test)]
 fn parse_gate_verdict(verdict: &Value, fallback: &JsonObject) -> anyhow::Result<ToolGate> {
     match verdict.get("behavior").and_then(Value::as_str) {
         Some("allow") => {
@@ -4453,7 +4378,7 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
     }
 
     #[test]
-    fn exact_contract_gate_bypass_denies_raw_foreground_tools() -> anyhow::Result<()> {
+    fn exact_contract_diagnostic_does_not_label_raw_foreground_tools() -> anyhow::Result<()> {
         let tools = tools_named(["act_type"]);
         let task = "Use exactly these real Synapse tools in this exact order:\n\
 1. act_type {\"text\":\"do-not-bypass\",\"verify_delta\":true}";
@@ -4475,7 +4400,7 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
     }
 
     #[test]
-    fn exact_contract_gate_bypass_denies_shell_and_operator_control() -> anyhow::Result<()> {
+    fn exact_contract_diagnostic_does_not_label_shell_or_operator_control() -> anyhow::Result<()> {
         let tools = tools_named([
             "act_run_shell",
             "act_spawn_agent",
@@ -4521,7 +4446,7 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
                     &object,
                     Some(&contract)
                 ),
-                "{tool_name} must never bypass approval"
+                "{tool_name} must not be labeled exact-contract-authorized"
             );
         }
         Ok(())
