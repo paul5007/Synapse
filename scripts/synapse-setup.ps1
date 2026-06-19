@@ -1942,11 +1942,12 @@ function New-SynapseCodexRestartHandoff {
         )
         post_restart_verification = @(
             'Run git status --short --branch and confirm the working tree matches STATE/RECOVERY_NOTES.md.',
+            "Read the active shell/Codex process parent chain and confirm the active codex.exe PID is not stale PID $codexPid from this handoff.",
             'Call real mcp__synapse.health and verify daemon pid/tool_surface_sha256 matches or intentionally supersedes this handoff.',
             'Run tool discovery for the previously missing tool, for example tool_search browser_evaluate.',
             'If the callable tool is exposed, resume the issue recorded in STATE/RECOVERY_NOTES.md and perform manual real-MCP FSV; do not use direct helper calls as acceptance.'
         )
-        restart_command_hint = 'Close this Codex session, start a new Codex session through the patched Codex launcher, then say: continue your work, you are the only agent working.'
+        restart_command_hint = "Close this Codex session completely, start a new Codex session through the patched Codex launcher, verify the active codex.exe PID is not $codexPid, then say: continue your work, you are the only agent working."
         repo_readback = Get-SynapseHandoffGitReadback -SourceDir $SourceDir
         token_path = $TokenPath
     }
@@ -1966,7 +1967,7 @@ function New-SynapseCodexRestartHandoff {
         "- Diff: $DiffSummary",
         '',
         '## Required Restart',
-        'The running Codex process cannot hot-add newly installed MCP tools or mutate cached tool schemas. Restart Codex through the patched launcher, then read the files and issues below before continuing.',
+        "The running Codex process cannot hot-add newly installed MCP tools or mutate cached tool schemas. Close this stale Codex process completely (PID $codexPid), restart Codex through the patched launcher, and prove the active codex.exe parent PID changed before continuing. Typing `continue` into the same PID is not a restart.",
         '',
         '## Read After Restart'
     )

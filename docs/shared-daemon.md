@@ -190,8 +190,11 @@ are not accepted as live session proof.
   snapshot, start snapshot, required wake-up files, GitHub issue reads, and
   post-restart verification steps. Restart Codex through the patched launcher
   so the real wired `mcp__synapse` client loads the new schema, then read the
-  handoff plus `STATE/RECOVERY_NOTES.md` before resuming. Direct HTTP or stdio
-  probes remain diagnostics only and are not D1/client-parity FSV.
+  active shell/Codex parent chain and prove the active `codex.exe` PID is not
+  the stale PID named in the handoff before resuming issue work. Typing
+  `continue` into the same PID is not a restart. Read the handoff plus
+  `STATE/RECOVERY_NOTES.md` before resuming. Direct HTTP or stdio probes remain
+  diagnostics only and are not D1/client-parity FSV.
 - **WSL Codex/Claude leaves `synapse-mcp --mode connect` children under
   `wsl.exe`** — this is a configuration error. Reconfigure the WSL client to
   HTTP transport with bearer auth. The bridge now refuses direct WSL interop
