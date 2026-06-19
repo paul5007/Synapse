@@ -560,8 +560,12 @@ fn external_chrome_profile_surfaces() -> Vec<String> {
                     .and_then(Value::as_str)
                     .unwrap_or("<unnamed>");
                 rows.push(format!(
-                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={} runtime_enabled=true active_bit={} disable_reasons={}",
+                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={} runtime_enabled=true state={} active_bit={} disable_reasons={}",
                     permissions.join(","),
+                    runtime_state
+                        .state
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "<absent>".to_owned()),
                     runtime_state
                         .active_bit
                         .map(|value| value.to_string())
@@ -594,12 +598,14 @@ fn active_api_permissions(setting: &Value) -> Vec<String> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ChromeExtensionRuntimeState {
+    state: Option<i64>,
     active_bit: Option<bool>,
     disable_reasons: Vec<u64>,
     runtime_enabled: bool,
 }
 
 fn chrome_extension_runtime_state(setting: &Value) -> ChromeExtensionRuntimeState {
+    let state = setting.get("state").and_then(Value::as_i64);
     let active_bit = setting.get("active_bit").and_then(Value::as_bool);
     let mut disable_reasons = setting
         .get("disable_reasons")
@@ -608,11 +614,13 @@ fn chrome_extension_runtime_state(setting: &Value) -> ChromeExtensionRuntimeStat
         .unwrap_or_default();
     disable_reasons.sort_unstable();
     disable_reasons.dedup();
-    // `active_bit=false` can appear in Secure Preferences for an extension that
-    // still has active API permissions. Only concrete disable reasons prove the
-    // extension is disabled enough to remove debugger/nativeMessaging risk.
-    let runtime_enabled = disable_reasons.is_empty();
+    // Chromium stores Extension::State in preferences (DISABLED=0, ENABLED=1).
+    // Stale permission rows can survive without `state`; they are not a
+    // concrete enabled-runtime signal and the live chrome.management bridge
+    // readback is the stronger authority for enabled hazards.
+    let runtime_enabled = state == Some(1) && disable_reasons.is_empty();
     ChromeExtensionRuntimeState {
+        state,
         active_bit,
         disable_reasons,
         runtime_enabled,
@@ -4175,6 +4183,7 @@ mod tests {
     #[test]
     fn chrome_extension_runtime_state_treats_disabled_permission_rows_as_not_enabled() {
         let setting = json!({
+            "state": 0,
             "active_bit": false,
             "disable_reasons": [65536],
             "active_permissions": {
@@ -4184,13 +4193,14 @@ mod tests {
 
         let runtime_state = chrome_extension_runtime_state(&setting);
 
+        assert_eq!(runtime_state.state, Some(0));
         assert_eq!(runtime_state.active_bit, Some(false));
         assert_eq!(runtime_state.disable_reasons, vec![65536]);
         assert!(!runtime_state.runtime_enabled);
     }
 
     #[test]
-    fn chrome_extension_runtime_state_does_not_trust_active_bit_alone() {
+    fn chrome_extension_runtime_state_requires_enabled_state_even_with_active_permissions() {
         let setting = json!({
             "active_bit": false,
             "active_permissions": {
@@ -4200,13 +4210,32 @@ mod tests {
 
         let runtime_state = chrome_extension_runtime_state(&setting);
 
+        assert_eq!(runtime_state.state, None);
+        assert_eq!(runtime_state.active_bit, Some(false));
+        assert!(runtime_state.disable_reasons.is_empty());
+        assert!(!runtime_state.runtime_enabled);
+    }
+
+    #[test]
+    fn chrome_extension_runtime_state_treats_enabled_state_as_runtime_enabled() {
+        let setting = json!({
+            "state": 1,
+            "active_bit": false,
+            "active_permissions": {
+                "api": ["debugger", "nativeMessaging"]
+            }
+        });
+
+        let runtime_state = chrome_extension_runtime_state(&setting);
+
+        assert_eq!(runtime_state.state, Some(1));
         assert_eq!(runtime_state.active_bit, Some(false));
         assert!(runtime_state.disable_reasons.is_empty());
         assert!(runtime_state.runtime_enabled);
     }
 
     #[test]
-    fn chrome_extension_runtime_state_fails_closed_when_disabled_state_is_absent() {
+    fn chrome_extension_runtime_state_treats_absent_state_as_stale_not_enabled() {
         let setting = json!({
             "active_permissions": {
                 "api": ["nativeMessaging"]
@@ -4215,9 +4244,10 @@ mod tests {
 
         let runtime_state = chrome_extension_runtime_state(&setting);
 
+        assert_eq!(runtime_state.state, None);
         assert_eq!(runtime_state.active_bit, None);
         assert!(runtime_state.disable_reasons.is_empty());
-        assert!(runtime_state.runtime_enabled);
+        assert!(!runtime_state.runtime_enabled);
     }
 
     #[test]

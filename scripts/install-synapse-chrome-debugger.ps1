@@ -591,6 +591,10 @@ function Get-ChromeExtensionRuntimeState {
         $Setting
     )
 
+    $state = $null
+    if ($Setting.PSObject.Properties.Name -contains 'state' -and $null -ne $Setting.state) {
+        $state = [int]$Setting.state
+    }
     $activeBit = $null
     if ($Setting.PSObject.Properties.Name -contains 'active_bit') {
         $activeBit = [bool]$Setting.active_bit
@@ -599,14 +603,13 @@ function Get-ChromeExtensionRuntimeState {
     if ($Setting.PSObject.Properties.Name -contains 'disable_reasons' -and $null -ne $Setting.disable_reasons) {
         $disableReasons = @($Setting.disable_reasons)
     }
-    $runtimeEnabled = $true
-    # Chrome can leave active_bit=false on rows whose active_permissions still
-    # include debugger/nativeMessaging. Disable reasons are the concrete SoT.
-    if ($disableReasons.Count -gt 0) {
-        $runtimeEnabled = $false
-    }
+    # Chromium persists extension state as DISABLED=0, ENABLED=1. Stale
+    # permission rows can remain without state; the live chrome.management
+    # bridge readback is the stronger authority for enabled hazards.
+    $runtimeEnabled = (($state -eq 1) -and ($disableReasons.Count -eq 0))
 
     [pscustomobject]@{
+        state = $state
         active_bit = $activeBit
         disable_reasons = $disableReasons
         runtime_enabled = $runtimeEnabled
@@ -678,6 +681,7 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                         manifest_api = $manifestApi
                         active_or_manifest_hazard_api = $synapseActiveHazardApi
                         granted_hazard_api = $synapseGrantedHazardApi
+                        state = $runtimeState.state
                         active_bit = $runtimeState.active_bit
                         disable_reasons = $runtimeState.disable_reasons
                         runtime_enabled = $runtimeState.runtime_enabled
@@ -710,6 +714,7 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                         granted_api = $grantedApi
                         manifest_api = $manifestApi
                         hazard_api = $hazardApi
+                        state = $runtimeState.state
                         active_bit = $runtimeState.active_bit
                         disable_reasons = $runtimeState.disable_reasons
                         runtime_enabled = $runtimeState.runtime_enabled
