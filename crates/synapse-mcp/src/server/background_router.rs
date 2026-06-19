@@ -27,16 +27,25 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, service::RequestContext};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use sha2::{Digest as _, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 use synapse_core::{ElementId, Point, Rect, error_codes};
 
 const DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TARGET_ACT_FOCUS_STABLE_MS: u32 = 75;
+const DEFAULT_TARGET_ACT_SAVE_TIMEOUT_MS: u32 = 2_000;
+const TARGET_ACT_SAVE_POLL_INTERVAL_MS: u64 = 50;
+const TARGET_ACT_SAVE_SOURCE_OF_TRUTH: &str = "file.bytes";
 const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, click, type, press, select, submit, run_shell, focus_window";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, click, type, press, select, submit, save, run_shell, focus_window";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -66,7 +75,8 @@ pub struct TargetActParams {
     /// `navigate`: destination URL.
     #[serde(default)]
     pub url: Option<String>,
-    /// `screenshot`: output file path.
+    /// `screenshot`: output file path. `save`: existing document file path
+    /// used as the physical Source of Truth after the target-scoped save.
     #[serde(default)]
     pub path: Option<String>,
     /// `set_field`: target element id (from observe/find), for the UIA/CDP-id
@@ -78,7 +88,8 @@ pub struct TargetActParams {
     /// normal-Chrome bridge (background, no foreground, no DOM/action debugger attach).
     #[serde(default)]
     pub selector: Option<String>,
-    /// `set_field`: full replacement text (empty clears the field).
+    /// `set_field`: full replacement text (empty clears the field). `save`:
+    /// optional expected file contents for the post-save file-byte readback.
     #[serde(default)]
     pub text: Option<String>,
     /// Browser DOM action: accessible/ARIA role to resolve.
@@ -170,7 +181,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -450,6 +461,7 @@ impl SynapseService {
             "submit" => {
                 target_act_browser_dom_action(self, "submit", &params, &request_context).await?
             }
+            "save" => target_act_save(self, &params, &request_context).await?,
             "run_shell" => {
                 let command = require_param(params.command, "run_shell", "command")?;
                 let response = self
@@ -579,6 +591,482 @@ impl SynapseService {
             result,
         }))
     }
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TargetActSaveResponse {
+    ok: bool,
+    method: String,
+    backend_tier_used: String,
+    required_foreground: bool,
+    source_of_truth: String,
+    path: String,
+    target_hwnd: i64,
+    target_process_name: String,
+    target_window_title: String,
+    before_len: u64,
+    after_len: u64,
+    before_sha256: String,
+    after_sha256: String,
+    changed: bool,
+    expected_text_sha256: Option<String>,
+    expected_text_matched: Option<bool>,
+    attempts: Vec<TargetActSaveAttempt>,
+    postcondition: crate::m2::postcondition::ActPostcondition,
+    elapsed_ms: u32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TargetActSaveAttempt {
+    method: String,
+    command_source: String,
+    sent: bool,
+    detail: String,
+    win32_result: Option<usize>,
+}
+
+struct TargetActFileSnapshot {
+    len: u64,
+    sha256: String,
+    bytes: Vec<u8>,
+}
+
+async fn target_act_save(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let result = target_act_save_impl(service, params, request_context).await;
+    let _ = service.audit_action_result_for_request("target_act", &result, request_context);
+    match result {
+        Ok(response) => Ok((
+            "target_window_save",
+            true,
+            TARGET_ACT_STATUS_OK,
+            target_act_result(&response)?,
+        )),
+        Err(error) => Ok((
+            "target_window_save",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_window_save", error),
+        )),
+    }
+}
+
+async fn target_act_save_impl(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<TargetActSaveResponse, ErrorData> {
+    let started = Instant::now();
+    target_act_validate_save_params(params)?;
+    let session_id = target_act_session_id(request_context, "save")?;
+    let path = require_param(params.path.clone(), "save", "path")?;
+    let expected_text = params.text.as_deref();
+    let verify_timeout_ms = target_act_save_verify_timeout(params.wait_timeout_ms)?;
+    let target = service.session_target(Some(&session_id))?.ok_or_else(|| {
+        mcp_error(
+            error_codes::TARGET_NOT_SET,
+            "target_act verb=save requires this MCP session to have an owned window target; call act_launch/set_target first",
+        )
+    })?;
+    let hwnd = match target {
+        SessionTarget::Window { hwnd } => hwnd,
+        SessionTarget::Cdp { .. } => {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                "target_act verb=save currently supports native window targets only; browser targets must use browser/CDP storage or download-specific tools",
+            ));
+        }
+    };
+    service.ensure_target_claim_allows_session("target_act", &session_id, &target)?;
+
+    let context = synapse_a11y::foreground_context(hwnd).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("target_act verb=save target HWND 0x{hwnd:x} context readback failed: {error}"),
+        )
+    })?;
+    if !context.process_name.eq_ignore_ascii_case("notepad.exe") {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb=save only supports Notepad window targets for #1275; target 0x{hwnd:x} is process {} title {:?}",
+                context.process_name, context.window_title
+            ),
+        ));
+    }
+
+    let path = canonical_existing_file_for_target_act_save(Path::new(&path))?;
+    if !target_act_notepad_title_matches_path(&context.window_title, &path) {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb=save refused: Notepad target title {:?} does not match file SoT {}",
+                context.window_title,
+                path.display()
+            ),
+        ));
+    }
+
+    let before = target_act_file_snapshot(&path)?;
+    let expected_sha256 = expected_text.map(crate::m2::postcondition::text_signature);
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": "save",
+        "delegated_tool": "target_window_save",
+        "target_hwnd": hwnd,
+        "target_process_name": context.process_name,
+        "target_window_title": context.window_title,
+        "path": path.display().to_string(),
+        "source_of_truth": TARGET_ACT_SAVE_SOURCE_OF_TRUTH,
+        "before_len": before.len,
+        "before_sha256": before.sha256,
+        "expected_text_sha256": expected_sha256,
+        "verify_timeout_ms": verify_timeout_ms,
+        "requires_agent_logical_foreground": true,
+        "required_foreground": false,
+        "no_human_os_foreground_fallback": true,
+    });
+    service.audit_action_started_with_details_for_request(
+        "target_act",
+        &request_details,
+        request_context,
+    )?;
+
+    let mut attempts = Vec::new();
+    for source in [
+        NotepadSaveCommandSource::Menu,
+        NotepadSaveCommandSource::Accelerator,
+    ] {
+        let attempt = send_notepad_save_command(hwnd, source)?;
+        attempts.push(attempt);
+        if let Some(after) =
+            poll_target_act_save_file(&path, &before, expected_text, verify_timeout_ms).await?
+        {
+            return Ok(target_act_save_response(
+                started,
+                &path,
+                hwnd,
+                &context.process_name,
+                &context.window_title,
+                before,
+                after,
+                expected_sha256,
+                expected_text,
+                attempts,
+            ));
+        }
+    }
+
+    let after = target_act_file_snapshot(&path)?;
+    Err(target_act_save_postcondition_error(
+        &path,
+        &before,
+        &after,
+        expected_text,
+        verify_timeout_ms,
+        &attempts,
+    ))
+}
+
+fn target_act_validate_save_params(params: &TargetActParams) -> Result<(), ErrorData> {
+    if params.url.as_ref().is_some_and(|value| !value.is_empty())
+        || params
+            .command
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || !params.args.is_empty()
+        || params
+            .working_dir
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || target_act_has_any_locator(params)
+        || target_act_coordinate(params)?.is_some()
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=save accepts only path, optional text as expected file contents, and optional wait_timeout_ms",
+        ));
+    }
+    Ok(())
+}
+
+fn target_act_save_verify_timeout(value: Option<u64>) -> Result<u32, ErrorData> {
+    let timeout = value.unwrap_or(u64::from(DEFAULT_TARGET_ACT_SAVE_TIMEOUT_MS));
+    if !(50..=10_000).contains(&timeout) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb=save wait_timeout_ms must be 50..=10000, got {timeout}"),
+        ));
+    }
+    Ok(u32::try_from(timeout).unwrap_or(DEFAULT_TARGET_ACT_SAVE_TIMEOUT_MS))
+}
+
+fn canonical_existing_file_for_target_act_save(path: &Path) -> Result<PathBuf, ErrorData> {
+    if path.as_os_str().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=save path must not be empty",
+        ));
+    }
+    let metadata = fs::metadata(path).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=save requires an existing file path Source of Truth; {} could not be read: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=save path must be an existing file, got {}",
+                path.display()
+            ),
+        ));
+    }
+    path.canonicalize().map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=save failed to canonicalize file SoT {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn target_act_notepad_title_matches_path(title: &str, path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lowered_title = title.to_ascii_lowercase();
+    lowered_title.contains("notepad")
+        && lowered_title.contains(file_name.to_ascii_lowercase().as_str())
+}
+
+fn target_act_file_snapshot(path: &Path) -> Result<TargetActFileSnapshot, ErrorData> {
+    let bytes = fs::read(path).map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "target_act verb=save file SoT read failed for {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(TargetActFileSnapshot {
+        len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        sha256: crate::m2::postcondition::hex_encode(&Sha256::digest(&bytes)),
+        bytes,
+    })
+}
+
+async fn poll_target_act_save_file(
+    path: &Path,
+    before: &TargetActFileSnapshot,
+    expected_text: Option<&str>,
+    timeout_ms: u32,
+) -> Result<Option<TargetActFileSnapshot>, ErrorData> {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        let after = target_act_file_snapshot(path)?;
+        if target_act_save_satisfied(before, &after, expected_text) {
+            return Ok(Some(after));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(TARGET_ACT_SAVE_POLL_INTERVAL_MS)).await;
+    }
+}
+
+fn target_act_save_satisfied(
+    before: &TargetActFileSnapshot,
+    after: &TargetActFileSnapshot,
+    expected_text: Option<&str>,
+) -> bool {
+    if let Some(expected_text) = expected_text {
+        return after.bytes == expected_text.as_bytes();
+    }
+    after.sha256 != before.sha256
+}
+
+fn target_act_save_response(
+    started: Instant,
+    path: &Path,
+    hwnd: i64,
+    process_name: &str,
+    window_title: &str,
+    before: TargetActFileSnapshot,
+    after: TargetActFileSnapshot,
+    expected_sha256: Option<String>,
+    expected_text: Option<&str>,
+    attempts: Vec<TargetActSaveAttempt>,
+) -> TargetActSaveResponse {
+    let changed = before.sha256 != after.sha256;
+    let expected_text_matched = expected_text.map(|expected| after.bytes == expected.as_bytes());
+    let detail = if expected_text_matched == Some(true) {
+        "target_act save verified file bytes equal expected text"
+    } else if changed {
+        "target_act save verified file bytes changed"
+    } else {
+        "target_act save verified file bytes already matched expected text"
+    };
+    TargetActSaveResponse {
+        ok: true,
+        method: attempts
+            .last()
+            .map(|attempt| attempt.method.clone())
+            .unwrap_or_else(|| "notepad_wm_command_save".to_owned()),
+        backend_tier_used: "win32_wm_command".to_owned(),
+        required_foreground: false,
+        source_of_truth: TARGET_ACT_SAVE_SOURCE_OF_TRUTH.to_owned(),
+        path: path.display().to_string(),
+        target_hwnd: hwnd,
+        target_process_name: process_name.to_owned(),
+        target_window_title: window_title.to_owned(),
+        before_len: before.len,
+        after_len: after.len,
+        before_sha256: before.sha256.clone(),
+        after_sha256: after.sha256.clone(),
+        changed,
+        expected_text_sha256: expected_sha256,
+        expected_text_matched,
+        attempts,
+        postcondition: crate::m2::postcondition::ActPostcondition {
+            status: "verified_state".to_owned(),
+            observed_delta: Some(changed),
+            source_of_truth: Some(TARGET_ACT_SAVE_SOURCE_OF_TRUTH.to_owned()),
+            before_signature: Some(before.sha256),
+            after_signature: Some(after.sha256),
+            detail: Some(detail.to_owned()),
+        },
+        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    }
+}
+
+fn target_act_save_postcondition_error(
+    path: &Path,
+    before: &TargetActFileSnapshot,
+    after: &TargetActFileSnapshot,
+    expected_text: Option<&str>,
+    verify_timeout_ms: u32,
+    attempts: &[TargetActSaveAttempt],
+) -> ErrorData {
+    let expected_text_sha256 = expected_text.map(crate::m2::postcondition::text_signature);
+    let expected_text_matched = expected_text.map(|expected| after.bytes == expected.as_bytes());
+    let detail = if expected_text.is_some() {
+        "file bytes did not equal expected text after target-scoped Notepad save"
+    } else {
+        "file bytes did not change after target-scoped Notepad save; pass text to verify an already-matching save"
+    };
+    crate::m2::postcondition::postcondition_failed_error(
+        "target_act",
+        TARGET_ACT_SAVE_SOURCE_OF_TRUTH,
+        detail,
+        before.sha256.clone(),
+        after.sha256.clone(),
+        json!({
+            "path": path.display().to_string(),
+            "before_len": before.len,
+            "after_len": after.len,
+            "expected_text_sha256": expected_text_sha256,
+            "expected_text_matched": expected_text_matched,
+            "verify_timeout_ms": verify_timeout_ms,
+            "attempts": attempts,
+        }),
+    )
+}
+
+#[derive(Copy, Clone)]
+enum NotepadSaveCommandSource {
+    Menu,
+    Accelerator,
+}
+
+impl NotepadSaveCommandSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Menu => "menu",
+            Self::Accelerator => "accelerator",
+        }
+    }
+
+    const fn wparam(self) -> usize {
+        const NOTEPAD_IDM_SAVE: usize = 3;
+        match self {
+            Self::Menu => NOTEPAD_IDM_SAVE,
+            Self::Accelerator => (1_usize << 16) | NOTEPAD_IDM_SAVE,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn send_notepad_save_command(
+    hwnd: i64,
+    source: NotepadSaveCommandSource,
+) -> Result<TargetActSaveAttempt, ErrorData> {
+    use std::ffi::c_void;
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        UI::WindowsAndMessaging::{
+            IsWindow, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SendMessageTimeoutW, WM_COMMAND,
+        },
+    };
+
+    let hwnd = HWND(hwnd as *mut c_void);
+    if hwnd.0.is_null() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return Err(mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            "target_act verb=save target HWND is not a live window",
+        ));
+    }
+    let mut win32_result = 0_usize;
+    let lresult = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_COMMAND,
+            WPARAM(source.wparam()),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            500,
+            Some(&raw mut win32_result),
+        )
+    };
+    let sent = lresult.0 != 0;
+    Ok(TargetActSaveAttempt {
+        method: format!("notepad_wm_command_save_{}", source.as_str()),
+        command_source: source.as_str().to_owned(),
+        sent,
+        detail: if sent {
+            "WM_COMMAND returned before timeout".to_owned()
+        } else {
+            format!(
+                "SendMessageTimeoutW(WM_COMMAND save/{}) failed or timed out: {}",
+                source.as_str(),
+                windows::core::Error::from_thread()
+            )
+        },
+        win32_result: sent.then_some(win32_result),
+    })
+}
+
+#[cfg(not(windows))]
+fn send_notepad_save_command(
+    _hwnd: i64,
+    _source: NotepadSaveCommandSource,
+) -> Result<TargetActSaveAttempt, ErrorData> {
+    Err(mcp_error(
+        error_codes::ACTION_TARGET_INVALID,
+        "target_act verb=save Notepad WM_COMMAND route is only available on Windows",
+    ))
 }
 
 fn target_act_session_id(
@@ -1427,6 +1915,130 @@ mod tests {
     }
 
     #[test]
+    fn target_act_save_accepts_file_source_of_truth_params() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "save",
+            "path": "C:\\Temp\\issue1275-save.txt",
+            "text": "Issue1275 expected persisted text",
+            "wait_timeout_ms": 750
+        }))
+        .expect("save should use the existing open-string target_act schema");
+
+        assert_eq!(params.verb.as_str(), "save");
+        assert_eq!(params.path.as_deref(), Some("C:\\Temp\\issue1275-save.txt"));
+        assert_eq!(
+            params.text.as_deref(),
+            Some("Issue1275 expected persisted text")
+        );
+        assert_eq!(params.wait_timeout_ms, Some(750));
+        target_act_validate_save_params(&params).expect("save params should validate");
+    }
+
+    #[test]
+    fn target_act_save_rejects_locator_command_and_coordinate_mixes() {
+        for params in [
+            json!({
+                "verb": "save",
+                "path": "C:\\Temp\\issue1275-save.txt",
+                "selector": "#document"
+            }),
+            json!({
+                "verb": "save",
+                "path": "C:\\Temp\\issue1275-save.txt",
+                "command": "powershell.exe"
+            }),
+            json!({
+                "verb": "save",
+                "path": "C:\\Temp\\issue1275-save.txt",
+                "x": 12,
+                "y": 34
+            }),
+        ] {
+            let params: TargetActParams =
+                serde_json::from_value(params).expect("synthetic save params deserialize");
+            let error = target_act_validate_save_params(&params)
+                .expect_err("save must reject unrelated action parameters");
+
+            assert_eq!(
+                target_act_error_code(&error),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+        }
+    }
+
+    #[test]
+    fn target_act_save_timeout_is_bounded() {
+        assert_eq!(
+            target_act_save_verify_timeout(None).expect("default timeout should validate"),
+            DEFAULT_TARGET_ACT_SAVE_TIMEOUT_MS
+        );
+        assert_eq!(
+            target_act_save_verify_timeout(Some(50)).expect("lower bound should validate"),
+            50
+        );
+        assert_eq!(
+            target_act_save_verify_timeout(Some(10_000)).expect("upper bound should validate"),
+            10_000
+        );
+
+        for value in [49, 10_001] {
+            let error = target_act_save_verify_timeout(Some(value))
+                .expect_err("out-of-range save timeout must fail closed");
+            assert_eq!(
+                target_act_error_code(&error),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+        }
+    }
+
+    #[test]
+    fn target_act_save_matches_notepad_title_to_file_source_of_truth() {
+        let path = Path::new("C:\\Temp\\issue1275-save.txt");
+
+        assert!(target_act_notepad_title_matches_path(
+            "issue1275-save.txt - Notepad",
+            path
+        ));
+        assert!(target_act_notepad_title_matches_path(
+            "*issue1275-save.txt - Notepad",
+            path
+        ));
+        assert!(!target_act_notepad_title_matches_path(
+            "other.txt - Notepad",
+            path
+        ));
+        assert!(!target_act_notepad_title_matches_path(
+            "issue1275-save.txt - WordPad",
+            path
+        ));
+    }
+
+    #[test]
+    fn target_act_save_satisfied_requires_expected_bytes_or_file_delta() {
+        let before = target_act_test_snapshot(b"old");
+        let same = target_act_test_snapshot(b"old");
+        let expected = target_act_test_snapshot(b"expected");
+        let changed = target_act_test_snapshot(b"changed");
+
+        assert!(
+            target_act_save_satisfied(&before, &expected, Some("expected")),
+            "expected text should accept exact file bytes even if delta semantics are separate"
+        );
+        assert!(
+            !target_act_save_satisfied(&before, &changed, Some("expected")),
+            "wrong file bytes must not satisfy an expected-text save"
+        );
+        assert!(
+            !target_act_save_satisfied(&before, &same, None),
+            "without expected text, unchanged file bytes are not enough"
+        );
+        assert!(
+            target_act_save_satisfied(&before, &changed, None),
+            "without expected text, any file-byte delta verifies the save side effect"
+        );
+    }
+
+    #[test]
     fn target_act_focus_window_uses_window_session_target() {
         let params =
             target_act_focus_window_params(Some(&SessionTarget::Window { hwnd: 0x250a08 }))
@@ -1780,5 +2392,13 @@ mod tests {
             result.pointer("/error/data/code").and_then(Value::as_str),
             Some(error_codes::ACTION_POSTCONDITION_FAILED)
         );
+    }
+
+    fn target_act_test_snapshot(bytes: &[u8]) -> TargetActFileSnapshot {
+        TargetActFileSnapshot {
+            len: u64::try_from(bytes.len()).expect("synthetic bytes length should fit u64"),
+            sha256: crate::m2::postcondition::hex_encode(&Sha256::digest(bytes)),
+            bytes: bytes.to_vec(),
+        }
     }
 }
