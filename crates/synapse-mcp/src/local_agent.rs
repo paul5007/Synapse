@@ -29,6 +29,7 @@ use uuid::Uuid;
 const SYNAPSE_TOOL_CATALOG: &str = "synapse_tool_catalog";
 const SYNAPSE_TOOL_CALL: &str = "synapse_tool";
 const INTERNALIZED_TOOL_CALL_ENVELOPE: &str = "tool_call";
+const ACT_CALL_TOOL_CALL_ENVELOPE: &str = "act_call";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalAgentCli {
@@ -655,7 +656,8 @@ impl Runner {
         self.tool_call_count = self.tool_call_count.saturating_add(1);
         let internalized_envelope = self.tool_exposure == ToolExposure::Internalized
             && call.name == INTERNALIZED_TOOL_CALL_ENVELOPE;
-        let routed = call.name == SYNAPSE_TOOL_CALL || internalized_envelope;
+        let act_call_envelope = call.name == ACT_CALL_TOOL_CALL_ENVELOPE;
+        let routed = call.name == SYNAPSE_TOOL_CALL || internalized_envelope || act_call_envelope;
         let catalog = call.name == SYNAPSE_TOOL_CATALOG;
         self.write_line(json!({
             "type": "local.tool_call.started",
@@ -733,6 +735,14 @@ impl Runner {
             }
         } else if internalized_envelope {
             match parse_internalized_tool_call_envelope(&call.arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.record_tool_parse_error(&call, error).await?;
+                    return Ok(());
+                }
+            }
+        } else if act_call_envelope {
+            match parse_act_call_tool_call_envelope(&call.arguments) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     self.record_tool_parse_error(&call, error).await?;
@@ -3181,6 +3191,48 @@ fn parse_internalized_tool_call_envelope(raw: &str) -> anyhow::Result<(String, J
     Ok((name, arguments))
 }
 
+fn parse_act_call_tool_call_envelope(raw: &str) -> anyhow::Result<(String, JsonObject)> {
+    let mut envelope = parse_tool_arguments(raw)?;
+    let name = envelope
+        .remove("tool_name")
+        .and_then(|value| value.as_str().map(str::trim).map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+        .context("act_call envelope requires non-empty tool_name")?;
+    let arguments = match envelope
+        .remove("arguments")
+        .or_else(|| envelope.remove("args"))
+    {
+        Some(value) => {
+            if !envelope.is_empty() {
+                bail!(
+                    "act_call envelope must not mix args/arguments with flattened delegated keys"
+                );
+            }
+            tool_argument_value_to_object(value, "act_call envelope arguments")?
+        }
+        None => envelope,
+    };
+    Ok((name, arguments))
+}
+
+fn tool_argument_value_to_object(value: Value, context: &str) -> anyhow::Result<JsonObject> {
+    match value {
+        Value::Object(map) => Ok(map),
+        Value::String(raw) => {
+            let value: Value = serde_json::from_str(&raw)
+                .with_context(|| format!("{context} string is not JSON"))?;
+            value
+                .as_object()
+                .cloned()
+                .with_context(|| format!("{context} string must decode to a JSON object"))
+        }
+        Value::Array(_) => bail!(
+            "{context} must be a JSON object with exact argument keys; positional arrays are ambiguous and rejected fail-closed"
+        ),
+        other => bail!("{context} must be a JSON object, got {other}"),
+    }
+}
+
 fn resolve_task(task: Option<&str>, task_file: Option<&PathBuf>) -> anyhow::Result<String> {
     if let Some(task) = task.filter(|value| !value.trim().is_empty()) {
         return Ok(task.to_owned());
@@ -3922,6 +3974,35 @@ mod tests {
     }
 
     #[test]
+    fn act_call_tool_call_envelope_parses_flattened_and_nested_arguments() -> anyhow::Result<()> {
+        let (name, args) = parse_act_call_tool_call_envelope(
+            r#"{"tool_name":"synapse_probe","nonce":"probe-123"}"#,
+        )?;
+        assert_eq!(name, "synapse_probe");
+        assert_eq!(args["nonce"], "probe-123");
+
+        let (name, args) = parse_act_call_tool_call_envelope(
+            r#"{"tool_name":"workspace_get","args":{"run_id":"issue1265","key":"safe-shell"}}"#,
+        )?;
+        assert_eq!(name, "workspace_get");
+        assert_eq!(args["run_id"], "issue1265");
+        assert_eq!(args["key"], "safe-shell");
+
+        let mixed = parse_act_call_tool_call_envelope(
+            r#"{"tool_name":"workspace_get","args":{"key":"safe-shell"},"run_id":"issue1265"}"#,
+        )
+        .expect_err("mixing nested and flattened args is ambiguous");
+        assert!(mixed.to_string().contains("must not mix"));
+
+        let array = parse_act_call_tool_call_envelope(
+            r#"{"tool_name":"workspace_get","args":["safe-shell"]}"#,
+        )
+        .expect_err("positional args are ambiguous and must fail closed");
+        assert!(array.to_string().contains("positional arrays"));
+        Ok(())
+    }
+
+    #[test]
     fn assistant_tool_call_message_keeps_string_content_for_chat_templates() {
         let completion = ChatCompletion {
             content: String::new(),
@@ -4443,6 +4524,53 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
                 "{tool_name} must never bypass approval"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_contract_gate_bypass_allows_prompt_authorized_target_act_run_shell()
+    -> anyhow::Result<()> {
+        let tools = tools_named(["target_act", "workspace_put"]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+1. target_act {\"verb\":\"run_shell\",\"command\":\"powershell.exe\",\"args\":[\"-NoLogo\",\"-NoProfile\",\"-Command\",\"Get-ChildItem\"],\"timeout_ms\":10000,\"working_dir\":\"C:\\\\code\\\\Synapse\"}\n\
+2. workspace_put {\"run_id\":\"issue1265\",\"key\":\"prompt-authorized-shell\",\"value\":{\"ok\":true}}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact contract");
+        let args: JsonObject = serde_json::from_value(json!({
+            "verb": "run_shell",
+            "command": "powershell.exe",
+            "args": ["-NoLogo", "-NoProfile", "-Command", "Get-ChildItem"],
+            "timeout_ms": 10000,
+            "working_dir": "C:\\code\\Synapse"
+        }))?;
+
+        assert!(local_agent_exact_contract_gate_bypass_allowed(
+            "target_act",
+            &args,
+            Some(&contract)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_contract_gate_bypass_denies_drifted_target_act_run_shell_args() -> anyhow::Result<()> {
+        let tools = tools_named(["target_act", "workspace_put"]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+1. target_act {\"verb\":\"run_shell\",\"command\":\"whoami.exe\",\"timeout_ms\":10000,\"working_dir\":\"C:\\\\code\\\\Synapse\"}\n\
+2. workspace_put {\"run_id\":\"issue1265\",\"key\":\"safe-shell\",\"value\":{\"ok\":true}}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact contract");
+        let args: JsonObject = serde_json::from_value(json!({
+            "verb": "run_shell",
+            "command": "whoami.exe",
+            "timeout_ms": 10000,
+            "working_dir": "C:\\code\\Synapse",
+            "unexpected": true
+        }))?;
+
+        assert!(!local_agent_exact_contract_gate_bypass_allowed(
+            "target_act",
+            &args,
+            Some(&contract)
+        ));
         Ok(())
     }
 

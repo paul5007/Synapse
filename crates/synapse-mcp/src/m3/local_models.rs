@@ -37,6 +37,7 @@ const DEFAULT_PROBE_TIMEOUT_MS: u64 = 10_000;
 const MAX_PROBE_TIMEOUT_MS: u64 = 120_000;
 const RAW_RESPONSE_EXCERPT_CHARS: usize = 2048;
 const PROBE_TOOL_NAME: &str = "synapse_probe";
+const ACT_CALL_TOOL_NAME: &str = "act_call";
 
 /// A raw `(key, value)` row as returned by a column-family scan.
 type RawRow = (Vec<u8>, Vec<u8>);
@@ -1141,31 +1142,7 @@ fn validate_tool_call_response(raw_text: &str, nonce: &str) -> Result<ProbeUsage
         .get("tool_calls")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "probe response missing message.tool_calls array".to_owned())?;
-    let call = tool_calls
-        .iter()
-        .find(|call| {
-            call.get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(serde_json::Value::as_str)
-                == Some(PROBE_TOOL_NAME)
-        })
-        .ok_or_else(|| format!("probe response did not call required tool {PROBE_TOOL_NAME:?}"))?;
-    let function = call
-        .get("function")
-        .ok_or_else(|| "probe tool call missing function object".to_owned())?;
-    let arguments = function
-        .get("arguments")
-        .ok_or_else(|| "probe tool call missing function.arguments".to_owned())?;
-    let argument_value = match arguments {
-        serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|error| format!("probe tool arguments string is not valid JSON: {error}"))?,
-        value if value.is_object() => value.clone(),
-        _ => {
-            return Err(
-                "probe tool arguments must be a JSON object or JSON object string".to_owned(),
-            );
-        }
-    };
+    let argument_value = required_probe_tool_arguments(tool_calls, PROBE_TOOL_NAME)?;
     let actual_nonce = argument_value
         .get("nonce")
         .and_then(serde_json::Value::as_str)
@@ -1187,6 +1164,101 @@ fn validate_tool_call_response(raw_text: &str, nonce: &str) -> Result<ProbeUsage
             .and_then(|usage| usage.get("total_tokens"))
             .and_then(serde_json::Value::as_u64),
     })
+}
+
+fn required_probe_tool_arguments(
+    tool_calls: &[serde_json::Value],
+    required_tool_name: &str,
+) -> Result<serde_json::Value, String> {
+    let mut errors = Vec::new();
+    for call in tool_calls {
+        match probe_tool_call_arguments(call, required_tool_name) {
+            Ok(Some(arguments)) => return Ok(arguments),
+            Ok(None) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+    let suffix = if errors.is_empty() {
+        String::new()
+    } else {
+        format!("; rejected candidate(s): {}", errors.join("; "))
+    };
+    Err(format!(
+        "probe response did not call required tool {required_tool_name:?}{suffix}"
+    ))
+}
+
+fn probe_tool_call_arguments(
+    call: &serde_json::Value,
+    required_tool_name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let function = call
+        .get("function")
+        .ok_or_else(|| "probe tool call missing function object".to_owned())?;
+    let name = function
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "probe tool call missing function.name string".to_owned())?;
+    let arguments = function
+        .get("arguments")
+        .ok_or_else(|| "probe tool call missing function.arguments".to_owned())?;
+
+    if name == required_tool_name {
+        return Ok(Some(serde_json::Value::Object(
+            parse_probe_argument_object(arguments, "probe tool arguments")?,
+        )));
+    }
+
+    if name != ACT_CALL_TOOL_NAME {
+        return Ok(None);
+    }
+
+    let mut wrapper = parse_probe_argument_object(arguments, "act_call arguments")?;
+    let nested_name = wrapper
+        .remove("tool_name")
+        .and_then(|value| value.as_str().map(str::trim).map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "act_call arguments require non-empty tool_name".to_owned())?;
+    if nested_name != required_tool_name {
+        return Ok(None);
+    }
+    let delegated = match wrapper
+        .remove("arguments")
+        .or_else(|| wrapper.remove("args"))
+    {
+        Some(value) => {
+            if !wrapper.is_empty() {
+                return Err(
+                    "act_call arguments must not mix args/arguments with flattened delegated keys"
+                        .to_owned(),
+                );
+            }
+            parse_probe_argument_object(&value, "act_call delegated arguments")?
+        }
+        None => wrapper,
+    };
+    Ok(Some(serde_json::Value::Object(delegated)))
+}
+
+fn parse_probe_argument_object(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match value {
+        serde_json::Value::String(raw) => {
+            let decoded = serde_json::from_str::<serde_json::Value>(raw)
+                .map_err(|error| format!("{context} string is not valid JSON: {error}"))?;
+            decoded
+                .as_object()
+                .cloned()
+                .ok_or_else(|| format!("{context} string must decode to a JSON object"))
+        }
+        serde_json::Value::Object(map) => Ok(map.clone()),
+        serde_json::Value::Array(_) => Err(format!(
+            "{context} must be a JSON object; positional arrays are ambiguous and rejected fail-closed"
+        )),
+        other => Err(format!("{context} must be a JSON object, got {other}")),
+    }
 }
 
 /// The real, read-only Synapse tool an internalized model is asked to call
@@ -1238,31 +1310,12 @@ fn validate_internalized_probe_response(raw_text: &str, nonce: &str) -> Result<P
         .ok_or_else(|| {
             "internalized probe response missing message.tool_calls array (model emitted no tool call from its weights)".to_owned()
         })?;
-    let call = tool_calls
-        .iter()
-        .find(|call| {
-            call.get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(serde_json::Value::as_str)
-                == Some(INTERNALIZED_PROBE_TOOL)
-        })
-        .ok_or_else(|| {
-            format!("internalized probe did not call the real tool {INTERNALIZED_PROBE_TOOL:?}")
+    let argument_value = required_probe_tool_arguments(tool_calls, INTERNALIZED_PROBE_TOOL)
+        .map_err(|error| {
+            format!(
+                "internalized probe did not call the real tool {INTERNALIZED_PROBE_TOOL:?}: {error}"
+            )
         })?;
-    let arguments = call
-        .get("function")
-        .and_then(|function| function.get("arguments"))
-        .ok_or_else(|| "internalized probe tool call missing function.arguments".to_owned())?;
-    let argument_value = match arguments {
-        serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|error| format!("probe tool arguments string is not valid JSON: {error}"))?,
-        value if value.is_object() => value.clone(),
-        _ => {
-            return Err(
-                "probe tool arguments must be a JSON object or JSON object string".to_owned(),
-            );
-        }
-    };
     let actual_key = argument_value
         .get("key")
         .and_then(serde_json::Value::as_str)
@@ -1994,6 +2047,53 @@ mod tests {
         assert_eq!(usage.prompt_tokens, Some(9));
         assert_eq!(usage.completion_tokens, Some(3));
         assert_eq!(usage.total_tokens, Some(12));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_probe_parser_accepts_act_call_wrapper_alias() -> anyhow::Result<()> {
+        let nonce = "probe-act-call";
+        let response_for = |arguments: serde_json::Value| {
+            json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "type": "function",
+                            "function": {
+                                "name": ACT_CALL_TOOL_NAME,
+                                "arguments": arguments.to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}
+            })
+            .to_string()
+        };
+
+        let response = response_for(json!({
+            "tool_name": PROBE_TOOL_NAME,
+            "nonce": nonce
+        }));
+        let usage = validate_tool_call_response(&response, nonce)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        assert_eq!(usage.total_tokens, Some(15));
+
+        let nested = response_for(json!({
+            "tool_name": PROBE_TOOL_NAME,
+            "args": {"nonce": nonce}
+        }));
+        assert!(validate_tool_call_response(&nested, nonce).is_ok());
+
+        let mixed = response_for(json!({
+            "tool_name": PROBE_TOOL_NAME,
+            "args": {"nonce": nonce},
+            "extra": true
+        }));
+        let error = validate_tool_call_response(&mixed, nonce)
+            .expect_err("mixed nested and flattened act_call args must fail closed");
+        assert!(error.contains("must not mix"));
         Ok(())
     }
 

@@ -348,6 +348,19 @@ fn windows_direct_uielement_api_fails_closed() {
 
 #[cfg(windows)]
 #[test]
+fn windows_foreground_context_invalid_hwnd_reports_no_foreground() {
+    let before = 0_i64;
+    println!("readback=foreground_context edge=invalid_hwnd before=0x{before:x}");
+    let after = foreground_context(before);
+    println!("readback=foreground_context edge=invalid_hwnd after={after:?}");
+    assert_eq!(
+        after.err().map(|error| error.code()),
+        Some(error_codes::A11Y_NO_FOREGROUND)
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_foreground_snapshot_round_trips_element_id() -> Result<(), Box<dyn std::error::Error>> {
     println!("readback=uia_snapshot edge=depth2 before=focused_window_resolved");
     let tree = match snapshot_focused_window(2) {

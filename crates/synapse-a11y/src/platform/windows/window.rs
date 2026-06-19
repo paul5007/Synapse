@@ -273,7 +273,7 @@ pub fn top_level_window_hwnd_by_name(name: String) -> A11yResult<Option<i64>> {
 }
 
 pub fn foreground_context(hwnd: i64) -> A11yResult<ForegroundContext> {
-    let hwnd = HWND(hwnd as *mut c_void);
+    let hwnd = valid_hwnd(hwnd)?;
     let mut pid = 0_u32;
     unsafe {
         GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
@@ -327,8 +327,18 @@ fn window_title(hwnd: HWND) -> String {
 
 fn window_rect(hwnd: HWND) -> A11yResult<Rect> {
     let mut rect = RECT::default();
-    unsafe { GetWindowRect(hwnd, &raw mut rect) }
-        .map_err(|err| A11yError::internal(err.to_string()))?;
+    unsafe { GetWindowRect(hwnd, &raw mut rect) }.map_err(|err| {
+        if is_invalid_window_handle_error(&err) {
+            A11yError::NoForeground {
+                detail: format!(
+                    "HWND 0x{:x} became invalid while reading the foreground window: {err}",
+                    hwnd.0 as isize
+                ),
+            }
+        } else {
+            A11yError::internal(err.to_string())
+        }
+    })?;
     Ok(Rect {
         x: rect.left,
         y: rect.top,
@@ -408,6 +418,11 @@ fn visible_top_level_hwnds() -> A11yResult<Vec<HWND>> {
     }
     .map_err(|err| A11yError::internal(format!("EnumWindows failed: {err}")))?;
     Ok(search.hwnds)
+}
+
+fn is_invalid_window_handle_error(error: &windows::core::Error) -> bool {
+    // ERROR_INVALID_WINDOW_HANDLE (1400) surfaced through HRESULT_FROM_WIN32.
+    error.code().0 as u32 == 0x8007_0578
 }
 
 fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {
