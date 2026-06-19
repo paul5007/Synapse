@@ -21,6 +21,7 @@ const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
 
 const NORMAL_ALLOWED_EXACT: &[&str] = &[
+    "act_launch",
     "act_run_shell",
     "act_run_shell_cancel",
     "act_run_shell_start",
@@ -163,7 +164,6 @@ const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
     "act_combo",
     "act_focus_window",
     "act_keymap",
-    "act_launch",
     "act_pad",
     "act_press",
     "act_scroll",
@@ -1217,6 +1217,7 @@ mod tests {
         names.extend(
             [
                 "act_run_shell",
+                "act_launch",
                 "cdp_open_tab",
                 "health",
                 "session_list",
@@ -1238,6 +1239,7 @@ mod tests {
     fn normal_profile_routes_foreground_capability_without_raw_primitives() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::NormalAgent, &names());
         assert!(visible.contains(&"act_run_shell".to_owned()));
+        assert!(visible.contains(&"act_launch".to_owned()));
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
@@ -1261,6 +1263,10 @@ mod tests {
         );
 
         let routes = hidden_tool_capability_routes(&visible);
+        assert!(
+            !routes.iter().any(|route| route.hidden_tool == "act_launch"),
+            "act_launch is a launch/target-creation capability with its own policy checks, not a hidden foreground input primitive"
+        );
         let act_type_route = routes
             .iter()
             .find(|route| route.hidden_tool == "act_type")

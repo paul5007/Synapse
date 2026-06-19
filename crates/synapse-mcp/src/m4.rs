@@ -3005,6 +3005,8 @@ pub(crate) async fn launch_for_session(
         cdp_launch.as_ref(),
         force_renderer_accessibility,
     );
+    let launch_target_name = launch_target_file_name(&params.target);
+    refuse_shared_tabbed_app_visible_reuse(&params, &launch_target_name)?;
     let launch_desktop = prepare_launch_desktop(params.desktop.as_deref(), session_id)?;
     let desktop_readback = launch_desktop
         .as_ref()
@@ -3016,8 +3018,6 @@ pub(crate) async fn launch_for_session(
     } else {
         LaunchedCdp::default()
     };
-    let launch_target_name = launch_target_file_name(&params.target);
-
     let cdp_target =
         verify_launched_chromium_url(&params, cdp_launch.as_ref(), &cdp, params.timeout_ms).await?;
     let window = if let Some(regex) = wait_regex {
@@ -5796,6 +5796,83 @@ fn window_context_summaries(contexts: &[ForegroundContext]) -> Vec<serde_json::V
         .collect()
 }
 
+fn refuse_shared_tabbed_app_visible_reuse(
+    params: &ActLaunchParams,
+    launch_target_name: &str,
+) -> Result<(), ErrorData> {
+    let Some(risk_family) = shared_tabbed_app_family(launch_target_name) else {
+        return Ok(());
+    };
+
+    #[cfg(not(windows))]
+    {
+        let _ = params;
+        let _ = risk_family;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let contexts = synapse_a11y::visible_top_level_window_contexts().map_err(|error| {
+            launch_tool_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "act_launch could not prove no existing shared tabbed app window is open for {launch_target_name}; refusing before spawn so the launch cannot hijack a user tabbed host"
+                ),
+                json!({
+                    "code": error_codes::ACTION_TARGET_INVALID,
+                    "reason": "shared_tabbed_app_preflight_unavailable",
+                    "target": params.target,
+                    "args": params.args,
+                    "desktop": params.desktop,
+                    "launch_target_name": launch_target_name,
+                    "risk_family": risk_family,
+                    "source_error_code": error.code(),
+                    "source_error": error.to_string(),
+                    "resolution": "retry after the window Source of Truth is readable, or use a provably owned native target instead of launching into a shared tabbed app host",
+                }),
+            )
+        })?;
+        let risky_windows = contexts
+            .into_iter()
+            .filter(|context| shared_tabbed_app_window_matches(launch_target_name, context))
+            .collect::<Vec<_>>();
+        if risky_windows.is_empty() {
+            return Ok(());
+        }
+        Err(launch_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "act_launch refused {launch_target_name} because an existing visible shared tabbed app window is already open; spawning could reuse that user-owned tab host"
+            ),
+            json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "reason": "shared_tabbed_app_existing_window_risk",
+                "target": params.target,
+                "args": params.args,
+                "desktop": params.desktop,
+                "launch_target_name": launch_target_name,
+                "risk_family": risk_family,
+                "existing_window_count": risky_windows.len(),
+                "observed_windows": window_context_summaries(&risky_windows),
+                "resolution": "create or select a provably owned native tab/document target first; Synapse refuses to launch into an existing user-owned tabbed host",
+            }),
+        ))
+    }
+}
+
+fn shared_tabbed_app_family(target_name: &str) -> Option<&'static str> {
+    match target_name.to_ascii_lowercase().as_str() {
+        "notepad.exe" => Some("windows_notepad_tabbed_host"),
+        _ => None,
+    }
+}
+
+fn shared_tabbed_app_window_matches(target_name: &str, context: &ForegroundContext) -> bool {
+    shared_tabbed_app_family(target_name).is_some()
+        && context.process_name.eq_ignore_ascii_case(target_name)
+}
+
 fn launch_window_error(
     reason: &'static str,
     pid: u32,
@@ -5890,6 +5967,9 @@ fn launch_target_matches_existing_window(
 ) -> bool {
     let target_name = target_name.to_ascii_lowercase();
     let process_name = context.process_name.to_ascii_lowercase();
+    if shared_tabbed_app_family(&target_name).is_some() && target_name == process_name {
+        return false;
+    }
     target_name == process_name
         || launch_target_matches_shell_activation(&target_name, launch_args, &process_name)
         || matches!(
@@ -12983,6 +13063,55 @@ mod tests {
                 .expect("existing single-instance matching window should be selected");
 
         assert_eq!(selected.hwnd, 10);
+    }
+
+    #[test]
+    fn launch_window_selection_rejects_existing_tabbed_notepad_window() {
+        let contexts = vec![foreground_for_launch_selection(
+            10,
+            100,
+            "Notepad.exe",
+            "issue1034-qwen8v2-notepad.txt - Notepad",
+        )];
+        let excluded = HashSet::from([10]);
+        let title_regex = regex::Regex::new("Notepad").expect("synthetic regex compiles");
+
+        let selected = select_launch_window(
+            &contexts,
+            999,
+            &title_regex,
+            &excluded,
+            "notepad.exe",
+            &["C:\\tmp\\issue1271.txt".to_owned()],
+        );
+
+        assert!(
+            selected.is_none(),
+            "existing Notepad tab hosts must not become agent-owned launch targets"
+        );
+    }
+
+    #[test]
+    fn launch_window_selection_accepts_new_tabbed_notepad_window_from_spawn_pid() {
+        let contexts = vec![
+            foreground_for_launch_selection(10, 100, "Notepad.exe", "User Notes - Notepad"),
+            foreground_for_launch_selection(11, 999, "Notepad.exe", "issue1271.txt - Notepad"),
+        ];
+        let excluded = HashSet::from([10]);
+        let title_regex =
+            regex::Regex::new("issue1271\\.txt - Notepad").expect("synthetic regex compiles");
+
+        let selected = select_launch_window(
+            &contexts,
+            999,
+            &title_regex,
+            &excluded,
+            "notepad.exe",
+            &["C:\\tmp\\issue1271.txt".to_owned()],
+        )
+        .expect("new Notepad window owned by the spawned PID should be selected");
+
+        assert_eq!(selected.hwnd, 11);
     }
 
     #[test]
