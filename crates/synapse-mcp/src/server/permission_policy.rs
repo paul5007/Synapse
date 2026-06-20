@@ -369,6 +369,7 @@ const SAFE_MCP_TOOLS: &[&str] = &[
     "read_text",
     "get_target",
     "health",
+    "agent_spawn_task_started",
     "agent_query",
     "agent_inbox",
     "agent_receipts",
@@ -489,6 +490,10 @@ mod tests {
         );
         assert_eq!(
             classify("mcp__synapse__timeline_get", &json!({})),
+            GateDecision::AutoAllow
+        );
+        assert_eq!(
+            classify("mcp__synapse__agent_spawn_task_started", &json!({})),
             GateDecision::AutoAllow
         );
         assert!(classify("mcp__synapse__act_run_shell", &json!({})).is_gate());

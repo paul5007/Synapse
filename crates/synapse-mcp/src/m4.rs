@@ -16,7 +16,7 @@ use rmcp::{
     schemars::{JsonSchema, Schema, SchemaGenerator, json_schema},
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use synapse_core::{
     Action, Backend, ComboInput, ComboStep, ForegroundContext, Key, Rect, error_codes,
@@ -1090,6 +1090,28 @@ pub struct ActSpawnAgentRequest {
     pub require_approval_gate: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSpawnTaskStartedParams {
+    /// Spawn id issued by `act_spawn_agent`. The MCP request's real
+    /// `Mcp-Session-Id` header supplies the session id; callers cannot provide
+    /// or spoof it.
+    pub spawn_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSpawnTaskStartedResponse {
+    pub ok: bool,
+    pub spawn_id: String,
+    pub session_id: String,
+    pub cli: ActSpawnAgentCli,
+    pub task_started_path: String,
+    pub started_at_unix_ms: u64,
+    pub readiness_source: String,
+    pub artifact: Value,
+}
+
 fn default_task_readiness_source() -> String {
     "task_start_artifact".to_owned()
 }
@@ -1114,9 +1136,9 @@ pub struct ActSpawnAgentResponse {
     pub registered_at_unix_ms: u64,
     pub task_started_at_unix_ms: u64,
     /// How task-start readiness was proven: `task_start_artifact` (the agent ran
-    /// the cooperative write-task-started helper) or a daemon-observed liveness
-    /// signal (`final_message_present`, `codex_control_thread_established`,
-    /// `stdout_turn_activity`) when the agent did real work but skipped it.
+    /// the cooperative write-task-started helper) or
+    /// `agent_spawn_task_started_tool` (the agent called the daemon MCP
+    /// readiness tool, which wrote the artifact from the real request session).
     #[serde(default = "default_task_readiness_source")]
     pub task_readiness_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

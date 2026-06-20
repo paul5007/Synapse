@@ -3,9 +3,10 @@ use super::{
     ActRunShellCancelResponse, ActRunShellJobIdParams, ActRunShellParams, ActRunShellResponse,
     ActRunShellStartParams, ActRunShellStartResponse, ActRunShellStatusParams,
     ActRunShellStatusResponse, ActSpawnAgentCli, ActSpawnAgentLogPaths, ActSpawnAgentParams,
-    ActSpawnAgentRequest, ActSpawnAgentResponse, ActSpawnAgentTarget, ErrorData, Json,
-    LaunchWindowState, MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, Parameters, RunShellAuthorization,
-    SessionTarget, ShellExecutionContext, SynapseService, TargetWire, assign_owned_process_job,
+    ActSpawnAgentRequest, ActSpawnAgentResponse, ActSpawnAgentTarget, AgentSpawnTaskStartedParams,
+    AgentSpawnTaskStartedResponse, ErrorData, Json, LaunchWindowState,
+    MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, Parameters, RunShellAuthorization, SessionTarget,
+    ShellExecutionContext, SynapseService, TargetWire, assign_owned_process_job,
     authorize_run_shell, authorize_run_shell_start, cancel_shell_job, execute_combo, launch,
     launch_for_session, launch_process_history_row, launch_process_history_row_key,
     launch_request_details, mcp_error, prepare_run_shell_params_for_context,
@@ -64,6 +65,10 @@ fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Result<
         "local_model_autonomous_tool_calls": agent_kind.is_local_model(),
         "local_model_approval_gate_used": false,
         "local_model_trusted_unattended_exact_contract": agent_kind.is_local_model(),
+        "assigned_prompt_present": params
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty()),
         // Spawn-template provenance (#909): the exact template version + config
         // hash this spawn was rendered from, or null for a direct spawn. The
         // manifest is the physical source of truth for run reproducibility.
@@ -764,9 +769,36 @@ impl SynapseService {
             .await
             .map(Json)
     }
+
+    #[tool(
+        description = "Spawned-agent cooperative readiness: after the spawned agent has called health/session_list and verified its target, call this tool with the daemon-issued spawn_id. The daemon uses the real MCP request session id to atomically write task-started.json, avoiding permission-gated local shell readiness helpers."
+    )]
+    pub async fn agent_spawn_task_started(
+        &self,
+        params: Parameters<AgentSpawnTaskStartedParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<AgentSpawnTaskStartedResponse>, ErrorData> {
+        self.agent_spawn_task_started_impl(params.0, &request_context)
+            .map(Json)
+    }
 }
 
 impl SynapseService {
+    fn agent_spawn_task_started_impl(
+        &self,
+        params: AgentSpawnTaskStartedParams,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<AgentSpawnTaskStartedResponse, ErrorData> {
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::HTTP_SESSION_INVALID,
+                    "agent_spawn_task_started requires an MCP session id (the daemon writes task-started.json from the real request session, not a caller-supplied value)",
+                )
+            })?;
+        write_agent_spawn_task_started_from_session(&params.spawn_id, &session_id)
+    }
+
     /// Shared audited spawn path for `act_spawn_agent` and task auto-dispatch.
     pub(crate) async fn spawn_agent_journaled(
         &self,
@@ -3742,8 +3774,12 @@ fn prepare_agent_spawn_files(
     }
 
     if let Some(settings_path) = &hook_settings_path {
-        let settings =
-            build_claude_hook_settings(spawn_id, &params.mcp_url, params.require_approval_gate)?;
+        let settings = build_claude_hook_settings(
+            spawn_id,
+            &params.mcp_url,
+            params.require_approval_gate,
+            &task_started_script_path,
+        )?;
         let encoded = serde_json::to_vec_pretty(&settings).map_err(|error| {
             mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
@@ -3865,6 +3901,7 @@ fn build_claude_hook_settings(
     spawn_id: &str,
     mcp_url: &str,
     require_approval_gate: bool,
+    task_started_script_path: &Path,
 ) -> Result<Value, ErrorData> {
     let ingress_url = agent_event_ingress_url(spawn_id, mcp_url, "claude_code_hooks")?;
     let hook_entry = json!({
@@ -3894,7 +3931,15 @@ fn build_claude_hook_settings(
         // without a gate round-trip (#927). Anything not matched falls through
         // to mcp__synapse__approval_gate, whose server-side policy is the
         // authoritative backstop (server::permission_policy).
-        settings["permissions"] = json!({ "allow": CLAUDE_AUTO_ALLOW_RULES });
+        let mut allow_rules: Vec<String> = CLAUDE_AUTO_ALLOW_RULES
+            .iter()
+            .map(|rule| (*rule).to_owned())
+            .collect();
+        allow_rules.push(format!(
+            "PowerShell({} *)",
+            task_started_script_path.display()
+        ));
+        settings["permissions"] = json!({ "allow": allow_rules });
     }
     Ok(settings)
 }
@@ -3913,6 +3958,11 @@ const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "ExitPlanMode",
     "BashOutput",
     "Task",
+    "mcp__synapse__health",
+    "mcp__synapse__session_list",
+    "mcp__synapse__get_target",
+    "mcp__synapse__set_target",
+    "mcp__synapse__agent_spawn_task_started",
     "Edit",
     "Write",
     "MultiEdit",
@@ -4058,8 +4108,10 @@ Mandatory provisioning checks:\n\
 {target_instruction}\n\
 5. If any Synapse MCP tool is missing or fails, stop and report the exact tool/error.\n\
 6. Before performing the assigned task or hold-open sleep, write the required task-start readiness artifact to: {task_started_path}\n\
+   Preferred path: call the real Synapse MCP agent_spawn_task_started tool with exactly this JSON: {{\"spawn_id\":\"{spawn_id}\"}}\n\
+   Verify the tool response has ok=true, session_id equal to this spawned MCP session id, and task_started_path equal to {task_started_path}.\n\
+   Compatibility fallback only if agent_spawn_task_started is missing or fails: run the daemon-generated PowerShell helper exactly once after replacing <your_session_id> with this spawned MCP session id.\n\
    Helper path: {task_started_script_path}\n\
-   Run the daemon-generated PowerShell helper exactly once after replacing <your_session_id> with this spawned MCP session id:\n\
    & {task_started_script_path_ps} -SessionId '<your_session_id>'\n\
    Do not rewrite the helper inline. The helper writes the JSON atomically, reads {task_started_path} back, and fails closed with an exact mismatch error if any field is wrong.\n\
 7. In your final response, include one compact JSON object containing spawn_id, health_ok, session_id, target_ok, task_started_path, and any error.\n\
@@ -4165,6 +4217,337 @@ $readBack | ConvertTo-Json -Depth 8\n",
         cli = cli,
         assigned_prompt_present = assigned_prompt_present,
     )
+}
+
+fn write_agent_spawn_task_started_from_session(
+    spawn_id: &str,
+    session_id: &str,
+) -> Result<AgentSpawnTaskStartedResponse, ErrorData> {
+    validate_agent_spawn_id_path_segment(spawn_id)?;
+    let root = agent_spawn_root_dir()?;
+    let log_dir = root.join(spawn_id);
+    if !log_dir.is_dir() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "agent_spawn_task_started refused unknown spawn_id {spawn_id:?}: no spawn directory at {}",
+                log_dir.display()
+            ),
+        ));
+    }
+
+    let manifest = read_agent_spawn_manifest(&log_dir, spawn_id)?;
+    let agent_kind = agent_kind_from_spawn_manifest(&manifest)?;
+    let assigned_prompt_present = manifest
+        .get("assigned_prompt_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let task_started_path = log_dir.join("task-started.json");
+
+    if task_started_path.is_file() {
+        let existing = read_task_started_value_strict(&task_started_path)?;
+        ensure_existing_task_started_claim(
+            &existing,
+            spawn_id,
+            agent_kind,
+            session_id,
+            assigned_prompt_present,
+            &task_started_path,
+        )?;
+        return response_from_task_started_artifact(
+            spawn_id,
+            agent_kind,
+            session_id,
+            &task_started_path,
+            existing,
+        );
+    }
+
+    let artifact = build_agent_spawn_task_started_artifact(
+        spawn_id,
+        agent_kind,
+        session_id,
+        assigned_prompt_present,
+        &task_started_path,
+    );
+    write_task_started_artifact_atomically(&task_started_path, &artifact)?;
+    let readback = read_task_started_value_strict(&task_started_path)?;
+    if readback != artifact {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "agent_spawn_task_started wrote {} but readback did not match the intended artifact",
+                task_started_path.display()
+            ),
+        ));
+    }
+    response_from_task_started_artifact(
+        spawn_id,
+        agent_kind,
+        session_id,
+        &task_started_path,
+        readback,
+    )
+}
+
+fn validate_agent_spawn_id_path_segment(spawn_id: &str) -> Result<(), ErrorData> {
+    if !spawn_id.starts_with("agent-spawn-") {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("spawn_id must start with \"agent-spawn-\", got {spawn_id:?}"),
+        ));
+    }
+    if spawn_id.len() > 128 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("spawn_id exceeds 128 chars ({})", spawn_id.len()),
+        ));
+    }
+    if !spawn_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "spawn_id must contain only ASCII alphanumerics and dashes",
+        ));
+    }
+    Ok(())
+}
+
+fn read_agent_spawn_manifest(log_dir: &Path, spawn_id: &str) -> Result<Value, ErrorData> {
+    let manifest_path = log_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
+    let bytes = fs::read(&manifest_path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "agent_spawn_task_started failed to read spawn manifest {}: {error}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+    let manifest: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "agent_spawn_task_started failed to parse spawn manifest {}: {error}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+    if manifest.get("spawn_id").and_then(Value::as_str) != Some(spawn_id) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "agent_spawn_task_started refused spawn_id {spawn_id:?}: manifest spawn_id mismatch in {}",
+                manifest_path.display()
+            ),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn agent_kind_from_spawn_manifest(manifest: &Value) -> Result<ActSpawnAgentCli, ErrorData> {
+    let cli = manifest
+        .get("cli")
+        .or_else(|| manifest.get("kind"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "agent_spawn_task_started refused spawn manifest without cli/kind",
+            )
+        })?;
+    match cli {
+        "codex" => Ok(ActSpawnAgentCli::Codex),
+        "claude" => Ok(ActSpawnAgentCli::Claude),
+        "local_model" => Ok(ActSpawnAgentCli::LocalModel),
+        other => Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("agent_spawn_task_started refused unsupported spawn cli {other:?}"),
+        )),
+    }
+}
+
+fn build_agent_spawn_task_started_artifact(
+    spawn_id: &str,
+    agent_kind: ActSpawnAgentCli,
+    session_id: &str,
+    assigned_prompt_present: bool,
+    task_started_path: &Path,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "spawn_id": spawn_id,
+        "cli": agent_kind.as_str(),
+        "session_id": session_id,
+        "status": "started",
+        "health_ok": true,
+        "target_ok": true,
+        "assigned_prompt_present": assigned_prompt_present,
+        "task_started_path": task_started_path.display().to_string(),
+        "started_at_unix_ms": unix_time_ms_now(),
+        "readiness_source": "agent_spawn_task_started_tool",
+    })
+}
+
+fn read_task_started_value_strict(path: &Path) -> Result<Value, ErrorData> {
+    let bytes = fs::read(path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "agent_spawn_task_started failed to read {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if bytes.is_empty() {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("agent_spawn_task_started found empty {}", path.display()),
+        ));
+    }
+    let json_bytes = bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(bytes.as_slice());
+    serde_json::from_slice(json_bytes).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "agent_spawn_task_started failed to parse {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn ensure_existing_task_started_claim(
+    existing: &Value,
+    spawn_id: &str,
+    agent_kind: ActSpawnAgentCli,
+    session_id: &str,
+    assigned_prompt_present: bool,
+    task_started_path: &Path,
+) -> Result<(), ErrorData> {
+    let expected_path = task_started_path.display().to_string();
+    let mut errors = Vec::new();
+    if existing.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        errors.push("schema_version mismatch");
+    }
+    if existing.get("spawn_id").and_then(Value::as_str) != Some(spawn_id) {
+        errors.push("spawn_id mismatch");
+    }
+    if existing.get("cli").and_then(Value::as_str) != Some(agent_kind.as_str()) {
+        errors.push("cli mismatch");
+    }
+    if existing.get("session_id").and_then(Value::as_str) != Some(session_id) {
+        errors.push("session_id mismatch");
+    }
+    if existing.get("status").and_then(Value::as_str) != Some("started") {
+        errors.push("status mismatch");
+    }
+    if existing.get("health_ok").and_then(Value::as_bool) != Some(true) {
+        errors.push("health_ok mismatch");
+    }
+    if existing.get("target_ok").and_then(Value::as_bool) != Some(true) {
+        errors.push("target_ok mismatch");
+    }
+    if existing
+        .get("assigned_prompt_present")
+        .and_then(Value::as_bool)
+        != Some(assigned_prompt_present)
+    {
+        errors.push("assigned_prompt_present mismatch");
+    }
+    if existing.get("task_started_path").and_then(Value::as_str) != Some(expected_path.as_str()) {
+        errors.push("task_started_path mismatch");
+    }
+    if existing
+        .get("started_at_unix_ms")
+        .and_then(Value::as_u64)
+        .is_none_or(|value| value == 0)
+    {
+        errors.push("started_at_unix_ms missing");
+    }
+    if !errors.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "agent_spawn_task_started refused to overwrite existing readiness artifact at {}: {}",
+                task_started_path.display(),
+                errors.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn write_task_started_artifact_atomically(path: &Path, artifact: &Value) -> Result<(), ErrorData> {
+    let bytes = serde_json::to_vec_pretty(artifact).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("agent_spawn_task_started failed to encode artifact: {error}"),
+        )
+    })?;
+    let temp_path = path.with_file_name(format!(
+        "{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("task-started.json"),
+        std::process::id(),
+        unix_time_ms_now()
+    ));
+    fs::write(&temp_path, bytes).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "agent_spawn_task_started failed to write temp artifact {}: {error}",
+                temp_path.display()
+            ),
+        )
+    })?;
+    fs::rename(&temp_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "agent_spawn_task_started failed to move temp artifact {} to {}: {error}",
+                temp_path.display(),
+                path.display()
+            ),
+        )
+    })
+}
+
+fn response_from_task_started_artifact(
+    spawn_id: &str,
+    agent_kind: ActSpawnAgentCli,
+    session_id: &str,
+    task_started_path: &Path,
+    artifact: Value,
+) -> Result<AgentSpawnTaskStartedResponse, ErrorData> {
+    let started_at_unix_ms = artifact
+        .get("started_at_unix_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "agent_spawn_task_started read {} without started_at_unix_ms",
+                    task_started_path.display()
+                ),
+            )
+        })?;
+    Ok(AgentSpawnTaskStartedResponse {
+        ok: true,
+        spawn_id: spawn_id.to_owned(),
+        session_id: session_id.to_owned(),
+        cli: agent_kind,
+        task_started_path: task_started_path.display().to_string(),
+        started_at_unix_ms,
+        readiness_source: "agent_spawn_task_started_tool".to_owned(),
+        artifact,
+    })
 }
 
 fn agent_spawn_powershell_script(
@@ -4734,6 +5117,17 @@ fn read_agent_spawn_task_start_artifact(
             0
         }
     };
+    let readiness_source = match object.get("readiness_source").and_then(Value::as_str) {
+        None => "task_start_artifact",
+        Some("task_start_artifact") => "task_start_artifact",
+        Some("agent_spawn_task_started_tool") => "agent_spawn_task_started_tool",
+        Some(_) => {
+            validation_errors.push(
+                "readiness_source must be task_start_artifact or agent_spawn_task_started_tool",
+            );
+            "task_start_artifact"
+        }
+    };
 
     if !validation_errors.is_empty() {
         return Err(json!({
@@ -4746,7 +5140,7 @@ fn read_agent_spawn_task_start_artifact(
 
     Ok(Some(AgentSpawnTaskStartRead {
         started_at_unix_ms,
-        readiness_source: "task_start_artifact",
+        readiness_source,
     }))
 }
 
@@ -5432,6 +5826,7 @@ mod tests {
         assert!(prompt.contains("Start-Sleep -Milliseconds 1234"));
         assert!(prompt.contains("task-start readiness artifact"));
         assert!(prompt.contains("task-started.json"));
+        assert!(prompt.contains("agent_spawn_task_started"));
         assert!(prompt.contains("write-task-started.ps1"));
         assert!(prompt.contains("Do not rewrite the helper inline"));
 
@@ -5650,6 +6045,62 @@ mod tests {
 
         assert_eq!(read.started_at_unix_ms, 1234);
         assert_eq!(read.readiness_source, "task_start_artifact");
+    }
+
+    #[test]
+    fn task_start_artifact_validation_accepts_daemon_readiness_tool_source() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
+            debug_path: None,
+            mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: None,
+            codex_app_server_runner_path: None,
+            codex_app_server_control_path: None,
+            codex_app_server_events_path: None,
+            codex_app_server_stdout_path: None,
+            codex_app_server_stderr_path: None,
+            local_model_runner_path: None,
+        };
+        let artifact = build_agent_spawn_task_started_artifact(
+            "agent-spawn-test",
+            ActSpawnAgentCli::Claude,
+            "expected-session",
+            true,
+            &files.task_started_path,
+        );
+        fs::write(
+            &files.task_started_path,
+            serde_json::to_vec_pretty(&artifact).expect("encode task start"),
+        )
+        .expect("write task start");
+        let matched = MatchedSpawnSession {
+            session_id: "expected-session".to_owned(),
+            registered_at_unix_ms: 1000,
+            agent_process_id: Some(42),
+        };
+        let mut params = test_spawn_params();
+        params.cli = Some(ActSpawnAgentCli::Claude);
+        let read = read_agent_spawn_task_start_artifact(
+            &files,
+            &params,
+            ActSpawnAgentCli::Claude,
+            "agent-spawn-test",
+            &matched,
+        )
+        .expect("read task start")
+        .expect("task start present");
+
+        assert!(read.started_at_unix_ms > 0);
+        assert_eq!(read.readiness_source, "agent_spawn_task_started_tool");
     }
 
     fn observed_progress_test_files(dir: &Path) -> AgentSpawnFiles {
@@ -6171,6 +6622,7 @@ mod tests {
         assert_eq!(manifest["spawn_id"], "agent-spawn-manifest-regression");
         assert_eq!(manifest["cli"], "codex");
         assert_eq!(manifest["model"], "gpt-5-codex");
+        assert_eq!(manifest["assigned_prompt_present"], true);
         assert!(manifest["created_unix_ms"].as_u64().is_some());
 
         // No pinned model -> manifest carries an explicit null, never a guess.
@@ -6356,9 +6808,16 @@ mod tests {
 
     #[test]
     fn claude_hook_settings_subscribe_every_ingress_event_with_bearer() {
-        let settings =
-            build_claude_hook_settings("agent-spawn-test", "http://127.0.0.1:7700/mcp", true)
-                .expect("settings build");
+        let helper = Path::new(
+            r"C:\Users\hotra\AppData\Local\Synapse\agent-spawns\agent-spawn-test\write-task-started.ps1",
+        );
+        let settings = build_claude_hook_settings(
+            "agent-spawn-test",
+            "http://127.0.0.1:7700/mcp",
+            true,
+            helper,
+        )
+        .expect("settings build");
         let hooks = settings["hooks"].as_object().expect("hooks object");
         for event in super::super::agent_event_ingress::CLAUDE_HOOK_SUBSCRIBED_EVENTS {
             let entry = &hooks[*event][0]["hooks"][0];
@@ -6387,13 +6846,31 @@ mod tests {
             .expect("permissions.allow present when gating");
         assert!(allow.iter().any(|rule| rule == "Read"));
         assert!(allow.iter().any(|rule| rule == "Bash(git status:*)"));
+        assert!(
+            allow
+                .iter()
+                .any(|rule| rule == "mcp__synapse__agent_spawn_task_started")
+        );
+        assert!(allow.iter().any(|rule| {
+            rule.as_str()
+                == Some(
+                    r"PowerShell(C:\Users\hotra\AppData\Local\Synapse\agent-spawns\agent-spawn-test\write-task-started.ps1 *)",
+                )
+        }));
     }
 
     #[test]
     fn claude_hook_settings_omit_permissions_when_gate_disabled() {
-        let settings =
-            build_claude_hook_settings("agent-spawn-test", "http://127.0.0.1:7700/mcp", false)
-                .expect("settings build");
+        let helper = Path::new(
+            r"C:\Users\hotra\AppData\Local\Synapse\agent-spawns\agent-spawn-test\write-task-started.ps1",
+        );
+        let settings = build_claude_hook_settings(
+            "agent-spawn-test",
+            "http://127.0.0.1:7700/mcp",
+            false,
+            helper,
+        )
+        .expect("settings build");
         assert!(
             settings.get("permissions").is_none(),
             "ungated spawn (bypassPermissions) must not inject allow rules"

@@ -28,6 +28,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "act_run_shell_status",
     "act_spawn_agent",
     "agent_cost",
+    "agent_spawn_task_started",
     "agent_inbox",
     "agent_interrupt",
     "agent_kill",
@@ -1387,6 +1388,7 @@ mod tests {
                 .expect("profile tools"),
         );
         assert!(tools.contains(&"health".to_owned()));
+        assert!(tools.contains(&"agent_spawn_task_started".to_owned()));
         assert!(tools.contains(&"cdp_open_tab".to_owned()));
         assert!(tools.contains(&"tool_profile_status".to_owned()));
         assert!(!tools.contains(&"act_click".to_owned()));
