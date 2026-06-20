@@ -195,7 +195,10 @@ impl AgentAttentionClass {
 }
 
 fn normal_terminal_reason(reason_code: Option<&str>) -> bool {
-    matches!(reason_code, Some("spawn_completed"))
+    matches!(
+        reason_code,
+        Some("spawn_completed" | "local_agent_completed")
+    )
 }
 
 fn terminal_setup_failure_reason(reason_code: Option<&str>) -> bool {
@@ -1602,6 +1605,13 @@ mod tests {
     fn completed_spawn_dead_state_is_not_actionable_attention() {
         assert_eq!(
             AgentAttentionClass::for_lifecycle(AgentLifecycleState::Dead, Some("spawn_completed")),
+            AgentAttentionClass::None
+        );
+        assert_eq!(
+            AgentAttentionClass::for_lifecycle(
+                AgentLifecycleState::Dead,
+                Some("local_agent_completed")
+            ),
             AgentAttentionClass::None
         );
         assert_eq!(

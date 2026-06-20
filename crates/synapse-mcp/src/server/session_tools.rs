@@ -1756,9 +1756,22 @@ fn session_attention_class(
     ) {
         return AgentAttentionClass::CleanupRequired;
     }
+    if recent_live_session_supersedes_terminal_history(registry, agent_state) {
+        return AgentAttentionClass::None;
+    }
     agent_state
         .map(|read| read.attention_class)
         .unwrap_or_default()
+}
+
+fn recent_live_session_supersedes_terminal_history(
+    registry: &SessionRegistryRead,
+    agent_state: Option<&AgentStateRead>,
+) -> bool {
+    registry.lifecycle == "live"
+        && registry.last_action.is_some()
+        && registry.last_seen_ms_ago < DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS
+        && agent_state.is_some_and(|read| read.attention_class.is_terminal_history())
 }
 
 fn terminal_dead_agent_state(agent_state: Option<&AgentStateRead>) -> bool {
@@ -2777,6 +2790,18 @@ mod tests {
             )
             .is_err()
         );
+
+        let active = dead_live_target_summary(
+            "active-dead-live",
+            None,
+            Vec::new(),
+            &[],
+            &lease_status,
+            DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS - 1,
+            Some("tools/call:session_list"),
+            false,
+        );
+        assert_eq!(active.attention_class, AgentAttentionClass::None);
 
         let own_claim = TargetClaimRead {
             target_key: "window:0x1234".to_owned(),

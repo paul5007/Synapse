@@ -1145,10 +1145,8 @@ fn agent_query_attention_class(
     lifecycle: Option<&AgentStateRead>,
     session_summary: Option<&super::session_tools::SessionSummary>,
 ) -> Option<AgentAttentionClass> {
-    if session_summary
-        .is_some_and(|summary| summary.attention_class == AgentAttentionClass::CleanupRequired)
-    {
-        return Some(AgentAttentionClass::CleanupRequired);
+    if let Some(summary) = session_summary {
+        return (!summary.attention_class.is_none()).then_some(summary.attention_class);
     }
     lifecycle
         .map(|read| read.attention_class)

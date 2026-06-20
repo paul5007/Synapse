@@ -49,11 +49,15 @@ fn db_of(service: &SynapseService) -> Arc<Db> {
 /// Register a live session stamped at the real wall clock, so it is not stale
 /// by the time the tool's mailbox-recipient check reads it.
 fn register_session(service: &SynapseService, session_id: &str) {
+    register_session_with_action(service, session_id, "test");
+}
+
+fn register_session_with_action(service: &SynapseService, session_id: &str, action: &str) {
     let mut registry = service
         .session_registry_ref()
         .lock()
         .expect("session registry lock");
-    registry.record_seen(session_id, Some("test".to_owned()), unix_time_ms_now());
+    registry.record_seen(session_id, Some(action.to_owned()), unix_time_ms_now());
 }
 
 /// Plant one journal row physically (pressure-bypass so it is immediately
@@ -389,6 +393,134 @@ async fn cleanup_required_attention_overlays_retained_session_target() {
             .expect("attention source")
             .contains("CF_SESSIONS session-target rows")
     );
+}
+
+#[tokio::test]
+async fn completed_local_agent_with_recovered_invalid_tool_call_is_not_attention() {
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+
+    let base = recent_base_ns();
+    write_event(
+        &db,
+        base + 1,
+        0,
+        AgentEventKind::SpawnReady,
+        Some(SPAWN),
+        Some(SESSION),
+        |_| {},
+    );
+    write_event(
+        &db,
+        base + 2,
+        0,
+        AgentEventKind::ToolCallStarted,
+        Some(SPAWN),
+        Some(SESSION),
+        |record| {
+            record.attributes.tool_name = Some("workspace_put".to_owned());
+        },
+    );
+    write_event(
+        &db,
+        base + 3,
+        0,
+        AgentEventKind::ToolCallFinished,
+        Some(SPAWN),
+        Some(SESSION),
+        |record| {
+            record.attributes.tool_name = Some("workspace_put".to_owned());
+            record.reason_code = Some("MODEL_TOOL_CALL_INVALID".to_owned());
+        },
+    );
+    write_event(
+        &db,
+        base + 4,
+        0,
+        AgentEventKind::ToolCallStarted,
+        Some(SPAWN),
+        Some(SESSION),
+        |record| {
+            record.attributes.tool_name = Some("workspace_put".to_owned());
+        },
+    );
+    write_event(
+        &db,
+        base + 5,
+        0,
+        AgentEventKind::ToolCallFinished,
+        Some(SPAWN),
+        Some(SESSION),
+        |record| {
+            record.attributes.tool_name = Some("workspace_put".to_owned());
+        },
+    );
+    write_event(
+        &db,
+        base + 6,
+        0,
+        AgentEventKind::Exited,
+        Some(SPAWN),
+        Some(SESSION),
+        |record| {
+            record.reason_code = Some("local_agent_completed".to_owned());
+        },
+    );
+
+    let response = service
+        .agent_query_impl(params(SPAWN), None)
+        .await
+        .expect("agent_query succeeds");
+
+    assert_eq!(response.state, Some(AgentLifecycleState::Dead));
+    assert_eq!(
+        response.reason_code.as_deref(),
+        Some("local_agent_completed")
+    );
+    assert_eq!(response.attention_class, None);
+    assert_eq!(
+        response.last_tool_call.as_ref().unwrap().tool_name,
+        "workspace_put"
+    );
+}
+
+#[tokio::test]
+async fn live_session_recent_tool_activity_suppresses_stale_terminal_history() {
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+    register_session_with_action(&service, SESSION, "tools/call:session_list");
+
+    let base = recent_base_ns();
+    write_event(
+        &db,
+        base + 1,
+        0,
+        AgentEventKind::StateChanged,
+        None,
+        Some(SESSION),
+        |record| {
+            record.reason_code = Some("unprobeable_silent_ended".to_owned());
+            record.state_from = Some("idle".to_owned());
+            record.state_to = Some("dead".to_owned());
+            record.payload = json!({
+                "origin": crate::server::agent_state::STATE_MACHINE_ORIGIN,
+            });
+        },
+    );
+
+    let response = service
+        .agent_query_impl(params(SESSION), None)
+        .await
+        .expect("agent_query succeeds");
+
+    assert_eq!(response.state, Some(AgentLifecycleState::Dead));
+    assert_eq!(
+        response.reason_code.as_deref(),
+        Some("unprobeable_silent_ended")
+    );
+    assert_eq!(response.attention_class, None);
 }
 
 #[tokio::test]
