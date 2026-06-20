@@ -1,14 +1,12 @@
-//! #1091–#1095 FSV: drive the REAL `console_capture_*` engine against a live
-//! Chrome on a synthetic page with KNOWN console output, and prove every
-//! captured entry matches what the page actually emitted.
+//! #1091–#1095 support probe: drive the REAL `console_capture_*` engine against
+//! a live Chrome on a synthetic page with KNOWN console output, and print
+//! readbacks for manual issue evidence.
 //!
-//! Source of Truth: the live `Runtime.consoleAPICalled` / `Runtime.exceptionThrown`
-//! / `Log.entryAdded` event stream — captured into the engine's per-target ring
-//! buffer, then read back and compared to the synthetic inputs we KNOW the page
-//! produced (X+X=Y: we control the logs, we assert the captured outputs).
+//! This is regression/support evidence only. It is not an FSV harness; manual
+//! Source-of-Truth verification belongs in the relevant GitHub issue comment.
 //!
 //! Usage (a Chromium must be listening with --remote-debugging-port):
-//!   cargo run -p synapse-a11y --example cdp_console_fsv -- http://127.0.0.1:9333
+//!   cargo run -p synapse-a11y --example `cdp_console_probe` -- <http://127.0.0.1:9333>
 #![allow(clippy::expect_used, clippy::too_many_lines, clippy::print_stdout)]
 
 #[cfg(not(windows))]
@@ -38,13 +36,15 @@ fn main() {
     let mut fail = 0u32;
 
     rt.block_on(async move {
-        let (browser, mut handler) = Browser::connect(&endpoint).await.expect("connect to Chrome");
+        let (browser, mut handler) = Browser::connect(&endpoint)
+            .await
+            .expect("connect to Chrome");
         let _drive = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         // --- Page A: the primary capture target -----------------------------
         let page = browser.new_page("about:blank").await.expect("new page");
         let target_id = page.target_id().inner().clone();
-        page.evaluate("document.title='Synapse Console FSV'")
+        page.evaluate("document.title='Synapse Console Probe'")
             .await
             .expect("title");
 
@@ -64,7 +64,7 @@ fn main() {
 
         // === Emit a KNOWN set of console output =========================
         page.evaluate(
-            r#"
+            r"
             console.log('syn-log-line');
             console.info('syn-info-line');
             console.warn('syn-warn-line');
@@ -73,7 +73,7 @@ fn main() {
             console.log('syn-object', {a: 1, ok: true, name: 'synapse'});
             console.log('syn-array', [10, 20, 'z']);
             console.log('syn-multi', 1, true, null);
-            "#,
+            ",
         )
         .await
         .expect("emit console");
@@ -84,10 +84,10 @@ fn main() {
         // errors must fire AFTER evaluate so they reach the capture connection's
         // Runtime.exceptionThrown stream, not this command's own response).
         page.evaluate(
-            r#"
+            r"
             setTimeout(() => { throw new Error('syn-uncaught-boom'); }, 0);
             setTimeout(() => { Promise.reject(new Error('syn-rejected-promise')); }, 0);
-            "#,
+            ",
         )
         .await
         .expect("emit errors");
@@ -95,8 +95,14 @@ fn main() {
         // Let the async events propagate to the capture connection.
         tokio::time::sleep(Duration::from_millis(800)).await;
 
-        let all = console_capture_read(&target_id, &ConsoleReadFilter { max: 1000, ..Default::default() })
-            .expect("buffer armed");
+        let all = console_capture_read(
+            &target_id,
+            &ConsoleReadFilter {
+                max: 1000,
+                ..Default::default()
+            },
+        )
+        .expect("buffer armed");
         println!(
             "readback=read stage=all returned={} total_buffered={} dropped={} next_cursor={}",
             all.returned, all.total_buffered, all.dropped, all.next_cursor
@@ -145,7 +151,9 @@ fn main() {
             let entry = find("console-api", needle);
             check!(
                 format!("console.{level} captured ({needle})"),
-                entry.as_ref().is_some_and(|e| e.level == level && e.text.contains(needle))
+                entry
+                    .as_ref()
+                    .is_some_and(|e| e.level == level && e.text.contains(needle))
             );
         }
 
@@ -168,12 +176,13 @@ fn main() {
         check!(
             "multi-arg primitives preserved (1 true null)",
             multi.as_ref().is_some_and(|e| {
-                e.args == vec![
-                    serde_json::json!("syn-multi"),
-                    serde_json::json!(1),
-                    serde_json::json!(true),
-                    serde_json::json!(null),
-                ]
+                e.args
+                    == vec![
+                        serde_json::json!("syn-multi"),
+                        serde_json::json!(1),
+                        serde_json::json!(true),
+                        serde_json::json!(null),
+                    ]
             })
         );
 
@@ -181,7 +190,8 @@ fn main() {
         let boom = find("page-error", "syn-uncaught-boom");
         check!(
             "uncaught throw captured as page-error with message",
-            boom.as_ref().is_some_and(|e| e.level == "error" && e.text.contains("syn-uncaught-boom"))
+            boom.as_ref()
+                .is_some_and(|e| e.level == "error" && e.text.contains("syn-uncaught-boom"))
         );
         check!(
             "uncaught throw carries a stack trace",
@@ -196,13 +206,18 @@ fn main() {
         );
         check!(
             "rejection source != console-api and != page-error",
-            rej.as_ref().is_some_and(|e| e.source == "unhandled-rejection")
+            rej.as_ref()
+                .is_some_and(|e| e.source == "unhandled-rejection")
         );
 
         // --- Filter: level=error narrows to error-level only --------------
         let only_err = console_capture_read(
             &target_id,
-            &ConsoleReadFilter { level: Some("error"), max: 1000, ..Default::default() },
+            &ConsoleReadFilter {
+                level: Some("error"),
+                max: 1000,
+                ..Default::default()
+            },
         )
         .expect("buffer");
         check!(
@@ -213,21 +228,35 @@ fn main() {
         // --- Filter: source=page-error narrows to page errors -------------
         let only_pageerr = console_capture_read(
             &target_id,
-            &ConsoleReadFilter { source: Some("page-error"), max: 1000, ..Default::default() },
+            &ConsoleReadFilter {
+                source: Some("page-error"),
+                max: 1000,
+                ..Default::default()
+            },
         )
         .expect("buffer");
         check!(
             "source=page-error filter excludes console + rejection",
-            only_pageerr.returned >= 1 && only_pageerr.entries.iter().all(|e| e.source == "page-error")
+            only_pageerr.returned >= 1
+                && only_pageerr
+                    .entries
+                    .iter()
+                    .all(|e| e.source == "page-error")
         );
 
         // --- Delta cursor: since_seq returns only newer entries -----------
         let cursor = all.next_cursor;
-        page.evaluate("console.log('syn-after-cursor')").await.expect("emit");
+        page.evaluate("console.log('syn-after-cursor')")
+            .await
+            .expect("emit");
         tokio::time::sleep(Duration::from_millis(400)).await;
         let delta = console_capture_read(
             &target_id,
-            &ConsoleReadFilter { since_seq: Some(cursor), max: 1000, ..Default::default() },
+            &ConsoleReadFilter {
+                since_seq: Some(cursor),
+                max: 1000,
+                ..Default::default()
+            },
         )
         .expect("buffer");
         check!(
@@ -246,26 +275,50 @@ fn main() {
             .await
             .expect("arm B");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        page_b.evaluate("console.log('syn-PAGE-B-ONLY')").await.expect("emit B");
+        page_b
+            .evaluate("console.log('syn-PAGE-B-ONLY')")
+            .await
+            .expect("emit B");
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let a_after = console_capture_read(&target_id, &ConsoleReadFilter { max: 1000, ..Default::default() })
-            .expect("A");
-        let b_after = console_capture_read(&target_b, &ConsoleReadFilter { max: 1000, ..Default::default() })
-            .expect("B");
+        let a_after = console_capture_read(
+            &target_id,
+            &ConsoleReadFilter {
+                max: 1000,
+                ..Default::default()
+            },
+        )
+        .expect("A");
+        let b_after = console_capture_read(
+            &target_b,
+            &ConsoleReadFilter {
+                max: 1000,
+                ..Default::default()
+            },
+        )
+        .expect("B");
         check!(
             "Page B's log appears in Page B's buffer",
-            b_after.entries.iter().any(|e| e.text.contains("syn-PAGE-B-ONLY"))
+            b_after
+                .entries
+                .iter()
+                .any(|e| e.text.contains("syn-PAGE-B-ONLY"))
         );
         check!(
             "Page B's log does NOT leak into Page A's buffer (per-target isolation)",
-            !a_after.entries.iter().any(|e| e.text.contains("syn-PAGE-B-ONLY"))
+            !a_after
+                .entries
+                .iter()
+                .any(|e| e.text.contains("syn-PAGE-B-ONLY"))
         );
 
         // --- Idempotent re-arm reuses the live capture (no duplication) ----
         let rearm = console_capture_ensure(&endpoint, &target_id, DEFAULT_CONSOLE_BUFFER_CAPACITY)
             .await
             .expect("re-arm");
-        check!("idempotent ensure reuses live capture (newly_armed=false)", !rearm.newly_armed);
+        check!(
+            "idempotent ensure reuses live capture (newly_armed=false)",
+            !rearm.newly_armed
+        );
 
         // --- Teardown stops capture -----------------------------------------
         let stopped = console_capture_stop(&target_id);
@@ -276,7 +329,7 @@ fn main() {
         );
         console_capture_stop(&target_b);
 
-        println!("\nFSV RESULT: {pass} passed, {fail} failed");
+        println!("\nSMOKE RESULT: {pass} passed, {fail} failed");
         if fail > 0 {
             std::process::exit(1);
         }
