@@ -4318,12 +4318,13 @@ $prompt | & claude @claudeArgs 1> {stdout_path} 2> {stderr_path}\n\
                 .max(120_000)
                 .min(MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS);
             let mut local_args = format!(
-                "@('--mode','local-agent','--local-agent-model',{model_ref},'--local-agent-task-file',{prompt_path},'--local-agent-mcp-url',{mcp_url},'--local-agent-spawn-id',$spawnId,'--local-agent-log-dir',{log_dir},'--local-agent-timeout-ms','{timeout_ms}')",
+                "@('--mode','local-agent','--local-agent-model',{model_ref},'--local-agent-task-file',{prompt_path},'--local-agent-mcp-url',{mcp_url},'--local-agent-spawn-id',$spawnId,'--local-agent-log-dir',{log_dir},'--local-agent-timeout-ms','{timeout_ms}','--local-agent-hold-open-ms','{hold_open_ms}')",
                 model_ref = ps_single_quote(model_ref),
                 prompt_path = prompt_path,
                 mcp_url = ps_single_quote(&params.mcp_url),
                 log_dir = ps_single_quoted_path(&files.log_dir),
                 timeout_ms = timeout_ms,
+                hold_open_ms = params.hold_open_ms,
             );
             if let Some(target) = &params.target {
                 let target_json = serde_json::to_string(target).map_err(|error| {
@@ -6227,6 +6228,8 @@ mod tests {
         assert!(script.contains("--local-agent-task-file"));
         assert!(script.contains("--local-agent-spawn-id"));
         assert!(script.contains("--local-agent-log-dir"));
+        assert!(script.contains("--local-agent-hold-open-ms"));
+        assert!(script.contains("'1234'"));
         assert!(script.contains("--local-agent-trusted-unattended-exact-contract"));
         assert!(!script.contains("& codex"));
         assert!(!script.contains("& claude"));

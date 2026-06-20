@@ -43,6 +43,7 @@ pub(crate) struct LocalAgentCli {
     pub target_json: Option<String>,
     pub max_turns: u32,
     pub timeout_ms: u64,
+    pub hold_open_ms: u64,
     pub context_char_limit: usize,
     pub tool_parse_retry_limit: u32,
     pub no_stream: bool,
@@ -148,6 +149,7 @@ struct Runner {
     total_usage: Usage,
     turn_count: u32,
     tool_call_count: u64,
+    successful_tool_call_count: u64,
     parse_error_count: u32,
     invalid_tool_call_count: u32,
     tool_call_error_count: u32,
@@ -280,6 +282,7 @@ pub(crate) async fn run_from_cli(cli: LocalAgentCli) -> anyhow::Result<ExitCode>
     let result = runner.run_loop().await;
     let exit_code = match result {
         Ok(()) => {
+            runner.hold_open_before_session_close().await?;
             runner.write_success_status()?;
             ExitCode::SUCCESS
         }
@@ -481,6 +484,7 @@ impl Runner {
             total_usage: Usage::default(),
             turn_count: 0,
             tool_call_count: 0,
+            successful_tool_call_count: 0,
             parse_error_count: 0,
             invalid_tool_call_count: 0,
             tool_call_error_count: 0,
@@ -621,6 +625,17 @@ impl Runner {
                         missing_tools.join(", ")
                     );
                 }
+                if final_answer_after_failed_only_tools_should_fail(
+                    used_any_tool,
+                    self.successful_tool_call_count,
+                    self.tool_call_error_count,
+                    self.invalid_tool_call_count,
+                    self.parse_error_count,
+                ) {
+                    bail!(
+                        "MODEL_TASK_NO_SUCCESSFUL_TOOL_CALLS: model answered after failed/invalid tool call(s) without any successful Synapse tool call"
+                    );
+                }
                 std::fs::write(self.log_dir.join("final-message.txt"), &completion.content)
                     .with_context(|| {
                         format!("write {}", self.log_dir.join("final-message.txt").display())
@@ -652,6 +667,34 @@ impl Runner {
             "LOCAL_AGENT_TURN_LIMIT: local model did not finish within {} turns",
             self.cli.max_turns
         )
+    }
+
+    async fn hold_open_before_session_close(&mut self) -> anyhow::Result<()> {
+        if self.cli.hold_open_ms == 0 {
+            return Ok(());
+        }
+        let started_unix_ms = unix_time_ms_now();
+        self.write_line(json!({
+            "type": "local.hold_open.started",
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "session_id": self.mcp_session_id,
+            "hold_open_ms": self.cli.hold_open_ms,
+            "started_at_unix_ms": started_unix_ms,
+            "source": "local_agent_mcp_session"
+        }))?;
+        tokio::time::sleep(Duration::from_millis(self.cli.hold_open_ms)).await;
+        self.write_line(json!({
+            "type": "local.hold_open.finished",
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "session_id": self.mcp_session_id,
+            "hold_open_ms": self.cli.hold_open_ms,
+            "started_at_unix_ms": started_unix_ms,
+            "finished_at_unix_ms": unix_time_ms_now(),
+            "source": "local_agent_mcp_session"
+        }))?;
+        Ok(())
     }
 
     async fn execute_tool_call(&mut self, call: OpenAiToolCall) -> anyhow::Result<()> {
@@ -919,6 +962,7 @@ impl Runner {
             self.successful_workspace_puts.push(args.clone());
         }
         if !is_error {
+            self.successful_tool_call_count = self.successful_tool_call_count.saturating_add(1);
             self.record_completed_task_tool(&tool_name, "model_tool_call");
             self.attach_task_contract_progress(&mut result_value);
         }
@@ -1819,6 +1863,7 @@ impl Runner {
                 "exit_code": 0,
                 "turn_count": self.turn_count,
                 "tool_call_count": self.tool_call_count,
+                "successful_tool_call_count": self.successful_tool_call_count,
                 "parse_error_count": self.parse_error_count,
                 "invalid_tool_call_count": self.invalid_tool_call_count,
                 "tool_call_error_count": self.tool_call_error_count,
@@ -1873,6 +1918,7 @@ impl Runner {
                 "error_message": detail,
                 "turn_count": self.turn_count,
                 "tool_call_count": self.tool_call_count,
+                "successful_tool_call_count": self.successful_tool_call_count,
                 "parse_error_count": self.parse_error_count,
                 "invalid_tool_call_count": self.invalid_tool_call_count,
                 "tool_call_error_count": self.tool_call_error_count,
@@ -2455,6 +2501,18 @@ fn missing_task_contract_tools(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn final_answer_after_failed_only_tools_should_fail(
+    used_any_tool: bool,
+    successful_tool_call_count: u64,
+    tool_call_error_count: u32,
+    invalid_tool_call_count: u32,
+    parse_error_count: u32,
+) -> bool {
+    used_any_tool
+        && successful_tool_call_count == 0
+        && (tool_call_error_count > 0 || invalid_tool_call_count > 0 || parse_error_count > 0)
 }
 
 fn next_missing_task_contract_tool<'a>(
@@ -4427,6 +4485,25 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
             "ordinary non-contract tool errors stay recoverable"
         );
         Ok(())
+    }
+
+    #[test]
+    fn final_answer_after_failed_only_tools_is_not_success() {
+        assert!(final_answer_after_failed_only_tools_should_fail(
+            true, 0, 1, 0, 0,
+        ));
+        assert!(final_answer_after_failed_only_tools_should_fail(
+            true, 0, 0, 1, 0,
+        ));
+        assert!(final_answer_after_failed_only_tools_should_fail(
+            true, 0, 0, 0, 1,
+        ));
+        assert!(!final_answer_after_failed_only_tools_should_fail(
+            true, 1, 1, 0, 0,
+        ));
+        assert!(!final_answer_after_failed_only_tools_should_fail(
+            false, 0, 0, 0, 0,
+        ));
     }
 
     #[test]

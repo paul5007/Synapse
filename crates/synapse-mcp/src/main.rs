@@ -230,6 +230,8 @@ struct Cli {
         default_value_t = 120_000
     )]
     local_agent_timeout_ms: u64,
+    #[arg(long, env = "SYNAPSE_LOCAL_AGENT_HOLD_OPEN_MS", default_value_t = 0)]
+    local_agent_hold_open_ms: u64,
     #[arg(
         long,
         env = "SYNAPSE_LOCAL_AGENT_CONTEXT_CHAR_LIMIT",
@@ -379,6 +381,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             target_json: cli.local_agent_target_json.clone(),
             max_turns: cli.local_agent_max_turns,
             timeout_ms: cli.local_agent_timeout_ms,
+            hold_open_ms: cli.local_agent_hold_open_ms,
             context_char_limit: cli.local_agent_context_char_limit,
             tool_parse_retry_limit: cli.local_agent_tool_parse_retry_limit,
             no_stream: cli.local_agent_no_stream,
