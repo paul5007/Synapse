@@ -321,6 +321,8 @@ pub struct AttachedAgentRegistryReadback {
     pub count_basis: &'static str,
     pub generated_at_unix_ms: u64,
     pub exact_live_count: usize,
+    pub fleet_stop_managed_count: usize,
+    pub unmanaged_live_count: usize,
     pub row_count: usize,
     pub killable_live_count: usize,
     pub unprobeable_observed_count: usize,
@@ -344,6 +346,7 @@ pub struct AttachedAgentRegistryRow {
     #[serde(default, skip_serializing_if = "AgentAttentionClass::is_none")]
     pub attention_class: AgentAttentionClass,
     pub counts_as_live: bool,
+    pub fleet_stop_managed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_counted_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1048,14 +1051,20 @@ fn split_unbound_agent_states(
         source_of_truth: "agent_state::unbound_reads split by lifecycle state",
         active_unbound_agent_count: active_rows.len(),
         terminal_unbound_agent_count: terminal_rows.len(),
-        terminal_states: vec!["dead"],
+        terminal_states: vec!["dead", "ambient_without_process_handle"],
         reason: "terminal unbound history is diagnostic history, not actionable attention",
     };
     (active_rows, terminal_rows, filter)
 }
 
 fn unbound_agent_row_is_terminal(row: &AgentStateRead) -> bool {
-    matches!(row.state, AgentLifecycleState::Dead) || row.attention_class.is_terminal_history()
+    matches!(row.state, AgentLifecycleState::Dead)
+        || row.attention_class.is_terminal_history()
+        || unbound_ambient_agent_row_has_no_process_handle(row)
+}
+
+fn unbound_ambient_agent_row_has_no_process_handle(row: &AgentStateRead) -> bool {
+    agent_state_is_ambient(row) && !agent_state_has_process_handle(row)
 }
 
 fn build_attached_agent_registry(
@@ -1158,6 +1167,11 @@ fn build_attached_agent_registry_with_process_probe(
 
     let rows = rows.into_values().collect::<Vec<_>>();
     let exact_live_count = rows.iter().filter(|row| row.counts_as_live).count();
+    let fleet_stop_managed_count = rows.iter().filter(|row| row.fleet_stop_managed).count();
+    let unmanaged_live_count = rows
+        .iter()
+        .filter(|row| row.counts_as_live && !row.fleet_stop_managed)
+        .count();
     let killable_live_count = rows
         .iter()
         .filter(|row| row.counts_as_live && row.kill_handle.available)
@@ -1165,9 +1179,11 @@ fn build_attached_agent_registry_with_process_probe(
     let unprobeable_observed_count = rows.iter().filter(|row| !row.process.probeable).count();
     AttachedAgentRegistryReadback {
         source_of_truth: ATTACHED_AGENT_REGISTRY_SOURCE_OF_TRUTH,
-        count_basis: "exact_live_count counts only rows whose live_process_ids are non-empty in the OS process table",
+        count_basis: "exact_live_count counts rows whose live_process_ids are non-empty; fleet_stop_managed_count/killable_live_count count rows with a Synapse-owned kill handle; unmanaged_live_count is live OS evidence outside fleet_stop control",
         generated_at_unix_ms: now_unix_ms,
         exact_live_count,
+        fleet_stop_managed_count,
+        unmanaged_live_count,
         row_count: rows.len(),
         killable_live_count,
         unprobeable_observed_count,
@@ -1197,6 +1213,7 @@ fn attached_row_from_spawned_session(
     let attention_class =
         attached_attention_class(agent_state, &registry.lifecycle, counts_as_live);
     let target_id = Some(spawned.spawn_id.clone());
+    let fleet_stop_managed = counts_as_live;
     AttachedAgentRegistryRow {
         registry_id: spawned.spawn_id.clone(),
         kind: spawned.cli.clone(),
@@ -1206,6 +1223,7 @@ fn attached_row_from_spawned_session(
         reason_code,
         attention_class,
         counts_as_live,
+        fleet_stop_managed,
         not_counted_reason,
         session_id: Some(registry.session_id.clone()),
         spawn_id: Some(spawned.spawn_id.clone()),
@@ -1245,6 +1263,7 @@ fn attached_row_from_agent_state(
         .or_else(|| row.session_id.clone())
         .or_else(|| (!agent_state_is_ambient(row)).then(|| row.anchor.clone()));
     let agent_kill_can_resolve = row.session_id.is_some() || registry.is_some();
+    let fleet_stop_managed = counts_as_live && agent_kill_can_resolve;
     AttachedAgentRegistryRow {
         registry_id: row
             .spawn_id
@@ -1261,6 +1280,7 @@ fn attached_row_from_agent_state(
         reason_code: row.reason_code.clone(),
         attention_class,
         counts_as_live,
+        fleet_stop_managed,
         not_counted_reason,
         session_id: row.session_id.clone(),
         spawn_id: row.spawn_id.clone(),
@@ -1366,6 +1386,7 @@ fn insert_ambient_agent_process_rows(
                 reason_code: Some("ambient_process_observed".to_owned()),
                 attention_class: AgentAttentionClass::None,
                 counts_as_live: true,
+                fleet_stop_managed: false,
                 not_counted_reason: None,
                 session_id: None,
                 spawn_id: None,
@@ -3057,6 +3078,11 @@ mod tests {
                 AgentLifecycleState::NeedsInput,
                 Some("permission_prompt"),
             ),
+            agent_read(
+                "agent-spawn-ambient-claude-transcript-only",
+                AgentLifecycleState::Stuck,
+                Some("silent_timeout_unprobeable"),
+            ),
         ];
         let (active, terminal, filter) = split_unbound_agent_states(rows);
 
@@ -3067,13 +3093,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["active-working", "active-stuck", "active-needs-input"]
         );
-        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal.len(), 2);
         assert_eq!(terminal[0].anchor, "dead-local-model");
         assert_eq!(terminal[0].state, AgentLifecycleState::Dead);
         assert_eq!(
             terminal[0].attention_class,
             AgentAttentionClass::TerminalSetupFailure
         );
+        assert_eq!(
+            terminal[1].anchor,
+            "agent-spawn-ambient-claude-transcript-only"
+        );
+        assert_eq!(terminal[1].state, AgentLifecycleState::Stuck);
         assert_eq!(
             active
                 .iter()
@@ -3082,7 +3113,12 @@ mod tests {
             Some(AgentAttentionClass::ActionableLiveStuck)
         );
         assert_eq!(filter.active_unbound_agent_count, 3);
-        assert_eq!(filter.terminal_unbound_agent_count, 1);
+        assert_eq!(filter.terminal_unbound_agent_count, 2);
+        assert!(
+            filter
+                .terminal_states
+                .contains(&"ambient_without_process_handle")
+        );
         assert!(filter.reason.contains("not actionable attention"));
     }
 
@@ -3159,6 +3195,8 @@ mod tests {
         );
 
         assert_eq!(registry.exact_live_count, 2);
+        assert_eq!(registry.fleet_stop_managed_count, 2);
+        assert_eq!(registry.unmanaged_live_count, 0);
         assert_eq!(registry.row_count, 4);
         assert_eq!(registry.killable_live_count, 2);
         assert_eq!(registry.unprobeable_observed_count, 1);
@@ -3168,6 +3206,7 @@ mod tests {
             .find(|row| row.registry_id == "agent-spawn-live")
             .expect("live spawned row");
         assert!(live.counts_as_live);
+        assert!(live.fleet_stop_managed);
         assert!(live.kill_handle.available);
         assert_eq!(
             live.attention_class,
@@ -3191,6 +3230,7 @@ mod tests {
             .find(|row| row.registry_id == "agent-spawn-dead")
             .expect("dead spawned row");
         assert!(!dead.counts_as_live);
+        assert!(!dead.fleet_stop_managed);
         assert_eq!(
             dead.not_counted_reason.as_deref(),
             Some("os_process_not_live")
@@ -3205,6 +3245,7 @@ mod tests {
             .find(|row| row.registry_id == "agent-spawn-cleanup")
             .expect("cleanup spawned row");
         assert!(cleanup.counts_as_live);
+        assert!(cleanup.fleet_stop_managed);
         assert_eq!(
             cleanup.attention_class,
             AgentAttentionClass::CleanupRequired
@@ -3215,6 +3256,7 @@ mod tests {
             .find(|row| row.registry_id == "agent-spawn-ambient-claude-test")
             .expect("ambient row");
         assert!(!ambient.counts_as_live);
+        assert!(!ambient.fleet_stop_managed);
         assert_eq!(
             ambient.not_counted_reason.as_deref(),
             Some("no_process_handle")
@@ -3319,6 +3361,7 @@ mod tests {
         assert_eq!(row.kind, "ambient");
         assert_eq!(row.source, "ambient_process_scan:claude");
         assert!(row.counts_as_live);
+        assert!(!row.fleet_stop_managed);
         assert_eq!(row.spawn_dir.as_deref(), Some("C:\\code\\Synapse"));
         assert_eq!(row.process.agent_process_id, Some(333));
         assert_eq!(row.process.parent_process_id, Some(322));
