@@ -1,8 +1,7 @@
-//! #982 FSV for the CLICK path: call the FIXED `cdp_click_node` (which routes
-//! through `get_page_with_discovery`) on an iframe-owned button and prove it
-//! actuates the in-process iframe handler by reading a window counter the
-//! button's onclick increments. Source of Truth: `window[<var>]` in the
-//! button's OWN frame, read separately after the click.
+//! #982 support probe for the CLICK path: call the fixed `cdp_click_node`
+//! route on an iframe-owned button and read the in-process iframe handler's
+//! counter separately after the click. This is regression/support evidence
+//! only; manual FSV evidence belongs in GitHub issue comments.
 //!
 //! args: endpoint, page targetId, button backendNodeId, window-counter var
 #![allow(clippy::expect_used)]
@@ -86,23 +85,23 @@ fn main() {
         .expect("rt");
     rt.block_on(async move {
         let before = read_counter().await;
-        println!("readback=cdp_click_node_fsv stage=before {var}={before:?}");
+        println!("readback=cdp_click_node_probe stage=before {var}={before:?}");
 
         let point = cdp_click_node(&endpoint, title_hint, Some(&target_id), bn, CdpMouseButton::Left, 1)
             .await
             .unwrap_or_else(|err| panic!("cdp_click_node FAILED (fix regressed): {err}"));
         println!(
-            "readback=cdp_click_node_fsv stage=click dispatched_at=({:.1},{:.1})",
+            "readback=cdp_click_node_probe stage=click dispatched_at=({:.1},{:.1})",
             point.x, point.y
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let after = read_counter().await;
-        println!("readback=cdp_click_node_fsv stage=after {var}={after:?}");
+        println!("readback=cdp_click_node_probe stage=after {var}={after:?}");
         assert_eq!(
             after, "1",
             "iframe button onclick must have incremented {var} from undefined to 1 (before={before:?})"
         );
-        println!("readback=cdp_click_node_fsv stage=verdict PASS before={before:?} after={after:?}");
+        println!("readback=cdp_click_node_probe stage=verdict PASS before={before:?} after={after:?}");
     });
 }

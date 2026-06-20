@@ -1,13 +1,12 @@
-//! #1110–#1120 FSV: drive the REAL `cdp_locate` selector engine against a live
-//! Chrome on a synthetic page with KNOWN content, and prove every engine
-//! resolves the exact node(s). Source of Truth: the live DOM — each resolved
-//! `backendNodeId` is independently read back to its element `id` via a separate
-//! `resolveNode` + `callFunctionOn` and compared to the element we KNOW the query
-//! should select. Then the resolved id drives a REAL `cdp_click_node` and we read
-//! the onclick counter the page increments.
+//! #1110-#1120 support probe: drive the real `cdp_locate` selector engine
+//! against a live Chrome on a synthetic page with known content. Each resolved
+//! `backendNodeId` is independently read back to its element `id`, then the
+//! resolved id drives a real `cdp_click_node` and reads the onclick counter.
+//! This is regression/support evidence only; manual FSV evidence belongs in
+//! GitHub issue comments.
 //!
 //! Usage (a Chromium must be listening with --remote-debugging-port):
-//!   cargo run -p synapse-a11y --example cdp_selector_engine_fsv -- http://127.0.0.1:9222
+//!   cargo run -p synapse-a11y --example cdp_selector_engine_probe -- http://127.0.0.1:9222
 #![allow(clippy::expect_used, clippy::too_many_lines, clippy::print_stdout)]
 
 #[cfg(not(windows))]
@@ -66,7 +65,7 @@ fn main() {
         let page = browser.new_page("about:blank").await.expect("new page");
         let target_id = page.target_id().inner().clone();
         page.evaluate(format!(
-            "document.title='Synapse Selector FSV'; document.body.innerHTML = `{PAGE_HTML}`;"
+            "document.title='Synapse Selector Probe'; document.body.innerHTML = `{PAGE_HTML}`;"
         ))
         .await
         .expect("inject synthetic page");
@@ -74,9 +73,9 @@ fn main() {
         let _ = page
             .execute(GetDocumentParams::builder().depth(-1).pierce(true).build())
             .await;
-        println!("readback=fsv stage=setup target={target_id} url=about:blank title='Synapse Selector FSV'");
+        println!("readback=probe stage=setup target={target_id} url=about:blank title='Synapse Selector Probe'");
 
-        // Independent Source-of-Truth read: backendNodeId -> element.id.
+        // Independent probe readback: backendNodeId -> element.id.
         let id_of = |backend: i64| {
             let page = page.clone();
             async move {
@@ -127,7 +126,7 @@ fn main() {
                 }
                 let expected: Vec<String> = $expected_ids.iter().map(|s: &&str| (*s).to_owned()).collect();
                 println!(
-                    "readback=fsv check='{}' match_count={} expected_count={} got_ids={:?} expected_ids={:?}",
+                    "readback=probe check='{}' match_count={} expected_count={} got_ids={:?} expected_ids={:?}",
                     $label, result.match_count, $expected_count, got, expected
                 );
                 assert_eq!(result.match_count, $expected_count, "[{}] match_count", $label);
@@ -244,7 +243,7 @@ fn main() {
             CdpLocateRequest { strict: true, ..req(CdpLocateEngine::Css, "a.lnk") },
         )
         .await;
-        println!("readback=fsv check='strict.multiple' result={strict_err:?}");
+        println!("readback=probe check='strict.multiple' result={strict_err:?}");
         assert!(strict_err.is_err(), "strict mode must error on >1 match");
         pass += 1;
         check!(
@@ -264,10 +263,10 @@ fn main() {
             .expect("read counter")
             .into_value::<String>()
             .unwrap_or_default();
-        println!("readback=fsv action stage=before __synapse_clicks={clicks_before:?}");
+        println!("readback=probe action stage=before __synapse_clicks={clicks_before:?}");
         let point = cdp_click_node(
             &endpoint,
-            "Synapse Selector FSV",
+            "Synapse Selector Probe",
             Some(&target_id),
             submit_backend,
             CdpMouseButton::Left,
@@ -283,7 +282,7 @@ fn main() {
             .into_value::<String>()
             .unwrap_or_default();
         println!(
-            "readback=fsv action stage=after click_at=({:.1},{:.1}) __synapse_clicks={clicks_after:?}",
+            "readback=probe action stage=after click_at=({:.1},{:.1}) __synapse_clicks={clicks_after:?}",
             point.x, point.y
         );
         assert_eq!(clicks_before, "0", "counter should start at 0");
@@ -291,6 +290,6 @@ fn main() {
         pass += 1;
 
         let _ = page.close().await;
-        println!("readback=fsv VERDICT PASS checks={pass}");
+        println!("readback=probe VERDICT PASS checks={pass}");
     });
 }
