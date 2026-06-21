@@ -1370,6 +1370,74 @@ pub struct BrowserAddTagResponse {
     pub required_foreground: bool,
 }
 
+/// Desired condition for `browser_wait_for` (#1127).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserWaitForState {
+    /// Resolve when the target text appears in the page text.
+    TextAppears,
+    /// Resolve when the target text is absent from the page text.
+    TextGone,
+    /// Resolve after the timeout budget elapses without checking text.
+    Timeout,
+}
+
+/// Parameters for `browser_wait_for` (#1127): wait for text to appear, text to
+/// disappear, or for a plain timeout in the calling session's owned CDP target.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForParams {
+    /// CDP TargetID to wait in. Defaults to the active session CDP target. Must
+    /// be owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Text to wait for. If supplied without `state`, the tool waits for it to
+    /// appear. Omit text for a plain timeout wait.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Wait condition. Defaults to `text_appears` when `text` is supplied and to
+    /// `timeout` when `text` is omitted.
+    #[serde(default)]
+    pub state: Option<BrowserWaitForState>,
+    /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Poll interval in milliseconds for text waits. Defaults to 100 ms.
+    #[serde(default)]
+    pub polling_interval_ms: Option<u64>,
+}
+
+/// Response for `browser_wait_for`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub state: BrowserWaitForState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub condition_met: bool,
+    pub elapsed_ms: u64,
+    pub timeout_ms: u64,
+    pub polling_interval_ms: u64,
+    pub poll_count: u64,
+    pub observed_text_len: usize,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Parameters for `browser_content` (#1158): return the full serialized HTML of
 /// the calling session's owned CDP page target.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]

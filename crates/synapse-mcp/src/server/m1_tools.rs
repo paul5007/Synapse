@@ -6,22 +6,23 @@ use super::{
     BrowserInitScriptOperation, BrowserInspectParams, BrowserInspectResponse,
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
     BrowserSetContentParams, BrowserSetContentResponse, BrowserTabEntry, BrowserTabsParams,
-    BrowserTabsResponse, CaptureScreenshotFormat, CaptureScreenshotParams,
-    CaptureScreenshotResponse, CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo,
-    CdpBridgeHostReadback, CdpBridgeReloadAckReadback, CdpBridgeReloadParams,
-    CdpBridgeReloadResponse, CdpCloseTabParams, CdpCloseTabResponse, CdpLargestContentfulPaintInfo,
-    CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams,
-    CdpOpenTabResponse, CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams,
-    CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage, ElementInspection, ErrorData,
-    FindParams, FindResponse, Health, HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse,
-    HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters, ReadTextParams, SessionTarget,
-    SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
-    SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
-    TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
-    mcp_error, observe_include, observe_input, populate_audio_summary, populate_clipboard_summary,
-    populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
-    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
-    set_target_input_schema, tool, tool_router,
+    BrowserTabsResponse, BrowserWaitForParams, BrowserWaitForResponse, BrowserWaitForState,
+    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
+    CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
+    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
+    CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
+    CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
+    CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage,
+    ElementInspection, ErrorData, FindParams, FindResponse, Health, HiddenDesktopPipFrameParams,
+    HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
+    ReadTextParams, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
+    SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
+    SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
+    WindowListResponse, empty_input_schema, mcp_error, observe_include, observe_input,
+    populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
+    populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
+    set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
+    tool_router,
 };
 use crate::m1::{
     ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
@@ -1999,6 +2000,63 @@ impl SynapseService {
                 &source,
                 None,
             )
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Wait in the calling session's owned browser tab for text to appear, text to disappear, or for a plain timeout. If text is supplied without state, waits for text_appears; if text is omitted, defaults to timeout. Uses raw CDP Runtime.evaluate to poll DOM text in-page and returns URL/title/readyState read back from the same target. Condition failures return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_wait_for(
+        &self,
+        params: Parameters<BrowserWaitForParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserWaitForResponse>, ErrorData> {
+        const TOOL: &str = "browser_wait_for";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_wait_for"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let wait = validate_browser_wait_for_params(&params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "state": wait.state,
+            "text_len": wait.text.as_deref().map(str::len),
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "state": wait.state,
+            "text_len": wait.text.as_deref().map(str::len),
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_wait_for_impl(&session_id, window_hwnd, &cdp_target_id, &wait)
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -4397,6 +4455,98 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_wait_for_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        wait: &NormalizedBrowserWaitForParams,
+    ) -> Result<BrowserWaitForResponse, ErrorData> {
+        const TOOL: &str = "browser_wait_for";
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
+        };
+        let expression = build_browser_wait_for_expression(wait)?;
+        let evaluated = synapse_a11y::cdp_evaluate_expression(
+            &endpoint,
+            cdp_target_id,
+            &expression,
+            true,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_wait_for raw CDP Runtime.evaluate failed: {error}"),
+            )
+        })?;
+        let payload: BrowserWaitForPayload = serde_json::from_value(evaluated.value.clone())
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    format!("browser_wait_for payload decode failed: {error}"),
+                )
+            })?;
+        if payload.timed_out {
+            return Err(mcp_error(
+                error_codes::BROWSER_WAIT_TIMEOUT,
+                format!(
+                    "browser_wait_for timed out after {} ms waiting for {:?}; poll_count={} observed_text_len={}",
+                    wait.timeout_ms, wait.state, payload.poll_count, payload.observed_text_len
+                ),
+            ));
+        }
+        tracing::info!(
+            code = "CDP_BACKGROUND_WAIT_FOR",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %evaluated.target_id,
+            state = ?wait.state,
+            elapsed_ms = payload.elapsed_ms,
+            poll_count = payload.poll_count,
+            target_url = %evaluated.url,
+            "readback=Runtime.evaluate(browser_wait_for) outcome=wait_satisfied"
+        );
+        Ok(BrowserWaitForResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: evaluated.target_id,
+            state: wait.state,
+            text: wait.text.clone(),
+            condition_met: payload.condition_met,
+            elapsed_ms: payload.elapsed_ms,
+            timeout_ms: wait.timeout_ms,
+            polling_interval_ms: wait.polling_interval_ms,
+            poll_count: payload.poll_count,
+            observed_text_len: payload.observed_text_len,
+            url: evaluated.url,
+            title: evaluated.title,
+            ready_state: evaluated.ready_state,
+            readback_backend: "Runtime.evaluate(browser_wait_for)".to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_wait_for_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _wait: &NormalizedBrowserWaitForParams,
+    ) -> Result<BrowserWaitForResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_wait_for is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_content_impl(
         &self,
         session_id: &str,
@@ -5869,6 +6019,31 @@ struct BrowserAddTagPayload {
     element_marker: String,
 }
 
+const DEFAULT_BROWSER_WAIT_TIMEOUT_MS: u64 = 30_000;
+const MAX_BROWSER_WAIT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS: u64 = 100;
+const MIN_BROWSER_WAIT_POLLING_INTERVAL_MS: u64 = 10;
+const MAX_BROWSER_WAIT_POLLING_INTERVAL_MS: u64 = 5_000;
+const BROWSER_WAIT_MAX_TEXT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct NormalizedBrowserWaitForParams {
+    state: BrowserWaitForState,
+    text: Option<String>,
+    timeout_ms: u64,
+    polling_interval_ms: u64,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct BrowserWaitForPayload {
+    condition_met: bool,
+    timed_out: bool,
+    elapsed_ms: u64,
+    poll_count: u64,
+    observed_text_len: usize,
+}
+
 fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<(), ErrorData> {
     if params.expression.trim().is_empty() {
         return Err(mcp_error(
@@ -5900,6 +6075,161 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
         ));
     }
     Ok(())
+}
+
+fn validate_browser_wait_for_params(
+    params: &BrowserWaitForParams,
+) -> Result<NormalizedBrowserWaitForParams, ErrorData> {
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_BROWSER_WAIT_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_BROWSER_WAIT_TIMEOUT_MS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("browser_wait_for timeout_ms must be 1..={MAX_BROWSER_WAIT_TIMEOUT_MS}"),
+        ));
+    }
+    let polling_interval_ms = params
+        .polling_interval_ms
+        .unwrap_or(DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS);
+    if !(MIN_BROWSER_WAIT_POLLING_INTERVAL_MS..=MAX_BROWSER_WAIT_POLLING_INTERVAL_MS)
+        .contains(&polling_interval_ms)
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_wait_for polling_interval_ms must be {MIN_BROWSER_WAIT_POLLING_INTERVAL_MS}..={MAX_BROWSER_WAIT_POLLING_INTERVAL_MS}"
+            ),
+        ));
+    }
+    let text = params.text.as_ref().map(|text| text.to_owned());
+    if let Some(text) = text.as_deref() {
+        if text.trim().is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "browser_wait_for text must not be empty when supplied",
+            ));
+        }
+        if text.len() > BROWSER_WAIT_MAX_TEXT_BYTES {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "browser_wait_for text is {} bytes; the maximum is {BROWSER_WAIT_MAX_TEXT_BYTES} bytes",
+                    text.len()
+                ),
+            ));
+        }
+        if text.contains('\0') {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "browser_wait_for text must not contain NUL",
+            ));
+        }
+    }
+    let state = match (params.state, text.as_ref()) {
+        (Some(BrowserWaitForState::TextAppears), Some(_)) => BrowserWaitForState::TextAppears,
+        (Some(BrowserWaitForState::TextGone), Some(_)) => BrowserWaitForState::TextGone,
+        (Some(BrowserWaitForState::Timeout), None) | (None, None) => BrowserWaitForState::Timeout,
+        (None, Some(_)) => BrowserWaitForState::TextAppears,
+        (Some(BrowserWaitForState::Timeout), Some(_)) => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "browser_wait_for state=timeout does not accept text",
+            ));
+        }
+        (Some(BrowserWaitForState::TextAppears | BrowserWaitForState::TextGone), None) => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "browser_wait_for state=text_appears/text_gone requires text",
+            ));
+        }
+    };
+    Ok(NormalizedBrowserWaitForParams {
+        state,
+        text,
+        timeout_ms,
+        polling_interval_ms,
+    })
+}
+
+#[cfg(windows)]
+fn build_browser_wait_for_expression(
+    wait: &NormalizedBrowserWaitForParams,
+) -> Result<String, ErrorData> {
+    let state = match wait.state {
+        BrowserWaitForState::TextAppears => "text_appears",
+        BrowserWaitForState::TextGone => "text_gone",
+        BrowserWaitForState::Timeout => "timeout",
+    };
+    let state_json = browser_tag_json_string("browser_wait_for", "state", state)?;
+    let text_json = browser_tag_json_string(
+        "browser_wait_for",
+        "text",
+        wait.text.as_deref().unwrap_or_default(),
+    )?;
+    let timeout_ms = wait.timeout_ms;
+    let polling_interval_ms = wait.polling_interval_ms;
+    let expression = format!(
+        r#"(() => new Promise((resolve) => {{
+            const state = {state_json};
+            const expectedText = {text_json};
+            const timeoutMs = {timeout_ms};
+            const pollingIntervalMs = {polling_interval_ms};
+            const started = Date.now();
+            let pollCount = 0;
+            let lastText = "";
+            const readText = () => {{
+                const root = document.body || document.documentElement;
+                if (!root) {{
+                    return "";
+                }}
+                const inner = typeof root.innerText === "string" ? root.innerText : "";
+                const textContent = typeof root.textContent === "string" ? root.textContent : "";
+                return inner || textContent;
+            }};
+            const finish = (conditionMet, timedOut) => resolve({{
+                condition_met: conditionMet,
+                timed_out: timedOut,
+                elapsed_ms: Math.max(0, Date.now() - started),
+                poll_count: pollCount,
+                observed_text_len: lastText.length
+            }});
+            if (state === "timeout") {{
+                window.setTimeout(() => {{
+                    lastText = readText();
+                    finish(true, false);
+                }}, timeoutMs);
+                return;
+            }}
+            const check = () => {{
+                pollCount += 1;
+                lastText = readText();
+                const contains = lastText.includes(expectedText);
+                const conditionMet = state === "text_gone" ? !contains : contains;
+                if (conditionMet) {{
+                    finish(true, false);
+                    return;
+                }}
+                if (Date.now() - started >= timeoutMs) {{
+                    finish(false, true);
+                    return;
+                }}
+                window.setTimeout(check, pollingIntervalMs);
+            }};
+            check();
+        }}))()"#
+    );
+    if expression.len() > BROWSER_EVALUATE_MAX_EXPRESSION_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_wait_for generated Runtime.evaluate expression is {} bytes after JSON escaping; the maximum is {BROWSER_EVALUATE_MAX_EXPRESSION_BYTES} bytes",
+                expression.len()
+            ),
+        ));
+    }
+    Ok(expression)
 }
 
 fn validate_browser_add_script_tag_params(
@@ -9032,25 +9362,28 @@ fn escape_json_pointer(segment: &str) -> String {
 mod tests {
     use super::{
         BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, BROWSER_INIT_SCRIPT_MAX_SOURCE_BYTES,
-        BROWSER_TAG_MAX_CONTENT_BYTES, BrowserTagSourceKind, CdpTargetOwner,
-        MAX_BROWSER_SET_CONTENT_HTML_BYTES, SessionTarget, SynapseService, TargetWire,
-        attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
-        cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
-        chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
-        hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
-        page_text_info_from_parts, perception_window_hwnd, resolve_browser_tag_source,
-        resolve_capture_target_window_context, select_single_active_browser_tab, sha256_hex,
-        target_wire, template_value, unavailable_page_vitals_info,
-        validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
-        validate_browser_add_style_tag_params, validate_browser_evaluate_params,
-        validate_browser_set_content_params, validate_target_window,
+        BROWSER_TAG_MAX_CONTENT_BYTES, BROWSER_WAIT_MAX_TEXT_BYTES, BrowserTagSourceKind,
+        CdpTargetOwner, DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
+        MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
+        MAX_BROWSER_WAIT_TIMEOUT_MS, MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionTarget,
+        SynapseService, TargetWire, attach_find_hygiene_annotations,
+        attach_ocr_hygiene_annotations, cdp_activate_resolution_request_details,
+        cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
+        chrome_page_vitals_info, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
+        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
+        resolve_browser_tag_source, resolve_capture_target_window_context,
+        select_single_active_browser_tab, sha256_hex, target_wire, template_value,
+        unavailable_page_vitals_info, validate_browser_add_init_script_params,
+        validate_browser_add_script_tag_params, validate_browser_add_style_tag_params,
+        validate_browser_evaluate_params, validate_browser_set_content_params,
+        validate_browser_wait_for_params, validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
         BrowserEvaluateParams, BrowserInitScriptOperation, BrowserSetContentParams,
-        BrowserTabEntry, BrowserTabsResponse, CdpActivateTabParams, CdpTargetInfoParams,
-        FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
-        HiddenDesktopPipStreamStatus,
+        BrowserTabEntry, BrowserTabsResponse, BrowserWaitForParams, BrowserWaitForState,
+        CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult, FindResultKind,
+        HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
     use base64::Engine as _;
@@ -9509,6 +9842,135 @@ mod tests {
         assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
 
         println!("readback=browser_add_tag validation edges all rejected with TOOL_PARAMS_INVALID");
+    }
+
+    #[test]
+    fn browser_wait_for_params_validation_edges() {
+        let text_default = validate_browser_wait_for_params(&BrowserWaitForParams {
+            text: Some("ready".to_owned()),
+            ..Default::default()
+        })
+        .expect("text-only wait defaults to text_appears");
+        assert_eq!(text_default.state, BrowserWaitForState::TextAppears);
+        assert_eq!(text_default.text.as_deref(), Some("ready"));
+        assert_eq!(text_default.timeout_ms, DEFAULT_BROWSER_WAIT_TIMEOUT_MS);
+        assert_eq!(
+            text_default.polling_interval_ms,
+            DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS
+        );
+
+        let timeout_default = validate_browser_wait_for_params(&BrowserWaitForParams {
+            timeout_ms: Some(250),
+            ..Default::default()
+        })
+        .expect("text omitted defaults to plain timeout");
+        assert_eq!(timeout_default.state, BrowserWaitForState::Timeout);
+        assert_eq!(timeout_default.text, None);
+        assert_eq!(timeout_default.timeout_ms, 250);
+
+        assert!(
+            validate_browser_wait_for_params(&BrowserWaitForParams {
+                state: Some(BrowserWaitForState::TextGone),
+                text: Some("loading".to_owned()),
+                polling_interval_ms: Some(MIN_BROWSER_WAIT_POLLING_INTERVAL_MS),
+                timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+
+        let error = validate_browser_wait_for_params(&BrowserWaitForParams {
+            state: Some(BrowserWaitForState::TextGone),
+            ..Default::default()
+        })
+        .expect_err("text_gone requires text");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_params(&BrowserWaitForParams {
+            state: Some(BrowserWaitForState::Timeout),
+            text: Some("ignored".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("timeout state rejects text");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        for blank in ["", "   ", "\t\n"] {
+            let error = validate_browser_wait_for_params(&BrowserWaitForParams {
+                text: Some(blank.to_owned()),
+                ..Default::default()
+            })
+            .expect_err("blank text must be rejected");
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+
+        let oversize = "x".repeat(BROWSER_WAIT_MAX_TEXT_BYTES + 1);
+        let error = validate_browser_wait_for_params(&BrowserWaitForParams {
+            text: Some(oversize),
+            ..Default::default()
+        })
+        .expect_err("oversize text must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_params(&BrowserWaitForParams {
+            text: Some("ready".to_owned()),
+            cdp_target_id: Some("   ".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("blank cdp_target_id must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_params(&BrowserWaitForParams {
+            timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize timeout must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_params(&BrowserWaitForParams {
+            polling_interval_ms: Some(MAX_BROWSER_WAIT_POLLING_INTERVAL_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize polling interval must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        println!(
+            "readback=browser_wait_for validation edges all rejected with TOOL_PARAMS_INVALID"
+        );
     }
 
     #[test]
