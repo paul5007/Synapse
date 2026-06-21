@@ -10,6 +10,7 @@ use super::{
     BrowserWaitForLoadStateParams, BrowserWaitForLoadStateResponse, BrowserWaitForLoadStateState,
     BrowserWaitForParams, BrowserWaitForResponse, BrowserWaitForSelectorParams,
     BrowserWaitForSelectorResponse, BrowserWaitForSelectorState, BrowserWaitForState,
+    BrowserWaitForUrlMatchKind, BrowserWaitForUrlParams, BrowserWaitForUrlResponse,
     CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
     CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
     CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
@@ -2113,6 +2114,63 @@ impl SynapseService {
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .browser_wait_for_load_state_impl(&session_id, window_hwnd, &cdp_target_id, &wait)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Wait until the calling session's owned browser tab URL matches an exact string, glob, or regex. Uses raw CDP Page navigation events plus target-scoped page-state polling, returning URL/title/readyState from the same target; timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_wait_for_url(
+        &self,
+        params: Parameters<BrowserWaitForUrlParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserWaitForUrlResponse>, ErrorData> {
+        const TOOL: &str = "browser_wait_for_url";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_wait_for_url"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let wait = validate_browser_wait_for_url_params(&params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "url_len": wait.url.len(),
+            "match_kind": wait.match_kind,
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "url_len": wait.url.len(),
+            "match_kind": wait.match_kind,
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_wait_for_url_impl(&session_id, window_hwnd, &cdp_target_id, &wait)
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -4836,6 +4894,84 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_wait_for_url_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        wait: &NormalizedBrowserWaitForUrlParams,
+    ) -> Result<BrowserWaitForUrlResponse, ErrorData> {
+        const TOOL: &str = "browser_wait_for_url";
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
+        };
+        let waited = synapse_a11y::cdp_wait_for_url(
+            &endpoint,
+            cdp_target_id,
+            &wait.url,
+            browser_wait_for_url_match_kind_to_a11y(wait.match_kind),
+            wait.timeout_ms,
+            wait.polling_interval_ms,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_wait_for_url raw CDP wait failed: {error}"),
+            )
+        })?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_WAIT_FOR_URL",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %waited.target_id,
+            match_kind = ?wait.match_kind,
+            elapsed_ms = waited.elapsed_ms,
+            poll_count = waited.poll_count,
+            navigation_event_count = waited.navigation_event_count,
+            target_url = %waited.url,
+            "readback=Page.frameNavigated+page_state(browser_wait_for_url) outcome=wait_satisfied"
+        );
+        Ok(BrowserWaitForUrlResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: waited.target_id,
+            url_pattern: wait.url.clone(),
+            match_kind: wait.match_kind,
+            condition_met: true,
+            elapsed_ms: waited.elapsed_ms,
+            timeout_ms: wait.timeout_ms,
+            polling_interval_ms: wait.polling_interval_ms,
+            poll_count: waited.poll_count,
+            navigation_event_count: waited.navigation_event_count,
+            url: waited.url,
+            title: waited.title,
+            ready_state: waited.ready_state,
+            readback_backend: "Page.frameNavigated + page-state polling(browser_wait_for_url)"
+                .to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_wait_for_url_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _wait: &NormalizedBrowserWaitForUrlParams,
+    ) -> Result<BrowserWaitForUrlResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_wait_for_url is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_wait_for_selector_impl(
         &self,
         session_id: &str,
@@ -6494,6 +6630,7 @@ const DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS: u64 = 100;
 const MIN_BROWSER_WAIT_POLLING_INTERVAL_MS: u64 = 10;
 const MAX_BROWSER_WAIT_POLLING_INTERVAL_MS: u64 = 5_000;
 const BROWSER_WAIT_MAX_TEXT_BYTES: usize = 64 * 1024;
+const BROWSER_WAIT_MAX_URL_PATTERN_CHARS: usize = 8192;
 
 #[derive(Debug)]
 struct NormalizedBrowserWaitForParams {
@@ -6507,6 +6644,14 @@ struct NormalizedBrowserWaitForParams {
 struct NormalizedBrowserWaitForLoadStateParams {
     state: BrowserWaitForLoadStateState,
     timeout_ms: u64,
+}
+
+#[derive(Debug)]
+struct NormalizedBrowserWaitForUrlParams {
+    url: String,
+    match_kind: BrowserWaitForUrlMatchKind,
+    timeout_ms: u64,
+    polling_interval_ms: u64,
 }
 
 #[derive(Debug)]
@@ -6624,6 +6769,52 @@ fn validate_browser_wait_for_load_state_params(
     Ok(NormalizedBrowserWaitForLoadStateParams {
         state: params.state.unwrap_or_default(),
         timeout_ms,
+    })
+}
+
+fn validate_browser_wait_for_url_params(
+    params: &BrowserWaitForUrlParams,
+) -> Result<NormalizedBrowserWaitForUrlParams, ErrorData> {
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    let url = params.url.clone();
+    if url.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_wait_for_url url must not be empty",
+        ));
+    }
+    if url.chars().count() > BROWSER_WAIT_MAX_URL_PATTERN_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_wait_for_url url must be at most {BROWSER_WAIT_MAX_URL_PATTERN_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    if url.contains('\0') {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_wait_for_url url must not contain NUL",
+        ));
+    }
+    if url.trim() != url {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_wait_for_url url must not contain leading or trailing whitespace",
+        ));
+    }
+    let match_kind = params.match_kind.unwrap_or_default();
+    validate_browser_wait_for_url_pattern(match_kind, &url)?;
+    let timeout_ms = validate_browser_wait_timeout("browser_wait_for_url", params.timeout_ms)?;
+    let polling_interval_ms =
+        validate_browser_wait_polling_interval("browser_wait_for_url", params.polling_interval_ms)?;
+    Ok(NormalizedBrowserWaitForUrlParams {
+        url,
+        match_kind,
+        timeout_ms,
+        polling_interval_ms,
     })
 }
 
@@ -6837,6 +7028,37 @@ fn validate_browser_wait_polling_interval(
         ));
     }
     Ok(polling_interval_ms)
+}
+
+fn validate_browser_wait_for_url_pattern(
+    match_kind: BrowserWaitForUrlMatchKind,
+    pattern: &str,
+) -> Result<(), ErrorData> {
+    let regex_pattern = match match_kind {
+        BrowserWaitForUrlMatchKind::Exact => return Ok(()),
+        BrowserWaitForUrlMatchKind::Glob => browser_wait_for_url_glob_regex(pattern),
+        BrowserWaitForUrlMatchKind::Regex => pattern.to_owned(),
+    };
+    regex::Regex::new(&regex_pattern).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("browser_wait_for_url {match_kind:?} pattern is invalid: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn browser_wait_for_url_glob_regex(glob: &str) -> String {
+    let mut regex = String::from("^");
+    for ch in glob.chars() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            _ => regex.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    regex.push('$');
+    regex
 }
 
 fn browser_wait_for_selector_locate_params(
@@ -7623,6 +7845,17 @@ fn browser_wait_for_load_state_to_a11y(
         }
         BrowserWaitForLoadStateState::Load => synapse_a11y::CdpLoadState::Load,
         BrowserWaitForLoadStateState::NetworkIdle => synapse_a11y::CdpLoadState::NetworkIdle,
+    }
+}
+
+#[cfg(windows)]
+fn browser_wait_for_url_match_kind_to_a11y(
+    kind: BrowserWaitForUrlMatchKind,
+) -> synapse_a11y::CdpUrlMatchKind {
+    match kind {
+        BrowserWaitForUrlMatchKind::Exact => synapse_a11y::CdpUrlMatchKind::Exact,
+        BrowserWaitForUrlMatchKind::Glob => synapse_a11y::CdpUrlMatchKind::Glob,
+        BrowserWaitForUrlMatchKind::Regex => synapse_a11y::CdpUrlMatchKind::Regex,
     }
 }
 
@@ -10378,7 +10611,8 @@ mod tests {
         validate_browser_add_style_tag_params, validate_browser_evaluate_params,
         validate_browser_set_content_params, validate_browser_wait_for_function_params,
         validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
-        validate_browser_wait_for_selector_params, validate_target_window,
+        validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
+        validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
@@ -10386,8 +10620,9 @@ mod tests {
         BrowserTabEntry, BrowserTabsResponse, BrowserWaitForFunctionParams,
         BrowserWaitForLoadStateParams, BrowserWaitForLoadStateState, BrowserWaitForParams,
         BrowserWaitForSelectorParams, BrowserWaitForSelectorState, BrowserWaitForState,
-        CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult, FindResultKind,
-        HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
+        BrowserWaitForUrlMatchKind, BrowserWaitForUrlParams, CdpActivateTabParams,
+        CdpTargetInfoParams, FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
+        HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
     use base64::Engine as _;
@@ -10471,6 +10706,24 @@ mod tests {
             let got = browser_wait_for_load_state_to_a11y(wire);
             println!("readback=load_state_map wire={wire:?} a11y={got:?}");
             assert_eq!(got.as_str(), expected.as_str(), "load state {wire:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_wait_for_url_match_kind_mapping_is_total() {
+        use super::browser_wait_for_url_match_kind_to_a11y;
+        use synapse_a11y::CdpUrlMatchKind;
+
+        let kinds = [
+            (BrowserWaitForUrlMatchKind::Exact, CdpUrlMatchKind::Exact),
+            (BrowserWaitForUrlMatchKind::Glob, CdpUrlMatchKind::Glob),
+            (BrowserWaitForUrlMatchKind::Regex, CdpUrlMatchKind::Regex),
+        ];
+        for (wire, expected) in kinds {
+            let got = browser_wait_for_url_match_kind_to_a11y(wire);
+            println!("readback=url_match_kind_map wire={wire:?} a11y={got:?}");
+            assert_eq!(got.as_str(), expected.as_str(), "url match kind {wire:?}");
         }
     }
 
@@ -11065,6 +11318,117 @@ mod tests {
 
         println!(
             "readback=browser_wait_for_load_state validation edges all rejected with TOOL_PARAMS_INVALID"
+        );
+    }
+
+    #[test]
+    fn browser_wait_for_url_params_validation_edges() {
+        let defaulted = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+            url: "https://example.test/ready".to_owned(),
+            timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS),
+            polling_interval_ms: Some(MIN_BROWSER_WAIT_POLLING_INTERVAL_MS),
+            cdp_target_id: Some("target-123".to_owned()),
+            ..Default::default()
+        })
+        .expect("valid waitForURL params pass");
+        assert_eq!(defaulted.url, "https://example.test/ready");
+        assert_eq!(defaulted.match_kind, BrowserWaitForUrlMatchKind::Exact);
+        assert_eq!(defaulted.timeout_ms, MAX_BROWSER_WAIT_TIMEOUT_MS);
+        assert_eq!(
+            defaulted.polling_interval_ms,
+            MIN_BROWSER_WAIT_POLLING_INTERVAL_MS
+        );
+
+        let glob = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+            url: "https://example.test/*/done?x=?".to_owned(),
+            match_kind: Some(BrowserWaitForUrlMatchKind::Glob),
+            ..Default::default()
+        })
+        .expect("valid glob passes");
+        assert_eq!(glob.match_kind, BrowserWaitForUrlMatchKind::Glob);
+        let glob_regex = super::browser_wait_for_url_glob_regex(&glob.url);
+        assert!(
+            regex::Regex::new(&glob_regex)
+                .expect("glob regex compiles")
+                .is_match("https://example.test/route/done?x=1")
+        );
+
+        let regex_ok = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+            url: r"^https://example\.test/items/\d+$".to_owned(),
+            match_kind: Some(BrowserWaitForUrlMatchKind::Regex),
+            ..Default::default()
+        })
+        .expect("valid regex passes");
+        assert_eq!(regex_ok.match_kind, BrowserWaitForUrlMatchKind::Regex);
+
+        for blank in ["", "   ", "\t\n"] {
+            let error = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+                url: blank.to_owned(),
+                ..Default::default()
+            })
+            .expect_err("blank url must be rejected");
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+
+        let error = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+            url: "https://example.test/".to_owned(),
+            cdp_target_id: Some("   ".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("blank cdp_target_id must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+            url: "(".to_owned(),
+            match_kind: Some(BrowserWaitForUrlMatchKind::Regex),
+            ..Default::default()
+        })
+        .expect_err("invalid regex must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+            url: "https://example.test/".to_owned(),
+            timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize timeout must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_url_params(&BrowserWaitForUrlParams {
+            url: "https://example.test/".to_owned(),
+            polling_interval_ms: Some(MAX_BROWSER_WAIT_POLLING_INTERVAL_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize polling interval must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        println!(
+            "readback=browser_wait_for_url validation edges all rejected with TOOL_PARAMS_INVALID"
         );
     }
 

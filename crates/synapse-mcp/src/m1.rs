@@ -1501,6 +1501,71 @@ pub struct BrowserWaitForLoadStateResponse {
     pub required_foreground: bool,
 }
 
+/// URL matching mode for `browser_wait_for_url` (#1131).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserWaitForUrlMatchKind {
+    /// Exact string match against the full current URL.
+    #[default]
+    Exact,
+    /// Glob match where `*` matches any sequence and `?` matches one character.
+    Glob,
+    /// Rust regular expression match against the full current URL string.
+    Regex,
+}
+
+/// Parameters for `browser_wait_for_url` (#1131): wait until the calling
+/// session's owned CDP target URL matches a string, glob, or regex.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForUrlParams {
+    /// URL pattern to wait for. Interpreted according to `match_kind`.
+    pub url: String,
+    /// Matching mode. Defaults to exact string matching.
+    #[serde(default)]
+    pub match_kind: Option<BrowserWaitForUrlMatchKind>,
+    /// CDP TargetID to wait in. Defaults to the active session CDP target. Must
+    /// be owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Poll interval in milliseconds. Defaults to 100 ms.
+    #[serde(default)]
+    pub polling_interval_ms: Option<u64>,
+}
+
+/// Response for `browser_wait_for_url`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForUrlResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub url_pattern: String,
+    pub match_kind: BrowserWaitForUrlMatchKind,
+    pub condition_met: bool,
+    pub elapsed_ms: u64,
+    pub timeout_ms: u64,
+    pub polling_interval_ms: u64,
+    pub poll_count: u64,
+    pub navigation_event_count: u64,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Parameters for `browser_wait_for_function` (#1129): poll a JavaScript
 /// predicate/expression until it resolves truthy in the calling session's owned
 /// CDP target.

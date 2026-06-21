@@ -32,10 +32,11 @@ use chromiumoxide::cdp::browser_protocol::network::{
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
-    EnableParams as PageEnableParams, EventDomContentEventFired, EventLifecycleEvent,
-    EventLoadEventFired, GetLayoutMetricsParams, GetNavigationHistoryParams, NavigateParams,
-    NavigateToHistoryEntryParams, ReloadParams, RemoveScriptToEvaluateOnNewDocumentParams,
-    ScriptIdentifier, SetDocumentContentParams, SetLifecycleEventsEnabledParams, Viewport,
+    EnableParams as PageEnableParams, EventDomContentEventFired, EventFrameNavigated,
+    EventLifecycleEvent, EventLoadEventFired, EventNavigatedWithinDocument, GetLayoutMetricsParams,
+    GetNavigationHistoryParams, NavigateParams, NavigateToHistoryEntryParams, ReloadParams,
+    RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier, SetDocumentContentParams,
+    SetLifecycleEventsEnabledParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
@@ -187,6 +188,38 @@ pub struct CdpLoadStateWaitResult {
     pub in_flight_requests: usize,
     pub network_idle_quiet_ms: u64,
     pub lifecycle_network_idle_seen: bool,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum CdpUrlMatchKind {
+    Exact,
+    Glob,
+    Regex,
+}
+
+impl CdpUrlMatchKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Glob => "glob",
+            Self::Regex => "regex",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CdpUrlWaitResult {
+    pub target_id: String,
+    pub pattern: String,
+    pub match_kind: String,
+    pub matched_url: String,
+    pub elapsed_ms: u64,
+    pub poll_count: u64,
+    pub navigation_event_count: u64,
     pub url: String,
     pub title: String,
     pub ready_state: String,
@@ -2193,6 +2226,189 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Waits for a page target's current URL to match an exact string, glob, or
+/// regex without activating the browser window.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the URL matcher or page-state readback fails;
+/// `BROWSER_WAIT_TIMEOUT` if the URL does not match within `wait_timeout_ms`.
+pub async fn cdp_wait_for_url(
+    endpoint: &str,
+    target_id: &str,
+    pattern: &str,
+    match_kind: CdpUrlMatchKind,
+    wait_timeout_ms: u64,
+    polling_interval_ms: u64,
+) -> A11yResult<CdpUrlWaitResult> {
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP target id must not be empty".to_owned(),
+        });
+    }
+    let matcher = CdpUrlMatcher::new(pattern, match_kind)?;
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let result = async {
+        let page = get_target_page_with_discovery(&browser, target_id).await?;
+        page.execute(PageEnableParams::default())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Page.enable before waitForURL: {err}"),
+            })?;
+        let mut frame_navigated = page
+            .event_listener::<EventFrameNavigated>()
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("subscribe Page.frameNavigated: {err}"),
+            })?;
+        let mut same_document_navigated = page
+            .event_listener::<EventNavigatedWithinDocument>()
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("subscribe Page.navigatedWithinDocument: {err}"),
+            })?;
+
+        let started = Instant::now();
+        let deadline = Duration::from_millis(wait_timeout_ms);
+        let poll_interval = Duration::from_millis(polling_interval_ms.max(1));
+        let mut poll_count = 0u64;
+        let mut navigation_event_count = 0u64;
+        let mut last_state: Option<CdpPageState> = None;
+        let mut last_error: Option<String>;
+
+        loop {
+            poll_count = poll_count.saturating_add(1);
+            match read_page_state(&page).await {
+                Ok(page_state) => {
+                    if matcher.matches(&page_state.url) {
+                        let target_id = page.target_id().inner().clone();
+                        return Ok(CdpUrlWaitResult {
+                            target_id,
+                            pattern: pattern.to_owned(),
+                            match_kind: match_kind.as_str().to_owned(),
+                            matched_url: page_state.url.clone(),
+                            elapsed_ms: duration_millis_u64(started.elapsed()),
+                            poll_count,
+                            navigation_event_count,
+                            url: page_state.url,
+                            title: page_state.title,
+                            ready_state: page_state.ready_state,
+                        });
+                    }
+                    last_state = Some(page_state);
+                    last_error = None;
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                }
+            }
+
+            if started.elapsed() >= deadline {
+                let state_detail = last_state
+                    .as_ref()
+                    .map(|state| {
+                        format!(
+                            "last url={:?} title={:?} readyState={:?}",
+                            state.url, state.title, state.ready_state
+                        )
+                    })
+                    .unwrap_or_else(|| "no page-state readback".to_owned());
+                let error_detail = last_error
+                    .as_deref()
+                    .map(|error| format!("; last readback error={error}"))
+                    .unwrap_or_default();
+                return Err(A11yError::BrowserWaitTimeout {
+                    detail: format!(
+                        "waitForURL({} {:?}) timed out after {wait_timeout_ms} ms; {state_detail}; poll_count={poll_count} navigation_event_count={navigation_event_count}{error_detail}",
+                        match_kind.as_str(),
+                        pattern,
+                    ),
+                });
+            }
+
+            let remaining = deadline.saturating_sub(started.elapsed());
+            let sleep_for = remaining.min(poll_interval);
+            tokio::select! {
+                Some(_) = frame_navigated.next() => {
+                    navigation_event_count = navigation_event_count.saturating_add(1);
+                }
+                Some(_) = same_document_navigated.next() => {
+                    navigation_event_count = navigation_event_count.saturating_add(1);
+                }
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
+        }
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
+#[derive(Debug)]
+enum CdpUrlMatcher {
+    Exact(String),
+    Glob(regex::Regex),
+    Regex(regex::Regex),
+}
+
+impl CdpUrlMatcher {
+    fn new(pattern: &str, match_kind: CdpUrlMatchKind) -> A11yResult<Self> {
+        if pattern.is_empty() {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: "waitForURL pattern must not be empty".to_owned(),
+            });
+        }
+        match match_kind {
+            CdpUrlMatchKind::Exact => Ok(Self::Exact(pattern.to_owned())),
+            CdpUrlMatchKind::Glob => {
+                let regex = cdp_url_glob_regex(pattern);
+                regex::Regex::new(&regex).map(Self::Glob).map_err(|err| {
+                    A11yError::CdpAxtreeFailed {
+                        detail: format!(
+                            "waitForURL glob {pattern:?} compiled to invalid regex {regex:?}: {err}"
+                        ),
+                    }
+                })
+            }
+            CdpUrlMatchKind::Regex => regex::Regex::new(pattern).map(Self::Regex).map_err(|err| {
+                A11yError::CdpAxtreeFailed {
+                    detail: format!("waitForURL regex {pattern:?} is invalid: {err}"),
+                }
+            }),
+        }
+    }
+
+    fn matches(&self, url: &str) -> bool {
+        match self {
+            Self::Exact(pattern) => url == pattern,
+            Self::Glob(regex) | Self::Regex(regex) => regex.is_match(url),
+        }
+    }
+}
+
+fn cdp_url_glob_regex(glob: &str) -> String {
+    let mut regex = String::from("^");
+    for ch in glob.chars() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            _ => regex.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    regex.push('$');
+    regex
+}
+
 /// Navigates/reloads/history-navigates a specific CDP page target and returns a
 /// separate post-command DOM/history readback for the same target.
 ///
@@ -4061,5 +4277,30 @@ mod tests {
             0,
             Duration::from_millis(500),
         ));
+    }
+
+    #[test]
+    fn cdp_url_matcher_supports_exact_glob_and_regex() {
+        let exact = CdpUrlMatcher::new("https://example.test/path", CdpUrlMatchKind::Exact)
+            .expect("exact matcher");
+        assert!(exact.matches("https://example.test/path"));
+        assert!(!exact.matches("https://example.test/path?x=1"));
+
+        let glob = CdpUrlMatcher::new("https://example.test/*/done?x=?", CdpUrlMatchKind::Glob)
+            .expect("glob matcher");
+        assert!(glob.matches("https://example.test/a/b/done?x=1"));
+        assert!(glob.matches("https://example.test/route/done?x=z"));
+        assert!(!glob.matches("https://example.test/route/done?x=zz"));
+
+        let regex =
+            CdpUrlMatcher::new(r"^https://example\.test/items/\d+$", CdpUrlMatchKind::Regex)
+                .expect("regex matcher");
+        assert!(regex.matches("https://example.test/items/42"));
+        assert!(!regex.matches("https://example.test/items/new"));
+
+        let err =
+            CdpUrlMatcher::new("(", CdpUrlMatchKind::Regex).expect_err("invalid regex must fail");
+        println!("readback=wait_for_url invalid_regex err={err}");
+        assert!(err.to_string().contains("waitForURL regex"));
     }
 }
