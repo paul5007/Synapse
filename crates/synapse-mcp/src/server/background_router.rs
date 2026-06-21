@@ -47,7 +47,7 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, tap, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -594,6 +594,7 @@ impl SynapseService {
                 }
             }
             "tap" => target_act_touch_tap(self, &params, &request_context).await?,
+            "hover" => target_act_hover(self, &params, &request_context).await?,
             "dispatch_event" | "dispatchevent" => {
                 target_act_browser_dom_action(self, "dispatch_event", &params, &request_context)
                     .await?
@@ -3157,6 +3158,205 @@ async fn target_act_touch_tap(
 }
 
 #[cfg(windows)]
+async fn target_act_hover(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let session_id = target_act_session_id(request_context, "hover")?;
+    if target_act_coordinate(params)?.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=hover targets an element center; use selector, role/name, or observed CDP element_id",
+        ));
+    }
+    if params.clicks.is_some()
+        || params.button.is_some()
+        || !params.modifiers.is_empty()
+        || target_act_has_click_position_input(params)
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=hover does not accept click-only options clicks/clickCount, button, modifiers, or position",
+        ));
+    }
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": "hover",
+        "selector_present": params.selector.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "element_id_present": params.element_id.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "role": params.role.as_deref(),
+        "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "requires_raw_cdp": true,
+        "delegated_tool": "synapse_a11y.cdp_aim_node",
+        "method": "Input.dispatchMouseEvent(mouseMoved)",
+        "required_foreground": false,
+    });
+    let Some(target) = service.session_target(Some(&session_id))? else {
+        let error = mcp_error(
+            error_codes::TARGET_NOT_SET,
+            "target_act verb=hover requires this MCP session to own a raw-CDP browser target; bind one with cdp_open_tab/set_target first",
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_aim_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    };
+    if let Err(error) =
+        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+    {
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_aim_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    }
+    let SessionTarget::Cdp {
+        window_hwnd,
+        cdp_target_id,
+    } = target
+    else {
+        let error = mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            "target_act verb=hover supports raw-CDP browser targets only; native/window targets cannot set browser :hover state without foreground mouse input",
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_aim_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    };
+    let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+        let error = mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb=hover requires a raw CDP debugging endpoint for window 0x{window_hwnd:x}; the normal chrome.tabs bridge cannot set CSS :hover state"
+            ),
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_aim_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    };
+
+    let mut request_details = request_details;
+    if let Some(object) = request_details.as_object_mut() {
+        object.insert("window_hwnd".to_owned(), json!(window_hwnd));
+        object.insert("cdp_target_id".to_owned(), json!(&cdp_target_id));
+    }
+    service.audit_action_started_with_details_for_session(
+        "target_act",
+        &request_details,
+        &session_id,
+    )?;
+    let result = target_act_hover_dispatch(&endpoint, window_hwnd, &cdp_target_id, params).await;
+    service.audit_action_result_for_session("target_act", &result, &session_id)?;
+    match result {
+        Ok(result) => Ok((
+            "synapse_a11y.cdp_aim_node",
+            true,
+            TARGET_ACT_STATUS_OK,
+            result,
+        )),
+        Err(error) => Ok((
+            "synapse_a11y.cdp_aim_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("synapse_a11y.cdp_aim_node", error),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+async fn target_act_hover(
+    _service: &SynapseService,
+    _params: &TargetActParams,
+    _request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let error = mcp_error(
+        error_codes::ACTION_TARGET_INVALID,
+        "target_act verb=hover requires Windows raw-CDP action support for Input.dispatchMouseEvent(mouseMoved)",
+    );
+    Ok((
+        "synapse_a11y.cdp_aim_node",
+        false,
+        target_act_error_status(&error),
+        target_act_error_result("target_act", error),
+    ))
+}
+
+#[cfg(windows)]
+async fn target_act_hover_dispatch(
+    endpoint: &str,
+    window_hwnd: i64,
+    cdp_target_id: &str,
+    params: &TargetActParams,
+) -> Result<Value, ErrorData> {
+    let element =
+        target_act_tap_element(endpoint, window_hwnd, cdp_target_id, params, "hover").await?;
+    let point = synapse_a11y::cdp_aim_node(
+        endpoint,
+        "",
+        Some(&element.target_id),
+        element.backend_node_id,
+    )
+    .await
+    .map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "target_act hover Input.dispatchMouseEvent(mouseMoved) failed for backendNodeId {} in target {:?}: {error}",
+                element.backend_node_id, element.target_id
+            ),
+        )
+    })?;
+    Ok(json!({
+        "ok": true,
+        "target_id": element.target_id,
+        "point": point,
+        "resolved_by": element.resolved_by,
+        "backend_node_id": element.backend_node_id,
+        "element_id": element.element_id,
+        "match_count": element.match_count,
+        "returned_count": element.returned_count,
+        "window_hwnd": window_hwnd,
+        "readback_backend": "raw_cdp",
+        "method": "Input.dispatchMouseEvent(mouseMoved)",
+        "scrolled_into_view_before_move": true
+    }))
+}
+
+#[cfg(windows)]
 async fn target_act_touch_tap_dispatch(
     endpoint: &str,
     window_hwnd: i64,
@@ -3200,7 +3400,8 @@ async fn target_act_touch_tap_dispatch(
         return Ok(result);
     }
 
-    let element = target_act_tap_element(endpoint, window_hwnd, cdp_target_id, params).await?;
+    let element =
+        target_act_tap_element(endpoint, window_hwnd, cdp_target_id, params, "tap").await?;
     let tap = synapse_a11y::cdp_touch_tap_node(
         endpoint,
         "",
@@ -3238,6 +3439,7 @@ async fn target_act_tap_element(
     window_hwnd: i64,
     cdp_target_id: &str,
     params: &TargetActParams,
+    verb: &'static str,
 ) -> Result<TargetActTapElement, ErrorData> {
     if let Some(raw) = params
         .element_id
@@ -3248,7 +3450,7 @@ async fn target_act_tap_element(
         if target_act_has_dom_locator(params) {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                "target_act verb=tap accepts an element_id or a DOM locator, not both",
+                format!("target_act verb={verb} accepts an element_id or a DOM locator, not both"),
             ));
         }
         if let Ok(element_id) = ElementId::parse(raw)
@@ -3260,7 +3462,7 @@ async fn target_act_tap_element(
                 return Err(mcp_error(
                     error_codes::ACTION_TARGET_INVALID,
                     format!(
-                        "target_act verb=tap element_id belongs to CDP target {target_id:?}, but this session target is {cdp_target_id:?}"
+                        "target_act verb={verb} element_id belongs to CDP target {target_id:?}, but this session target is {cdp_target_id:?}"
                     ),
                 ));
             }
@@ -3287,12 +3489,15 @@ async fn target_act_tap_element(
                     ..Default::default()
                 },
                 "dom_id",
+                verb,
             )
             .await;
         }
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=tap element_id must be an observed CDP web element id or a plain DOM id; use selector/role/name for DOM locator taps",
+            format!(
+                "target_act verb={verb} element_id must be an observed CDP web element id or a plain DOM id; use selector/role/name for DOM locator actions"
+            ),
         ));
     }
 
@@ -3314,6 +3519,7 @@ async fn target_act_tap_element(
                 ..Default::default()
             },
             "selector",
+            verb,
         )
         .await;
     }
@@ -3332,6 +3538,7 @@ async fn target_act_tap_element(
                 ..Default::default()
             },
             "role",
+            verb,
         )
         .await;
     }
@@ -3349,13 +3556,16 @@ async fn target_act_tap_element(
                 ..Default::default()
             },
             "name_text",
+            verb,
         )
         .await;
     }
 
     Err(mcp_error(
         error_codes::TOOL_PARAMS_INVALID,
-        "target_act verb=tap requires viewport x/y, an observed CDP element_id, selector, role, or name",
+        format!(
+            "target_act verb={verb} requires an observed CDP element_id, selector, role, or name"
+        ),
     ))
 }
 
@@ -3366,20 +3576,21 @@ async fn target_act_locate_tap_element(
     cdp_target_id: &str,
     request: synapse_a11y::CdpLocateRequest,
     resolved_by: &'static str,
+    verb: &'static str,
 ) -> Result<TargetActTapElement, ErrorData> {
     let located = synapse_a11y::cdp_locate(endpoint, cdp_target_id, request)
         .await
         .map_err(|error| {
             mcp_error(
                 error.code(),
-                format!("target_act tap raw CDP locator resolution failed: {error}"),
+                format!("target_act {verb} raw CDP locator resolution failed: {error}"),
             )
         })?;
     let Some(backend_node_id) = located.backend_node_ids.first().copied() else {
         return Err(mcp_error(
             error_codes::ACTION_ELEMENT_NOT_RESOLVED,
             format!(
-                "target_act verb=tap found no element for {} query {:?} in target {:?}",
+                "target_act verb={verb} found no element for {} query {:?} in target {:?}",
                 located.engine, located.query, located.target_id
             ),
         ));
@@ -5641,6 +5852,25 @@ mod tests {
             .expect("visible DOM id should become a selector");
 
         assert_eq!(selector, r#"[id="apply\"now\\button"]"#);
+    }
+
+    #[test]
+    fn target_act_hover_params_deserialize() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "hover",
+            "role": "button",
+            "name": "Account menu"
+        }))
+        .expect("hover params should deserialize");
+
+        assert_eq!(params.verb.as_str(), "hover");
+        assert_eq!(params.role.as_deref(), Some("button"));
+        assert_eq!(params.name.as_deref(), Some("Account menu"));
+        assert!(
+            target_act_coordinate(&params)
+                .expect("hover should not contain coordinates")
+                .is_none()
+        );
     }
 
     #[test]
