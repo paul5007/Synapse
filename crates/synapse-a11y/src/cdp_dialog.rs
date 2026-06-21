@@ -9,11 +9,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chromiumoxide::Browser;
 use chromiumoxide::cdp::browser_protocol::page::{
     DialogType, EnableParams as PageEnableParams, EventJavascriptDialogClosed,
     EventJavascriptDialogOpening, FrameId, HandleJavaScriptDialogParams,
 };
+use chromiumoxide::{Browser, Page};
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
@@ -32,6 +32,7 @@ pub enum CdpDialogDefaultPolicy {
     Accept,
     #[default]
     Dismiss,
+    Manual,
 }
 
 impl CdpDialogDefaultPolicy {
@@ -39,10 +40,11 @@ impl CdpDialogDefaultPolicy {
         matches!(self, Self::Accept)
     }
 
-    fn action(self) -> CdpDialogAutoAction {
+    fn auto_action(self) -> Option<CdpDialogAutoAction> {
         match self {
-            Self::Accept => CdpDialogAutoAction::Accepted,
-            Self::Dismiss => CdpDialogAutoAction::Dismissed,
+            Self::Accept => Some(CdpDialogAutoAction::Accepted),
+            Self::Dismiss => Some(CdpDialogAutoAction::Dismissed),
+            Self::Manual => None,
         }
     }
 }
@@ -53,6 +55,20 @@ impl CdpDialogDefaultPolicy {
 pub enum CdpDialogAutoAction {
     Accepted,
     Dismissed,
+}
+
+/// Explicit action for a currently pending JavaScript dialog (#1098).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CdpDialogHandleAction {
+    Accept,
+    Dismiss,
+}
+
+impl CdpDialogHandleAction {
+    fn accept(self) -> bool {
+        matches!(self, Self::Accept)
+    }
 }
 
 /// One JavaScript dialog open/close record for a target.
@@ -71,6 +87,10 @@ pub struct CdpDialogEntry {
     pub auto_action: Option<CdpDialogAutoAction>,
     pub auto_handled_at_unix_ms: Option<u64>,
     pub auto_handle_error: Option<String>,
+    pub manual_action: Option<CdpDialogHandleAction>,
+    pub manual_prompt_text: Option<String>,
+    pub manual_handled_at_unix_ms: Option<u64>,
+    pub manual_handle_error: Option<String>,
     pub closed_at_unix_ms: Option<u64>,
     pub close_result: Option<bool>,
     pub user_input: Option<String>,
@@ -111,6 +131,16 @@ pub struct CdpDialogReadResult {
     pub dropped: u64,
     pub armed_at_unix_ms: u64,
     pub default_policy: CdpDialogDefaultPolicy,
+}
+
+/// Result of explicitly accepting or dismissing a pending dialog.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CdpDialogHandleResult {
+    pub cdp_target_id: String,
+    pub action: CdpDialogHandleAction,
+    pub prompt_text: Option<String>,
+    pub handled_at_unix_ms: u64,
+    pub dialog: CdpDialogEntry,
 }
 
 struct DialogState {
@@ -166,6 +196,51 @@ impl DialogState {
         self.auto_handled_count = self.auto_handled_count.saturating_add(1);
     }
 
+    fn mark_manual_handled(
+        &mut self,
+        seq: u64,
+        action: CdpDialogHandleAction,
+        prompt_text: Option<String>,
+        handled_at_unix_ms: u64,
+    ) -> Option<CdpDialogEntry> {
+        self.pending_seq = None;
+        let entry = self.entry_mut(seq)?;
+        entry.pending = false;
+        entry.manual_action = Some(action);
+        entry.manual_prompt_text = prompt_text.clone();
+        entry.manual_handled_at_unix_ms = Some(handled_at_unix_ms);
+        entry.manual_handle_error = None;
+        entry.closed_at_unix_ms = Some(handled_at_unix_ms);
+        entry.close_result = Some(action.accept());
+        entry.user_input = if action.accept() {
+            Some(
+                prompt_text
+                    .or_else(|| entry.default_prompt.clone())
+                    .unwrap_or_default(),
+            )
+        } else {
+            Some(String::new())
+        };
+        let updated = entry.clone();
+        self.closed_count = self.closed_count.saturating_add(1);
+        Some(updated)
+    }
+
+    fn mark_manual_error(
+        &mut self,
+        seq: u64,
+        action: CdpDialogHandleAction,
+        prompt_text: Option<String>,
+        error: String,
+    ) {
+        if let Some(entry) = self.entry_mut(seq) {
+            entry.manual_action = Some(action);
+            entry.manual_prompt_text = prompt_text;
+            entry.manual_handle_error = Some(error);
+        }
+        self.error_count = self.error_count.saturating_add(1);
+    }
+
     fn mark_auto_error(&mut self, seq: u64, action: CdpDialogAutoAction, error: String) {
         if let Some(entry) = self.entry_mut(seq) {
             entry.auto_action = Some(action);
@@ -210,6 +285,7 @@ struct DialogCaptureSlot {
     endpoint: String,
     armed_at_unix_ms: u64,
     capacity: usize,
+    page: Page,
     _browser: Browser,
     handler_task: JoinHandle<()>,
     listener_task: JoinHandle<()>,
@@ -299,6 +375,7 @@ pub async fn dialog_capture_ensure(
     let state = Arc::new(Mutex::new(DialogState::new(capacity, default_policy)));
     let pump_state = Arc::clone(&state);
     let listener_page = page.clone();
+    let slot_page = page.clone();
     let listener_task = tokio::spawn(async move {
         let _page = page;
         loop {
@@ -306,7 +383,9 @@ pub async fn dialog_capture_ensure(
                 Some(event) = openings.next() => {
                     let event = event.as_ref();
                     let (seq, policy) = push_opening(&pump_state, event);
-                    let action = policy.action();
+                    let Some(action) = policy.auto_action() else {
+                        continue;
+                    };
                     match dialog_handle_params(policy, event.default_prompt.as_deref()) {
                         Ok(params) => {
                             match listener_page.execute(params).await {
@@ -338,6 +417,7 @@ pub async fn dialog_capture_ensure(
         endpoint: endpoint.to_owned(),
         armed_at_unix_ms,
         capacity,
+        page: slot_page,
         _browser: browser,
         handler_task,
         listener_task,
@@ -383,6 +463,98 @@ pub fn dialog_capture_set_default_policy(
         }
         Err(_) => false,
     }
+}
+
+/// Accepts or dismisses the currently pending JavaScript dialog for `target_id`.
+///
+/// `prompt_text` is only valid for `Accept`; when omitted for a prompt dialog,
+/// the dialog's captured `default_prompt` is submitted if one exists.
+pub async fn dialog_handle_pending(
+    target_id: &str,
+    action: CdpDialogHandleAction,
+    prompt_text: Option<String>,
+) -> A11yResult<CdpDialogHandleResult> {
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "dialog handle target id must not be empty".to_owned(),
+        });
+    }
+    if matches!(action, CdpDialogHandleAction::Dismiss) && prompt_text.is_some() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "dialog prompt_text is only valid when accepting a dialog".to_owned(),
+        });
+    }
+    validate_prompt_text(prompt_text.as_deref())?;
+
+    let slot = lookup_live(target_id).ok_or_else(|| A11yError::CdpAttachFailed {
+        detail: format!("dialog capture is not armed for target {target_id}"),
+    })?;
+    let pending = {
+        let state = slot.state.lock().map_err(|_| A11yError::CdpAttachFailed {
+            detail: "dialog capture state lock is poisoned".to_owned(),
+        })?;
+        state
+            .pending_dialog()
+            .ok_or_else(|| A11yError::CdpAttachFailed {
+                detail: format!("no pending JavaScript dialog for target {target_id}"),
+            })?
+    };
+    let effective_prompt_text = if action.accept() {
+        prompt_text
+            .clone()
+            .or_else(|| pending.default_prompt.clone())
+    } else {
+        None
+    };
+    let params = dialog_manual_handle_params(action, effective_prompt_text.as_deref())?;
+    let handled_at_unix_ms = now_unix_ms();
+    match slot.page.execute(params).await {
+        Ok(_) => {
+            let mut state = slot.state.lock().map_err(|_| A11yError::CdpAttachFailed {
+                detail: "dialog capture state lock is poisoned".to_owned(),
+            })?;
+            let dialog = state
+                .mark_manual_handled(
+                    pending.seq,
+                    action,
+                    effective_prompt_text.clone(),
+                    handled_at_unix_ms,
+                )
+                .ok_or_else(|| A11yError::CdpAttachFailed {
+                    detail: format!("pending JavaScript dialog disappeared for target {target_id}"),
+                })?;
+            Ok(CdpDialogHandleResult {
+                cdp_target_id: target_id.to_owned(),
+                action,
+                prompt_text: effective_prompt_text,
+                handled_at_unix_ms,
+                dialog,
+            })
+        }
+        Err(error) => {
+            if let Ok(mut state) = slot.state.lock() {
+                state.mark_manual_error(
+                    pending.seq,
+                    action,
+                    effective_prompt_text.clone(),
+                    format!("Page.handleJavaScriptDialog explicit action failed: {error}"),
+                );
+            }
+            Err(A11yError::CdpAxtreeFailed {
+                detail: format!("Page.handleJavaScriptDialog for target {target_id}: {error}"),
+            })
+        }
+    }
+}
+
+/// Compatibility alias for callers using the issue's CDP-prefixed naming.
+pub async fn cdp_dialog_handle_pending(
+    target_id: &str,
+    action: CdpDialogHandleAction,
+    prompt_text: Option<String>,
+) -> A11yResult<CdpDialogHandleResult> {
+    dialog_handle_pending(target_id, action, prompt_text).await
 }
 
 /// Reads a filtered, cursor-delimited dialog history for a target.
@@ -539,6 +711,10 @@ fn dialog_entry_from_opening(
         auto_action: None,
         auto_handled_at_unix_ms: None,
         auto_handle_error: None,
+        manual_action: None,
+        manual_prompt_text: None,
+        manual_handled_at_unix_ms: None,
+        manual_handle_error: None,
         closed_at_unix_ms: None,
         close_result: None,
         user_input: None,
@@ -560,6 +736,34 @@ fn dialog_handle_params(
         .map_err(|detail| A11yError::CdpAttachFailed {
             detail: format!("Page.handleJavaScriptDialog params: {detail}"),
         })
+}
+
+fn dialog_manual_handle_params(
+    action: CdpDialogHandleAction,
+    prompt_text: Option<&str>,
+) -> A11yResult<HandleJavaScriptDialogParams> {
+    let mut builder = HandleJavaScriptDialogParams::builder().accept(action.accept());
+    if action.accept()
+        && let Some(prompt_text) = prompt_text
+    {
+        builder = builder.prompt_text(prompt_text.to_owned());
+    }
+    builder
+        .build()
+        .map_err(|detail| A11yError::CdpAttachFailed {
+            detail: format!("Page.handleJavaScriptDialog params: {detail}"),
+        })
+}
+
+fn validate_prompt_text(prompt_text: Option<&str>) -> A11yResult<()> {
+    if let Some(prompt_text) = prompt_text
+        && prompt_text.contains('\0')
+    {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "dialog prompt_text must not contain NUL".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn dialog_type_string(dialog_type: &DialogType) -> String {
@@ -633,6 +837,35 @@ mod tests {
     }
 
     #[test]
+    fn manual_policy_does_not_auto_handle() {
+        assert_eq!(CdpDialogDefaultPolicy::Manual.auto_action(), None);
+        assert_eq!(
+            CdpDialogDefaultPolicy::Accept.auto_action(),
+            Some(CdpDialogAutoAction::Accepted)
+        );
+        assert_eq!(
+            CdpDialogDefaultPolicy::Dismiss.auto_action(),
+            Some(CdpDialogAutoAction::Dismissed)
+        );
+    }
+
+    #[test]
+    fn explicit_handle_params_serialize_accept_text_and_dismiss() {
+        let accept =
+            dialog_manual_handle_params(CdpDialogHandleAction::Accept, Some("typed value"))
+                .expect("accept params");
+        let accept_json = serde_json::to_value(accept).expect("accept json");
+        assert_eq!(accept_json["accept"], true);
+        assert_eq!(accept_json["promptText"], "typed value");
+
+        let dismiss =
+            dialog_manual_handle_params(CdpDialogHandleAction::Dismiss, None).expect("dismiss");
+        let dismiss_json = serde_json::to_value(dismiss).expect("dismiss json");
+        assert_eq!(dismiss_json["accept"], false);
+        assert!(dismiss_json.get("promptText").is_none());
+    }
+
+    #[test]
     fn dialog_state_tracks_pending_auto_and_close() {
         let event = opening_event();
         let mut state = DialogState::new(8, CdpDialogDefaultPolicy::Dismiss);
@@ -653,6 +886,31 @@ mod tests {
         assert!(!last.pending);
         assert_eq!(last.close_result, Some(false));
         assert_eq!(last.user_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn dialog_state_tracks_explicit_handle_result() {
+        let event = opening_event();
+        let mut state = DialogState::new(8, CdpDialogDefaultPolicy::Manual);
+        let seq = state.push_opening(dialog_entry_from_opening(&event, state.default_policy, 10));
+
+        let handled = state
+            .mark_manual_handled(
+                seq,
+                CdpDialogHandleAction::Accept,
+                Some("typed value".to_owned()),
+                20,
+            )
+            .expect("handled dialog");
+
+        assert!(state.pending_dialog().is_none());
+        assert_eq!(state.closed_count, 1);
+        assert!(!handled.pending);
+        assert_eq!(handled.manual_action, Some(CdpDialogHandleAction::Accept));
+        assert_eq!(handled.manual_prompt_text.as_deref(), Some("typed value"));
+        assert_eq!(handled.manual_handled_at_unix_ms, Some(20));
+        assert_eq!(handled.close_result, Some(true));
+        assert_eq!(handled.user_input.as_deref(), Some("typed value"));
     }
 
     #[test]
