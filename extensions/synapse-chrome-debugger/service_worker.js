@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-check-uncheck-v1";
-const BRIDGE_BUILD_SHA256 = "a848cc84f03897822f0c37cb428eae220ca62c57ed47a5bf25c7ff850b2f7dd4";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-click-options-v1";
+const BRIDGE_BUILD_SHA256 = "fbee19874f831616a1b46dc945a0ed5778dfea67a45c4f680e1abc83eea6cadf";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -1146,7 +1146,10 @@ async function handleDomAction(params) {
     options: action === "select" ? normalizeSelectOptions(params.options) : [],
     eventType: action === "dispatch_event" ? normalizeEventType(params.eventType) : null,
     eventInit: action === "dispatch_event" ? normalizeEventInit(params.eventInit) : null,
-    clicks: normalizeClickCount(params.clicks),
+    clicks: normalizeClickCount(params.clicks, action),
+    button: normalizeMouseButton(params.button, "domAction"),
+    modifiers: normalizeClickModifiers(params.modifiers, "domAction"),
+    position: normalizeClickPosition(params, "domAction"),
     maxPageTextChars: MAX_PAGE_TEXT_CHARS
   };
   let injected;
@@ -1386,6 +1389,8 @@ async function handleCoordinateClick(params) {
         y: normalizeCoordinateValue(params.y, "y"),
         coordinateSpace: normalizeCoordinateSpace(params.coordinateSpace),
         clicks: normalizeClickCount(params.clicks),
+        button: normalizeMouseButton(params.button, "coordinateClick"),
+        modifiers: normalizeClickModifiers(params.modifiers, "coordinateClick"),
         maxPageTextChars: MAX_PAGE_TEXT_CHARS
       }]
     });
@@ -2839,12 +2844,12 @@ function normalizeDomAction(action) {
   if (normalized === "selecttext" || normalized === "select-text") {
     return "select_text";
   }
-  if (["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(normalized)) {
+  if (["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(normalized)) {
     return normalized;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `domAction action must be one of click, press, select, submit, dispatch_event, clear, focus, blur, select_text, check, uncheck; got ${JSON.stringify(action)}`
+    `domAction action must be one of click, dblclick, press, select, submit, dispatch_event, clear, focus, blur, select_text, check, uncheck; got ${JSON.stringify(action)}`
   );
 }
 
@@ -2856,9 +2861,9 @@ function stringOrNull(value) {
   return text ? text : null;
 }
 
-function normalizeClickCount(value) {
+function normalizeClickCount(value, action = "click") {
   if (value === null || value === undefined) {
-    return 1;
+    return action === "dblclick" ? 2 : 1;
   }
   const clicks = Number(value);
   if (!Number.isSafeInteger(clicks) || clicks < 1 || clicks > 3) {
@@ -2867,7 +2872,89 @@ function normalizeClickCount(value) {
       `domAction clicks must be an integer in 1..=3; got ${JSON.stringify(value)}`
     );
   }
+  if (action === "dblclick" && clicks !== 2) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction dblclick requires clicks/clickCount to be omitted or 2; got ${JSON.stringify(value)}`
+    );
+  }
   return clicks;
+}
+
+function normalizeMouseButton(value, owner = "domAction") {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return "left";
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["left", "right", "middle"].includes(normalized)) {
+    return normalized;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `${owner} button must be one of left, right, middle; got ${JSON.stringify(value)}`
+  );
+}
+
+function normalizeClickModifiers(value, owner = "domAction") {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `${owner} modifiers must be an array of ctrl/shift/alt/meta strings; got ${JSON.stringify(value)}`
+    );
+  }
+  const seen = new Set();
+  for (const item of value) {
+    const normalized = String(item || "").trim().toLowerCase();
+    let canonical = null;
+    if (normalized === "ctrl" || normalized === "control") {
+      canonical = "ctrl";
+    } else if (normalized === "shift") {
+      canonical = "shift";
+    } else if (normalized === "alt" || normalized === "option") {
+      canonical = "alt";
+    } else if (["meta", "super", "cmd", "command"].includes(normalized)) {
+      canonical = "meta";
+    }
+    if (!canonical) {
+      throw bridgeError(
+        ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+        `${owner} modifier must be ctrl, shift, alt, or meta; got ${JSON.stringify(item)}`
+      );
+    }
+    seen.add(canonical);
+  }
+  return ["alt", "ctrl", "meta", "shift"].filter((modifier) => seen.has(modifier));
+}
+
+function normalizeClickPosition(params, owner = "domAction") {
+  const nested = params?.position && typeof params.position === "object" && !Array.isArray(params.position)
+    ? params.position
+    : null;
+  const rawX = params?.positionX ?? params?.offsetX ?? nested?.x;
+  const rawY = params?.positionY ?? params?.offsetY ?? nested?.y;
+  if (rawX === null || rawX === undefined || rawY === null || rawY === undefined) {
+    if (rawX === null || rawX === undefined) {
+      if (rawY === null || rawY === undefined) {
+        return null;
+      }
+    }
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `${owner} position requires both x and y; got x=${JSON.stringify(rawX)} y=${JSON.stringify(rawY)}`
+    );
+  }
+  const x = Number(rawX);
+  const y = Number(rawY);
+  if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < 0 || y < 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `${owner} position must use non-negative safe-integer CSS pixels; got x=${JSON.stringify(rawX)} y=${JSON.stringify(rawY)}`
+    );
+  }
+  return { x, y };
 }
 
 function normalizeEventType(value) {
@@ -2984,7 +3071,12 @@ function performDomActionInPage(request) {
     optionIndex: Number.isSafeInteger(request?.optionIndex) ? request.optionIndex : null,
     options: Array.isArray(request?.options) ? request.options : []
   };
-  const clicks = Number.isSafeInteger(request?.clicks) ? request.clicks : 1;
+  const clicks = Number.isSafeInteger(request?.clicks) ? request.clicks : (action === "dblclick" ? 2 : 1);
+  const clickOptions = {
+    button: normalizeMouseButtonLocal(request?.button),
+    modifiers: normalizeClickModifiersLocal(request?.modifiers),
+    position: normalizeClickPositionLocal(request?.position)
+  };
   const eventType = stringOrEmpty(request?.eventType);
   const eventInit = plainObjectOrEmpty(request?.eventInit);
   const resolveOnly = Boolean(request?.resolveOnly);
@@ -2992,7 +3084,7 @@ function performDomActionInPage(request) {
     ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
     : 4096;
 
-  if (!["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(action)) {
+  if (!["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(action)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
   }
   if (action === "dispatch_event" && !eventType) {
@@ -3043,8 +3135,8 @@ function performDomActionInPage(request) {
   const eventsDispatched = [];
   let actionReadback = {};
   try {
-    if (action === "click" || action === "press") {
-      actionReadback = performClick(element, clicks, eventsDispatched);
+    if (action === "click" || action === "press" || action === "dblclick") {
+      actionReadback = performClick(element, action, clicks, clickOptions, eventsDispatched);
     } else if (action === "select") {
       actionReadback = performNativeSelect(element, locator, eventsDispatched);
     } else if (action === "submit") {
@@ -3167,19 +3259,194 @@ function performDomActionInPage(request) {
     return Array.from(document.querySelectorAll("button,a[href],input[type='button'],input[type='submit'],input[type='reset'],summary,[role='button'],[role='link'],[role='menuitem'],[role='tab'],[tabindex]"));
   }
 
-  function performClick(element, count, events) {
-    if (typeof element.click !== "function") {
-      throw actionError(ERROR_ACTION_UNSUPPORTED, `resolved ${tag(element)} element has no click() method`);
-    }
+  function performClick(element, actionName, count, options, events) {
     scrollIntoViewIfPossible(element);
     const bounded = Math.min(Math.max(count, 1), 3);
-    for (let index = 0; index < bounded; index += 1) {
+    const button = options?.button || "left";
+    const modifiers = Array.isArray(options?.modifiers) ? options.modifiers : [];
+    const needsSyntheticEvents = actionName === "dblclick" || bounded !== 1 || button !== "left" || modifiers.length > 0 || Boolean(options?.position);
+    if (!needsSyntheticEvents && typeof element.click === "function") {
       element.click();
       events.push("click");
+      return {
+        click_count: 1,
+        button,
+        modifiers,
+        position: null,
+        activation_event: "click",
+        native_click_method: true
+      };
+    }
+    const point = elementClickPoint(element, options?.position || null);
+    let activationEvent = "click";
+    for (let index = 0; index < bounded; index += 1) {
+      const detail = index + 1;
+      dispatchPointerLikeEvent(element, "pointerdown", point, button, modifiers, detail, true);
+      events.push("pointerdown");
+      dispatchMouseLikeEvent(element, "mousedown", point, button, modifiers, detail, true);
+      events.push("mousedown");
+      dispatchPointerLikeEvent(element, "pointerup", point, button, modifiers, detail, false);
+      events.push("pointerup");
+      dispatchMouseLikeEvent(element, "mouseup", point, button, modifiers, detail, false);
+      events.push("mouseup");
+      activationEvent = activationEventForButton(button);
+      dispatchMouseLikeEvent(element, activationEvent, point, button, modifiers, detail, false);
+      events.push(activationEvent);
+      if (button === "left" && detail === 2 && (actionName === "dblclick" || bounded >= 2)) {
+        dispatchMouseLikeEvent(element, "dblclick", point, button, modifiers, detail, false);
+        events.push("dblclick");
+      }
     }
     return {
-      click_count: bounded
+      click_count: bounded,
+      button,
+      modifiers,
+      position: options?.position || null,
+      viewport_point: {
+        client_x: point.client_x,
+        client_y: point.client_y
+      },
+      element_point: {
+        x: point.element_x,
+        y: point.element_y
+      },
+      activation_event: activationEvent
     };
+  }
+
+  function elementClickPoint(element, position) {
+    const rect = element.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      throw actionError(ERROR_ELEMENT_NOT_ACTIONABLE, `resolved ${tag(element)} element has no clickable box`);
+    }
+    const elementX = position ? Number(position.x) : rect.width / 2;
+    const elementY = position ? Number(position.y) : rect.height / 2;
+    if (!Number.isFinite(elementX) || !Number.isFinite(elementY) || elementX < 0 || elementY < 0 || elementX >= rect.width || elementY >= rect.height) {
+      throw actionError(
+        ERROR_ELEMENT_NOT_ACTIONABLE,
+        `click position (${elementX}, ${elementY}) falls outside ${tag(element)} box ${Math.round(rect.width)}x${Math.round(rect.height)}`
+      );
+    }
+    return {
+      client_x: rect.left + elementX,
+      client_y: rect.top + elementY,
+      element_x: elementX,
+      element_y: elementY
+    };
+  }
+
+  function dispatchPointerLikeEvent(element, eventType, point, button, modifiers, detail, pressed) {
+    if (typeof PointerEvent !== "function") {
+      dispatchMouseLikeEvent(element, eventType.replace(/^pointer/, "mouse"), point, button, modifiers, detail, pressed);
+      return;
+    }
+    element.dispatchEvent(new PointerEvent(eventType, {
+      ...mouseEventInit(point, button, modifiers, detail, pressed),
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true,
+      width: 1,
+      height: 1,
+      pressure: pressed ? 0.5 : 0
+    }));
+  }
+
+  function dispatchMouseLikeEvent(element, eventType, point, button, modifiers, detail, pressed) {
+    element.dispatchEvent(new MouseEvent(eventType, mouseEventInit(point, button, modifiers, detail, pressed)));
+  }
+
+  function mouseEventInit(point, button, modifiers, detail, pressed) {
+    return {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      detail,
+      button: mouseButtonCode(button),
+      buttons: pressed ? mouseButtonBits(button) : 0,
+      clientX: point.client_x,
+      clientY: point.client_y,
+      screenX: Math.round(Number(window.screenX || 0) + point.client_x),
+      screenY: Math.round(Number(window.screenY || 0) + point.client_y),
+      ...modifierFlags(modifiers)
+    };
+  }
+
+  function activationEventForButton(button) {
+    if (button === "right") {
+      return "contextmenu";
+    }
+    if (button === "middle") {
+      return "auxclick";
+    }
+    return "click";
+  }
+
+  function mouseButtonCode(button) {
+    if (button === "middle") {
+      return 1;
+    }
+    if (button === "right") {
+      return 2;
+    }
+    return 0;
+  }
+
+  function mouseButtonBits(button) {
+    if (button === "middle") {
+      return 4;
+    }
+    if (button === "right") {
+      return 2;
+    }
+    return 1;
+  }
+
+  function modifierFlags(modifiers) {
+    const set = new Set(Array.isArray(modifiers) ? modifiers : []);
+    return {
+      altKey: set.has("alt"),
+      ctrlKey: set.has("ctrl"),
+      metaKey: set.has("meta"),
+      shiftKey: set.has("shift")
+    };
+  }
+
+  function normalizeMouseButtonLocal(value) {
+    const normalized = String(value || "left").trim().toLowerCase();
+    return ["left", "right", "middle"].includes(normalized) ? normalized : "left";
+  }
+
+  function normalizeClickModifiersLocal(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    const seen = new Set();
+    for (const item of value) {
+      const normalized = String(item || "").trim().toLowerCase();
+      if (normalized === "ctrl" || normalized === "control") {
+        seen.add("ctrl");
+      } else if (normalized === "shift") {
+        seen.add("shift");
+      } else if (normalized === "alt" || normalized === "option") {
+        seen.add("alt");
+      } else if (["meta", "super", "cmd", "command"].includes(normalized)) {
+        seen.add("meta");
+      }
+    }
+    return ["alt", "ctrl", "meta", "shift"].filter((modifier) => seen.has(modifier));
+  }
+
+  function normalizeClickPositionLocal(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const x = Number(value.x);
+    const y = Number(value.y);
+    if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < 0 || y < 0) {
+      return null;
+    }
+    return { x, y };
   }
 
   function performDispatchEvent(element, requestedType, requestedInit, events) {
@@ -4028,6 +4295,8 @@ function performCoordinateClickInPage(request) {
   const y = Number(request?.y);
   const coordinateSpace = String(request?.coordinateSpace || "screen").toLowerCase();
   const clicks = Number.isSafeInteger(request?.clicks) ? Math.min(Math.max(request.clicks, 1), 3) : 1;
+  const button = normalizeMouseButtonLocal(request?.button);
+  const modifiers = normalizeClickModifiersLocal(request?.modifiers);
   const maxPageTextChars = Number.isSafeInteger(request?.maxPageTextChars)
     ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
     : 4096;
@@ -4122,16 +4391,22 @@ function performCoordinateClickInPage(request) {
     // Some elements reject focus; the click event may still be actionable.
   }
   for (let index = 0; index < clicks; index += 1) {
-    dispatchPointerLikeEvent(element, "pointerdown", viewportPoint);
+    const detail = index + 1;
+    dispatchPointerLikeEvent(element, "pointerdown", viewportPoint, button, modifiers, detail, true);
     eventsDispatched.push("pointerdown");
-    dispatchMouseLikeEvent(element, "mousedown", viewportPoint);
+    dispatchMouseLikeEvent(element, "mousedown", viewportPoint, button, modifiers, detail, true);
     eventsDispatched.push("mousedown");
-    dispatchPointerLikeEvent(element, "pointerup", viewportPoint);
+    dispatchPointerLikeEvent(element, "pointerup", viewportPoint, button, modifiers, detail, false);
     eventsDispatched.push("pointerup");
-    dispatchMouseLikeEvent(element, "mouseup", viewportPoint);
+    dispatchMouseLikeEvent(element, "mouseup", viewportPoint, button, modifiers, detail, false);
     eventsDispatched.push("mouseup");
-    dispatchMouseLikeEvent(element, "click", viewportPoint);
-    eventsDispatched.push("click");
+    const activationEvent = activationEventForButton(button);
+    dispatchMouseLikeEvent(element, activationEvent, viewportPoint, button, modifiers, detail, false);
+    eventsDispatched.push(activationEvent);
+    if (button === "left" && detail === 2 && clicks >= 2) {
+      dispatchMouseLikeEvent(element, "dblclick", viewportPoint, button, modifiers, detail, false);
+      eventsDispatched.push("dblclick");
+    }
   }
 
   const afterElement = element.isConnected ? elementSummary(element) : null;
@@ -4145,6 +4420,8 @@ function performCoordinateClickInPage(request) {
     viewport_coordinate: viewportPoint,
     viewport_readback: viewportReadback,
     click_count: clicks,
+    button,
+    modifiers,
     before_element: beforeElement,
     after_element: afterElement,
     before_active_element: beforeActiveElement,
@@ -4186,48 +4463,114 @@ function performCoordinateClickInPage(request) {
     };
   }
 
-  function dispatchPointerLikeEvent(element, eventType, point) {
+  function dispatchPointerLikeEvent(element, eventType, point, button, modifiers, detail, pressed) {
     if (typeof PointerEvent === "function") {
-      element.dispatchEvent(new PointerEvent(eventType, pointerEventInit(point)));
+      element.dispatchEvent(new PointerEvent(eventType, pointerEventInit(point, button, modifiers, detail, pressed)));
       return;
     }
-    dispatchMouseLikeEvent(element, eventType.replace(/^pointer/, "mouse"), point);
+    dispatchMouseLikeEvent(element, eventType.replace(/^pointer/, "mouse"), point, button, modifiers, detail, pressed);
   }
 
-  function dispatchMouseLikeEvent(element, eventType, point) {
-    element.dispatchEvent(new MouseEvent(eventType, mouseEventInit(point)));
+  function dispatchMouseLikeEvent(element, eventType, point, button, modifiers, detail, pressed) {
+    element.dispatchEvent(new MouseEvent(eventType, mouseEventInit(point, button, modifiers, detail, pressed)));
   }
 
-  function pointerEventInit(point) {
+  function pointerEventInit(point, button, modifiers, detail, pressed) {
     return {
-      ...mouseEventInit(point),
+      ...mouseEventInit(point, button, modifiers, detail, pressed),
       pointerId: 1,
       pointerType: "mouse",
       isPrimary: true,
       width: 1,
       height: 1,
-      pressure: eventPressure(point)
+      pressure: eventPressure(pressed)
     };
   }
 
-  function mouseEventInit(point) {
+  function mouseEventInit(point, button, modifiers, detail, pressed) {
     return {
       bubbles: true,
       cancelable: true,
       composed: true,
       view: window,
-      detail: clicks,
-      button: 0,
-      buttons: 1,
+      detail,
+      button: mouseButtonCode(button),
+      buttons: pressed ? mouseButtonBits(button) : 0,
       clientX: point.client_x,
       clientY: point.client_y,
       screenX: coordinateSpace === "screen" ? x : Math.round(Number(window.screenX || 0) + point.client_x),
-      screenY: coordinateSpace === "screen" ? y : Math.round(Number(window.screenY || 0) + point.client_y)
+      screenY: coordinateSpace === "screen" ? y : Math.round(Number(window.screenY || 0) + point.client_y),
+      ...modifierFlags(modifiers)
     };
   }
 
-  function eventPressure() {
-    return 0.5;
+  function eventPressure(pressed) {
+    return pressed ? 0.5 : 0;
+  }
+
+  function activationEventForButton(button) {
+    if (button === "right") {
+      return "contextmenu";
+    }
+    if (button === "middle") {
+      return "auxclick";
+    }
+    return "click";
+  }
+
+  function mouseButtonCode(button) {
+    if (button === "middle") {
+      return 1;
+    }
+    if (button === "right") {
+      return 2;
+    }
+    return 0;
+  }
+
+  function mouseButtonBits(button) {
+    if (button === "middle") {
+      return 4;
+    }
+    if (button === "right") {
+      return 2;
+    }
+    return 1;
+  }
+
+  function modifierFlags(modifiers) {
+    const set = new Set(Array.isArray(modifiers) ? modifiers : []);
+    return {
+      altKey: set.has("alt"),
+      ctrlKey: set.has("ctrl"),
+      metaKey: set.has("meta"),
+      shiftKey: set.has("shift")
+    };
+  }
+
+  function normalizeMouseButtonLocal(value) {
+    const normalized = String(value || "left").trim().toLowerCase();
+    return ["left", "right", "middle"].includes(normalized) ? normalized : "left";
+  }
+
+  function normalizeClickModifiersLocal(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    const seen = new Set();
+    for (const item of value) {
+      const normalized = String(item || "").trim().toLowerCase();
+      if (normalized === "ctrl" || normalized === "control") {
+        seen.add("ctrl");
+      } else if (normalized === "shift") {
+        seen.add("shift");
+      } else if (normalized === "alt" || normalized === "option") {
+        seen.add("alt");
+      } else if (["meta", "super", "cmd", "command"].includes(normalized)) {
+        seen.add("meta");
+      }
+    }
+    return ["alt", "ctrl", "meta", "shift"].filter((modifier) => seen.has(modifier));
   }
 
   function elementSummary(element) {

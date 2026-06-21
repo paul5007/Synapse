@@ -47,7 +47,7 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, tap, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, tap, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -150,8 +150,26 @@ pub struct TargetActParams {
     #[serde(default, alias = "eventInit")]
     pub event_init: Option<Value>,
     /// `click`: click count for target element clicks. Defaults to 1; valid range is 1..=3.
-    #[serde(default)]
+    /// `dblclick` defaults to 2 and rejects any other count.
+    #[serde(default, alias = "clickCount")]
     pub clicks: Option<u8>,
+    /// `click` / `dblclick`: mouse button for browser/native click delivery.
+    #[serde(default)]
+    pub button: Option<TargetActMouseButton>,
+    /// `click` / `dblclick`: modifier keys held while dispatching the click.
+    #[serde(default)]
+    pub modifiers: Vec<TargetActClickModifier>,
+    /// `click` / `dblclick`: element-relative click position X in CSS pixels
+    /// for browser DOM locator clicks. Use nested `position` for Playwright-style
+    /// input, or `position_x`/`position_y` aliases for flat callers.
+    #[serde(default, alias = "positionX", alias = "offset_x", alias = "offsetX")]
+    pub position_x: Option<i32>,
+    /// `click` / `dblclick`: element-relative click position Y in CSS pixels.
+    #[serde(default, alias = "positionY", alias = "offset_y", alias = "offsetY")]
+    pub position_y: Option<i32>,
+    /// `click` / `dblclick`: Playwright-style element-relative position.
+    #[serde(default)]
+    pub position: Option<TargetActClickPosition>,
     /// `click` / `type`: coordinate X for target-owned coordinate fallback.
     /// Defaults to screen coordinates; set coordinate_space for viewport/window-relative input.
     #[serde(default)]
@@ -191,6 +209,80 @@ pub struct TargetActSelectOption {
     pub label: Option<String>,
     #[serde(default)]
     pub index: Option<i32>,
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetActMouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+impl TargetActMouseButton {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Middle => "middle",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, JsonSchema, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetActClickModifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Meta,
+}
+
+impl<'de> Deserialize<'de> for TargetActClickModifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de;
+
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => Ok(Self::Ctrl),
+            "shift" => Ok(Self::Shift),
+            "alt" | "option" => Ok(Self::Alt),
+            "meta" | "super" | "cmd" | "command" => Ok(Self::Meta),
+            other => Err(de::Error::custom(format!(
+                "unsupported click modifier {other:?}; expected ctrl, shift, alt, or meta"
+            ))),
+        }
+    }
+}
+
+impl TargetActClickModifier {
+    const fn as_bridge_str(self) -> &'static str {
+        match self {
+            Self::Ctrl => "ctrl",
+            Self::Shift => "shift",
+            Self::Alt => "alt",
+            Self::Meta => "meta",
+        }
+    }
+
+    const fn as_act_click_str(self) -> &'static str {
+        match self {
+            Self::Ctrl => "ctrl",
+            Self::Shift => "shift",
+            Self::Alt => "alt",
+            Self::Meta => "super",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TargetActClickPosition {
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq)]
@@ -459,29 +551,44 @@ impl SynapseService {
                 target_act_insert_or_append_text(self, &params, &request_context, true).await?
             }
             "set_selection" => target_act_set_selection(self, &params, &request_context).await?,
-            "click" => {
+            action @ ("click" | "dblclick") => {
                 if target_act_coordinate(&params)?.is_some() {
                     if target_act_has_any_locator(&params) {
                         return Err(mcp_error(
                             error_codes::TOOL_PARAMS_INVALID,
-                            "target_act verb=click accepts either x/y coordinates or an element/DOM locator, not both",
+                            format!(
+                                "target_act verb={action} accepts either x/y coordinates or an element/DOM locator, not both"
+                            ),
                         ));
                     }
-                    target_act_coordinate_click(self, &params, &request_context).await?
+                    target_act_coordinate_click(self, action, &params, &request_context).await?
                 } else if target_act_has_dom_locator(&params) {
-                    target_act_browser_dom_action(self, "click", &params, &request_context).await?
+                    target_act_browser_dom_action(self, action, &params, &request_context).await?
                 } else {
                     let element_id =
-                        require_param(params.element_id.clone(), "click", "element_id")?;
+                        require_param(params.element_id.clone(), action, "element_id")?;
                     if let Some(element_id) = target_act_legacy_click_element_id(&element_id)? {
-                        let clicks = target_act_click_count(params.clicks)?;
-                        let click_params = target_act_click_params(element_id, clicks)?;
+                        if target_act_click_position(&params)?.is_some() {
+                            return Err(mcp_error(
+                                error_codes::TOOL_PARAMS_INVALID,
+                                format!(
+                                    "target_act verb={action} position is supported for browser DOM locators, not observed native/UIA element_id clicks"
+                                ),
+                            ));
+                        }
+                        let clicks = target_act_click_count_for_action(action, params.clicks)?;
+                        let click_params = target_act_click_params(
+                            element_id,
+                            clicks,
+                            params.button,
+                            &params.modifiers,
+                        )?;
                         let response = self
                             .act_click(Parameters(click_params), request_context)
                             .await;
                         target_act_delegate_response("act_click", response)?
                     } else {
-                        target_act_browser_dom_action(self, "click", &params, &request_context)
+                        target_act_browser_dom_action(self, action, &params, &request_context)
                             .await?
                     }
                 }
@@ -520,7 +627,8 @@ impl SynapseService {
                 let text = require_param(params.text.clone(), "type", "text")?;
                 let coordinate_result = if target_act_coordinate(&params)?.is_some() {
                     let (delegated_tool, ok, status, result) =
-                        target_act_coordinate_click(self, &params, &request_context).await?;
+                        target_act_coordinate_click(self, "click", &params, &request_context)
+                            .await?;
                     if !ok {
                         return Ok(Json(TargetActResponse {
                             verb: verb.as_str().to_owned(),
@@ -2553,7 +2661,7 @@ async fn target_act_cdp_dom_primitive(
 
 async fn target_act_browser_dom_action(
     service: &SynapseService,
-    action: &'static str,
+    action: &str,
     params: &TargetActParams,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
@@ -2568,6 +2676,9 @@ async fn target_act_browser_dom_action(
     }
     target_act_validate_dom_locator(action, params)?;
     let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
+    let click_count = target_act_dom_click_count(action, params.clicks)?;
+    let click_position = target_act_click_position(params)?;
+    let click_modifiers = target_act_click_modifiers_bridge_value(&params.modifiers)?;
     let request_details = json!({
         "session_id": &session_id,
         "verb": action,
@@ -2582,7 +2693,10 @@ async fn target_act_browser_dom_action(
         "options_count": params.options.len(),
         "event_type": params.event_type.as_deref(),
         "event_init_present": params.event_init.is_some(),
-        "clicks": params.clicks,
+        "button": params.button.map(TargetActMouseButton::as_str),
+        "modifiers": &click_modifiers,
+        "position": click_position.map(|(x, y)| json!({ "x": x, "y": y })),
+        "clicks": click_count,
         "wait_timeout_ms": wait_timeout_ms,
         "required_foreground": false,
     });
@@ -2638,7 +2752,10 @@ async fn target_act_browser_dom_action(
         "options_count": params.options.len(),
         "event_type": params.event_type.as_deref(),
         "event_init_present": params.event_init.is_some(),
-        "clicks": params.clicks,
+        "button": params.button.map(TargetActMouseButton::as_str),
+        "modifiers": &click_modifiers,
+        "position": click_position.map(|(x, y)| json!({ "x": x, "y": y })),
+        "clicks": click_count,
         "wait_timeout_ms": wait_timeout_ms,
         "required_foreground": false,
     });
@@ -2672,7 +2789,11 @@ async fn target_act_browser_dom_action(
             options: options_value.as_ref(),
             event_type: params.event_type.as_deref(),
             event_init: params.event_init.as_ref(),
-            clicks: params.clicks,
+            clicks: click_count,
+            button: params.button.map(TargetActMouseButton::as_str),
+            modifiers: Some(&click_modifiers),
+            position_x: click_position.map(|(x, _)| x),
+            position_y: click_position.map(|(_, y)| y),
             wait_timeout_ms,
         },
     )
@@ -2697,6 +2818,7 @@ async fn target_act_browser_dom_action(
 
 async fn target_act_coordinate_click(
     service: &SynapseService,
+    action: &str,
     params: &TargetActParams,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
@@ -2707,15 +2829,27 @@ async fn target_act_coordinate_click(
             "target_act coordinate click requires both x and y",
         )
     })?;
-    let clicks = target_act_click_count(params.clicks)?;
+    if target_act_click_position(params)?.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb={action} position is for element-relative browser DOM clicks; coordinate clicks already use x/y"
+            ),
+        ));
+    }
+    let clicks = target_act_click_count_for_action(action, params.clicks)?;
     let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
+    let click_modifiers = target_act_click_modifiers_bridge_value(&params.modifiers)?;
     let request_details = json!({
         "session_id": &session_id,
         "verb": "coordinate_click",
+        "action": action,
         "x": coordinate.x,
         "y": coordinate.y,
         "coordinate_space": coordinate.space.as_bridge_str(),
         "clicks": clicks,
+        "button": params.button.map(TargetActMouseButton::as_str),
+        "modifiers": &click_modifiers,
         "wait_timeout_ms": wait_timeout_ms,
         "requires_session_target": true,
         "no_human_os_foreground_fallback": true,
@@ -2769,6 +2903,8 @@ async fn target_act_coordinate_click(
                 "y": coordinate.y,
                 "coordinate_space": coordinate.space.as_bridge_str(),
                 "clicks": clicks,
+                "button": params.button.map(TargetActMouseButton::as_str),
+                "modifiers": &click_modifiers,
                 "wait_timeout_ms": wait_timeout_ms,
                 "required_foreground": false,
             });
@@ -2785,6 +2921,8 @@ async fn target_act_coordinate_click(
                     y: coordinate.y,
                     coordinate_space: coordinate.space.as_bridge_str(),
                     clicks,
+                    button: params.button.map(TargetActMouseButton::as_str),
+                    modifiers: Some(&click_modifiers),
                     wait_timeout_ms,
                 },
             )
@@ -2838,7 +2976,8 @@ async fn target_act_coordinate_click(
                     target_act_error_result("act_click", error),
                 ));
             }
-            let click_params = target_act_click_point_params(point, clicks)?;
+            let click_params =
+                target_act_click_point_params(point, clicks, params.button, &params.modifiers)?;
             let response = service
                 .act_click(Parameters(click_params), request_context.clone())
                 .await;
@@ -3354,6 +3493,112 @@ fn target_act_coordinate(
     }
 }
 
+fn target_act_is_click_like_dom_action(action: &str) -> bool {
+    matches!(action, "click" | "press" | "dblclick")
+}
+
+fn target_act_dom_click_count(action: &str, clicks: Option<u8>) -> Result<Option<u8>, ErrorData> {
+    if target_act_is_click_like_dom_action(action) {
+        target_act_click_count_for_action(action, clicks).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn target_act_click_count_for_action(action: &str, clicks: Option<u8>) -> Result<u8, ErrorData> {
+    let default_clicks = if action == "dblclick" { 2 } else { 1 };
+    let clicks = clicks.unwrap_or(default_clicks);
+    if !(1..=3).contains(&clicks) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb={action} clicks must be in 1..=3, got {clicks}"),
+        ));
+    }
+    if action == "dblclick" && clicks != 2 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=dblclick requires clicks/clickCount to be omitted or 2, got {clicks}"
+            ),
+        ));
+    }
+    Ok(clicks)
+}
+
+fn target_act_has_click_position_input(params: &TargetActParams) -> bool {
+    params.position.is_some() || params.position_x.is_some() || params.position_y.is_some()
+}
+
+fn target_act_click_position(params: &TargetActParams) -> Result<Option<(i32, i32)>, ErrorData> {
+    let flat = match (params.position_x, params.position_y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "target_act click position requires both position_x and position_y when using flat position fields",
+            ));
+        }
+    };
+    let nested = params.position.map(|position| (position.x, position.y));
+    if let (Some(flat), Some(nested)) = (flat, nested) {
+        if flat != nested {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act click position is ambiguous: flat position {flat:?} conflicts with nested position {nested:?}"
+                ),
+            ));
+        }
+    }
+    let position = nested.or(flat);
+    if let Some((x, y)) = position {
+        if x < 0 || y < 0 {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act click position must be non-negative element-relative CSS pixels, got x={x} y={y}"
+                ),
+            ));
+        }
+    }
+    Ok(position)
+}
+
+fn target_act_click_modifiers_bridge_value(
+    modifiers: &[TargetActClickModifier],
+) -> Result<Value, ErrorData> {
+    serde_json::to_value(
+        modifiers
+            .iter()
+            .map(|modifier| modifier.as_bridge_str())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("target_act click modifiers encode failed: {error}"),
+        )
+    })
+}
+
+fn target_act_click_modifiers_act_value(
+    modifiers: &[TargetActClickModifier],
+) -> Result<Value, ErrorData> {
+    serde_json::to_value(
+        modifiers
+            .iter()
+            .map(|modifier| modifier.as_act_click_str())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("target_act click modifiers encode failed: {error}"),
+        )
+    })
+}
+
 fn target_act_legacy_click_element_id(value: &str) -> Result<Option<ElementId>, ErrorData> {
     target_act_parse_observed_element_id(value, "click")
 }
@@ -3443,8 +3688,20 @@ fn target_act_validate_dom_locator(
             "target_act verb=dispatch_event event_init must be a JSON object when supplied",
         ));
     }
-    if matches!(action, "click" | "press") {
-        let _ = target_act_click_count(params.clicks)?;
+    if target_act_is_click_like_dom_action(action) {
+        let _ = target_act_click_count_for_action(action, params.clicks)?;
+        let _ = target_act_click_position(params)?;
+    } else if params.clicks.is_some()
+        || params.button.is_some()
+        || !params.modifiers.is_empty()
+        || target_act_has_click_position_input(params)
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb={action} does not accept click-only options clicks/clickCount, button, modifiers, or position"
+            ),
+        ));
     }
     Ok(())
 }
@@ -3934,7 +4191,7 @@ async fn target_act_focus_for_text_insert(
     verb: &str,
 ) -> Result<Option<(&'static str, bool, &'static str, Value)>, ErrorData> {
     if target_act_coordinate(params)?.is_some() {
-        return target_act_coordinate_click(service, params, request_context)
+        return target_act_coordinate_click(service, "click", params, request_context)
             .await
             .map(Some);
     }
@@ -3945,7 +4202,7 @@ async fn target_act_focus_for_text_insert(
         .filter(|value| !value.trim().is_empty())
     {
         if let Some(element_id) = target_act_legacy_click_element_id(raw_element_id)? {
-            let click_params = target_act_click_params(element_id, 1)?;
+            let click_params = target_act_click_params(element_id, 1, None, &[])?;
             let response = service
                 .act_click(Parameters(click_params), request_context.clone())
                 .await;
@@ -4273,23 +4530,20 @@ async fn target_act_set_selection_native(
     }
 }
 
-fn target_act_click_count(clicks: Option<u8>) -> Result<u8, ErrorData> {
-    let clicks = clicks.unwrap_or(1);
-    if !(1..=3).contains(&clicks) {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("target_act verb=click clicks must be in 1..=3, got {clicks}"),
-        ));
-    }
-    Ok(clicks)
-}
-
-fn target_act_click_params(element_id: ElementId, clicks: u8) -> Result<ActClickParams, ErrorData> {
+fn target_act_click_params(
+    element_id: ElementId,
+    clicks: u8,
+    button: Option<TargetActMouseButton>,
+    modifiers: &[TargetActClickModifier],
+) -> Result<ActClickParams, ErrorData> {
+    let modifiers = target_act_click_modifiers_act_value(modifiers)?;
     serde_json::from_value(json!({
         "target": {
             "element_id": element_id.to_string()
         },
+        "button": button.map(TargetActMouseButton::as_str).unwrap_or("left"),
         "clicks": clicks,
+        "modifiers": modifiers,
         "verify_delta": true,
         "verify_timeout_ms": default_verify_timeout_ms()
     }))
@@ -4301,13 +4555,21 @@ fn target_act_click_params(element_id: ElementId, clicks: u8) -> Result<ActClick
     })
 }
 
-fn target_act_click_point_params(point: Point, clicks: u8) -> Result<ActClickParams, ErrorData> {
+fn target_act_click_point_params(
+    point: Point,
+    clicks: u8,
+    button: Option<TargetActMouseButton>,
+    modifiers: &[TargetActClickModifier],
+) -> Result<ActClickParams, ErrorData> {
+    let modifiers = target_act_click_modifiers_act_value(modifiers)?;
     serde_json::from_value(json!({
         "target": {
             "x": point.x,
             "y": point.y
         },
+        "button": button.map(TargetActMouseButton::as_str).unwrap_or("left"),
         "clicks": clicks,
+        "modifiers": modifiers,
         "verify_delta": true,
         "verify_timeout_ms": default_verify_timeout_ms()
     }))
@@ -5234,8 +5496,27 @@ mod tests {
 
     #[test]
     fn target_act_click_count_rejects_out_of_range() {
-        let error = target_act_click_count(Some(4)).expect_err("clicks=4 should fail");
+        let error =
+            target_act_click_count_for_action("click", Some(4)).expect_err("clicks=4 should fail");
 
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    #[test]
+    fn target_act_dblclick_defaults_and_rejects_wrong_count() {
+        assert_eq!(
+            target_act_click_count_for_action("dblclick", None).expect("default dblclick"),
+            2
+        );
+        assert_eq!(
+            target_act_click_count_for_action("dblclick", Some(2)).expect("explicit dblclick"),
+            2
+        );
+        let error = target_act_click_count_for_action("dblclick", Some(1))
+            .expect_err("dblclick clickCount=1 should fail");
         assert_eq!(
             target_act_error_code(&error),
             Some(error_codes::TOOL_PARAMS_INVALID)
@@ -5261,7 +5542,10 @@ mod tests {
         assert_eq!(coordinate.y, 77);
         assert_eq!(coordinate.space, TargetActCoordinateSpace::Viewport);
         assert_eq!(coordinate.space.as_bridge_str(), "viewport");
-        assert_eq!(target_act_click_count(params.clicks).unwrap(), 3);
+        assert_eq!(
+            target_act_click_count_for_action("click", params.clicks).unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -5361,6 +5645,52 @@ mod tests {
 
     #[test]
     fn target_act_dom_verbs_deserialize_and_validate() {
+        let click_with_options: TargetActParams = serde_json::from_value(json!({
+            "verb": "click",
+            "selector": "#canvas",
+            "clickCount": 2,
+            "button": "right",
+            "modifiers": ["Shift", "control", "meta"],
+            "position": { "x": 12, "y": 8 }
+        }))
+        .expect("click options params should deserialize");
+        assert_eq!(click_with_options.verb.as_str(), "click");
+        assert_eq!(click_with_options.clicks, Some(2));
+        assert_eq!(click_with_options.button, Some(TargetActMouseButton::Right));
+        assert_eq!(
+            click_with_options.modifiers,
+            vec![
+                TargetActClickModifier::Shift,
+                TargetActClickModifier::Ctrl,
+                TargetActClickModifier::Meta
+            ]
+        );
+        assert_eq!(
+            target_act_click_position(&click_with_options).expect("click position"),
+            Some((12, 8))
+        );
+        target_act_validate_dom_locator("click", &click_with_options)
+            .expect("click options locator should validate");
+
+        let dblclick: TargetActParams = serde_json::from_value(json!({
+            "verb": "dblclick",
+            "selector": "#apply",
+            "offsetX": 3,
+            "offsetY": 4
+        }))
+        .expect("dblclick params should deserialize");
+        assert_eq!(dblclick.verb.as_str(), "dblclick");
+        assert_eq!(
+            target_act_dom_click_count("dblclick", dblclick.clicks).expect("dblclick count"),
+            Some(2)
+        );
+        assert_eq!(
+            target_act_click_position(&dblclick).expect("dblclick position"),
+            Some((3, 4))
+        );
+        target_act_validate_dom_locator("dblclick", &dblclick)
+            .expect("dblclick locator should validate");
+
         let press: TargetActParams = serde_json::from_value(json!({
             "verb": "press",
             "role": "button",

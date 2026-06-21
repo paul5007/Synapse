@@ -271,6 +271,7 @@ fn main() {
             submit_backend,
             CdpMouseButton::Left,
             1,
+            0,
         )
         .await
         .expect("cdp_click_node on resolved id");

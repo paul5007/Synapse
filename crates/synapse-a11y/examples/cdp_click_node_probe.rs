@@ -87,7 +87,7 @@ fn main() {
         let before = read_counter().await;
         println!("readback=cdp_click_node_probe stage=before {var}={before:?}");
 
-        let point = cdp_click_node(&endpoint, title_hint, Some(&target_id), bn, CdpMouseButton::Left, 1)
+        let point = cdp_click_node(&endpoint, title_hint, Some(&target_id), bn, CdpMouseButton::Left, 1, 0)
             .await
             .unwrap_or_else(|err| panic!("cdp_click_node FAILED (fix regressed): {err}"));
         println!(

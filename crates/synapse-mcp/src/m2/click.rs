@@ -135,6 +135,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
         return execute_cdp_click(&params, element, backend, double_click_timing, started).await;
     }
     if let ActClickTarget::Element(element) = &params.target {
+        reject_click_modifiers_for_non_cdp(&params, "native/UIA element targets")?;
         ensure_element_transport_backend_allowed(&params, "UIA")?;
         return element::execute_element_click(
             handle,
@@ -148,6 +149,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
         .await;
     }
 
+    reject_click_modifiers_for_non_cdp(&params, "coordinate point targets")?;
     let target = point_mouse_target(&params.target)?;
     let mut actions = Vec::with_capacity(usize::from(params.clicks) + 1);
     actions.push(Action::MouseMove {
@@ -334,6 +336,7 @@ async fn execute_cdp_click(
             ));
         }
     };
+    let modifiers = cdp_click_modifier_bits(&params.modifiers);
 
     if let Some(endpoint) = synapse_a11y::endpoint_for_window(hwnd) {
         synapse_a11y::cdp_click_node(
@@ -343,6 +346,7 @@ async fn execute_cdp_click(
             backend_node_id,
             button,
             i64::from(params.clicks),
+            modifiers,
         )
         .await
         .map_err(|err| {
@@ -757,12 +761,32 @@ fn validate_click_params(params: &ActClickParams) -> Result<(), ErrorData> {
             ),
         ));
     }
-    if !params.modifiers.is_empty() {
-        return Err(action_error_to_mcp(&ActionError::BackendUnavailable {
-            detail: "act_click modifiers are not wired in the M2 click schema slice".to_owned(),
-        }));
-    }
     Ok(())
+}
+
+fn cdp_click_modifier_bits(modifiers: &[schema::ClickModifier]) -> i64 {
+    modifiers.iter().fold(0_i64, |bits, modifier| {
+        bits | match modifier {
+            schema::ClickModifier::Alt => 1,
+            schema::ClickModifier::Ctrl => 2,
+            schema::ClickModifier::Super => 4,
+            schema::ClickModifier::Shift => 8,
+        }
+    })
+}
+
+fn reject_click_modifiers_for_non_cdp(
+    params: &ActClickParams,
+    target_kind: &str,
+) -> Result<(), ErrorData> {
+    if params.modifiers.is_empty() {
+        return Ok(());
+    }
+    Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+        detail: format!(
+            "act_click modifiers are supported only for web (CDP) element targets, not {target_kind}"
+        ),
+    }))
 }
 
 fn ensure_element_transport_backend_allowed(

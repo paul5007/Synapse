@@ -79,6 +79,7 @@ mod windows_impl {
             button,
             CdpMouseButton::Left,
             1,
+            0,
         )
         .await?;
         let after = eval_string(&page, "document.body.getAttribute('data-clicked')||''").await?;

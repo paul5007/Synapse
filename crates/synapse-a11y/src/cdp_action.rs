@@ -523,6 +523,7 @@ pub async fn cdp_click_node(
     backend_node_id: i64,
     button: CdpMouseButton,
     click_count: i64,
+    modifiers: i64,
 ) -> A11yResult<CdpActionPoint> {
     with_node_center(
         endpoint,
@@ -530,27 +531,30 @@ pub async fn cdp_click_node(
         target_id_hint,
         backend_node_id,
         |page, center| async move {
-            page.execute(mouse_event(
+            page.execute(mouse_event_with_modifiers(
                 DispatchMouseEventType::MouseMoved,
                 center,
                 button.to_cdp(),
                 0,
+                modifiers,
             ))
             .await
             .map_err(|err| dispatch_err(&err))?;
-            page.execute(mouse_event(
+            page.execute(mouse_event_with_modifiers(
                 DispatchMouseEventType::MousePressed,
                 center,
                 button.to_cdp(),
                 click_count.max(1),
+                modifiers,
             ))
             .await
             .map_err(|err| dispatch_err(&err))?;
-            page.execute(mouse_event(
+            page.execute(mouse_event_with_modifiers(
                 DispatchMouseEventType::MouseReleased,
                 center,
                 button.to_cdp(),
                 click_count.max(1),
+                modifiers,
             ))
             .await
             .map_err(|err| dispatch_err(&err))?;
@@ -3764,7 +3768,17 @@ fn mouse_event(
     button: MouseButton,
     click_count: i64,
 ) -> DispatchMouseEventParams {
-    mouse_event_with_buttons(kind, point, button, click_count, None)
+    mouse_event_with_modifiers(kind, point, button, click_count, 0)
+}
+
+fn mouse_event_with_modifiers(
+    kind: DispatchMouseEventType,
+    point: CdpActionPoint,
+    button: MouseButton,
+    click_count: i64,
+    modifiers: i64,
+) -> DispatchMouseEventParams {
+    mouse_event_with_buttons(kind, point, button, click_count, None, modifiers)
 }
 
 fn mouse_event_with_buttons(
@@ -3773,6 +3787,7 @@ fn mouse_event_with_buttons(
     button: MouseButton,
     click_count: i64,
     buttons_override: Option<i64>,
+    modifiers: i64,
 ) -> DispatchMouseEventParams {
     // `buttons` is the bitmask of buttons CURRENTLY held: the button's bit while
     // pressed, 0 once moved or released. Getting this wrong (e.g. leaving the
@@ -3784,6 +3799,7 @@ fn mouse_event_with_buttons(
     params.click_count = Some(click_count);
     params.buttons = Some(buttons_override.unwrap_or(if is_pressed { bit } else { 0 }));
     params.button = Some(button);
+    params.modifiers = Some(modifiers);
     params
 }
 
@@ -4539,6 +4555,22 @@ mod tests {
     }
 
     #[test]
+    fn mouse_event_preserves_modifier_bitmask() {
+        let point = CdpActionPoint { x: 10.0, y: 20.0 };
+        let pressed = mouse_event_with_modifiers(
+            DispatchMouseEventType::MousePressed,
+            point,
+            MouseButton::Left,
+            2,
+            1 | 2 | 8,
+        );
+
+        assert_eq!(pressed.modifiers, Some(11));
+        assert_eq!(pressed.click_count, Some(2));
+        assert_eq!(pressed.buttons, Some(1));
+    }
+
+    #[test]
     fn cdp_mouse_button_maps_to_cdp_enum() {
         assert_eq!(CdpMouseButton::Left.to_cdp(), MouseButton::Left);
         assert_eq!(CdpMouseButton::Right.to_cdp(), MouseButton::Right);
@@ -4607,6 +4639,7 @@ mod tests {
             MouseButton::Left,
             0,
             Some(mouse_button_bit(&MouseButton::Left)),
+            0,
         );
         println!(
             "readback=mouse_event drag_move buttons:{:?} button:{:?}",
