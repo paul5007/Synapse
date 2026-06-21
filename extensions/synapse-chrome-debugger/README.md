@@ -91,10 +91,10 @@ registration for the expected Synapse extension so the worker can report its
 `debugger`/`nativeMessaging` hazards remain, normal bridge commands fail closed
 with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before queueing any browser work.
 
-Background tab commands (`openTab`, `closeTab`, `navigateTab`, `activateTab`,
+Background tab commands (`listTabs`, `openTab`, `closeTab`, `navigateTab`, `activateTab`,
 `targetInfoPageText`, `pageVitals`, `domAction`, `setFieldValue`, and
 `typeActiveElement`) use `chrome.windows.getAll`,
-`chrome.tabs.create`, `chrome.tabs.remove`, `chrome.tabs.update`,
+`chrome.tabs.query`, `chrome.tabs.create`, `chrome.tabs.remove`, `chrome.tabs.update`,
 `chrome.tabs.reload`, `chrome.tabs.goBack`, `chrome.tabs.goForward`, and
 `chrome.scripting.executeScript`. When the daemon gives the normal bridge an OS
 HWND hint, the extension cannot see HWNDs directly, so it maps the hint through

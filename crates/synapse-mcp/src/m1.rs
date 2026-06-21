@@ -697,6 +697,103 @@ pub struct CdpTargetInfoResponse {
     pub page_vitals: Option<CdpPageVitalsInfo>,
 }
 
+/// Parameters for `browser_tabs` (#1298): enumerate tabs in an already-open
+/// Chromium browser window through the normal Chrome bridge.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserTabsParams {
+    /// Browser HWND whose tabs should be listed. If omitted, the active session
+    /// target's window is used; if the session has no target, this explicit
+    /// discovery tool passively uses the current human OS foreground window.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserTabEntry {
+    /// Ready to pass to `set_target` to bind this tab.
+    pub target: TargetWire,
+    pub window_hwnd: i64,
+    pub cdp_target_id: String,
+    pub tab_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    pub index: i32,
+    pub target_type: String,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub active: bool,
+    pub highlighted: bool,
+    pub pinned: bool,
+    pub target_attached: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserTabsResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_focused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_state: Option<String>,
+    pub chrome_window_selection_reason: String,
+    pub chrome_window_candidate_count: u32,
+    pub chrome_window_non_focused_count: u32,
+    pub target_count: u32,
+    pub active_tab_count: u32,
+    pub used_human_os_foreground_window: bool,
+    pub source_of_truth: String,
+    pub tabs: Vec<BrowserTabEntry>,
+}
+
+/// Parameters for `browser_adopt_active_tab` (#1298): explicitly bind the
+/// active tab from an already-open Chromium window as this MCP session's CDP
+/// target without creating, navigating, activating, or closing any tab.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAdoptActiveTabParams {
+    /// Browser HWND whose active tab should be adopted. If omitted, the active
+    /// session target's window is used; if the session has no target, this
+    /// explicit adoption tool passively uses the current human OS foreground
+    /// Chromium window.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAdoptActiveTabResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub tab_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub target_count: u32,
+    pub active_tab_count: u32,
+    pub chrome_window_selection_reason: String,
+    pub used_human_os_foreground_window: bool,
+    pub source_of_truth: String,
+    /// False: adopted user tabs are bindable/drivable but not owned for
+    /// `cdp_close_tab`; closing remains limited to tabs Synapse created.
+    pub close_authority: bool,
+    pub previous: Option<TargetWire>,
+    pub current: TargetWire,
+    pub tab: BrowserTabEntry,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CdpLargestContentfulPaintInfo {

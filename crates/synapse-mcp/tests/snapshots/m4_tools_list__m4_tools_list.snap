@@ -1,9 +1,10 @@
 ---
 source: crates/synapse-mcp/tests/m4_tools_list.rs
+assertion_line: 56
 expression: snapshot
 ---
 {
-  "count": 194,
+  "count": 196,
   "m4_defaults": [
     {
       "actual": 33,
@@ -259,12 +260,14 @@ expression: snapshot
     "audio_transcribe",
     "audit_export_bundle",
     "audit_intelligence_query",
+    "browser_adopt_active_tab",
     "browser_console_messages",
     "browser_content",
     "browser_evaluate",
     "browser_inspect",
     "browser_locate",
     "browser_set_value",
+    "browser_tabs",
     "capture_screenshot",
     "cdp_activate_tab",
     "cdp_bridge_reload",

@@ -1,9 +1,10 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-19-frame-aware-safe-bridge-v1";
-const BRIDGE_BUILD_SHA256 = "170ebf1ac150480c46c485ec2b1f62ed8ce52d7c734bcfa6d0172442eb5b6edb";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-tab-adopt-v1";
+const BRIDGE_BUILD_SHA256 = "f6927e7983989158827f91fafe195c7d2aba88eed01681f8f87bbb4e835ae5bf";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
+  "listTabs",
   "openTab",
   "closeTab",
   "targetInfo",
@@ -293,6 +294,7 @@ async function requireExternalPopupRisksSuppressed(commandKind, params) {
 function commandRequiresExternalPopupSuppression(kind) {
   return [
     "openTab",
+    "listTabs",
     "closeTab",
     "targetInfo",
     "targetInfoPageText",
@@ -686,6 +688,8 @@ async function handleCommand(command) {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "openTab") {
       result = await handleOpenTab(params);
+    } else if (kind === "listTabs") {
+      result = await handleListTabs(params);
     } else if (kind === "closeTab") {
       result = await handleCloseTab(params);
     } else if (kind === "capturePageScreenshot") {
@@ -851,6 +855,39 @@ async function handleCloseTab(params) {
     tab_id: selected.tabId,
     target_count_before: beforePages.length,
     target_count_after: afterPages.length
+  };
+}
+
+async function handleListTabs(params) {
+  const openWindow = await selectOpenWindowForHwndHint(params);
+  const query = {};
+  if (Number.isInteger(openWindow?.windowId)) {
+    query.windowId = openWindow.windowId;
+  }
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query(query);
+  } catch (error) {
+    throw bridgeError(ERROR_AXTREE_FAILED, `chrome.tabs.query(${JSON.stringify(query)}): ${errorMessage(error)}`);
+  }
+  const targets = tabs
+    .filter((tab) => typeof tab.id === "number")
+    .map((tab) => tabListEntryFromTabTarget(tabTargetFromTab(tab), tab));
+  let selectedWindow = null;
+  if (Number.isInteger(openWindow?.windowId)) {
+    selectedWindow = await chromeWindowState(openWindow.windowId);
+  }
+  return {
+    extension_id: chrome.runtime.id,
+    chrome_window_id: Number.isInteger(openWindow?.windowId) ? openWindow.windowId : null,
+    chrome_window_focused: typeof selectedWindow?.focused === "boolean" ? selectedWindow.focused : null,
+    chrome_window_state: typeof selectedWindow?.state === "string" ? selectedWindow.state : "",
+    chrome_window_selection_reason: openWindow?.selectionReason || "all_chrome_windows",
+    chrome_window_candidate_count: openWindow?.candidateCount || 0,
+    chrome_window_non_focused_count: openWindow?.nonFocusedCount || 0,
+    target_count: targets.length,
+    active_tab_count: targets.filter((target) => target.active).length,
+    tabs: targets
   };
 }
 
@@ -1689,6 +1726,23 @@ function tabTargetFromTab(tab) {
     highlighted: Boolean(tab.highlighted),
     pinned: Boolean(tab.pinned),
     attached: false
+  };
+}
+
+function tabListEntryFromTabTarget(target, tab) {
+  return {
+    target_id: target.id,
+    tab_id: target.tabId,
+    chrome_window_id: target.chromeWindowId,
+    index: Number.isInteger(tab.index) ? tab.index : -1,
+    target_type: target.type || "page",
+    url: target.url || "",
+    title: target.title || "",
+    ready_state: target.status || "",
+    active: Boolean(target.active),
+    highlighted: Boolean(target.highlighted),
+    pinned: Boolean(target.pinned),
+    target_attached: Boolean(target.attached)
   };
 }
 

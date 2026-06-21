@@ -40,10 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-19-frame-aware-safe-bridge-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-21-tab-adopt-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "170ebf1ac150480c46c485ec2b1f62ed8ce52d7c734bcfa6d0172442eb5b6edb";
+    "f6927e7983989158827f91fafe195c7d2aba88eed01681f8f87bbb4e835ae5bf";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -52,6 +51,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "coordinateClick",
     "domAction",
     "externalPopupRiskSuppression",
+    "listTabs",
     "navigateTab",
     "openTab",
     "pageVitals",
@@ -1662,6 +1662,49 @@ pub(crate) struct ChromeDebuggerCloseTabResult {
     pub target_count_before: u32,
     pub target_count_after: u32,
     pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerTabTarget {
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub index: i32,
+    pub target_type: String,
+    pub url: String,
+    pub title: String,
+    #[serde(default)]
+    pub ready_state: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub highlighted: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub target_attached: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerListTabsResult {
+    pub extension_id: Option<String>,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub chrome_window_focused: Option<bool>,
+    #[serde(default)]
+    pub chrome_window_state: String,
+    #[serde(default)]
+    pub chrome_window_selection_reason: String,
+    #[serde(default)]
+    pub chrome_window_candidate_count: u32,
+    #[serde(default)]
+    pub chrome_window_non_focused_count: u32,
+    pub target_count: u32,
+    pub active_tab_count: u32,
+    pub tabs: Vec<ChromeDebuggerTabTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3458,6 +3501,34 @@ pub(crate) async fn open_tab(
     serde_json::from_value::<ChromeDebuggerOpenTabResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger open tab response: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn list_tabs(
+    hwnd: i64,
+    expected_window_bounds: Option<Rect>,
+    expected_window_title: Option<&str>,
+) -> Result<ChromeDebuggerListTabsResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "listTabs")?;
+    let result = bridge()
+        .send_command(
+            "listTabs",
+            json!({
+                "hwnd": hwnd,
+                "expectedWindowBounds": expected_window_bounds.map(|bounds| json!({
+                    "x": bounds.x,
+                    "y": bounds.y,
+                    "w": bounds.w,
+                    "h": bounds.h,
+                })),
+                "expectedWindowTitle": expected_window_title,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerListTabsResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger list tabs response: {error}"
         ))
     })
 }

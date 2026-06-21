@@ -1,23 +1,25 @@
 use super::{
-    BrowserConsoleMessagesParams, BrowserConsoleMessagesResponse, BrowserContentParams,
-    BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse, BrowserInspectParams,
-    BrowserInspectResponse, BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams,
-    BrowserLocateResponse, CaptureScreenshotFormat, CaptureScreenshotParams,
-    CaptureScreenshotResponse, CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo,
-    CdpBridgeHostReadback, CdpBridgeReloadAckReadback, CdpBridgeReloadParams,
-    CdpBridgeReloadResponse, CdpCloseTabParams, CdpCloseTabResponse, CdpLargestContentfulPaintInfo,
-    CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams,
-    CdpOpenTabResponse, CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams,
-    CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage, ElementInspection, ErrorData,
-    FindParams, FindResponse, Health, HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse,
-    HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters, ReadTextParams, SessionTarget,
-    SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
-    SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
-    TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
-    mcp_error, observe_include, observe_input, populate_audio_summary, populate_clipboard_summary,
-    populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
-    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
-    set_target_input_schema, tool, tool_router,
+    BrowserAdoptActiveTabParams, BrowserAdoptActiveTabResponse, BrowserConsoleMessagesParams,
+    BrowserConsoleMessagesResponse, BrowserContentParams, BrowserContentResponse,
+    BrowserEvaluateParams, BrowserEvaluateResponse, BrowserInspectParams, BrowserInspectResponse,
+    BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
+    BrowserTabEntry, BrowserTabsParams, BrowserTabsResponse, CaptureScreenshotFormat,
+    CaptureScreenshotParams, CaptureScreenshotResponse, CdpActivateTabParams,
+    CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
+    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
+    CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
+    CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
+    CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage,
+    ElementInspection, ErrorData, FindParams, FindResponse, Health, HiddenDesktopPipFrameParams,
+    HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
+    ReadTextParams, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
+    SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
+    SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
+    WindowListResponse, empty_input_schema, mcp_error, observe_include, observe_input,
+    populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
+    populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
+    set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
+    tool_router,
 };
 use crate::m1::{
     ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
@@ -1531,6 +1533,79 @@ impl SynapseService {
             .await
             .map(|reload| chrome_bridge_reload_response(&session_id, wait_timeout_ms, reload))
             .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Enumerate tabs in an already-open Chromium browser window through the normal Chrome bridge without debugger attach, tab activation, navigation, or OS foreground input (#1298). If window_hwnd is omitted, uses this session's active target window; if no target is set, this explicit discovery tool passively uses the current human OS foreground Chromium window. Each row includes a ready-to-pass set_target payload with kind=cdp and cdp_target_id=chrome-tab:<id>."
+    )]
+    pub async fn browser_tabs(
+        &self,
+        params: Parameters<BrowserTabsParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserTabsResponse>, ErrorData> {
+        const TOOL: &str = "browser_tabs";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_tabs"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let (window_context, used_human_os_foreground_window) =
+            self.resolve_browser_tabs_window_context(TOOL, &session_id, params.0.window_hwnd)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_context.hwnd,
+            "window_title": &window_context.window_title,
+            "process_name": &window_context.process_name,
+            "used_human_os_foreground_window": used_human_os_foreground_window,
+            "required_foreground": false,
+            "no_debugger_attach": true,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_tabs_impl(&session_id, window_context, used_human_os_foreground_window)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Explicitly adopt the active tab from an already-open Chromium browser window as this MCP session's active CDP target (#1298). This is the consented handoff path for the user's existing authenticated foreground tab: it lists tabs through the normal Chrome bridge, selects exactly one active tab in the requested/foreground window, and binds that chrome-tab:<id> with set_target semantics. It never creates, closes, navigates, activates, foregrounds, or debugger-attaches; adopted user tabs are drivable but are not owned for cdp_close_tab."
+    )]
+    pub async fn browser_adopt_active_tab(
+        &self,
+        params: Parameters<BrowserAdoptActiveTabParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserAdoptActiveTabResponse>, ErrorData> {
+        const TOOL: &str = "browser_adopt_active_tab";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_adopt_active_tab"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let (window_context, used_human_os_foreground_window) =
+            self.resolve_browser_tabs_window_context(TOOL, &session_id, params.0.window_hwnd)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_context.hwnd,
+            "window_title": &window_context.window_title,
+            "process_name": &window_context.process_name,
+            "used_human_os_foreground_window": used_human_os_foreground_window,
+            "required_foreground": false,
+            "no_debugger_attach": true,
+            "mutation": "session_target_bind_only",
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_adopt_active_tab_impl(
+                &session_id,
+                window_context,
+                used_human_os_foreground_window,
+            )
+            .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
     }
@@ -3412,6 +3487,220 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    fn resolve_browser_tabs_window_context(
+        &self,
+        tool: &str,
+        session_id: &str,
+        window_hwnd: Option<i64>,
+    ) -> Result<(ForegroundContext, bool), ErrorData> {
+        let (context, used_human_os_foreground_window) = if let Some(hwnd) = window_hwnd {
+            (validate_target_window_context(hwnd)?, false)
+        } else if let Some(target) = self.session_target(Some(session_id))? {
+            let hwnd = match target {
+                SessionTarget::Window { hwnd } => hwnd,
+                SessionTarget::Cdp { window_hwnd, .. } => window_hwnd,
+            };
+            (validate_target_window_context(hwnd)?, false)
+        } else {
+            let context = synapse_a11y::current_foreground_context().map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "{tool} could not read the current human OS foreground window: {error}"
+                    ),
+                )
+            })?;
+            (context, true)
+        };
+        if !synapse_a11y::is_chromium_family(&context.process_name) {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} requires a Chromium browser window; resolved hwnd={:#x} process_name={:?} title={:?}",
+                    context.hwnd, context.process_name, context.window_title
+                ),
+            ));
+        }
+        Ok((context, used_human_os_foreground_window))
+    }
+
+    #[cfg(not(windows))]
+    fn resolve_browser_tabs_window_context(
+        &self,
+        tool: &str,
+        _session_id: &str,
+        _window_hwnd: Option<i64>,
+    ) -> Result<(ForegroundContext, bool), ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            format!("{tool} is only available on Windows in this build"),
+        ))
+    }
+
+    #[cfg(windows)]
+    async fn browser_tabs_impl(
+        &self,
+        session_id: &str,
+        window_context: ForegroundContext,
+        used_human_os_foreground_window: bool,
+    ) -> Result<BrowserTabsResponse, ErrorData> {
+        if synapse_a11y::endpoint_for_window(window_context.hwnd).is_some() {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_tabs targets the normal Chrome extension bridge, but window {:#x} exposes a raw CDP debug endpoint; use cdp_target_info for Synapse automation-profile targets",
+                    window_context.hwnd
+                ),
+            ));
+        }
+        let listed = crate::chrome_debugger_bridge::list_tabs(
+            window_context.hwnd,
+            Some(window_context.window_bounds),
+            Some(&window_context.window_title),
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "browser_tabs Chrome bridge chrome.tabs.query/readback failed: {}",
+                    error.detail()
+                ),
+            )
+        })?;
+        let endpoint = listed
+            .extension_id
+            .as_deref()
+            .map(chrome_debugger_endpoint)
+            .unwrap_or_else(chrome_debugger_default_endpoint);
+        let tabs = listed
+            .tabs
+            .into_iter()
+            .map(|tab| browser_tab_entry(window_context.hwnd, tab))
+            .collect::<Vec<_>>();
+        let active_tab_count =
+            u32::try_from(tabs.iter().filter(|tab| tab.active).count()).unwrap_or(u32::MAX);
+        tracing::info!(
+            code = "BROWSER_TABS_LISTED",
+            session_id = %session_id,
+            hwnd = window_context.hwnd,
+            endpoint = %endpoint,
+            target_count = tabs.len(),
+            active_tab_count,
+            used_human_os_foreground_window,
+            "readback=chrome.tabs.query outcome=tabs_listed"
+        );
+        Ok(BrowserTabsResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd: window_context.hwnd,
+            transport: "chrome_tabs_extension".to_owned(),
+            endpoint,
+            chrome_window_id: listed.chrome_window_id,
+            chrome_window_focused: listed.chrome_window_focused,
+            chrome_window_state: if listed.chrome_window_state.is_empty() {
+                None
+            } else {
+                Some(listed.chrome_window_state)
+            },
+            chrome_window_selection_reason: if listed.chrome_window_selection_reason.is_empty() {
+                "passive_hwnd_mapping".to_owned()
+            } else {
+                listed.chrome_window_selection_reason
+            },
+            chrome_window_candidate_count: listed.chrome_window_candidate_count,
+            chrome_window_non_focused_count: listed.chrome_window_non_focused_count,
+            target_count: listed.target_count,
+            active_tab_count,
+            used_human_os_foreground_window,
+            source_of_truth: "chrome.tabs.query via normal Synapse Chrome bridge".to_owned(),
+            tabs,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_tabs_impl(
+        &self,
+        _session_id: &str,
+        _window_context: ForegroundContext,
+        _used_human_os_foreground_window: bool,
+    ) -> Result<BrowserTabsResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_tabs is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
+    async fn browser_adopt_active_tab_impl(
+        &self,
+        session_id: &str,
+        window_context: ForegroundContext,
+        used_human_os_foreground_window: bool,
+    ) -> Result<BrowserAdoptActiveTabResponse, ErrorData> {
+        let tabs = self
+            .browser_tabs_impl(session_id, window_context, used_human_os_foreground_window)
+            .await?;
+        let active_tab = select_single_active_browser_tab(&tabs)?.clone();
+        validate_cdp_target_id(&active_tab.cdp_target_id)?;
+        let current = TargetWire::Cdp {
+            window_hwnd: tabs.window_hwnd,
+            cdp_target_id: active_tab.cdp_target_id.clone(),
+        };
+        let previous = self.set_session_target(
+            session_id,
+            SessionTarget::Cdp {
+                window_hwnd: tabs.window_hwnd,
+                cdp_target_id: active_tab.cdp_target_id.clone(),
+            },
+        )?;
+        tracing::info!(
+            code = "BROWSER_ACTIVE_TAB_ADOPTED",
+            session_id = %session_id,
+            hwnd = tabs.window_hwnd,
+            endpoint = %tabs.endpoint,
+            cdp_target_id = %active_tab.cdp_target_id,
+            tab_id = active_tab.tab_id,
+            chrome_window_id = active_tab.chrome_window_id.unwrap_or_default(),
+            used_human_os_foreground_window = tabs.used_human_os_foreground_window,
+            "readback=session_target outcome=adopted_existing_chrome_tab"
+        );
+        Ok(BrowserAdoptActiveTabResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd: tabs.window_hwnd,
+            transport: tabs.transport,
+            endpoint: tabs.endpoint,
+            cdp_target_id: active_tab.cdp_target_id.clone(),
+            tab_id: active_tab.tab_id,
+            chrome_window_id: active_tab.chrome_window_id,
+            url: active_tab.url.clone(),
+            title: active_tab.title.clone(),
+            ready_state: active_tab.ready_state.clone(),
+            target_count: tabs.target_count,
+            active_tab_count: tabs.active_tab_count,
+            chrome_window_selection_reason: tabs.chrome_window_selection_reason,
+            used_human_os_foreground_window: tabs.used_human_os_foreground_window,
+            source_of_truth: tabs.source_of_truth,
+            close_authority: false,
+            previous,
+            current,
+            tab: active_tab,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_adopt_active_tab_impl(
+        &self,
+        _session_id: &str,
+        _window_context: ForegroundContext,
+        _used_human_os_foreground_window: bool,
+    ) -> Result<BrowserAdoptActiveTabResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_adopt_active_tab is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     #[expect(
         clippy::too_many_arguments,
         reason = "browser_evaluate carries page/element scope, args, and CDP flags through the audited choke point"
@@ -4835,6 +5124,60 @@ fn cdp_target_id_audit_ref(target_id: Option<&str>) -> Value {
         None => json!({
             "present": false,
         }),
+    }
+}
+
+fn browser_tab_entry(
+    window_hwnd: i64,
+    tab: crate::chrome_debugger_bridge::ChromeDebuggerTabTarget,
+) -> BrowserTabEntry {
+    BrowserTabEntry {
+        target: TargetWire::Cdp {
+            window_hwnd,
+            cdp_target_id: tab.target_id.clone(),
+        },
+        window_hwnd,
+        cdp_target_id: tab.target_id,
+        tab_id: tab.tab_id,
+        chrome_window_id: tab.chrome_window_id,
+        index: tab.index,
+        target_type: tab.target_type,
+        url: tab.url,
+        title: tab.title,
+        ready_state: tab.ready_state,
+        active: tab.active,
+        highlighted: tab.highlighted,
+        pinned: tab.pinned,
+        target_attached: tab.target_attached,
+    }
+}
+
+fn select_single_active_browser_tab(
+    tabs: &BrowserTabsResponse,
+) -> Result<&BrowserTabEntry, ErrorData> {
+    let active_tabs = tabs
+        .tabs
+        .iter()
+        .filter(|tab| tab.active)
+        .collect::<Vec<_>>();
+    match active_tabs.as_slice() {
+        [active] => Ok(*active),
+        [] => Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "browser_adopt_active_tab found no active Chrome tab for window {:#x}; target_count={}",
+                tabs.window_hwnd, tabs.target_count
+            ),
+        )),
+        many => Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "browser_adopt_active_tab refused ambiguous active tab state for window {:#x}: active_tab_count={} target_count={}",
+                tabs.window_hwnd,
+                many.len(),
+                tabs.target_count
+            ),
+        )),
     }
 }
 
@@ -7524,12 +7867,13 @@ mod tests {
         chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
         hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
         page_text_info_from_parts, perception_window_hwnd, resolve_capture_target_window_context,
-        sha256_hex, target_wire, template_value, unavailable_page_vitals_info,
-        validate_browser_evaluate_params, validate_target_window,
+        select_single_active_browser_tab, sha256_hex, target_wire, template_value,
+        unavailable_page_vitals_info, validate_browser_evaluate_params, validate_target_window,
     };
     use crate::m1::{
-        BrowserEvaluateParams, CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult,
-        FindResultKind, HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
+        BrowserEvaluateParams, BrowserTabEntry, BrowserTabsResponse, CdpActivateTabParams,
+        CdpTargetInfoParams, FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
+        HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
     use base64::Engine as _;
@@ -7589,6 +7933,82 @@ mod tests {
                 format!("{expected:?}"),
                 "relation {wire:?}"
             );
+        }
+    }
+
+    #[test]
+    fn browser_adopt_active_tab_requires_exactly_one_active_tab() {
+        let ok = browser_tabs_response_for_test(vec![
+            browser_tab_for_test("chrome-tab:10", false),
+            browser_tab_for_test("chrome-tab:11", true),
+        ]);
+        let selected = select_single_active_browser_tab(&ok).expect("one active tab is selectable");
+        assert_eq!(selected.cdp_target_id, "chrome-tab:11");
+
+        let none =
+            browser_tabs_response_for_test(vec![browser_tab_for_test("chrome-tab:10", false)]);
+        let error =
+            select_single_active_browser_tab(&none).expect_err("no active tabs must fail closed");
+        assert!(
+            error.message.contains("found no active Chrome tab"),
+            "{error:?}"
+        );
+
+        let many = browser_tabs_response_for_test(vec![
+            browser_tab_for_test("chrome-tab:10", true),
+            browser_tab_for_test("chrome-tab:11", true),
+        ]);
+        let error = select_single_active_browser_tab(&many)
+            .expect_err("multiple active tabs must fail closed");
+        assert!(
+            error.message.contains("ambiguous active tab state"),
+            "{error:?}"
+        );
+    }
+
+    fn browser_tabs_response_for_test(tabs: Vec<BrowserTabEntry>) -> BrowserTabsResponse {
+        BrowserTabsResponse {
+            session_id: "session-test".to_owned(),
+            window_hwnd: 0x1234,
+            transport: "chrome_tabs_extension".to_owned(),
+            endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs".to_owned(),
+            chrome_window_id: Some(7),
+            chrome_window_focused: Some(true),
+            chrome_window_state: Some("normal".to_owned()),
+            chrome_window_selection_reason: "test".to_owned(),
+            chrome_window_candidate_count: 1,
+            chrome_window_non_focused_count: 0,
+            target_count: u32::try_from(tabs.len()).unwrap_or(u32::MAX),
+            active_tab_count: u32::try_from(tabs.iter().filter(|tab| tab.active).count())
+                .unwrap_or(u32::MAX),
+            used_human_os_foreground_window: true,
+            source_of_truth: "test".to_owned(),
+            tabs,
+        }
+    }
+
+    fn browser_tab_for_test(target_id: &str, active: bool) -> BrowserTabEntry {
+        BrowserTabEntry {
+            target: TargetWire::Cdp {
+                window_hwnd: 0x1234,
+                cdp_target_id: target_id.to_owned(),
+            },
+            window_hwnd: 0x1234,
+            cdp_target_id: target_id.to_owned(),
+            tab_id: target_id
+                .strip_prefix("chrome-tab:")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            chrome_window_id: Some(7),
+            index: 0,
+            target_type: "page".to_owned(),
+            url: "https://example.test/".to_owned(),
+            title: "Example".to_owned(),
+            ready_state: "complete".to_owned(),
+            active,
+            highlighted: active,
+            pinned: false,
+            target_attached: false,
         }
     }
 
