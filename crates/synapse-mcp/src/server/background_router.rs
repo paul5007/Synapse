@@ -15,8 +15,8 @@
 use super::browser_field::BrowserSetValueParams;
 use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
 use crate::m1::{
-    BrowserEvaluateParams, CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction,
-    CdpNavigateTabParams, CdpTargetInfoParams, ObserveParams, mcp_error,
+    CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
+    CdpTargetInfoParams, ObserveParams, mcp_error,
 };
 use crate::m2::{
     ActClickParams, ActFocusWindowParams, ActPressParams, ActSetFieldTextLocator,
@@ -2488,12 +2488,22 @@ async fn target_act_cdp_dom_primitive(
                 ),
             )
         })?;
+    let element_hwnd = element_id
+        .parts()
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("target_act verb={action} element_id is invalid: {error}"),
+            )
+        })?
+        .hwnd;
     let request_details = json!({
         "session_id": &session_id,
         "verb": action,
         "element_id": element_id.to_string(),
+        "element_hwnd": element_hwnd,
         "backend_node_id": backend_node_id,
-        "cdp_target_id": &element_target_id,
+        "element_cdp_target_id": &element_target_id,
         "delegated_tool": "synapse_a11y.cdp_dom_primitive_node",
         "required_foreground": false,
     });
@@ -2543,11 +2553,11 @@ async fn target_act_cdp_dom_primitive(
             ));
         }
     };
-    if cdp_target_id != element_target_id {
+    if window_hwnd != element_hwnd {
         let error = mcp_error(
             error_codes::ACTION_TARGET_INVALID,
             format!(
-                "target_act verb={action} element_id belongs to CDP target {element_target_id:?}, but this session owns {cdp_target_id:?}"
+                "target_act verb={action} element belongs to browser HWND 0x{element_hwnd:x}, but this session target is HWND 0x{window_hwnd:x}"
             ),
         );
         service.audit_action_denied_with_details_for_session(
@@ -2599,13 +2609,50 @@ async fn target_act_cdp_dom_primitive(
             target_act_error_result("target_act", error),
         ));
     };
+    let routed_target_id = match target_act_validate_observed_cdp_element_target(
+        &endpoint,
+        window_hwnd,
+        &cdp_target_id,
+        &element_target_id,
+        action,
+    )
+    .await
+    {
+        Ok(()) => element_target_id.clone(),
+        Err(error) => {
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &request_details,
+                &session_id,
+            );
+            return Ok((
+                "synapse_a11y.cdp_dom_primitive_node",
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        }
+    };
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": action,
+        "element_id": element_id.to_string(),
+        "element_hwnd": element_hwnd,
+        "backend_node_id": backend_node_id,
+        "session_cdp_target_id": &cdp_target_id,
+        "element_cdp_target_id": &element_target_id,
+        "dispatch_cdp_target_id": &routed_target_id,
+        "delegated_tool": "synapse_a11y.cdp_dom_primitive_node",
+        "required_foreground": false,
+    });
     service.audit_action_started_with_details_for_session(
         "target_act",
         &request_details,
         &session_id,
     )?;
     let result =
-        synapse_a11y::cdp_dom_primitive_node(&endpoint, &cdp_target_id, backend_node_id, action)
+        synapse_a11y::cdp_dom_primitive_node(&endpoint, &routed_target_id, backend_node_id, action)
             .await
             .map_err(|error| {
                 mcp_error(
@@ -2620,7 +2667,8 @@ async fn target_act_cdp_dom_primitive(
             if let Some(object) = value.as_object_mut() {
                 object.insert("element_id".to_owned(), json!(element_id.to_string()));
                 object.insert("backend_node_id".to_owned(), json!(backend_node_id));
-                object.insert("target_id".to_owned(), json!(cdp_target_id));
+                object.insert("target_id".to_owned(), json!(routed_target_id));
+                object.insert("session_target_id".to_owned(), json!(cdp_target_id));
                 object.insert("window_hwnd".to_owned(), json!(window_hwnd));
             }
             Ok((
@@ -3434,6 +3482,59 @@ async fn target_act_touch_tap_dispatch(
 }
 
 #[cfg(windows)]
+async fn target_act_validate_observed_cdp_element_target(
+    endpoint: &str,
+    window_hwnd: i64,
+    session_cdp_target_id: &str,
+    element_cdp_target_id: &str,
+    verb: &str,
+) -> Result<(), ErrorData> {
+    if target_act_cdp_target_matches_session_or_frame(
+        session_cdp_target_id,
+        element_cdp_target_id,
+        &[],
+    ) {
+        return Ok(());
+    }
+    let frames = synapse_a11y::cdp_list_frames(endpoint, window_hwnd, session_cdp_target_id)
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "target_act verb={verb} could not validate CDP frame ownership for element target {element_cdp_target_id:?} under session target {session_cdp_target_id:?}: {error}"
+                ),
+            )
+        })?;
+    if target_act_cdp_target_matches_session_or_frame(
+        session_cdp_target_id,
+        element_cdp_target_id,
+        &frames.frames,
+    ) {
+        return Ok(());
+    }
+    Err(mcp_error(
+        error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+        format!(
+            "target_act verb={verb} element_id belongs to CDP target {element_cdp_target_id:?}, but that target is not the owned tab {session_cdp_target_id:?} or any currently attached frame target under it; re-resolve the element because its frame may be stale"
+        ),
+    ))
+}
+
+fn target_act_cdp_target_matches_session_or_frame(
+    session_cdp_target_id: &str,
+    element_cdp_target_id: &str,
+    frames: &[synapse_a11y::CdpFrameTreeEntry],
+) -> bool {
+    element_cdp_target_id.eq_ignore_ascii_case(session_cdp_target_id)
+        || frames.iter().any(|frame| {
+            frame
+                .cdp_target_id
+                .eq_ignore_ascii_case(element_cdp_target_id)
+        })
+}
+
+#[cfg(windows)]
 async fn target_act_tap_element(
     endpoint: &str,
     window_hwnd: i64,
@@ -3456,16 +3557,33 @@ async fn target_act_tap_element(
         if let Ok(element_id) = ElementId::parse(raw)
             && let Some(backend_node_id) = synapse_a11y::cdp_backend_from_element_id(&element_id)
         {
-            let target_id = synapse_a11y::cdp_target_from_element_id(&element_id)
-                .unwrap_or_else(|| cdp_target_id.to_owned());
-            if !target_id.eq_ignore_ascii_case(cdp_target_id) {
+            let element_hwnd = element_id
+                .parts()
+                .map_err(|error| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!("target_act verb={verb} element_id is invalid: {error}"),
+                    )
+                })?
+                .hwnd;
+            if element_hwnd != window_hwnd {
                 return Err(mcp_error(
                     error_codes::ACTION_TARGET_INVALID,
                     format!(
-                        "target_act verb={verb} element_id belongs to CDP target {target_id:?}, but this session target is {cdp_target_id:?}"
+                        "target_act verb={verb} element belongs to browser HWND 0x{element_hwnd:x}, but this session target is HWND 0x{window_hwnd:x}"
                     ),
                 ));
             }
+            let target_id = synapse_a11y::cdp_target_from_element_id(&element_id)
+                .unwrap_or_else(|| cdp_target_id.to_owned());
+            target_act_validate_observed_cdp_element_target(
+                endpoint,
+                window_hwnd,
+                cdp_target_id,
+                &target_id,
+                verb,
+            )
+            .await?;
             return Ok(TargetActTapElement {
                 backend_node_id,
                 target_id,
@@ -4584,27 +4702,235 @@ async fn target_act_set_selection_web(
     end: u32,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
-    if synapse_a11y::cdp_target_from_element_id(&element_id).is_none() {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=set_selection web element_id must include an embedded CDP target id; re-resolve it with find/observe against the owned tab",
-        ));
-    }
-    let response = service
-        .browser_evaluate(
-            Parameters(BrowserEvaluateParams {
-                expression: TARGET_ACT_SET_SELECTION_JS.to_owned(),
-                cdp_target_id: None,
-                window_hwnd: None,
-                element_id: Some(element_id.to_string()),
-                args: Some(vec![json!(start), json!(end)]),
-                await_promise: Some(false),
-                return_by_value: Some(true),
-            }),
-            request_context.clone(),
+    #[cfg(windows)]
+    {
+        const DELEGATED_TOOL: &str = "synapse_a11y.cdp_evaluate_on_element";
+        let session_id = target_act_session_id(request_context, "set_selection")?;
+        let backend_node_id =
+            synapse_a11y::cdp_backend_from_element_id(&element_id).ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "target_act verb=set_selection element_id is not a CDP-backed web element",
+                )
+            })?;
+        let element_target_id =
+            synapse_a11y::cdp_target_from_element_id(&element_id).ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "target_act verb=set_selection web element_id must include an embedded CDP target id; re-resolve it with find/observe against the owned tab",
+                )
+            })?;
+        let element_hwnd = element_id
+            .parts()
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("target_act verb=set_selection element_id is invalid: {error}"),
+                )
+            })?
+            .hwnd;
+        let request_details = json!({
+            "session_id": &session_id,
+            "verb": "set_selection",
+            "element_id": element_id.to_string(),
+            "element_hwnd": element_hwnd,
+            "backend_node_id": backend_node_id,
+            "element_cdp_target_id": &element_target_id,
+            "selection_start": start,
+            "selection_end": end,
+            "delegated_tool": DELEGATED_TOOL,
+            "required_foreground": false,
+        });
+        let Some(target) = service.session_target(Some(&session_id))? else {
+            let error = mcp_error(
+                error_codes::TARGET_NOT_SET,
+                "target_act verb=set_selection requires this MCP session to own a CDP browser target; bind one with cdp_open_tab/set_target first",
+            );
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &request_details,
+                &session_id,
+            );
+            return Ok((
+                DELEGATED_TOOL,
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        };
+        let (window_hwnd, session_cdp_target_id) = match &target {
+            SessionTarget::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            } => (*window_hwnd, cdp_target_id.clone()),
+            SessionTarget::Window { .. } => {
+                let error = mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    "target_act verb=set_selection with an observed web element_id requires a session-owned CDP target, not a native/window target",
+                );
+                service.audit_action_denied_with_details_for_session(
+                    "target_act",
+                    &error,
+                    &request_details,
+                    &session_id,
+                );
+                return Ok((
+                    DELEGATED_TOOL,
+                    false,
+                    target_act_error_status(&error),
+                    target_act_error_result("target_act", error),
+                ));
+            }
+        };
+        if window_hwnd != element_hwnd {
+            let error = mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "target_act verb=set_selection element belongs to browser HWND 0x{element_hwnd:x}, but this session target is HWND 0x{window_hwnd:x}"
+                ),
+            );
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &request_details,
+                &session_id,
+            );
+            return Ok((
+                DELEGATED_TOOL,
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        }
+        if let Err(error) =
+            service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+        {
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &request_details,
+                &session_id,
+            );
+            return Ok((
+                DELEGATED_TOOL,
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        }
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            let error = mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "target_act verb=set_selection requires a raw CDP debugging endpoint for window 0x{window_hwnd:x}"
+                ),
+            );
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &request_details,
+                &session_id,
+            );
+            return Ok((
+                DELEGATED_TOOL,
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        };
+        if let Err(error) = target_act_validate_observed_cdp_element_target(
+            &endpoint,
+            window_hwnd,
+            &session_cdp_target_id,
+            &element_target_id,
+            "set_selection",
         )
-        .await;
-    target_act_delegate_response("browser_evaluate", response)
+        .await
+        {
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &request_details,
+                &session_id,
+            );
+            return Ok((
+                DELEGATED_TOOL,
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        }
+        let request_details = json!({
+            "session_id": &session_id,
+            "verb": "set_selection",
+            "element_id": element_id.to_string(),
+            "window_hwnd": window_hwnd,
+            "backend_node_id": backend_node_id,
+            "session_cdp_target_id": &session_cdp_target_id,
+            "element_cdp_target_id": &element_target_id,
+            "dispatch_cdp_target_id": &element_target_id,
+            "selection_start": start,
+            "selection_end": end,
+            "delegated_tool": DELEGATED_TOOL,
+            "required_foreground": false,
+        });
+        service.audit_action_started_with_details_for_session(
+            "target_act",
+            &request_details,
+            &session_id,
+        )?;
+        let result = synapse_a11y::cdp_evaluate_on_element(
+            &endpoint,
+            &element_target_id,
+            backend_node_id,
+            TARGET_ACT_SET_SELECTION_JS,
+            &[json!(start), json!(end)],
+            false,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("target_act web set_selection failed: {error}"),
+            )
+        });
+        service.audit_action_result_for_session("target_act", &result, &session_id)?;
+        match result {
+            Ok(readback) => {
+                let mut value = target_act_result(&readback)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("element_id".to_owned(), json!(element_id.to_string()));
+                    object.insert("backend_node_id".to_owned(), json!(backend_node_id));
+                    object.insert("session_target_id".to_owned(), json!(session_cdp_target_id));
+                    object.insert("target_id".to_owned(), json!(element_target_id));
+                    object.insert("window_hwnd".to_owned(), json!(window_hwnd));
+                }
+                Ok((DELEGATED_TOOL, true, TARGET_ACT_STATUS_OK, value))
+            }
+            Err(error) => Ok((
+                DELEGATED_TOOL,
+                false,
+                target_act_error_status(&error),
+                target_act_error_result(DELEGATED_TOOL, error),
+            )),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (service, element_id, start, end, request_context);
+        let error = mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            "target_act verb=set_selection observed CDP element_id support requires Windows CDP action support",
+        );
+        Ok((
+            "synapse_a11y.cdp_evaluate_on_element",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("synapse_a11y.cdp_evaluate_on_element", error),
+        ))
+    }
 }
 
 fn target_act_native_element_target(
@@ -6308,6 +6634,55 @@ mod tests {
     }
 
     #[test]
+    fn target_act_cdp_target_match_accepts_owned_root_case_insensitive() {
+        assert!(target_act_cdp_target_matches_session_or_frame(
+            "ABC123",
+            "abc123",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn target_act_cdp_target_match_accepts_owned_oopif_child() {
+        let frames = vec![
+            target_act_test_frame_entry("main-frame", None, "root-target", 0, false),
+            target_act_test_frame_entry(
+                "child-frame",
+                Some("main-frame"),
+                "iframe-target",
+                1,
+                true,
+            ),
+        ];
+
+        assert!(target_act_cdp_target_matches_session_or_frame(
+            "root-target",
+            "IFRAME-TARGET",
+            &frames
+        ));
+    }
+
+    #[test]
+    fn target_act_cdp_target_match_rejects_unrelated_or_stale_child() {
+        let frames = vec![
+            target_act_test_frame_entry("main-frame", None, "root-target", 0, false),
+            target_act_test_frame_entry(
+                "child-frame",
+                Some("main-frame"),
+                "iframe-target",
+                1,
+                true,
+            ),
+        ];
+
+        assert!(!target_act_cdp_target_matches_session_or_frame(
+            "root-target",
+            "stale-frame-target",
+            &frames
+        ));
+    }
+
+    #[test]
     fn target_act_dom_error_codes_classify() {
         for code in [
             error_codes::CHROME_DOM_ACTION_UNSUPPORTED,
@@ -6415,6 +6790,39 @@ mod tests {
             patterns: patterns.to_vec(),
             children_count: 0,
             depth: 1,
+        }
+    }
+
+    fn target_act_test_frame_entry(
+        frame_id: &str,
+        parent_frame_id: Option<&str>,
+        cdp_target_id: &str,
+        depth: u32,
+        is_out_of_process: bool,
+    ) -> synapse_a11y::CdpFrameTreeEntry {
+        synapse_a11y::CdpFrameTreeEntry {
+            frame_id: frame_id.to_owned(),
+            parent_frame_id: parent_frame_id.map(ToOwned::to_owned),
+            cdp_target_id: cdp_target_id.to_owned(),
+            target_type: if is_out_of_process { "iframe" } else { "page" }.to_owned(),
+            target_attached: Some(true),
+            url: format!("https://example.test/{frame_id}"),
+            name: None,
+            origin: "https://example.test".to_owned(),
+            security_origin: Some("https://example.test".to_owned()),
+            loader_id: Some(format!("loader-{frame_id}")),
+            depth,
+            sibling_index: 0,
+            child_count: 0,
+            is_out_of_process,
+            frame_element_id: None,
+            frame_element_backend_node_id: None,
+            frame_element_cdp_target_id: None,
+            frame_element_source: if parent_frame_id.is_some() {
+                "DOM.Node.frameId".to_owned()
+            } else {
+                "main_frame".to_owned()
+            },
         }
     }
 }
