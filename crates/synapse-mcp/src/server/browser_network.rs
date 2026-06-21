@@ -1,5 +1,7 @@
 //! Network capture listing tools (#1081) backed by the a11y CDP Network buffer.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
@@ -9,6 +11,7 @@ use super::{
     tool, tool_router,
 };
 use crate::m1::{BrowserNetworkWaitEntry, mcp_error};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,11 +19,19 @@ use synapse_core::error_codes;
 
 const REQUESTS_TOOL: &str = "browser_network_requests";
 const REQUEST_TOOL: &str = "browser_network_request";
+const ROUTE_TOOL: &str = "browser_route";
 const DEFAULT_NETWORK_REQUEST_LIMIT: usize = 100;
 const MAX_NETWORK_REQUEST_LIMIT: usize = 1000;
 const MAX_NETWORK_FILTER_CHARS: usize = 8192;
 const MAX_NETWORK_RESOURCE_TYPE_CHARS: usize = 128;
 const MAX_NETWORK_REQUEST_ID_CHARS: usize = 2048;
+const MAX_ROUTE_ID_CHARS: usize = 256;
+const MAX_ROUTE_URL_CHARS: usize = 8192;
+const MAX_ROUTE_RESPONSE_PHRASE_CHARS: usize = 256;
+const MAX_ROUTE_HEADER_COUNT: usize = 128;
+const MAX_ROUTE_HEADER_NAME_CHARS: usize = 256;
+const MAX_ROUTE_HEADER_VALUE_CHARS: usize = 8192;
+const MAX_ROUTE_BODY_CHARS: usize = 1_048_576;
 
 /// Parameters for `browser_network_requests` (#1081): return captured Network
 /// request records for the calling session's owned CDP target.
@@ -247,6 +258,145 @@ pub struct BrowserNetworkResponseBody {
     pub body_len_chars: usize,
 }
 
+/// Operation for `browser_route` (#1084).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRouteOperation {
+    /// Add or replace a route that fulfills matching requests.
+    #[default]
+    AddFulfill,
+    /// Remove one route by id.
+    Remove,
+    /// Clear all routes for the target and disable Fetch interception.
+    Clear,
+    /// List active routes without arming interception.
+    List,
+}
+
+/// URL match kind for `browser_route` (#1084).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRouteMatchKind {
+    /// Simple glob with `*` and `?`.
+    #[default]
+    Glob,
+    /// Rust regular expression.
+    Regex,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRouteHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Parameters for `browser_route` (#1084): add/list/remove/clear target-scoped
+/// Fetch routes. `add_fulfill` arms the target and fulfills matching requests;
+/// unmatched requests continue by default.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRouteParams {
+    /// CDP TargetID to route. Defaults to the active session CDP target. Must
+    /// be owned by this session; the human foreground tab is never an implicit fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Route operation. Defaults to `add_fulfill`.
+    #[serde(default)]
+    pub operation: BrowserRouteOperation,
+    /// Route id. Optional for `add_fulfill`; generated when omitted.
+    #[serde(default)]
+    pub route_id: Option<String>,
+    /// URL glob or regex for `add_fulfill`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// URL match kind for `add_fulfill`. Defaults to `glob`.
+    #[serde(default)]
+    pub match_kind: BrowserRouteMatchKind,
+    /// Optional CDP resource type, e.g. `Document`, `XHR`, `Fetch`, `Script`.
+    #[serde(default)]
+    pub resource_type: Option<String>,
+    /// HTTP status for fulfilled responses. Defaults to 200.
+    #[serde(default)]
+    pub status: Option<i64>,
+    /// Optional reason phrase for the fulfilled response.
+    #[serde(default)]
+    pub response_phrase: Option<String>,
+    /// UTF-8 response headers for the fulfilled response.
+    #[serde(default)]
+    pub headers: Vec<BrowserRouteHeader>,
+    /// UTF-8 response body. Mutually exclusive with `body_base64`.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Base64-encoded response body. Mutually exclusive with `body`.
+    #[serde(default)]
+    pub body_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRouteResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub operation: BrowserRouteOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
+    pub route_removed: bool,
+    pub cleared_count: usize,
+    pub route_count: usize,
+    pub routes: Vec<BrowserRouteRuleResponse>,
+    pub fetch_status: BrowserRouteFetchStatus,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRouteRuleResponse {
+    pub id: String,
+    pub url: String,
+    pub match_kind: BrowserRouteMatchKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    pub action: String,
+    pub status: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_phrase: Option<String>,
+    pub headers: Vec<BrowserRouteHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_base64_len_chars: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRouteFetchStatus {
+    pub fetch_armed: bool,
+    pub newly_armed: bool,
+    pub armed_at_unix_ms: u64,
+    pub pattern_count: usize,
+    pub route_count: usize,
+    pub paused_count: u64,
+    pub continued_count: u64,
+    pub fulfilled_count: u64,
+    pub continue_error_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_route_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug)]
 struct NormalizedBrowserNetworkRequestsParams {
     since_seq: Option<u64>,
@@ -264,6 +414,13 @@ struct NormalizedBrowserNetworkRequestParams {
     request_id: String,
     include_body: bool,
     include_post_data: bool,
+}
+
+#[derive(Debug)]
+struct NormalizedBrowserRouteParams {
+    operation: BrowserRouteOperation,
+    route_id: Option<String>,
+    route: Option<synapse_a11y::CdpFetchRouteRule>,
 }
 
 #[tool_router(router = browser_network_tool_router, vis = "pub(super)")]
@@ -389,6 +546,69 @@ impl SynapseService {
             .browser_network_request_impl(&session_id, window_hwnd, &cdp_target_id, &request)
             .await;
         self.audit_action_result_for_session(REQUEST_TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Add/list/remove/clear Fetch route rules for the calling session's owned browser tab. The default add_fulfill operation arms target-scoped raw CDP Fetch interception, fulfills matching URL glob/regex requests with status/headers/body, and continues unmatched requests by default. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_route(
+        &self,
+        params: Parameters<BrowserRouteParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserRouteResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = ROUTE_TOOL,
+            "tool.invocation kind=browser_route"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let route = validate_browser_route_params(&params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "operation": route.operation,
+            "route_id": route.route_id.as_deref(),
+            "url_len": params.0.url.as_deref().map(str::len),
+            "match_kind": params.0.match_kind,
+            "resource_type": params.0.resource_type.as_deref(),
+            "status": params.0.status,
+            "header_count": params.0.headers.len(),
+            "body_len": params.0.body.as_deref().map(str::len),
+            "body_base64_len": params.0.body_base64.as_deref().map(str::len),
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            ROUTE_TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            ROUTE_TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "operation": route.operation,
+            "route_id": route.route_id.as_deref(),
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(
+            ROUTE_TOOL,
+            &request_details,
+            &session_id,
+        )?;
+        let result = self
+            .browser_route_impl(&session_id, window_hwnd, &cdp_target_id, &route)
+            .await;
+        self.audit_action_result_for_session(ROUTE_TOOL, &result, &session_id)?;
         result.map(Json)
     }
 
@@ -581,6 +801,149 @@ impl SynapseService {
         })
     }
 
+    #[cfg(windows)]
+    async fn browser_route_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        route: &NormalizedBrowserRouteParams,
+    ) -> Result<BrowserRouteResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(ROUTE_TOOL, window_hwnd));
+        };
+        let mut route_removed = false;
+        let mut cleared_count = 0usize;
+        let fetch_status = match route.operation {
+            BrowserRouteOperation::AddFulfill => {
+                let ensure =
+                    synapse_a11y::fetch_interception_ensure(&endpoint, cdp_target_id, Vec::new())
+                        .await
+                        .map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!("{ROUTE_TOOL} raw CDP Fetch interception failed: {error}"),
+                            )
+                        })?;
+                let normalized_route = route.route.clone().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("{ROUTE_TOOL} add_fulfill route was not normalized"),
+                    )
+                })?;
+                let mut status = synapse_a11y::fetch_route_add(cdp_target_id, normalized_route)
+                    .map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!("{ROUTE_TOOL} raw CDP Fetch route add failed: {error}"),
+                        )
+                    })?;
+                status.newly_armed = ensure.newly_armed;
+                browser_route_fetch_status_from_a11y(Some(status), true)
+            }
+            BrowserRouteOperation::Remove => {
+                if let Some(route_id) = route.route_id.as_deref() {
+                    route_removed = synapse_a11y::fetch_route_remove(cdp_target_id, route_id)
+                        .map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!("{ROUTE_TOOL} raw CDP Fetch route remove failed: {error}"),
+                            )
+                        })?;
+                }
+                let routes = synapse_a11y::fetch_route_rules(cdp_target_id).unwrap_or_default();
+                let status = synapse_a11y::fetch_interception_status(cdp_target_id);
+                if routes.is_empty() && status.is_some() {
+                    synapse_a11y::fetch_interception_stop(cdp_target_id)
+                        .await
+                        .map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!("{ROUTE_TOOL} raw CDP Fetch disable failed: {error}"),
+                            )
+                        })?;
+                    browser_route_fetch_status_from_a11y(None, false)
+                } else {
+                    browser_route_fetch_status_from_a11y(status, !routes.is_empty())
+                }
+            }
+            BrowserRouteOperation::Clear => {
+                cleared_count =
+                    synapse_a11y::fetch_route_clear(cdp_target_id).map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!("{ROUTE_TOOL} raw CDP Fetch route clear failed: {error}"),
+                        )
+                    })?;
+                if synapse_a11y::fetch_interception_status(cdp_target_id).is_some() {
+                    synapse_a11y::fetch_interception_stop(cdp_target_id)
+                        .await
+                        .map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!("{ROUTE_TOOL} raw CDP Fetch disable failed: {error}"),
+                            )
+                        })?;
+                }
+                browser_route_fetch_status_from_a11y(None, false)
+            }
+            BrowserRouteOperation::List => {
+                let status = synapse_a11y::fetch_interception_status(cdp_target_id);
+                let fetch_armed = status.is_some();
+                browser_route_fetch_status_from_a11y(status, fetch_armed)
+            }
+        };
+        let routes = synapse_a11y::fetch_route_rules(cdp_target_id)
+            .unwrap_or_default()
+            .iter()
+            .map(browser_route_rule_to_wire)
+            .collect::<Vec<_>>();
+        tracing::info!(
+            code = "CDP_BACKGROUND_BROWSER_ROUTE",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id,
+            operation = ?route.operation,
+            route_id = route.route_id.as_deref(),
+            route_count = routes.len(),
+            route_removed,
+            cleared_count,
+            "readback=Fetch.fulfillRequest(browser_route) outcome=route_operation_returned"
+        );
+        Ok(BrowserRouteResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: cdp_target_id.to_owned(),
+            operation: route.operation,
+            route_id: route.route_id.clone(),
+            route_removed,
+            cleared_count,
+            route_count: routes.len(),
+            routes,
+            fetch_status,
+            readback_backend: "Fetch interception routes(browser_route)".to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_route_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _route: &NormalizedBrowserRouteParams,
+    ) -> Result<BrowserRouteResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_route is only available on Windows in this build",
+        ))
+    }
+
     #[cfg(not(windows))]
     async fn browser_network_request_impl(
         &self,
@@ -628,6 +991,104 @@ fn default_true() -> bool {
     true
 }
 
+fn validate_browser_route_params(
+    params: &BrowserRouteParams,
+) -> Result<NormalizedBrowserRouteParams, ErrorData> {
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    let route_id = match params.operation {
+        BrowserRouteOperation::AddFulfill => params
+            .route_id
+            .as_deref()
+            .map(validate_route_id)
+            .transpose()?
+            .unwrap_or_else(generate_route_id),
+        BrowserRouteOperation::Remove => {
+            validate_route_id(params.route_id.as_deref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("{ROUTE_TOOL} route_id is required for remove"),
+                )
+            })?)?
+        }
+        BrowserRouteOperation::Clear | BrowserRouteOperation::List => params
+            .route_id
+            .as_deref()
+            .map(validate_route_id)
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    let route_id = if route_id.is_empty() {
+        None
+    } else {
+        Some(route_id)
+    };
+    let route = match params.operation {
+        BrowserRouteOperation::AddFulfill => Some(normalize_route_fulfill(
+            params,
+            route_id
+                .clone()
+                .expect("add_fulfill always has a generated route id"),
+        )?),
+        BrowserRouteOperation::Remove
+        | BrowserRouteOperation::Clear
+        | BrowserRouteOperation::List => None,
+    };
+    Ok(NormalizedBrowserRouteParams {
+        operation: params.operation,
+        route_id,
+        route,
+    })
+}
+
+fn normalize_route_fulfill(
+    params: &BrowserRouteParams,
+    route_id: String,
+) -> Result<synapse_a11y::CdpFetchRouteRule, ErrorData> {
+    let url = validate_route_url(params.url.as_deref().ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} url is required for add_fulfill"),
+        )
+    })?)?;
+    if matches!(params.match_kind, BrowserRouteMatchKind::Regex) {
+        regex::Regex::new(&url).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{ROUTE_TOOL} url regex is invalid: {error}"),
+            )
+        })?;
+    }
+    let resource_type =
+        validate_resource_type_for_tool(ROUTE_TOOL, params.resource_type.as_deref())?;
+    let status = params.status.unwrap_or(200);
+    if !(100..=599).contains(&status) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} status must be 100..=599"),
+        ));
+    }
+    let response_phrase = validate_route_response_phrase(params.response_phrase.as_deref())?;
+    let headers = validate_route_headers(&params.headers)?;
+    let body_base64 = normalize_route_body(params)?;
+    Ok(synapse_a11y::CdpFetchRouteRule {
+        id: route_id,
+        url,
+        match_kind: match params.match_kind {
+            BrowserRouteMatchKind::Glob => synapse_a11y::CdpFetchRouteMatchKind::Glob,
+            BrowserRouteMatchKind::Regex => synapse_a11y::CdpFetchRouteMatchKind::Regex,
+        },
+        resource_type,
+        action: synapse_a11y::CdpFetchRouteAction::Fulfill(synapse_a11y::CdpFetchRouteFulfill {
+            status,
+            response_phrase,
+            headers,
+            body_base64,
+        }),
+    })
+}
+
 fn validate_browser_network_requests_params(
     params: &BrowserNetworkRequestsParams,
 ) -> Result<NormalizedBrowserNetworkRequestsParams, ErrorData> {
@@ -660,7 +1121,8 @@ fn validate_browser_network_requests_params(
             })
         })
         .transpose()?;
-    let resource_type = validate_resource_type(params.resource_type.as_deref())?;
+    let resource_type =
+        validate_resource_type_for_tool(REQUESTS_TOOL, params.resource_type.as_deref())?;
     validate_status_bound("status_min", params.status_min)?;
     validate_status_bound("status_max", params.status_max)?;
     if let (Some(min), Some(max)) = (params.status_min, params.status_max)
@@ -754,39 +1216,266 @@ fn validate_text_filter(field: &str, value: Option<&str>) -> Result<Option<Strin
     Ok(Some(value.to_owned()))
 }
 
-fn validate_resource_type(value: Option<&str>) -> Result<Option<String>, ErrorData> {
+fn validate_resource_type_for_tool(
+    tool_name: &str,
+    value: Option<&str>,
+) -> Result<Option<String>, ErrorData> {
     let Some(value) = value else {
         return Ok(None);
     };
     if value.trim().is_empty() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("{REQUESTS_TOOL} resource_type must not be empty"),
+            format!("{tool_name} resource_type must not be empty"),
         ));
     }
     if value.trim() != value {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "{REQUESTS_TOOL} resource_type must not contain leading or trailing whitespace"
-            ),
+            format!("{tool_name} resource_type must not contain leading or trailing whitespace"),
         ));
     }
     if value.contains('\0') || value.chars().any(char::is_control) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("{REQUESTS_TOOL} resource_type must not contain control characters"),
+            format!("{tool_name} resource_type must not contain control characters"),
         ));
     }
     if value.chars().count() > MAX_NETWORK_RESOURCE_TYPE_CHARS {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
-                "{REQUESTS_TOOL} resource_type must be at most {MAX_NETWORK_RESOURCE_TYPE_CHARS} Unicode scalar values"
+                "{tool_name} resource_type must be at most {MAX_NETWORK_RESOURCE_TYPE_CHARS} Unicode scalar values"
             ),
         ));
     }
     Ok(Some(value.to_owned()))
+}
+
+fn validate_route_id(route_id: &str) -> Result<String, ErrorData> {
+    if route_id.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} route_id must not be empty"),
+        ));
+    }
+    if route_id.trim() != route_id {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} route_id must not contain leading or trailing whitespace"),
+        ));
+    }
+    if route_id.contains('\0') || route_id.chars().any(char::is_control) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} route_id must not contain control characters"),
+        ));
+    }
+    if route_id.chars().any(char::is_whitespace) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} route_id must not contain whitespace"),
+        ));
+    }
+    if route_id.chars().count() > MAX_ROUTE_ID_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{ROUTE_TOOL} route_id must be at most {MAX_ROUTE_ID_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    Ok(route_id.to_owned())
+}
+
+fn validate_route_url(url: &str) -> Result<String, ErrorData> {
+    if url.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} url must not be empty"),
+        ));
+    }
+    if url.trim() != url {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} url must not contain leading or trailing whitespace"),
+        ));
+    }
+    if url.contains('\0') || url.chars().any(char::is_control) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} url must not contain control characters"),
+        ));
+    }
+    if url.chars().count() > MAX_ROUTE_URL_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} url must be at most {MAX_ROUTE_URL_CHARS} Unicode scalar values"),
+        ));
+    }
+    Ok(url.to_owned())
+}
+
+fn validate_route_response_phrase(value: Option<&str>) -> Result<Option<String>, ErrorData> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} response_phrase must not contain line breaks or NUL"),
+        ));
+    }
+    if value.chars().count() > MAX_ROUTE_RESPONSE_PHRASE_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{ROUTE_TOOL} response_phrase must be at most {MAX_ROUTE_RESPONSE_PHRASE_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn validate_route_headers(
+    headers: &[BrowserRouteHeader],
+) -> Result<Vec<(String, String)>, ErrorData> {
+    if headers.len() > MAX_ROUTE_HEADER_COUNT {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} headers must contain at most {MAX_ROUTE_HEADER_COUNT} entries"),
+        ));
+    }
+    headers
+        .iter()
+        .map(|header| {
+            validate_route_header_name(&header.name)?;
+            validate_route_header_value(&header.value)?;
+            Ok((header.name.clone(), header.value.clone()))
+        })
+        .collect()
+}
+
+fn validate_route_header_name(value: &str) -> Result<(), ErrorData> {
+    if value.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} header name must not be empty"),
+        ));
+    }
+    if value.trim() != value {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} header name must not contain leading or trailing whitespace"),
+        ));
+    }
+    if value.chars().count() > MAX_ROUTE_HEADER_NAME_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{ROUTE_TOOL} header name must be at most {MAX_ROUTE_HEADER_NAME_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    if value.bytes().any(|byte| {
+        byte <= 0x20
+            || byte >= 0x7f
+            || matches!(
+                byte,
+                b'(' | b')'
+                    | b'<'
+                    | b'>'
+                    | b'@'
+                    | b','
+                    | b';'
+                    | b':'
+                    | b'\\'
+                    | b'"'
+                    | b'/'
+                    | b'['
+                    | b']'
+                    | b'?'
+                    | b'='
+                    | b'{'
+                    | b'}'
+            )
+    }) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} header name {value:?} contains an invalid byte"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_route_header_value(value: &str) -> Result<(), ErrorData> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} header value must not contain line breaks or NUL"),
+        ));
+    }
+    if value.chars().count() > MAX_ROUTE_HEADER_VALUE_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{ROUTE_TOOL} header value must be at most {MAX_ROUTE_HEADER_VALUE_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_route_body(params: &BrowserRouteParams) -> Result<Option<String>, ErrorData> {
+    if params.body.is_some() && params.body_base64.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{ROUTE_TOOL} accepts body or body_base64, not both"),
+        ));
+    }
+    if let Some(body) = params.body.as_deref() {
+        if body.chars().count() > MAX_ROUTE_BODY_CHARS {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "{ROUTE_TOOL} body must be at most {MAX_ROUTE_BODY_CHARS} Unicode scalar values"
+                ),
+            ));
+        }
+        return Ok(Some(BASE64_STANDARD.encode(body.as_bytes())));
+    }
+    if let Some(body_base64) = params.body_base64.as_deref() {
+        if body_base64.contains('\0') || body_base64.chars().any(char::is_control) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{ROUTE_TOOL} body_base64 must not contain control characters"),
+            ));
+        }
+        if body_base64.chars().count() > MAX_ROUTE_BODY_CHARS {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "{ROUTE_TOOL} body_base64 must be at most {MAX_ROUTE_BODY_CHARS} Unicode scalar values"
+                ),
+            ));
+        }
+        BASE64_STANDARD.decode(body_base64).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{ROUTE_TOOL} body_base64 is invalid: {error}"),
+            )
+        })?;
+        return Ok(Some(body_base64.to_owned()));
+    }
+    Ok(None)
+}
+
+fn generate_route_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("route-{millis}-{}", std::process::id())
 }
 
 fn validate_status_bound(field: &str, value: Option<i64>) -> Result<(), ErrorData> {
@@ -996,6 +1685,73 @@ fn require_response_body_available(entry: &synapse_a11y::CdpNetworkEntry) -> Res
         ));
     }
     Ok(())
+}
+
+fn browser_route_fetch_status_from_a11y(
+    status: Option<synapse_a11y::CdpFetchInterceptionStatus>,
+    fetch_armed: bool,
+) -> BrowserRouteFetchStatus {
+    match status {
+        Some(status) => BrowserRouteFetchStatus {
+            fetch_armed,
+            newly_armed: status.newly_armed,
+            armed_at_unix_ms: status.armed_at_unix_ms,
+            pattern_count: status.pattern_count,
+            route_count: status.route_count,
+            paused_count: status.paused_count,
+            continued_count: status.continued_count,
+            fulfilled_count: status.fulfilled_count,
+            continue_error_count: status.continue_error_count,
+            last_request_id: status.last_request_id,
+            last_url: status.last_url,
+            last_route_id: status.last_route_id,
+            last_error: status.last_error,
+        },
+        None => BrowserRouteFetchStatus {
+            fetch_armed,
+            newly_armed: false,
+            armed_at_unix_ms: 0,
+            pattern_count: 0,
+            route_count: 0,
+            paused_count: 0,
+            continued_count: 0,
+            fulfilled_count: 0,
+            continue_error_count: 0,
+            last_request_id: None,
+            last_url: None,
+            last_route_id: None,
+            last_error: None,
+        },
+    }
+}
+
+fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> BrowserRouteRuleResponse {
+    match &rule.action {
+        synapse_a11y::CdpFetchRouteAction::Fulfill(fulfill) => BrowserRouteRuleResponse {
+            id: rule.id.clone(),
+            url: rule.url.clone(),
+            match_kind: match rule.match_kind {
+                synapse_a11y::CdpFetchRouteMatchKind::Glob => BrowserRouteMatchKind::Glob,
+                synapse_a11y::CdpFetchRouteMatchKind::Regex => BrowserRouteMatchKind::Regex,
+            },
+            resource_type: rule.resource_type.clone(),
+            action: "fulfill".to_owned(),
+            status: fulfill.status,
+            response_phrase: fulfill.response_phrase.clone(),
+            headers: fulfill
+                .headers
+                .iter()
+                .map(|(name, value)| BrowserRouteHeader {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            body_base64_len_chars: fulfill
+                .body_base64
+                .as_ref()
+                .map(|body| body.chars().count()),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1210,6 +1966,158 @@ mod tests {
                 .and_then(serde_json::Value::as_str);
             assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
         }
+    }
+
+    #[test]
+    fn browser_route_add_fulfill_validation_defaults_and_encodes_body() {
+        let normalized = validate_browser_route_params(&BrowserRouteParams {
+            cdp_target_id: Some("target-123".to_owned()),
+            route_id: Some("api-users".to_owned()),
+            url: Some("https://example.test/api/*".to_owned()),
+            resource_type: Some("XHR".to_owned()),
+            headers: vec![BrowserRouteHeader {
+                name: "content-type".to_owned(),
+                value: "application/json".to_owned(),
+            }],
+            body: Some("{\"ok\":true}".to_owned()),
+            ..Default::default()
+        })
+        .expect("valid route params pass");
+
+        assert_eq!(normalized.operation, BrowserRouteOperation::AddFulfill);
+        assert_eq!(normalized.route_id.as_deref(), Some("api-users"));
+        let route = normalized.route.expect("route normalized");
+        assert_eq!(route.id, "api-users");
+        assert_eq!(route.url, "https://example.test/api/*");
+        assert_eq!(route.match_kind, synapse_a11y::CdpFetchRouteMatchKind::Glob);
+        assert_eq!(route.resource_type.as_deref(), Some("XHR"));
+        let fulfill = match route.action {
+            synapse_a11y::CdpFetchRouteAction::Fulfill(fulfill) => fulfill,
+        };
+        assert_eq!(fulfill.status, 200);
+        assert_eq!(fulfill.headers[0].0, "content-type");
+        assert_eq!(
+            fulfill.body_base64.as_deref(),
+            Some(BASE64_STANDARD.encode("{\"ok\":true}").as_str())
+        );
+    }
+
+    #[test]
+    fn browser_route_validation_edges() {
+        for error in [
+            validate_browser_route_params(&BrowserRouteParams {
+                operation: BrowserRouteOperation::Remove,
+                ..Default::default()
+            })
+            .expect_err("remove requires route_id"),
+            validate_browser_route_params(&BrowserRouteParams {
+                route_id: Some("bad id".to_owned()),
+                url: Some("https://example.test/*".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("route id whitespace must be rejected"),
+            validate_browser_route_params(&BrowserRouteParams {
+                route_id: Some("bad-status".to_owned()),
+                url: Some("https://example.test/*".to_owned()),
+                status: Some(99),
+                ..Default::default()
+            })
+            .expect_err("bad status must be rejected"),
+            validate_browser_route_params(&BrowserRouteParams {
+                route_id: Some("bad-regex".to_owned()),
+                url: Some("[".to_owned()),
+                match_kind: BrowserRouteMatchKind::Regex,
+                ..Default::default()
+            })
+            .expect_err("bad regex must be rejected"),
+            validate_browser_route_params(&BrowserRouteParams {
+                route_id: Some("two-bodies".to_owned()),
+                url: Some("https://example.test/*".to_owned()),
+                body: Some("plain".to_owned()),
+                body_base64: Some("cGxhaW4=".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("body and body_base64 are mutually exclusive"),
+            validate_browser_route_params(&BrowserRouteParams {
+                route_id: Some("bad-base64".to_owned()),
+                url: Some("https://example.test/*".to_owned()),
+                body_base64: Some("not base64".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("invalid base64 must be rejected"),
+            validate_browser_route_params(&BrowserRouteParams {
+                route_id: Some("bad-header".to_owned()),
+                url: Some("https://example.test/*".to_owned()),
+                headers: vec![BrowserRouteHeader {
+                    name: "bad header".to_owned(),
+                    value: "value".to_owned(),
+                }],
+                ..Default::default()
+            })
+            .expect_err("bad header name must be rejected"),
+        ] {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+    }
+
+    #[test]
+    fn browser_route_rule_wire_hides_body_content() {
+        let rule = synapse_a11y::CdpFetchRouteRule {
+            id: "api-users".to_owned(),
+            url: "https://example.test/api/*".to_owned(),
+            match_kind: synapse_a11y::CdpFetchRouteMatchKind::Regex,
+            resource_type: Some("XHR".to_owned()),
+            action: synapse_a11y::CdpFetchRouteAction::Fulfill(
+                synapse_a11y::CdpFetchRouteFulfill {
+                    status: 204,
+                    response_phrase: Some("No Content".to_owned()),
+                    headers: vec![("x-test".to_owned(), "yes".to_owned())],
+                    body_base64: Some("c2VjcmV0".to_owned()),
+                },
+            ),
+        };
+
+        let wire = browser_route_rule_to_wire(&rule);
+        assert_eq!(wire.id, "api-users");
+        assert_eq!(wire.match_kind, BrowserRouteMatchKind::Regex);
+        assert_eq!(wire.status, 204);
+        assert_eq!(wire.response_phrase.as_deref(), Some("No Content"));
+        assert_eq!(wire.headers[0].name, "x-test");
+        assert_eq!(wire.body_base64_len_chars, Some(8));
+    }
+
+    #[test]
+    fn browser_route_fetch_status_maps_a11y_counters() {
+        let wire = browser_route_fetch_status_from_a11y(
+            Some(synapse_a11y::CdpFetchInterceptionStatus {
+                newly_armed: true,
+                endpoint: "http://127.0.0.1:9222".to_owned(),
+                cdp_target_id: "target-123".to_owned(),
+                armed_at_unix_ms: 42,
+                pattern_count: 0,
+                route_count: 2,
+                paused_count: 3,
+                continued_count: 1,
+                fulfilled_count: 2,
+                continue_error_count: 0,
+                last_request_id: Some("fetch-1".to_owned()),
+                last_url: Some("https://example.test/api".to_owned()),
+                last_route_id: Some("api-users".to_owned()),
+                last_error: None,
+            }),
+            true,
+        );
+
+        assert!(wire.fetch_armed);
+        assert!(wire.newly_armed);
+        assert_eq!(wire.route_count, 2);
+        assert_eq!(wire.fulfilled_count, 2);
+        assert_eq!(wire.last_route_id.as_deref(), Some("api-users"));
     }
 
     #[test]

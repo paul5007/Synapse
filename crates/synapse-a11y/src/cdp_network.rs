@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams as FetchContinueRequestParams, DisableParams as FetchDisableParams,
     EnableParams as FetchEnableParams, EventRequestPaused as FetchEventRequestPaused,
+    FulfillRequestParams as FetchFulfillRequestParams, HeaderEntry as FetchHeaderEntry,
     RequestId as FetchRequestId, RequestPattern as FetchRequestPattern,
     RequestStage as FetchRequestStage,
 };
@@ -24,6 +25,7 @@ use chromiumoxide::cdp::browser_protocol::network::{
 };
 use chromiumoxide::{Browser, Page};
 use futures_util::StreamExt as _;
+use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -207,12 +209,50 @@ pub struct CdpFetchInterceptionStatus {
     pub cdp_target_id: String,
     pub armed_at_unix_ms: u64,
     pub pattern_count: usize,
+    pub route_count: usize,
     pub paused_count: u64,
     pub continued_count: u64,
+    pub fulfilled_count: u64,
     pub continue_error_count: u64,
     pub last_request_id: Option<String>,
     pub last_url: Option<String>,
+    pub last_route_id: Option<String>,
     pub last_error: Option<String>,
+}
+
+/// URL match kind for Fetch route rules.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub enum CdpFetchRouteMatchKind {
+    #[default]
+    Glob,
+    Regex,
+}
+
+/// Synthetic response used by a Fetch route fulfill rule.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CdpFetchRouteFulfill {
+    pub status: i64,
+    pub response_phrase: Option<String>,
+    pub headers: Vec<(String, String)>,
+    /// Base64-encoded response body, as expected by CDP Fetch.fulfillRequest.
+    pub body_base64: Option<String>,
+}
+
+/// Action for a Fetch route rule.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub enum CdpFetchRouteAction {
+    Fulfill(CdpFetchRouteFulfill),
+}
+
+/// Per-target Fetch route rule. Rules are evaluated in insertion order; the
+/// first match handles the paused request.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CdpFetchRouteRule {
+    pub id: String,
+    pub url: String,
+    pub match_kind: CdpFetchRouteMatchKind,
+    pub resource_type: Option<String>,
+    pub action: CdpFetchRouteAction,
 }
 
 struct RingBuffer {
@@ -381,9 +421,11 @@ struct NetworkCaptureRegistry {
 struct FetchInterceptionCounters {
     paused_count: u64,
     continued_count: u64,
+    fulfilled_count: u64,
     continue_error_count: u64,
     last_request_id: Option<String>,
     last_url: Option<String>,
+    last_route_id: Option<String>,
     last_error: Option<String>,
 }
 
@@ -392,6 +434,7 @@ struct FetchInterceptionSlot {
     target_id: String,
     armed_at_unix_ms: u64,
     patterns: Vec<CdpFetchInterceptionPattern>,
+    rules: Arc<Mutex<Vec<CdpFetchRouteRule>>>,
     counters: Arc<Mutex<FetchInterceptionCounters>>,
     page: Page,
     _browser: Browser,
@@ -755,7 +798,9 @@ pub async fn fetch_interception_ensure(
     };
 
     let counters = Arc::new(Mutex::new(FetchInterceptionCounters::default()));
+    let rules = Arc::new(Mutex::new(Vec::new()));
     let pump_counters = Arc::clone(&counters);
+    let pump_rules = Arc::clone(&rules);
     let slot_page = page.clone();
     let listener_page = page.clone();
     let listener_task = tokio::spawn(async move {
@@ -768,20 +813,68 @@ pub async fn fetch_interception_ensure(
                 counters.last_request_id = Some(request_id.clone());
                 counters.last_url = Some(event.request.url.clone());
             }
-            let continued = listener_page
-                .execute(FetchContinueRequestParams::new(event.request_id.clone()))
-                .await;
-            if let Ok(mut counters) = pump_counters.lock() {
-                match continued {
-                    Ok(_) => {
-                        counters.continued_count = counters.continued_count.saturating_add(1);
+            let matched_rule = pump_rules
+                .lock()
+                .ok()
+                .and_then(|rules| fetch_route_match(event, &rules));
+            match matched_rule {
+                Some(rule) => {
+                    let route_id = rule.id.clone();
+                    match fetch_apply_route(&listener_page, event, &rule).await {
+                        Ok(()) => {
+                            if let Ok(mut counters) = pump_counters.lock() {
+                                counters.last_route_id = Some(route_id);
+                                counters.fulfilled_count =
+                                    counters.fulfilled_count.saturating_add(1);
+                            }
+                        }
+                        Err(error) => {
+                            let mut last_error = format!(
+                                "Fetch route {route_id} failed request_id={request_id}: {error}"
+                            );
+                            let continued = listener_page
+                                .execute(FetchContinueRequestParams::new(event.request_id.clone()))
+                                .await;
+                            if let Ok(mut counters) = pump_counters.lock() {
+                                counters.last_route_id = Some(route_id);
+                                counters.continue_error_count =
+                                    counters.continue_error_count.saturating_add(1);
+                                match continued {
+                                    Ok(_) => {
+                                        counters.continued_count =
+                                            counters.continued_count.saturating_add(1);
+                                    }
+                                    Err(continue_error) => {
+                                        counters.continue_error_count =
+                                            counters.continue_error_count.saturating_add(1);
+                                        last_error.push_str(&format!(
+                                            "; fallback Fetch.continueRequest failed: {continue_error}"
+                                        ));
+                                    }
+                                }
+                                counters.last_error = Some(last_error);
+                            }
+                        }
                     }
-                    Err(error) => {
-                        counters.continue_error_count =
-                            counters.continue_error_count.saturating_add(1);
-                        counters.last_error = Some(format!(
-                            "Fetch.continueRequest request_id={request_id}: {error}"
-                        ));
+                }
+                None => {
+                    let continued = listener_page
+                        .execute(FetchContinueRequestParams::new(event.request_id.clone()))
+                        .await;
+                    if let Ok(mut counters) = pump_counters.lock() {
+                        match continued {
+                            Ok(_) => {
+                                counters.continued_count =
+                                    counters.continued_count.saturating_add(1);
+                            }
+                            Err(error) => {
+                                counters.continue_error_count =
+                                    counters.continue_error_count.saturating_add(1);
+                                counters.last_error = Some(format!(
+                                    "Fetch.continueRequest request_id={request_id}: {error}"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -794,6 +887,7 @@ pub async fn fetch_interception_ensure(
         target_id: target_id.to_owned(),
         armed_at_unix_ms,
         patterns,
+        rules,
         counters,
         page: slot_page,
         _browser: browser,
@@ -816,6 +910,65 @@ pub async fn fetch_interception_ensure(
 pub fn fetch_interception_status(target_id: &str) -> Option<CdpFetchInterceptionStatus> {
     lookup_fetch_live(target_id.trim())
         .map(|slot| fetch_interception_status_from_slot(&slot, false))
+}
+
+/// Returns the configured Fetch route rules for a target.
+#[must_use]
+pub fn fetch_route_rules(target_id: &str) -> Option<Vec<CdpFetchRouteRule>> {
+    let slot = lookup_fetch_live(target_id.trim())?;
+    slot.rules.lock().ok().map(|rules| rules.clone())
+}
+
+/// Adds or replaces a Fetch route rule for an active interception target.
+pub fn fetch_route_add(
+    target_id: &str,
+    rule: CdpFetchRouteRule,
+) -> A11yResult<CdpFetchInterceptionStatus> {
+    let target_id = target_id.trim();
+    validate_fetch_route_rule(&rule)?;
+    let slot = lookup_fetch_live(target_id).ok_or_else(|| A11yError::CdpAttachFailed {
+        detail: format!("Fetch interception for target {target_id} is not armed"),
+    })?;
+    {
+        let mut rules = slot.rules.lock().map_err(|_| A11yError::CdpAttachFailed {
+            detail: "Fetch route registry lock is poisoned".to_owned(),
+        })?;
+        if let Some(existing) = rules.iter_mut().find(|existing| existing.id == rule.id) {
+            *existing = rule;
+        } else {
+            rules.push(rule);
+        }
+    }
+    Ok(fetch_interception_status_from_slot(&slot, false))
+}
+
+/// Removes one Fetch route rule for a target. Returns true when a rule existed.
+pub fn fetch_route_remove(target_id: &str, route_id: &str) -> A11yResult<bool> {
+    let target_id = target_id.trim();
+    let route_id = normalize_route_id(route_id)?;
+    let Some(slot) = lookup_fetch_live(target_id) else {
+        return Ok(false);
+    };
+    let mut rules = slot.rules.lock().map_err(|_| A11yError::CdpAttachFailed {
+        detail: "Fetch route registry lock is poisoned".to_owned(),
+    })?;
+    let before = rules.len();
+    rules.retain(|rule| rule.id != route_id);
+    Ok(rules.len() != before)
+}
+
+/// Clears Fetch route rules for a target. Returns the number of removed rules.
+pub fn fetch_route_clear(target_id: &str) -> A11yResult<usize> {
+    let target_id = target_id.trim();
+    let Some(slot) = lookup_fetch_live(target_id) else {
+        return Ok(0);
+    };
+    let mut rules = slot.rules.lock().map_err(|_| A11yError::CdpAttachFailed {
+        detail: "Fetch route registry lock is poisoned".to_owned(),
+    })?;
+    let removed = rules.len();
+    rules.clear();
+    Ok(removed)
 }
 
 /// Disables Fetch interception for a target. Returns false when no slot exists.
@@ -910,17 +1063,21 @@ fn fetch_interception_status_from_slot(
     newly_armed: bool,
 ) -> CdpFetchInterceptionStatus {
     let counters = slot.counters.lock().ok();
+    let route_count = slot.rules.lock().map_or(0, |rules| rules.len());
     CdpFetchInterceptionStatus {
         newly_armed,
         endpoint: slot.endpoint.clone(),
         cdp_target_id: slot.target_id.clone(),
         armed_at_unix_ms: slot.armed_at_unix_ms,
         pattern_count: slot.patterns.len(),
+        route_count,
         paused_count: counters.as_ref().map_or(0, |c| c.paused_count),
         continued_count: counters.as_ref().map_or(0, |c| c.continued_count),
+        fulfilled_count: counters.as_ref().map_or(0, |c| c.fulfilled_count),
         continue_error_count: counters.as_ref().map_or(0, |c| c.continue_error_count),
         last_request_id: counters.as_ref().and_then(|c| c.last_request_id.clone()),
         last_url: counters.as_ref().and_then(|c| c.last_url.clone()),
+        last_route_id: counters.as_ref().and_then(|c| c.last_route_id.clone()),
         last_error: counters.as_ref().and_then(|c| c.last_error.clone()),
     }
 }
@@ -973,6 +1130,238 @@ fn fetch_pattern_to_cdp(pattern: &CdpFetchInterceptionPattern) -> A11yResult<Fet
 
 fn fetch_request_id_string(request_id: &FetchRequestId) -> String {
     <FetchRequestId as std::borrow::Borrow<str>>::borrow(request_id).to_owned()
+}
+
+fn fetch_route_match(
+    event: &FetchEventRequestPaused,
+    rules: &[CdpFetchRouteRule],
+) -> Option<CdpFetchRouteRule> {
+    rules
+        .iter()
+        .find(|rule| fetch_route_rule_matches(event, rule))
+        .cloned()
+}
+
+fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRouteRule) -> bool {
+    if !fetch_route_url_matches(&event.request.url, rule) {
+        return false;
+    }
+    if let Some(resource_type) = rule.resource_type.as_deref() {
+        if !enum_str(&event.resource_type).eq_ignore_ascii_case(resource_type) {
+            return false;
+        }
+    }
+    true
+}
+
+fn fetch_route_url_matches(url: &str, rule: &CdpFetchRouteRule) -> bool {
+    match rule.match_kind {
+        CdpFetchRouteMatchKind::Glob => glob_matches(&rule.url, url),
+        CdpFetchRouteMatchKind::Regex => Regex::new(&rule.url)
+            .map(|regex| regex.is_match(url))
+            .unwrap_or(false),
+    }
+}
+
+async fn fetch_apply_route(
+    page: &Page,
+    event: &FetchEventRequestPaused,
+    rule: &CdpFetchRouteRule,
+) -> A11yResult<()> {
+    match &rule.action {
+        CdpFetchRouteAction::Fulfill(fulfill) => {
+            let params = fetch_fulfill_params(event.request_id.clone(), fulfill)?;
+            page.execute(params)
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("Fetch.fulfillRequest route_id={}: {err}", rule.id),
+                })?;
+            Ok(())
+        }
+    }
+}
+
+fn fetch_fulfill_params(
+    request_id: FetchRequestId,
+    fulfill: &CdpFetchRouteFulfill,
+) -> A11yResult<FetchFulfillRequestParams> {
+    validate_fetch_route_fulfill(fulfill)?;
+    let headers = fulfill
+        .headers
+        .iter()
+        .map(|(name, value)| FetchHeaderEntry::new(name.clone(), value.clone()));
+    let mut builder = FetchFulfillRequestParams::builder()
+        .request_id(request_id)
+        .response_code(fulfill.status)
+        .response_headers(headers);
+    if let Some(body_base64) = fulfill.body_base64.as_deref() {
+        builder = builder.body(body_base64.to_owned());
+    }
+    if let Some(response_phrase) = fulfill.response_phrase.as_deref() {
+        builder = builder.response_phrase(response_phrase.to_owned());
+    }
+    builder
+        .build()
+        .map_err(|detail| A11yError::CdpAttachFailed {
+            detail: format!("Fetch.fulfillRequest route params: {detail}"),
+        })
+}
+
+fn validate_fetch_route_rule(rule: &CdpFetchRouteRule) -> A11yResult<()> {
+    normalize_route_id(&rule.id)?;
+    if rule.url.trim() != rule.url || rule.url.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route url must be non-empty without surrounding whitespace".to_owned(),
+        });
+    }
+    if rule.url.contains('\0') {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route url must not contain NUL".to_owned(),
+        });
+    }
+    if matches!(rule.match_kind, CdpFetchRouteMatchKind::Regex) {
+        Regex::new(&rule.url).map_err(|error| A11yError::CdpAttachFailed {
+            detail: format!("Fetch route regex url is invalid: {error}"),
+        })?;
+    }
+    if let Some(resource_type) = rule.resource_type.as_deref() {
+        validate_fetch_resource_type(resource_type, "Fetch route resource_type")?;
+    }
+    match &rule.action {
+        CdpFetchRouteAction::Fulfill(fulfill) => validate_fetch_route_fulfill(fulfill)?,
+    }
+    Ok(())
+}
+
+fn validate_fetch_route_fulfill(fulfill: &CdpFetchRouteFulfill) -> A11yResult<()> {
+    if !(100..=599).contains(&fulfill.status) {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route fulfill status must be between 100 and 599".to_owned(),
+        });
+    }
+    if let Some(response_phrase) = fulfill.response_phrase.as_deref() {
+        if response_phrase.contains(['\r', '\n', '\0']) {
+            return Err(A11yError::CdpAttachFailed {
+                detail: "Fetch route response_phrase must not contain control line breaks or NUL"
+                    .to_owned(),
+            });
+        }
+    }
+    for (name, value) in &fulfill.headers {
+        validate_header_name(name)?;
+        validate_header_value(value)?;
+    }
+    if let Some(body_base64) = fulfill.body_base64.as_deref() {
+        if body_base64.contains('\0') {
+            return Err(A11yError::CdpAttachFailed {
+                detail: "Fetch route body_base64 must not contain NUL".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn normalize_route_id(route_id: &str) -> A11yResult<&str> {
+    let route_id = route_id.trim();
+    if route_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route id must not be empty".to_owned(),
+        });
+    }
+    if route_id.contains(char::is_whitespace) || route_id.contains('\0') {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route id must not contain whitespace or NUL".to_owned(),
+        });
+    }
+    Ok(route_id)
+}
+
+fn validate_fetch_resource_type(value: &str, field: &str) -> A11yResult<()> {
+    if value.trim() != value || value.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: format!("{field} must be non-empty without surrounding whitespace"),
+        });
+    }
+    value
+        .parse::<NetworkResourceType>()
+        .map(|_| ())
+        .map_err(|error| A11yError::CdpAttachFailed {
+            detail: format!("{field} {value:?} is invalid: {error}"),
+        })
+}
+
+fn validate_header_name(value: &str) -> A11yResult<()> {
+    if value.trim() != value || value.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route header name must be non-empty without surrounding whitespace"
+                .to_owned(),
+        });
+    }
+    if value.bytes().any(|byte| {
+        byte <= 0x20
+            || byte >= 0x7f
+            || matches!(
+                byte,
+                b'(' | b')'
+                    | b'<'
+                    | b'>'
+                    | b'@'
+                    | b','
+                    | b';'
+                    | b':'
+                    | b'\\'
+                    | b'"'
+                    | b'/'
+                    | b'['
+                    | b']'
+                    | b'?'
+                    | b'='
+                    | b'{'
+                    | b'}'
+            )
+    }) {
+        return Err(A11yError::CdpAttachFailed {
+            detail: format!("Fetch route header name {value:?} contains an invalid byte"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_header_value(value: &str) -> A11yResult<()> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route header value must not contain line breaks or NUL".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn glob_matches(pattern: &str, candidate: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let candidate = candidate.as_bytes();
+    let (mut p, mut c) = (0usize, 0usize);
+    let mut star = None;
+    let mut retry = 0usize;
+    while c < candidate.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == candidate[c]) {
+            p += 1;
+            c += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            retry = c;
+            p += 1;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            retry += 1;
+            c = retry;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn normalize_request_id(request_id: &str) -> A11yResult<&str> {
@@ -1143,6 +1532,37 @@ mod tests {
         }
     }
 
+    fn paused_event(request_id: &str, url: &str, resource_type: &str) -> FetchEventRequestPaused {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "request": {
+                "url": url,
+                "method": "GET",
+                "headers": {"Accept": "application/json"},
+                "initialPriority": "High",
+                "referrerPolicy": "strict-origin-when-cross-origin"
+            },
+            "frameId": "frame-1",
+            "resourceType": resource_type
+        }))
+        .expect("Fetch.requestPaused event")
+    }
+
+    fn fulfill_rule(id: &str, url: &str, match_kind: CdpFetchRouteMatchKind) -> CdpFetchRouteRule {
+        CdpFetchRouteRule {
+            id: id.to_owned(),
+            url: url.to_owned(),
+            match_kind,
+            resource_type: None,
+            action: CdpFetchRouteAction::Fulfill(CdpFetchRouteFulfill {
+                status: 201,
+                response_phrase: Some("Created".to_owned()),
+                headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                body_base64: Some("eyJvayI6dHJ1ZX0=".to_owned()),
+            }),
+        }
+    }
+
     #[test]
     fn ring_buffer_keeps_bounded_request_records_and_evicts_oldest() {
         let mut buffer = RingBuffer::new(2);
@@ -1260,5 +1680,97 @@ mod tests {
     fn fetch_request_id_string_round_trips_generated_id() {
         let request_id = FetchRequestId::from("intercept-1".to_owned());
         assert_eq!(fetch_request_id_string(&request_id), "intercept-1");
+    }
+
+    #[test]
+    fn fetch_route_glob_matches_url_with_star_and_question_mark() {
+        assert!(glob_matches(
+            "https://example.test/api/*/user?.json",
+            "https://example.test/api/v1/user1.json"
+        ));
+        assert!(!glob_matches(
+            "https://example.test/api/*/user?.json",
+            "https://example.test/assets/user1.json"
+        ));
+    }
+
+    #[test]
+    fn fetch_route_match_supports_regex_and_first_match_order() {
+        let event = paused_event("fetch-1", "https://example.test/api/users/42", "XHR");
+        let first = fulfill_rule(
+            "first",
+            r"^https://example\.test/api/users/\d+$",
+            CdpFetchRouteMatchKind::Regex,
+        );
+        let second = fulfill_rule(
+            "second",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+
+        let matched = fetch_route_match(&event, &[first, second]).expect("matched route");
+        assert_eq!(matched.id, "first");
+    }
+
+    #[test]
+    fn fetch_route_match_respects_resource_type() {
+        let event = paused_event("fetch-1", "https://example.test/api/users", "XHR");
+        let mut document_rule = fulfill_rule(
+            "document",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        document_rule.resource_type = Some("Document".to_owned());
+        let mut xhr_rule = fulfill_rule(
+            "xhr",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        xhr_rule.resource_type = Some("XHR".to_owned());
+
+        let matched =
+            fetch_route_match(&event, &[document_rule, xhr_rule]).expect("matched xhr route");
+        assert_eq!(matched.id, "xhr");
+    }
+
+    #[test]
+    fn fetch_route_validation_rejects_bad_values() {
+        let mut rule = fulfill_rule(
+            "bad id",
+            "https://example.test/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        assert!(validate_fetch_route_rule(&rule).is_err());
+
+        rule.id = "ok".to_owned();
+        rule.url = "[".to_owned();
+        rule.match_kind = CdpFetchRouteMatchKind::Regex;
+        assert!(validate_fetch_route_rule(&rule).is_err());
+
+        rule.url = "https://example.test/*".to_owned();
+        rule.match_kind = CdpFetchRouteMatchKind::Glob;
+        let CdpFetchRouteAction::Fulfill(fulfill) = &mut rule.action;
+        fulfill.status = 99;
+        assert!(validate_fetch_route_rule(&rule).is_err());
+    }
+
+    #[test]
+    fn fetch_fulfill_params_serializes_status_headers_phrase_and_body() {
+        let CdpFetchRouteAction::Fulfill(fulfill) = fulfill_rule(
+            "route-1",
+            "https://example.test/*",
+            CdpFetchRouteMatchKind::Glob,
+        )
+        .action;
+        let params = fetch_fulfill_params(FetchRequestId::from("intercept-1".to_owned()), &fulfill)
+            .expect("fulfill params");
+        let value = serde_json::to_value(params).expect("params json");
+
+        assert_eq!(value["requestId"], "intercept-1");
+        assert_eq!(value["responseCode"], 201);
+        assert_eq!(value["responsePhrase"], "Created");
+        assert_eq!(value["body"], "eyJvayI6dHJ1ZX0=");
+        assert_eq!(value["responseHeaders"][0]["name"], "content-type");
+        assert_eq!(value["responseHeaders"][0]["value"], "application/json");
     }
 }
