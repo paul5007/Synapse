@@ -27,30 +27,30 @@ use super::{
     ProfileRegistryRollbackParams, ProfileRegistryRollbackResponse, ReflexCancelParams,
     ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse, ReflexListParams,
     ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse, ReplayRecordParams,
-    ReplayRecordResponse, RoutineInspectParams, RoutineInspectResponse, RoutineListParams,
-    RoutineListResponse, RoutineMineParams, RoutineMineResponse, RoutineUpdateParams,
-    RoutineUpdateResponse, StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams,
-    StorageInspectResponse, StoragePressureSampleParams, StoragePressureSampleResponse,
-    StoragePutProbeRowsParams, StoragePutProbeRowsResponse, SubscribeCancelParams,
-    SubscribeCancelResponse, SubscribeParams, SubscribeResponse, SynapseService,
-    TimelineExclusionsParams, TimelineExclusionsResponse, TimelinePauseParams,
-    TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse, TimelineResumeParams,
-    TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
+    ReplayRecordResponse, RoutineAutomateParams, RoutineAutomateResponse, RoutineInspectParams,
+    RoutineInspectResponse, RoutineListParams, RoutineListResponse, RoutineMineParams,
+    RoutineMineResponse, RoutineUpdateParams, RoutineUpdateResponse, StorageGcOnceParams,
+    StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
+    StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
+    StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
+    SubscribeResponse, SynapseService, TimelineExclusionsParams, TimelineExclusionsResponse,
+    TimelinePauseParams, TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse,
+    TimelineResumeParams, TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
     apply_storage_pressure_sample, cancel_file_jsonl_tail_watcher, cancel_reflex,
     cancel_subscription, decide_approval, decide_profile_authoring_candidate,
     disable_registry_profile, export_audit_bundle, export_profile_authoring_candidate,
-    export_registry, generate_profile_authoring_candidate, get_episode, history_reflexes,
-    import_registry, inspect_profile_authoring_candidate, inspect_routine, inspect_storage,
-    install_file_jsonl_tail_watcher, install_registry_package, list_approvals, list_episodes,
-    list_local_models, list_profile_authoring_candidates, list_profiles, list_reflexes,
-    list_routines, mine_and_store_routines, pause_timeline, prepare_activation_links,
-    probe_local_model, purge_timeline, put_probe_rows, query_audit_intelligence, query_flags,
-    query_registry, record_replay, refresh_profile_quality, register_local_model, register_reflex,
-    remove_local_model, request_approval, resume_timeline, rollback_registry_profile,
-    run_storage_gc_once, scan_storage, scan_text_tool, search_timeline, segment_episodes,
-    start_demo_recording, stop_demo_recording, subscribe_to_events, tail_audio, tool, tool_router,
-    transcribe_audio, update_approval_toast_state, update_local_model, update_routine,
-    update_timeline_exclusions,
+    export_registry, generate_profile_authoring_candidate, generate_routine_automation_candidate,
+    get_episode, history_reflexes, import_registry, inspect_profile_authoring_candidate,
+    inspect_routine, inspect_storage, install_file_jsonl_tail_watcher, install_registry_package,
+    list_approvals, list_episodes, list_local_models, list_profile_authoring_candidates,
+    list_profiles, list_reflexes, list_routines, mine_and_store_routines, pause_timeline,
+    prepare_activation_links, probe_local_model, purge_timeline, put_probe_rows,
+    query_audit_intelligence, query_flags, query_registry, record_replay, refresh_profile_quality,
+    register_local_model, register_reflex, remove_local_model, request_approval, resume_timeline,
+    rollback_registry_profile, run_storage_gc_once, scan_storage, scan_text_tool, search_timeline,
+    segment_episodes, start_demo_recording, stop_demo_recording, subscribe_to_events, tail_audio,
+    tool, tool_router, transcribe_audio, update_approval_toast_state, update_local_model,
+    update_routine, update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 use serde_json::{Value, json};
@@ -351,6 +351,33 @@ impl SynapseService {
         generate_profile_authoring_candidate(&profile_runtime, &reflex_runtime, &params.0).map(Json)
     }
 
+    #[tool(
+        description = "Promote one mined routine into a reviewable profile-authoring automation candidate (#861). Loads the mined routine, compiles/stores its setup plan, writes a normal profile_authoring candidate whose patch describes the full agent task including judgment-required steps, and writes routine_automation/v1/<routine_id> status so routine_inspect shows candidate/installed/rejected state. Use profile_authoring_inspect/decide/export for review and installation."
+    )]
+    pub async fn routine_automate(
+        &self,
+        params: Parameters<RoutineAutomateParams>,
+    ) -> Result<Json<RoutineAutomateResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "routine_automate",
+            routine_id = %params.0.routine_id,
+            profile_id = ?params.0.profile_id,
+            candidate_id = ?params.0.candidate_id,
+            store_plan = params.0.store_plan,
+            "tool.invocation kind=routine_automate"
+        );
+        self.require_m3_permissions(
+            "routine_automate",
+            &crate::m3::profile_authoring::required_permissions_routine_automate(&params.0),
+        )?;
+        let profile_runtime = self.profile_runtime()?;
+        let reflex_runtime = self.reflex_runtime()?;
+        let db = self.m3_storage()?;
+        generate_routine_automation_candidate(&profile_runtime, &reflex_runtime, &db, &params.0)
+            .map(Json)
+    }
+
     #[tool(description = "List local profile authoring candidates")]
     pub async fn profile_authoring_list(
         &self,
@@ -409,7 +436,9 @@ impl SynapseService {
         )?;
         let profile_runtime = self.profile_runtime()?;
         let reflex_runtime = self.reflex_runtime()?;
-        decide_profile_authoring_candidate(&profile_runtime, &reflex_runtime, &params.0).map(Json)
+        let db = self.m3_storage()?;
+        decide_profile_authoring_candidate(&profile_runtime, &reflex_runtime, &db, &params.0)
+            .map(Json)
     }
 
     #[tool(description = "Export a local profile authoring candidate bundle")]

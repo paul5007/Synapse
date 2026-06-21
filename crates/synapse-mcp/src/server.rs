@@ -117,9 +117,10 @@ use crate::{
             ProfileAuthoringExportParams, ProfileAuthoringExportResponse,
             ProfileAuthoringGenerateParams, ProfileAuthoringGenerateResponse,
             ProfileAuthoringInspectParams, ProfileAuthoringInspectResponse,
-            ProfileAuthoringListParams, ProfileAuthoringListResponse,
-            decide_profile_authoring_candidate, export_profile_authoring_candidate,
-            generate_profile_authoring_candidate, inspect_profile_authoring_candidate,
+            ProfileAuthoringListParams, ProfileAuthoringListResponse, RoutineAutomateParams,
+            RoutineAutomateResponse, decide_profile_authoring_candidate,
+            export_profile_authoring_candidate, generate_profile_authoring_candidate,
+            generate_routine_automation_candidate, inspect_profile_authoring_candidate,
             list_profile_authoring_candidates,
         },
         profile_quality::{

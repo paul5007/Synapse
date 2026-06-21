@@ -49,6 +49,7 @@ use super::episodes::{
     decode_episode_row, hex_encode, key_after, local_day_start, next_local_day_start, now_ts_ns,
 };
 use super::hygiene::{HygieneTaintRecord, read_taint_record_from_db};
+use super::profile_authoring::{RoutineAutomationRecord, load_routine_automation_record};
 use super::{
     M3ToolStub,
     permissions::{Permission, RequiredPermissions, required},
@@ -1021,6 +1022,10 @@ pub struct RoutineInspectResponse {
     /// Exact `hygiene/taint/v1/routine/<routine_id>` ledger row, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taint: Option<HygieneTaintRecord>,
+    /// Automation candidate/install state written by `routine_automate` and
+    /// updated by `profile_authoring_decide`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<RoutineAutomationRecord>,
 }
 
 /// Lifecycle operations accepted by `routine_update`.
@@ -1315,6 +1320,7 @@ pub fn inspect_routine(
     };
     let taint = read_taint_record_from_db(db, "routine", &params.routine_id)?;
     let tainted = taint.is_some();
+    let automation = load_routine_automation_record(db, &params.routine_id)?;
     Ok(RoutineInspectResponse {
         routine_id: params.routine_id.clone(),
         mined: record.is_some(),
@@ -1323,6 +1329,7 @@ pub fn inspect_routine(
         state,
         tainted,
         taint,
+        automation,
     })
 }
 

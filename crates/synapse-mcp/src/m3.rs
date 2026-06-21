@@ -612,7 +612,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 56] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 57] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -627,6 +627,7 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 56] {
         profile_authoring::profile_authoring_inspect(),
         profile_authoring::profile_authoring_decide(),
         profile_authoring::profile_authoring_export(),
+        profile_authoring::routine_automate(),
         profile_quality::profile_quality_refresh(),
         profile_registry::profile_registry_query(),
         profile_registry::profile_registry_install(),

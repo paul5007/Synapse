@@ -87,6 +87,7 @@ fn m3_tool_stub_names_are_stable() {
         "profile_authoring_inspect",
         "profile_authoring_decide",
         "profile_authoring_export",
+        "routine_automate",
         "profile_quality_refresh",
         "profile_registry_query",
         "profile_registry_install",

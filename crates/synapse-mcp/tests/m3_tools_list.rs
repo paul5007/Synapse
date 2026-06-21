@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 51] = [
+const EXPECTED_TOOLS: [&str; 52] = [
     "act_click",
     "act_clipboard",
     "act_keymap",
@@ -48,6 +48,7 @@ const EXPECTED_TOOLS: [&str; 51] = [
     "reflex_register",
     "release_all",
     "replay_record",
+    "routine_automate",
     "set_capture_target",
     "set_perception_mode",
     "storage_gc_once",
@@ -556,6 +557,7 @@ fn read_required_fields(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
     read_required(readbacks, tools, "profile_authoring_decide", "decision")?;
     read_required(readbacks, tools, "profile_authoring_export", "candidate_id")?;
     read_required(readbacks, tools, "profile_authoring_export", "output_path")?;
+    read_required(readbacks, tools, "routine_automate", "routine_id")?;
     read_required(readbacks, tools, "profile_quality_refresh", "profile_id")?;
     read_required(
         readbacks,

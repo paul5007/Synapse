@@ -10,20 +10,23 @@ use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use synapse_core::{Backend, ProfileId, ProfileUseScope, error_codes};
+use synapse_core::{Backend, ProfileId, ProfileUseScope, error_codes, types::RoutineRecord};
 use synapse_profiles::{ProfileError, ProfileRuntime, ProfileStatus};
 use synapse_reflex::ReflexRuntime;
-use synapse_storage::{cf, decode_json, encode_json};
+use synapse_storage::{Db, cf, decode_json, encode_json};
 
 use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
     permissions::{Permission, RequiredPermissions, normalize_replay_path, replay_root, required},
+    plan::{PlanDocument, RoutineCompilePlanParams, compile_routine_plan},
+    routines::{load_routine_record, validate_routine_id_param},
 };
 
 const AUTHORING_PREFIX: &str = "profile_authoring/v1/";
 const CANDIDATE_PREFIX: &str = "profile_authoring/v1/candidate/";
+const ROUTINE_AUTOMATION_PREFIX: &str = "routine_automation/v1/";
 const AUTHORING_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MAX_AUDIT_ROWS: u32 = 500;
 const DEFAULT_MAX_REPLAY_ROWS: u32 = 500;
@@ -33,6 +36,10 @@ const CANDIDATE_ID_HASH_CHARS: usize = 16;
 
 type RawStorageRow = (Vec<u8>, Vec<u8>);
 type RawStorageRows = Vec<RawStorageRow>;
+
+const fn default_true() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +99,19 @@ pub struct ProfileAuthoringDecideParams {
 pub struct ProfileAuthoringExportParams {
     pub candidate_id: String,
     pub output_path: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineAutomateParams {
+    pub routine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<ProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
+    pub store_plan: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -229,6 +249,42 @@ pub struct ProfileAuthoringExportResponse {
     pub state: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineAutomationRecord {
+    pub schema_version: u32,
+    pub row_kind: String,
+    pub routine_id: String,
+    pub profile_id: ProfileId,
+    pub candidate_id: String,
+    pub candidate_row_key: String,
+    pub plan_ref: String,
+    pub state: String,
+    pub generated_at_ns: u64,
+    pub updated_at_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_at_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_at_ns: Option<u64>,
+    pub plan_fully_deterministic: bool,
+    pub total_steps: u32,
+    pub deterministic_steps: u32,
+    pub agent_task_steps: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineAutomateResponse {
+    pub cf_name: String,
+    pub row_key: String,
+    pub wrote_row: bool,
+    pub active_profile_id: Option<ProfileId>,
+    pub candidate: ProfileAuthoringCandidate,
+    pub summary: ProfileAuthoringCandidateSummary,
+    pub plan: PlanDocument,
+    pub automation: RoutineAutomationRecord,
+}
+
 #[must_use]
 pub const fn profile_authoring_generate() -> M3ToolStub {
     M3ToolStub::new("profile_authoring_generate")
@@ -252,6 +308,11 @@ pub const fn profile_authoring_decide() -> M3ToolStub {
 #[must_use]
 pub const fn profile_authoring_export() -> M3ToolStub {
     M3ToolStub::new("profile_authoring_export")
+}
+
+#[must_use]
+pub const fn routine_automate() -> M3ToolStub {
+    M3ToolStub::new("routine_automate")
 }
 
 #[must_use]
@@ -294,6 +355,17 @@ pub fn required_permissions_decide(params: &ProfileAuthoringDecideParams) -> Req
 #[must_use]
 pub fn required_permissions_export(_params: &ProfileAuthoringExportParams) -> RequiredPermissions {
     required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_routine_automate(
+    _params: &RoutineAutomateParams,
+) -> RequiredPermissions {
+    required([
+        Permission::ReadProfile,
+        Permission::ReadStorage,
+        Permission::WriteStorage,
+    ])
 }
 
 pub fn generate_profile_authoring_candidate(
@@ -382,6 +454,173 @@ pub fn generate_profile_authoring_candidate(
     })
 }
 
+pub fn generate_routine_automation_candidate(
+    profile_runtime: &ProfileRuntime,
+    reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &Arc<Db>,
+    params: &RoutineAutomateParams,
+) -> Result<RoutineAutomateResponse, ErrorData> {
+    validate_routine_id_param("routine_automate", &params.routine_id)?;
+    let profile_id = resolve_routine_automation_profile_id(profile_runtime, params)?;
+    let profile = profile_status(profile_runtime, &profile_id)?;
+    let Some(routine) = load_routine_record(db, &params.routine_id)? else {
+        return Err(authoring_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "ROUTINE_NOT_MINED: routine_id {} is not in CF_ROUTINES; nothing to automate",
+                params.routine_id
+            ),
+            json!({
+                "routine_id": params.routine_id,
+                "cf_name": cf::CF_ROUTINES,
+            }),
+        ));
+    };
+    if !db.pressure_permits_write(cf::CF_KV) {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "routine_automate refused under disk pressure: cf_name={} pressure_level={:?}",
+                cf::CF_KV,
+                db.pressure_level()
+            ),
+        ));
+    }
+
+    let plan_response = compile_routine_plan(
+        db,
+        &RoutineCompilePlanParams {
+            routine_id: params.routine_id.clone(),
+            store: params.store_plan,
+        },
+    )?;
+    let plan = plan_response.plan;
+    let now_ns = now_ns();
+    let evidence_hash = routine_automation_evidence_hash(&profile.id, &routine, &plan)?;
+    let candidate_id = params
+        .candidate_id
+        .as_deref()
+        .map(normalized_candidate_id)
+        .transpose()?
+        .unwrap_or_else(|| routine_automation_candidate_id(&routine.routine_id, &evidence_hash));
+    let row_key = candidate_key(&candidate_id);
+    let plan_ref = format!("plan/v1/{}", routine.routine_id);
+    let patch = routine_automation_patch(&profile, &routine, &plan, &candidate_id, &plan_ref);
+    let evidence_summary =
+        routine_automation_evidence_summary(&routine, &plan, plan_response.stored);
+    let expected_improvement = vec![
+        format!(
+            "Promote routine {} into a reviewable, armable automation candidate",
+            routine.routine_id
+        ),
+        format!(
+            "Preserve {} compiled setup steps, including {} judgment-required agent task stubs",
+            plan.total_steps, plan.agent_task_steps
+        ),
+        "Reuse profile_authoring_inspect/decide/export for operator review and installation state"
+            .to_owned(),
+    ];
+    let candidate = ProfileAuthoringCandidate {
+        schema_version: AUTHORING_SCHEMA_VERSION,
+        row_kind: "profile_authoring_candidate".to_owned(),
+        candidate_id,
+        profile_id: profile.id.clone(),
+        state: "candidate".to_owned(),
+        generated_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        accepted_at_ns: None,
+        rejected_at_ns: None,
+        operator_note: None,
+        rejection_reason: None,
+        source: ProfileAuthoringSource {
+            audit_cf_name: cf::CF_ROUTINES.to_owned(),
+            profile_cf_name: cf::CF_PROFILES.to_owned(),
+            replay_path: None,
+            audit_rows_scanned: 1,
+            audit_rows_relevant: 1,
+            replay_rows_scanned: 0,
+            replay_rows_relevant: 0,
+            source_row_keys: vec![hex_encode(routine.routine_id.as_bytes())],
+            source_audit_ids: routine
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.episode_ids.iter().cloned())
+                .collect(),
+            evidence_hash,
+        },
+        evidence_summary,
+        expected_improvement,
+        patch,
+        safety_review: ProfileAuthoringSafetyReview {
+            activation: ProfileAuthoringActivationReview {
+                required: true,
+                active_on_accept: false,
+            },
+            contribution: ProfileAuthoringContributionReview {
+                registry_allowed: false,
+                external_sharing_allowed: false,
+            },
+            unsafe_permission_escalation: false,
+            rejected_reasons: Vec::new(),
+        },
+    };
+    let encoded = encode_candidate(&candidate)?;
+    let runtime = lock_runtime(reflex_runtime, "writing routine automation candidate")?;
+    runtime
+        .storage_put_profile_rows(vec![(row_key.as_bytes().to_vec(), encoded)])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let readback = runtime
+        .storage_profile_row(row_key.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                "routine automation candidate was not readable after write",
+            )
+        })?;
+    drop(runtime);
+    let candidate = decode_candidate(&readback)?;
+    let summary = candidate_summary(&row_key, &candidate, readback.len());
+    let automation = RoutineAutomationRecord {
+        schema_version: AUTHORING_SCHEMA_VERSION,
+        row_kind: "routine_automation".to_owned(),
+        routine_id: routine.routine_id.clone(),
+        profile_id: profile.id,
+        candidate_id: candidate.candidate_id.clone(),
+        candidate_row_key: row_key.clone(),
+        plan_ref,
+        state: "candidate".to_owned(),
+        generated_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        installed_at_ns: None,
+        rejected_at_ns: None,
+        plan_fully_deterministic: plan.fully_deterministic,
+        total_steps: plan.total_steps,
+        deterministic_steps: plan.deterministic_steps,
+        agent_task_steps: plan.agent_task_steps,
+    };
+    write_routine_automation_record(db, &automation)?;
+    let automation = load_routine_automation_record(db, &routine.routine_id)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            "routine automation row was not readable after write",
+        )
+    })?;
+    let active_profile_id = profile_runtime
+        .active_profile_id()
+        .map_err(|error| profile_error(&error))?;
+    Ok(RoutineAutomateResponse {
+        cf_name: cf::CF_PROFILES.to_owned(),
+        row_key,
+        wrote_row: true,
+        active_profile_id,
+        candidate,
+        summary,
+        plan,
+        automation,
+    })
+}
+
 pub fn list_profile_authoring_candidates(
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
     params: &ProfileAuthoringListParams,
@@ -465,14 +704,15 @@ pub fn inspect_profile_authoring_candidate(
 pub fn decide_profile_authoring_candidate(
     profile_runtime: &ProfileRuntime,
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &Arc<Db>,
     params: &ProfileAuthoringDecideParams,
 ) -> Result<ProfileAuthoringDecideResponse, ErrorData> {
     validate_decide_fields(params)?;
     match params.decision {
         ProfileAuthoringDecision::Accept => {
-            decide_accept_candidate(profile_runtime, reflex_runtime, params)
+            decide_accept_candidate(profile_runtime, reflex_runtime, db, params)
         }
-        ProfileAuthoringDecision::Reject => decide_reject_candidate(reflex_runtime, params),
+        ProfileAuthoringDecision::Reject => decide_reject_candidate(reflex_runtime, db, params),
     }
 }
 
@@ -503,6 +743,7 @@ fn validate_decide_fields(params: &ProfileAuthoringDecideParams) -> Result<(), E
 fn decide_accept_candidate(
     profile_runtime: &ProfileRuntime,
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &Arc<Db>,
     params: &ProfileAuthoringDecideParams,
 ) -> Result<ProfileAuthoringDecideResponse, ErrorData> {
     let candidate_id = normalized_candidate_id(&params.candidate_id)?;
@@ -531,6 +772,7 @@ fn decide_accept_candidate(
         ));
     };
     let candidate = read_candidate_required(reflex_runtime, &row_key)?.0;
+    maybe_mark_routine_automation_decision(db, &candidate, "installed", candidate.accepted_at_ns)?;
     let active_profile_id = profile_runtime
         .active_profile_id()
         .map_err(|error| profile_error(&error))?;
@@ -551,6 +793,7 @@ fn decide_accept_candidate(
 
 fn decide_reject_candidate(
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &Arc<Db>,
     params: &ProfileAuthoringDecideParams,
 ) -> Result<ProfileAuthoringDecideResponse, ErrorData> {
     let candidate_id = normalized_candidate_id(&params.candidate_id)?;
@@ -579,6 +822,7 @@ fn decide_reject_candidate(
         ));
     };
     let candidate = read_candidate_required(reflex_runtime, &row_key)?.0;
+    maybe_mark_routine_automation_decision(db, &candidate, "rejected", candidate.rejected_at_ns)?;
     Ok(ProfileAuthoringDecideResponse {
         cf_name: cf::CF_PROFILES.to_owned(),
         row_key,
@@ -681,6 +925,271 @@ pub fn export_profile_authoring_candidate(
         profile_id: candidate.profile_id,
         state: candidate.state,
     })
+}
+
+pub(crate) fn load_routine_automation_record(
+    db: &Arc<Db>,
+    routine_id: &str,
+) -> Result<Option<RoutineAutomationRecord>, ErrorData> {
+    validate_routine_id_param("routine_inspect", routine_id)?;
+    let key = routine_automation_key(routine_id);
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, key.as_bytes())
+        .map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!("routine automation storage read failed: {error}"),
+            )
+        })?;
+    match rows
+        .into_iter()
+        .find(|(row_key, _)| row_key == key.as_bytes())
+    {
+        Some((_key, value)) => decode_json::<RoutineAutomationRecord>(&value)
+            .map(Some)
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!("ROUTINE_AUTOMATION_ROW_DECODE_FAILED for {routine_id}: {error}"),
+                )
+            }),
+        None => Ok(None),
+    }
+}
+
+fn resolve_routine_automation_profile_id(
+    runtime: &ProfileRuntime,
+    params: &RoutineAutomateParams,
+) -> Result<ProfileId, ErrorData> {
+    if let Some(profile_id) = params.profile_id.as_ref() {
+        return Ok(profile_id.clone());
+    }
+    runtime
+        .active_profile_id()
+        .map_err(|error| profile_error(&error))?
+        .ok_or_else(|| {
+            authoring_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "routine_automate requires profile_id when no active profile is set",
+                json!({
+                    "routine_id": params.routine_id,
+                    "missing_field": "profile_id",
+                }),
+            )
+        })
+}
+
+fn routine_automation_key(routine_id: &str) -> String {
+    format!("{ROUTINE_AUTOMATION_PREFIX}{routine_id}")
+}
+
+fn write_routine_automation_record(
+    db: &Arc<Db>,
+    record: &RoutineAutomationRecord,
+) -> Result<(), ErrorData> {
+    let key = routine_automation_key(&record.routine_id);
+    let value = encode_json(record).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "failed to encode routine automation row for {}: {error}",
+                record.routine_id
+            ),
+        )
+    })?;
+    db.put_batch_pressure_bypass(cf::CF_KV, [(key.into_bytes(), value)])
+        .map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "failed to persist routine automation row for {}: {error}",
+                    record.routine_id
+                ),
+            )
+        })
+}
+
+fn maybe_mark_routine_automation_decision(
+    db: &Arc<Db>,
+    candidate: &ProfileAuthoringCandidate,
+    state: &str,
+    decided_at_ns: Option<u64>,
+) -> Result<(), ErrorData> {
+    let Some(routine_id) = routine_id_from_candidate(candidate) else {
+        return Ok(());
+    };
+    let Some(mut record) = load_routine_automation_record(db, &routine_id)? else {
+        return Ok(());
+    };
+    if record.candidate_id != candidate.candidate_id {
+        return Ok(());
+    }
+    record.state = state.to_owned();
+    record.updated_at_ns = decided_at_ns.unwrap_or_else(now_ns);
+    match state {
+        "installed" => {
+            record.installed_at_ns = Some(record.updated_at_ns);
+            record.rejected_at_ns = None;
+        }
+        "rejected" => {
+            record.rejected_at_ns = Some(record.updated_at_ns);
+        }
+        _ => {}
+    }
+    write_routine_automation_record(db, &record)
+}
+
+fn routine_id_from_candidate(candidate: &ProfileAuthoringCandidate) -> Option<String> {
+    candidate
+        .patch
+        .pointer("/routine_automation/routine_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn routine_automation_candidate_id(routine_id: &str, evidence_hash: &str) -> String {
+    let suffix = evidence_hash
+        .strip_prefix("sha256:")
+        .unwrap_or(evidence_hash)
+        .chars()
+        .take(CANDIDATE_ID_HASH_CHARS)
+        .collect::<String>();
+    format!("routine-auto.{routine_id}.{suffix}")
+}
+
+fn routine_automation_evidence_hash(
+    profile_id: &str,
+    routine: &RoutineRecord,
+    plan: &PlanDocument,
+) -> Result<String, ErrorData> {
+    let payload = json!({
+        "kind": "routine_automation",
+        "profile_id": profile_id,
+        "routine": routine,
+        "plan": {
+            "record_version": plan.record_version,
+            "routine_id": &plan.routine_id,
+            "granularity": &plan.granularity,
+            "schedule_label": &plan.schedule_label,
+            "total_steps": plan.total_steps,
+            "deterministic_steps": plan.deterministic_steps,
+            "agent_task_steps": plan.agent_task_steps,
+            "fully_deterministic": plan.fully_deterministic,
+            "steps": &plan.steps,
+        },
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("routine automation evidence hash encode failed: {error}"),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("sha256:{}", hex_encode(&hasher.finalize())))
+}
+
+fn routine_automation_evidence_summary(
+    routine: &RoutineRecord,
+    plan: &PlanDocument,
+    plan_stored: bool,
+) -> Value {
+    json!({
+        "source": "routine_automate",
+        "routine_id": &routine.routine_id,
+        "granularity": &routine.granularity,
+        "schedule_label": &routine.schedule_label,
+        "support_days": routine.support_days,
+        "occurrence_count": routine.occurrence_count,
+        "confidence": routine.confidence,
+        "evidence_episode_ids": routine
+            .evidence
+            .iter()
+            .flat_map(|evidence| evidence.episode_ids.iter())
+            .collect::<Vec<_>>(),
+        "plan": {
+            "stored": plan_stored,
+            "total_steps": plan.total_steps,
+            "deterministic_steps": plan.deterministic_steps,
+            "agent_task_steps": plan.agent_task_steps,
+            "fully_deterministic": plan.fully_deterministic,
+        },
+    })
+}
+
+fn routine_automation_patch(
+    profile: &ProfileStatus,
+    routine: &RoutineRecord,
+    plan: &PlanDocument,
+    candidate_id: &str,
+    plan_ref: &str,
+) -> Value {
+    json!({
+        "schema_version": AUTHORING_SCHEMA_VERSION,
+        "kind": "routine_automation_candidate",
+        "profile_id": &profile.id,
+        "routine_automation": {
+            "routine_id": &routine.routine_id,
+            "candidate_id": candidate_id,
+            "candidate_row_key": candidate_key(candidate_id),
+            "profile_id": &profile.id,
+            "plan_ref": plan_ref,
+            "install_state_key": routine_automation_key(&routine.routine_id),
+            "source_routine": {
+                "granularity": &routine.granularity,
+                "schedule_label": &routine.schedule_label,
+                "mean_minute_of_day": routine.mean_minute_of_day,
+                "tolerance_minutes": routine.tolerance_minutes,
+                "support_days": routine.support_days,
+                "occurrence_count": routine.occurrence_count,
+                "confidence": routine.confidence,
+            },
+            "task": {
+                "title": routine_automation_title(routine),
+                "instructions": routine_automation_instructions(routine, plan),
+                "acceptance": [
+                    "Run the compiled setup plan steps in order.",
+                    "Verify every deterministic postcondition against physical source of truth.",
+                    "For agent_task steps, use the routine evidence and report success/failure explicitly.",
+                    "Do not arm unattended execution until the operator reviews and accepts this candidate."
+                ],
+            },
+            "compiled_plan": plan,
+        },
+        "safety": {
+            "activation_required": true,
+            "operator_review_required": true,
+            "auto_arm_on_accept": false,
+        },
+    })
+}
+
+fn routine_automation_title(routine: &RoutineRecord) -> String {
+    format!(
+        "Automate routine {} ({})",
+        routine.routine_id, routine.schedule_label
+    )
+}
+
+fn routine_automation_instructions(routine: &RoutineRecord, plan: &PlanDocument) -> Vec<String> {
+    let mut instructions = vec![
+        format!(
+            "Use source routine {} mined from {} occurrence(s) over {} support day(s).",
+            routine.routine_id, routine.occurrence_count, routine.support_days
+        ),
+        format!(
+            "Schedule signature: {}; confidence {:.3}.",
+            routine.schedule_label, routine.confidence
+        ),
+        "Execute setup steps through Synapse target-aware/background-first tools when possible; do not silently skip judgment-required steps.".to_owned(),
+    ];
+    instructions.extend(plan.steps.iter().map(|step| {
+        format!(
+            "Step {}: {}. Backend={:?}. Postcondition={:?}.",
+            step.index, step.action, step.backend, step.postcondition
+        )
+    }));
+    instructions
 }
 
 struct ReplayRecords {
@@ -1684,7 +2193,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use synapse_core::{Backend, PerceptionMode, ProfileBackends, ProfileUseScope};
+    use synapse_core::{
+        Backend, PerceptionMode, ProfileBackends, ProfileUseScope, SCHEMA_VERSION,
+        types::{RoutineDowClass, RoutineGranularity, RoutineStep},
+    };
+    use synapse_storage::Db;
+
+    fn temp_db() -> (tempfile::TempDir, Arc<Db>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Db::open(dir.path(), SCHEMA_VERSION).expect("open db"));
+        (dir, db)
+    }
 
     fn test_profile_status(profile_id: &str) -> ProfileStatus {
         ProfileStatus {
@@ -1708,6 +2227,44 @@ mod tests {
             matches: Vec::new(),
             metadata: BTreeMap::new(),
             source_path: PathBuf::from("notepad.toml"),
+        }
+    }
+
+    fn routine_step(app: &str, document: Option<&str>) -> RoutineStep {
+        RoutineStep {
+            app: app.to_owned(),
+            document: document.map(str::to_owned),
+        }
+    }
+
+    fn test_routine() -> RoutineRecord {
+        RoutineRecord {
+            record_version: 1,
+            ts_ns: 100,
+            routine_id: "rt1-0123456789abcdef".to_owned(),
+            granularity: RoutineGranularity::AppDocument,
+            steps: vec![
+                routine_step("chrome.exe", Some("mail.google.com")),
+                routine_step("excel.exe", Some("q3 report")),
+            ],
+            dow_class: RoutineDowClass::Weekdays,
+            mean_minute_of_day: 525,
+            tolerance_minutes: 20,
+            schedule_label: "weekdays 08:45+/-20m".to_owned(),
+            support_days: 5,
+            occurrence_count: 7,
+            opportunity_days: 8,
+            confidence: 0.61,
+            window_start_ns: 0,
+            window_end_ns: 10,
+            active_days_in_window: 8,
+            first_seen_day_start_ns: 1,
+            last_seen_day_start_ns: 9,
+            evidence: vec![synapse_core::types::RoutineEvidence {
+                day_start_ns: 1,
+                minute_of_day: 525,
+                episode_ids: vec!["ep1-alpha".to_owned(), "ep1-beta".to_owned()],
+            }],
         }
     }
 
@@ -1808,5 +2365,127 @@ mod tests {
             built.patch["safety"]["metadata"]["demo_recording"],
             json!("true")
         );
+    }
+
+    #[test]
+    fn routine_automation_patch_packages_plan_and_agent_task_steps() {
+        let profile = test_profile_status("excel");
+        let routine = test_routine();
+        let plan = crate::m3::plan::compile_plan(&routine, 123);
+        let patch = routine_automation_patch(
+            &profile,
+            &routine,
+            &plan,
+            "routine-auto.rt1-0123456789abcdef.feedfacefeedface",
+            "plan/v1/rt1-0123456789abcdef",
+        );
+
+        println!("readback=routine_automate_patch patch={patch}");
+        assert_eq!(patch["kind"], "routine_automation_candidate");
+        assert_eq!(
+            patch["routine_automation"]["routine_id"],
+            "rt1-0123456789abcdef"
+        );
+        assert_eq!(
+            patch["routine_automation"]["compiled_plan"]["agent_task_steps"],
+            1
+        );
+        assert!(
+            patch["routine_automation"]["task"]["instructions"]
+                .as_array()
+                .expect("instructions")
+                .iter()
+                .any(|value| value
+                    .as_str()
+                    .is_some_and(|line| line.contains("judgment-required")))
+        );
+    }
+
+    #[test]
+    fn routine_automation_decision_updates_durable_status_row() {
+        let (_dir, db) = temp_db();
+        let routine = test_routine();
+        let plan = crate::m3::plan::compile_plan(&routine, 123);
+        let profile = test_profile_status("excel");
+        let candidate_id = "routine-auto.rt1-0123456789abcdef.feedfacefeedface";
+        let row_key = candidate_key(candidate_id);
+        let record = RoutineAutomationRecord {
+            schema_version: AUTHORING_SCHEMA_VERSION,
+            row_kind: "routine_automation".to_owned(),
+            routine_id: routine.routine_id.clone(),
+            profile_id: profile.id.clone(),
+            candidate_id: candidate_id.to_owned(),
+            candidate_row_key: row_key.clone(),
+            plan_ref: "plan/v1/rt1-0123456789abcdef".to_owned(),
+            state: "candidate".to_owned(),
+            generated_at_ns: 123,
+            updated_at_ns: 123,
+            installed_at_ns: None,
+            rejected_at_ns: None,
+            plan_fully_deterministic: plan.fully_deterministic,
+            total_steps: plan.total_steps,
+            deterministic_steps: plan.deterministic_steps,
+            agent_task_steps: plan.agent_task_steps,
+        };
+        write_routine_automation_record(&db, &record).expect("write automation row");
+        let candidate = ProfileAuthoringCandidate {
+            schema_version: AUTHORING_SCHEMA_VERSION,
+            row_kind: "profile_authoring_candidate".to_owned(),
+            candidate_id: candidate_id.to_owned(),
+            profile_id: profile.id,
+            state: "accepted".to_owned(),
+            generated_at_ns: 123,
+            updated_at_ns: 456,
+            accepted_at_ns: Some(456),
+            rejected_at_ns: None,
+            operator_note: None,
+            rejection_reason: None,
+            source: ProfileAuthoringSource {
+                audit_cf_name: cf::CF_ROUTINES.to_owned(),
+                profile_cf_name: cf::CF_PROFILES.to_owned(),
+                replay_path: None,
+                audit_rows_scanned: 1,
+                audit_rows_relevant: 1,
+                replay_rows_scanned: 0,
+                replay_rows_relevant: 0,
+                source_row_keys: vec![],
+                source_audit_ids: vec![],
+                evidence_hash: "sha256:feedfacefeedface".to_owned(),
+            },
+            evidence_summary: json!({}),
+            expected_improvement: vec![],
+            patch: routine_automation_patch(
+                &test_profile_status("excel"),
+                &routine,
+                &plan,
+                candidate_id,
+                "plan/v1/rt1-0123456789abcdef",
+            ),
+            safety_review: ProfileAuthoringSafetyReview {
+                activation: ProfileAuthoringActivationReview {
+                    required: true,
+                    active_on_accept: false,
+                },
+                contribution: ProfileAuthoringContributionReview {
+                    registry_allowed: false,
+                    external_sharing_allowed: false,
+                },
+                unsafe_permission_escalation: false,
+                rejected_reasons: vec![],
+            },
+        };
+
+        maybe_mark_routine_automation_decision(&db, &candidate, "installed", Some(456))
+            .expect("mark installed");
+        let readback = load_routine_automation_record(&db, &routine.routine_id)
+            .expect("load automation")
+            .expect("automation row");
+        println!(
+            "readback=routine_automation state={} candidate_id={} routine_id={}",
+            readback.state, readback.candidate_id, readback.routine_id
+        );
+        assert_eq!(readback.state, "installed");
+        assert_eq!(readback.installed_at_ns, Some(456));
+        assert_eq!(readback.candidate_id, candidate_id);
     }
 }
