@@ -2874,7 +2874,7 @@ impl SynapseService {
 
 /// Resolves the calling session id for target tools, failing loud when absent
 /// (the target registry is per-session).
-fn require_target_session_id(
+pub(super) fn require_target_session_id(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<String, ErrorData> {
     super::context::mcp_session_id_from_request_context(request_context)?.ok_or_else(|| {
@@ -6766,7 +6766,7 @@ fn cdp_activate_resolution_request_details(
     })
 }
 
-fn cdp_target_id_audit_ref(target_id: Option<&str>) -> Value {
+pub(super) fn cdp_target_id_audit_ref(target_id: Option<&str>) -> Value {
     match target_id {
         Some(target_id) => json!({
             "present": true,
@@ -6873,7 +6873,7 @@ fn chrome_debugger_endpoint(extension_id: &str) -> String {
     format!("chrome-extension://{extension_id}/chrome.tabs")
 }
 
-fn validate_cdp_target_id(cdp_target_id: &str) -> Result<(), ErrorData> {
+pub(super) fn validate_cdp_target_id(cdp_target_id: &str) -> Result<(), ErrorData> {
     if cdp_target_id.trim().is_empty() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -8566,7 +8566,7 @@ struct BrowserContentPayload {
 /// Shared error for browser introspection tools when the owned target has no
 /// raw CDP debugging endpoint (the popup-safe extension bridge cannot serve it).
 #[cfg(windows)]
-fn browser_raw_cdp_required_error(tool: &str, window_hwnd: i64) -> ErrorData {
+pub(super) fn browser_raw_cdp_required_error(tool: &str, window_hwnd: i64) -> ErrorData {
     mcp_error(
         error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
         format!(

@@ -56,6 +56,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "browser_evaluate",
     "browser_inspect",
     "browser_locate",
+    "browser_network_requests",
     "browser_set_content",
     "browser_set_value",
     "browser_tabs",
@@ -136,6 +137,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_evaluate",
     "browser_inspect",
     "browser_locate",
+    "browser_network_requests",
     "browser_set_content",
     "browser_set_value",
     "browser_tabs",
@@ -1255,6 +1257,7 @@ mod tests {
                 "browser_add_script_tag",
                 "browser_add_style_tag",
                 "browser_evaluate",
+                "browser_network_requests",
                 "browser_set_content",
                 "browser_set_value",
                 "browser_wait_for",
@@ -1285,6 +1288,7 @@ mod tests {
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
         assert!(visible.contains(&"browser_add_script_tag".to_owned()));
         assert!(visible.contains(&"browser_add_style_tag".to_owned()));
+        assert!(visible.contains(&"browser_network_requests".to_owned()));
         assert!(visible.contains(&"browser_set_content".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
         assert!(visible.contains(&"browser_wait_for".to_owned()));
@@ -1353,6 +1357,7 @@ mod tests {
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
         assert!(visible.contains(&"browser_add_script_tag".to_owned()));
         assert!(visible.contains(&"browser_add_style_tag".to_owned()));
+        assert!(visible.contains(&"browser_network_requests".to_owned()));
         assert!(visible.contains(&"browser_set_content".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
         assert!(visible.contains(&"browser_wait_for".to_owned()));
