@@ -56,6 +56,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "browser_clock",
     "browser_console_messages",
     "browser_content",
+    "browser_device",
     "browser_evaluate",
     "browser_expose_binding",
     "browser_frames",
@@ -150,6 +151,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_clock",
     "browser_console_messages",
     "browser_content",
+    "browser_device",
     "browser_evaluate",
     "browser_expose_binding",
     "browser_frames",
@@ -1282,6 +1284,7 @@ mod tests {
                 "browser_add_init_script",
                 "browser_add_script_tag",
                 "browser_add_style_tag",
+                "browser_device",
                 "browser_evaluate",
                 "browser_expose_binding",
                 "browser_handle_dialog",
@@ -1322,6 +1325,7 @@ mod tests {
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
         assert!(visible.contains(&"browser_add_script_tag".to_owned()));
         assert!(visible.contains(&"browser_add_style_tag".to_owned()));
+        assert!(visible.contains(&"browser_device".to_owned()));
         assert!(visible.contains(&"browser_expose_binding".to_owned()));
         assert!(visible.contains(&"browser_handle_dialog".to_owned()));
         assert!(visible.contains(&"browser_network_har".to_owned()));
@@ -1399,6 +1403,7 @@ mod tests {
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
         assert!(visible.contains(&"browser_add_script_tag".to_owned()));
         assert!(visible.contains(&"browser_add_style_tag".to_owned()));
+        assert!(visible.contains(&"browser_device".to_owned()));
         assert!(visible.contains(&"browser_expose_binding".to_owned()));
         assert!(visible.contains(&"browser_handle_dialog".to_owned()));
         assert!(visible.contains(&"browser_network_har".to_owned()));
