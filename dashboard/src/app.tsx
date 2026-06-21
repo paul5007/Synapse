@@ -1153,6 +1153,7 @@ interface ApprovalRow {
   createdMs: number;
   updatedMs: number;
   expiresMs?: number;
+  timeoutDecision?: string;
   toolName?: string;
   spawnId?: string;
   command?: string;
@@ -1218,6 +1219,7 @@ function parseApprovalRows(panel?: DashboardState["approvals"]): ApprovalRow[] {
         updatedMs: Number(item.updated_at_unix_ms) || 0,
         expiresMs:
           item.expires_at_unix_ms == null ? undefined : Number(item.expires_at_unix_ms),
+        timeoutDecision: rawText(item.timeout_decision) || undefined,
         toolName: rawText(payload.tool_name) || undefined,
         spawnId: rawText(payload.spawn_id) || undefined,
         command,
@@ -1241,9 +1243,26 @@ const APPROVAL_KIND_LABEL: Record<string, string> = {
 // Kinds that represent an agent stopped waiting on a human (#1027/#1028): they
 // belong in the fleet "Agents awaiting your decision" attention section.
 const AGENT_ATTENTION_KINDS = ["agent_permission", "agent_escalation", "agent_question"];
+const TERMINAL_APPROVAL_STATUSES = new Set(["accepted", "declined", "ignored"]);
+
+function approvalRowIsTerminal(row: ApprovalRow): boolean {
+  return TERMINAL_APPROVAL_STATUSES.has(row.status.toLowerCase());
+}
+
+function approvalRowIsBatchSelectable(row: ApprovalRow): boolean {
+  // Question approvals need per-card response text, so they are not safe for
+  // one-click batch approval.
+  return !approvalRowIsTerminal(row) && !row.allow.respond && (row.allow.accept || row.allow.ignore);
+}
+
+function approvalRowSupportsBatchDecision(row: ApprovalRow, decision: "approve" | "deny"): boolean {
+  if (!approvalRowIsBatchSelectable(row)) return false;
+  return decision === "approve" ? row.allow.accept : row.allow.ignore;
+}
 
 function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided?: () => void }) {
   const rows = useMemo(() => parseApprovalRows(state?.approvals), [state]);
+  const rowsById = useMemo(() => new Map(rows.map((row) => [row.approvalId, row])), [rows]);
   const agentRows = useMemo(
     () => rows.filter((row) => AGENT_ATTENTION_KINDS.includes(row.kind)),
     [rows]
@@ -1296,6 +1315,8 @@ function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided
 
   async function decideSelected(decision: "approve" | "deny") {
     for (const id of Array.from(selected)) {
+      const row = rowsById.get(id);
+      if (!row || !approvalRowSupportsBatchDecision(row, decision)) continue;
       // Sequential so one failure surfaces against its own card without
       // racing the shared refetch.
       // eslint-disable-next-line no-await-in-loop
@@ -1304,6 +1325,8 @@ function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided
   }
 
   function toggleSelected(approvalId: string) {
+    const row = rowsById.get(approvalId);
+    if (!row || !approvalRowIsBatchSelectable(row)) return;
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(approvalId)) next.delete(approvalId);
@@ -1312,7 +1335,10 @@ function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided
     });
   }
 
-  const selectedCount = selected.size;
+  const selectedCount = Array.from(selected).filter((id) => {
+    const row = rowsById.get(id);
+    return row ? approvalRowIsBatchSelectable(row) : false;
+  }).length;
 
   return (
     <div className="space-y-6">
@@ -1418,13 +1444,21 @@ function ApprovalCard({
   onDeny: () => void;
 }) {
   const kindLabel = APPROVAL_KIND_LABEL[row.kind] ?? row.kind;
-  const expiresInMs = row.expiresMs ? row.expiresMs - Date.now() : undefined;
+  const nowMs = Date.now();
+  const createdAgeMs = row.createdMs ? Math.max(0, nowMs - row.createdMs) : undefined;
+  const expiresInMs = row.expiresMs ? row.expiresMs - nowMs : undefined;
   const expiresLabel =
     expiresInMs === undefined
       ? undefined
       : expiresInMs <= 0
         ? "expired"
         : `expires in ${Math.max(1, Math.round(expiresInMs / 60000))}m`;
+  const timeoutLabel =
+    expiresLabel && row.timeoutDecision
+      ? `${expiresLabel} · default ${row.timeoutDecision}`
+      : expiresLabel;
+  const terminal = approvalRowIsTerminal(row);
+  const batchSelectable = approvalRowIsBatchSelectable(row);
 
   // #1030 affordances. `respond` items are questions answered by the operator;
   // `edit` items let the operator replace the proposed tool args before it runs.
@@ -1439,9 +1473,10 @@ function ApprovalCard({
   const [editError, setEditError] = useState("");
   const [responseText, setResponseText] = useState("");
 
-  const denyDisabled = busy || (requireNoteToDeny && !note.trim());
+  const denyDisabled = busy || terminal || (requireNoteToDeny && !note.trim());
 
   function submitApprove() {
+    if (terminal) return;
     if (isQuestion) {
       onApprove({ response: responseText.trim() });
       return;
@@ -1470,14 +1505,23 @@ function ApprovalCard({
         <input
           type="checkbox"
           aria-label="Select approval"
-          checked={selected}
+          checked={batchSelectable && selected}
           onChange={onToggleSelected}
+          disabled={!batchSelectable}
           className="mt-1 size-4 accent-[var(--accent)]"
         />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="rounded bg-canvas px-2 py-0.5 font-mono text-[11px] uppercase tracking-wide text-secondary">
               {kindLabel}
+            </span>
+            <span
+              className={cn(
+                "rounded bg-canvas px-2 py-0.5 text-[11px] font-semibold",
+                terminal ? "text-[var(--danger,#ff6b6b)]" : "text-secondary"
+              )}
+            >
+              {row.status}
             </span>
             {row.destructive ? (
               <span className="rounded bg-[var(--danger-surface,#3a1f1f)] px-2 py-0.5 text-[11px] font-semibold text-[var(--danger,#ff6b6b)]">
@@ -1488,8 +1532,8 @@ function ApprovalCard({
               <span className="font-mono text-xs text-primary">{row.toolName}</span>
             ) : null}
             <span className="ml-auto text-[11px] text-tertiary">
-              {row.createdMs ? timeAgo(row.createdMs) : ""}
-              {expiresLabel ? ` · ${expiresLabel}` : ""}
+              {createdAgeMs === undefined ? "" : timeAgo(createdAgeMs)}
+              {timeoutLabel ? ` · ${timeoutLabel}` : ""}
             </span>
           </div>
 
@@ -1506,6 +1550,7 @@ function ApprovalCard({
               aria-label="Edit tool args"
               value={editText}
               onChange={(event) => setEditText(event.target.value)}
+              disabled={terminal}
               rows={Math.min(12, Math.max(3, editText.split("\n").length))}
               className="mt-2 w-full rounded bg-canvas p-2 font-mono text-[11px] text-primary"
             />
@@ -1531,6 +1576,7 @@ function ApprovalCard({
               value={responseText}
               onChange={(event) => setResponseText(event.target.value)}
               placeholder="Type your answer to the agent…"
+              disabled={terminal}
               rows={3}
               className="mt-2 w-full rounded border border-border bg-canvas p-2 text-xs text-primary placeholder:text-tertiary"
             />
@@ -1542,6 +1588,7 @@ function ApprovalCard({
               value={note}
               onChange={(event) => onNote(event.target.value)}
               placeholder={requireNoteToDeny ? "Reason (required to deny)…" : "Optional note / reason…"}
+              disabled={terminal}
               className="h-8 min-w-[12rem] flex-1 rounded border border-border bg-canvas px-2 text-xs text-primary placeholder:text-tertiary"
             />
             {/* Edit-args toggle for items that allow it. */}
@@ -1549,7 +1596,7 @@ function ApprovalCard({
               <Button
                 size="sm"
                 variant={editing ? "secondary" : "ghost"}
-                disabled={busy}
+                disabled={busy || terminal}
                 onClick={() => {
                   setEditError("");
                   setEditing((value) => !value);
@@ -1561,24 +1608,26 @@ function ApprovalCard({
             ) : null}
             {/* Primary accept / respond action. */}
             {isQuestion ? (
-              <Button size="sm" variant="secondary" disabled={busy || !responseText.trim()} onClick={submitApprove}>
+              <Button size="sm" variant="secondary" disabled={busy || terminal || !responseText.trim()} onClick={submitApprove}>
                 <CheckCircle2 className="size-4" /> {busy ? "…" : "Send answer"}
               </Button>
             ) : row.allow.accept ? (
-              <Button size="sm" variant="secondary" disabled={busy} onClick={submitApprove}>
+              <Button size="sm" variant="secondary" disabled={busy || terminal} onClick={submitApprove}>
                 <CheckCircle2 className="size-4" />{" "}
                 {busy ? "…" : editing ? "Approve with edits" : "Approve"}
               </Button>
             ) : null}
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={denyDisabled}
-              title={requireNoteToDeny && !note.trim() ? "A reason is required to deny" : undefined}
-              onClick={onDeny}
-            >
-              <X className="size-4" /> Deny
-            </Button>
+            {row.allow.ignore ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={denyDisabled}
+                title={requireNoteToDeny && !note.trim() ? "A reason is required to deny" : undefined}
+                onClick={onDeny}
+              >
+                <X className="size-4" /> Deny
+              </Button>
+            ) : null}
           </div>
           {error ? (
             <div className="mt-2 text-xs text-[var(--danger,#ff6b6b)]">{error}</div>

@@ -8,6 +8,7 @@ function panel<T>(source: string, data: T) {
 
 export function dashboardFixture(kind: "populated" | "empty" = "populated"): DashboardState {
   const empty = kind === "empty";
+  const approvalNow = Date.now();
   const sessions = empty
     ? []
     : [
@@ -174,7 +175,7 @@ export function dashboardFixture(kind: "populated" | "empty" = "populated"): Das
             toolRow("agent_wait", "error", "ACTION_BUDGET_EXPIRED", "agent-local-002", "daemon", 3)
           ]
     }),
-    approvals: panel("approval_list", { rows: empty ? [] : [{ item: { status: "pending", kind: "shell", title: "Review command", body: "Approve durable action", updated_at_unix_ms: baseTime } }] }),
+    approvals: panel("approval_list", { rows: empty ? [] : approvalRows(approvalNow) }),
     suggestions: panel("suggestions", { rows: [] }),
     armed_runs: panel("armed_runs", { rows: [] }),
     agent_transcripts: panel("agent_transcripts", {
@@ -325,6 +326,88 @@ function toolRow(tool: string, outcome: string, errorCode: string, actor: string
     error_code: errorCode,
     payload_sha256: `sha-${index}`
   };
+}
+
+function approvalRows(nowMs: number) {
+  const permissionInput = {
+    command: "powershell.exe",
+    args: [
+      "-NoLogo",
+      "-NoProfile",
+      "-Command",
+      "Set-Content -Path .\\approval-marker.txt -Value approved"
+    ],
+    working_dir: "C:\\code\\synapse"
+  };
+  return [
+    {
+      item: {
+        schema_version: 1,
+        approval_id: "apr1-story-shell",
+        kind: "agent_permission",
+        status: "pending",
+        title: "Approve durable shell action",
+        body: "Agent needs permission to write an approval marker file.",
+        payload_json: JSON.stringify({
+          tool_name: "act_run_shell",
+          spawn_id: "agent-codex-001",
+          input: permissionInput
+        }),
+        destructive: true,
+        created_at_unix_ms: nowMs - 90_000,
+        updated_at_unix_ms: nowMs - 30_000,
+        expires_at_unix_ms: nowMs + 30 * 60_000,
+        timeout_decision: "declined",
+        requested_by_session: "agent-codex-001",
+        allow: { accept: true, edit: true, respond: false, ignore: true }
+      }
+    },
+    {
+      item: {
+        schema_version: 1,
+        approval_id: "apr1-story-question",
+        kind: "agent_question",
+        status: "pending",
+        title: "Answer planning question",
+        body: "Should the agent update the fixture only, or also add a visual regression?",
+        payload_json: JSON.stringify({
+          spawn_id: "agent-codex-001",
+          input: { question: "Which verification path should I use?" }
+        }),
+        destructive: false,
+        created_at_unix_ms: nowMs - 4 * 60_000,
+        updated_at_unix_ms: nowMs - 4 * 60_000,
+        expires_at_unix_ms: nowMs + 10 * 60_000,
+        timeout_decision: "ignored",
+        requested_by_session: "agent-codex-001",
+        allow: { accept: false, edit: false, respond: true, ignore: true }
+      }
+    },
+    {
+      item: {
+        schema_version: 1,
+        approval_id: "apr1-story-expired",
+        kind: "suggestion",
+        status: "ignored",
+        title: "Expired suggestion",
+        body: "The stale row remains visible as a terminal timeout decision.",
+        payload_json: JSON.stringify({
+          tool_name: "approval_request",
+          input: { proposed: "No longer actionable" }
+        }),
+        destructive: false,
+        created_at_unix_ms: nowMs - 45 * 60_000,
+        updated_at_unix_ms: nowMs - 60_000,
+        expires_at_unix_ms: nowMs - 60_000,
+        timeout_decision: "ignored",
+        requested_by_session: "agent-codex-001",
+        decided_by_session: "timeout",
+        decided_at_unix_ms: nowMs - 60_000,
+        decision_note: "timeout default materialized as ignored",
+        allow: { accept: true, edit: false, respond: false, ignore: true }
+      }
+    }
+  ];
 }
 
 function transcriptRow(spawnId: string, lineNo: number, role: string, event: string, content: string) {
