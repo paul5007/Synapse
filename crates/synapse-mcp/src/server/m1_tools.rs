@@ -6,9 +6,10 @@ use super::{
     BrowserInitScriptOperation, BrowserInspectParams, BrowserInspectResponse,
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
     BrowserSetContentParams, BrowserSetContentResponse, BrowserTabEntry, BrowserTabsParams,
-    BrowserTabsResponse, BrowserWaitForParams, BrowserWaitForResponse, BrowserWaitForState,
-    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
-    CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
+    BrowserTabsResponse, BrowserWaitForFunctionParams, BrowserWaitForFunctionResponse,
+    BrowserWaitForParams, BrowserWaitForResponse, BrowserWaitForState, CaptureScreenshotFormat,
+    CaptureScreenshotParams, CaptureScreenshotResponse, CdpActivateTabParams,
+    CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
     CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
     CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
     CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
@@ -2057,6 +2058,63 @@ impl SynapseService {
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .browser_wait_for_impl(&session_id, window_hwnd, &cdp_target_id, &wait)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Poll a JavaScript predicate/expression in the calling session's owned browser tab until it resolves truthy, returning the final JSON-safe value. If expression evaluates to a function, it is called as fn(...args) each poll; otherwise the expression value is re-read each poll. Timed-out predicates return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_wait_for_function(
+        &self,
+        params: Parameters<BrowserWaitForFunctionParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserWaitForFunctionResponse>, ErrorData> {
+        const TOOL: &str = "browser_wait_for_function";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_wait_for_function"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let wait = validate_browser_wait_for_function_params(&params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "expression_len": wait.expression.len(),
+            "arg_count": wait.args.len(),
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "expression_len": wait.expression.len(),
+            "arg_count": wait.args.len(),
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_wait_for_function_impl(&session_id, window_hwnd, &cdp_target_id, &wait)
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -4547,6 +4605,106 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_wait_for_function_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        wait: &NormalizedBrowserWaitForFunctionParams,
+    ) -> Result<BrowserWaitForFunctionResponse, ErrorData> {
+        const TOOL: &str = "browser_wait_for_function";
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
+        };
+        let expression = build_browser_wait_for_function_expression(wait)?;
+        let evaluated = synapse_a11y::cdp_evaluate_expression(
+            &endpoint,
+            cdp_target_id,
+            &expression,
+            true,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_wait_for_function raw CDP Runtime.evaluate failed: {error}"),
+            )
+        })?;
+        let payload: BrowserWaitForFunctionPayload =
+            serde_json::from_value(evaluated.value.clone()).map_err(|error| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    format!("browser_wait_for_function payload decode failed: {error}"),
+                )
+            })?;
+        if payload.timed_out {
+            return Err(mcp_error(
+                error_codes::BROWSER_WAIT_TIMEOUT,
+                format!(
+                    "browser_wait_for_function timed out after {} ms; poll_count={} value_type={} value_description={:?}",
+                    wait.timeout_ms,
+                    payload.poll_count,
+                    payload.value_type,
+                    payload.value_description
+                ),
+            ));
+        }
+        tracing::info!(
+            code = "CDP_BACKGROUND_WAIT_FOR_FUNCTION",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %evaluated.target_id,
+            expression_len = wait.expression.len(),
+            arg_count = wait.args.len(),
+            elapsed_ms = payload.elapsed_ms,
+            poll_count = payload.poll_count,
+            value_type = %payload.value_type,
+            target_url = %evaluated.url,
+            "readback=Runtime.evaluate(browser_wait_for_function) outcome=wait_satisfied"
+        );
+        Ok(BrowserWaitForFunctionResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: evaluated.target_id,
+            condition_met: payload.condition_met,
+            elapsed_ms: payload.elapsed_ms,
+            timeout_ms: wait.timeout_ms,
+            polling_interval_ms: wait.polling_interval_ms,
+            poll_count: payload.poll_count,
+            expression_len: wait.expression.len(),
+            arg_count: wait.args.len(),
+            value: payload.value,
+            value_type: payload.value_type,
+            value_description: payload.value_description,
+            unserializable_value: payload.unserializable_value,
+            url: evaluated.url,
+            title: evaluated.title,
+            ready_state: evaluated.ready_state,
+            readback_backend: "Runtime.evaluate(browser_wait_for_function)".to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_wait_for_function_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _wait: &NormalizedBrowserWaitForFunctionParams,
+    ) -> Result<BrowserWaitForFunctionResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_wait_for_function is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_content_impl(
         &self,
         session_id: &str,
@@ -6044,6 +6202,27 @@ struct BrowserWaitForPayload {
     observed_text_len: usize,
 }
 
+#[derive(Debug)]
+struct NormalizedBrowserWaitForFunctionParams {
+    expression: String,
+    args: Vec<Value>,
+    timeout_ms: u64,
+    polling_interval_ms: u64,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct BrowserWaitForFunctionPayload {
+    condition_met: bool,
+    timed_out: bool,
+    elapsed_ms: u64,
+    poll_count: u64,
+    value: Value,
+    value_type: String,
+    value_description: Option<String>,
+    unserializable_value: Option<String>,
+}
+
 fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<(), ErrorData> {
     if params.expression.trim().is_empty() {
         return Err(mcp_error(
@@ -6077,32 +6256,59 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
     Ok(())
 }
 
+fn validate_browser_wait_for_function_params(
+    params: &BrowserWaitForFunctionParams,
+) -> Result<NormalizedBrowserWaitForFunctionParams, ErrorData> {
+    if params.expression.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_wait_for_function requires a non-empty expression",
+        ));
+    }
+    if params.expression.len() > BROWSER_EVALUATE_MAX_EXPRESSION_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_wait_for_function expression is {} bytes; the maximum is {BROWSER_EVALUATE_MAX_EXPRESSION_BYTES} bytes",
+                params.expression.len()
+            ),
+        ));
+    }
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    let timeout_ms = validate_browser_wait_timeout("browser_wait_for_function", params.timeout_ms)?;
+    let polling_interval_ms = validate_browser_wait_polling_interval(
+        "browser_wait_for_function",
+        params.polling_interval_ms,
+    )?;
+    let args = params.args.clone().unwrap_or_default();
+    if args.len() > BROWSER_EVALUATE_MAX_ARGS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_wait_for_function accepts at most {BROWSER_EVALUATE_MAX_ARGS} args; got {}",
+                args.len()
+            ),
+        ));
+    }
+    Ok(NormalizedBrowserWaitForFunctionParams {
+        expression: params.expression.clone(),
+        args,
+        timeout_ms,
+        polling_interval_ms,
+    })
+}
+
 fn validate_browser_wait_for_params(
     params: &BrowserWaitForParams,
 ) -> Result<NormalizedBrowserWaitForParams, ErrorData> {
     if let Some(target_id) = params.cdp_target_id.as_deref() {
         validate_cdp_target_id(target_id)?;
     }
-    let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_BROWSER_WAIT_TIMEOUT_MS);
-    if timeout_ms == 0 || timeout_ms > MAX_BROWSER_WAIT_TIMEOUT_MS {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("browser_wait_for timeout_ms must be 1..={MAX_BROWSER_WAIT_TIMEOUT_MS}"),
-        ));
-    }
-    let polling_interval_ms = params
-        .polling_interval_ms
-        .unwrap_or(DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS);
-    if !(MIN_BROWSER_WAIT_POLLING_INTERVAL_MS..=MAX_BROWSER_WAIT_POLLING_INTERVAL_MS)
-        .contains(&polling_interval_ms)
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "browser_wait_for polling_interval_ms must be {MIN_BROWSER_WAIT_POLLING_INTERVAL_MS}..={MAX_BROWSER_WAIT_POLLING_INTERVAL_MS}"
-            ),
-        ));
-    }
+    let timeout_ms = validate_browser_wait_timeout("browser_wait_for", params.timeout_ms)?;
+    let polling_interval_ms =
+        validate_browser_wait_polling_interval("browser_wait_for", params.polling_interval_ms)?;
     let text = params.text.as_ref().map(|text| text.to_owned());
     if let Some(text) = text.as_deref() {
         if text.trim().is_empty() {
@@ -6151,6 +6357,127 @@ fn validate_browser_wait_for_params(
         timeout_ms,
         polling_interval_ms,
     })
+}
+
+fn validate_browser_wait_timeout(tool: &str, value: Option<u64>) -> Result<u64, ErrorData> {
+    let timeout_ms = value.unwrap_or(DEFAULT_BROWSER_WAIT_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_BROWSER_WAIT_TIMEOUT_MS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} timeout_ms must be 1..={MAX_BROWSER_WAIT_TIMEOUT_MS}"),
+        ));
+    }
+    Ok(timeout_ms)
+}
+
+fn validate_browser_wait_polling_interval(
+    tool: &str,
+    value: Option<u64>,
+) -> Result<u64, ErrorData> {
+    let polling_interval_ms = value.unwrap_or(DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS);
+    if !(MIN_BROWSER_WAIT_POLLING_INTERVAL_MS..=MAX_BROWSER_WAIT_POLLING_INTERVAL_MS)
+        .contains(&polling_interval_ms)
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} polling_interval_ms must be {MIN_BROWSER_WAIT_POLLING_INTERVAL_MS}..={MAX_BROWSER_WAIT_POLLING_INTERVAL_MS}"
+            ),
+        ));
+    }
+    Ok(polling_interval_ms)
+}
+
+#[cfg(windows)]
+fn build_browser_wait_for_function_expression(
+    wait: &NormalizedBrowserWaitForFunctionParams,
+) -> Result<String, ErrorData> {
+    let args_json = serde_json::to_string(&wait.args).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("browser_wait_for_function could not serialize args: {error}"),
+        )
+    })?;
+    let predicate = &wait.expression;
+    let timeout_ms = wait.timeout_ms;
+    let polling_interval_ms = wait.polling_interval_ms;
+    let expression = format!(
+        r#"(() => new Promise((resolve, reject) => {{
+            const args = {args_json};
+            const timeoutMs = {timeout_ms};
+            const pollingIntervalMs = {polling_interval_ms};
+            const started = Date.now();
+            let pollCount = 0;
+            const serializeValue = (value) => {{
+                const valueType = typeof value;
+                if (value === undefined) {{
+                    return {{ value: null, value_type: "undefined", value_description: "undefined", unserializable_value: null }};
+                }}
+                if (valueType === "bigint") {{
+                    return {{ value: String(value), value_type: valueType, value_description: String(value) + "n", unserializable_value: String(value) + "n" }};
+                }}
+                if (valueType === "number" && !Number.isFinite(value)) {{
+                    return {{ value: null, value_type: valueType, value_description: String(value), unserializable_value: String(value) }};
+                }}
+                if (valueType === "function" || valueType === "symbol") {{
+                    return {{ value: null, value_type: valueType, value_description: String(value), unserializable_value: null }};
+                }}
+                try {{
+                    return {{ value: JSON.parse(JSON.stringify(value)), value_type: valueType, value_description: null, unserializable_value: null }};
+                }} catch (error) {{
+                    return {{ value: null, value_type: valueType, value_description: String(value), unserializable_value: null }};
+                }}
+            }};
+            const finish = (conditionMet, timedOut, value) => {{
+                const serialized = serializeValue(value);
+                resolve({{
+                    condition_met: conditionMet,
+                    timed_out: timedOut,
+                    elapsed_ms: Math.max(0, Date.now() - started),
+                    poll_count: pollCount,
+                    value: serialized.value,
+                    value_type: serialized.value_type,
+                    value_description: serialized.value_description,
+                    unserializable_value: serialized.unserializable_value
+                }});
+            }};
+            const evaluatePredicate = async () => {{
+                const candidate = ({predicate});
+                const value = (typeof candidate === "function") ? candidate(...args) : candidate;
+                return await Promise.resolve(value);
+            }};
+            const check = async () => {{
+                pollCount += 1;
+                let value;
+                try {{
+                    value = await evaluatePredicate();
+                }} catch (error) {{
+                    reject(error);
+                    return;
+                }}
+                if (value) {{
+                    finish(true, false, value);
+                    return;
+                }}
+                if (Date.now() - started >= timeoutMs) {{
+                    finish(false, true, value);
+                    return;
+                }}
+                window.setTimeout(check, pollingIntervalMs);
+            }};
+            check();
+        }}))()"#
+    );
+    if expression.len() > BROWSER_EVALUATE_MAX_EXPRESSION_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_wait_for_function generated Runtime.evaluate expression is {} bytes after JSON escaping; the maximum is {BROWSER_EVALUATE_MAX_EXPRESSION_BYTES} bytes",
+                expression.len()
+            ),
+        ));
+    }
+    Ok(expression)
 }
 
 #[cfg(windows)]
@@ -9376,14 +9703,15 @@ mod tests {
         unavailable_page_vitals_info, validate_browser_add_init_script_params,
         validate_browser_add_script_tag_params, validate_browser_add_style_tag_params,
         validate_browser_evaluate_params, validate_browser_set_content_params,
-        validate_browser_wait_for_params, validate_target_window,
+        validate_browser_wait_for_function_params, validate_browser_wait_for_params,
+        validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
         BrowserEvaluateParams, BrowserInitScriptOperation, BrowserSetContentParams,
-        BrowserTabEntry, BrowserTabsResponse, BrowserWaitForParams, BrowserWaitForState,
-        CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult, FindResultKind,
-        HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
+        BrowserTabEntry, BrowserTabsResponse, BrowserWaitForFunctionParams, BrowserWaitForParams,
+        BrowserWaitForState, CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult,
+        FindResultKind, HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
     use base64::Engine as _;
@@ -9970,6 +10298,107 @@ mod tests {
 
         println!(
             "readback=browser_wait_for validation edges all rejected with TOOL_PARAMS_INVALID"
+        );
+    }
+
+    #[test]
+    fn browser_wait_for_function_params_validation_edges() {
+        let ok = validate_browser_wait_for_function_params(&BrowserWaitForFunctionParams {
+            expression: "() => window.__ready === true".to_owned(),
+            args: Some(vec![serde_json::json!("arg")]),
+            timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS),
+            polling_interval_ms: Some(MIN_BROWSER_WAIT_POLLING_INTERVAL_MS),
+            cdp_target_id: Some("target-123".to_owned()),
+            ..Default::default()
+        })
+        .expect("valid waitForFunction params pass");
+        assert_eq!(ok.expression, "() => window.__ready === true");
+        assert_eq!(ok.args.len(), 1);
+        assert_eq!(ok.timeout_ms, MAX_BROWSER_WAIT_TIMEOUT_MS);
+        assert_eq!(ok.polling_interval_ms, MIN_BROWSER_WAIT_POLLING_INTERVAL_MS);
+
+        let error = validate_browser_wait_for_function_params(&BrowserWaitForFunctionParams {
+            expression: "   ".to_owned(),
+            ..Default::default()
+        })
+        .expect_err("blank expression must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let oversize = "x".repeat(BROWSER_EVALUATE_MAX_EXPRESSION_BYTES + 1);
+        let error = validate_browser_wait_for_function_params(&BrowserWaitForFunctionParams {
+            expression: oversize,
+            ..Default::default()
+        })
+        .expect_err("oversize expression must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let args = (0..=super::BROWSER_EVALUATE_MAX_ARGS)
+            .map(|index| serde_json::json!(index))
+            .collect::<Vec<_>>();
+        let error = validate_browser_wait_for_function_params(&BrowserWaitForFunctionParams {
+            expression: "() => true".to_owned(),
+            args: Some(args),
+            ..Default::default()
+        })
+        .expect_err("too many args must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_function_params(&BrowserWaitForFunctionParams {
+            expression: "() => true".to_owned(),
+            cdp_target_id: Some("   ".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("blank cdp_target_id must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_function_params(&BrowserWaitForFunctionParams {
+            expression: "() => true".to_owned(),
+            timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize timeout must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_function_params(&BrowserWaitForFunctionParams {
+            expression: "() => true".to_owned(),
+            polling_interval_ms: Some(MAX_BROWSER_WAIT_POLLING_INTERVAL_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize polling interval must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        println!(
+            "readback=browser_wait_for_function validation edges all rejected with TOOL_PARAMS_INVALID"
         );
     }
 

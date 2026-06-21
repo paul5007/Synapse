@@ -1438,6 +1438,69 @@ pub struct BrowserWaitForResponse {
     pub required_foreground: bool,
 }
 
+/// Parameters for `browser_wait_for_function` (#1129): poll a JavaScript
+/// predicate/expression until it resolves truthy in the calling session's owned
+/// CDP target.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForFunctionParams {
+    /// JavaScript expression or function declaration. If it evaluates to a
+    /// function, Synapse calls it as `fn(...args)` on every poll; otherwise the
+    /// expression value itself is tested on every poll.
+    pub expression: String,
+    /// CDP TargetID to wait in. Defaults to the active session CDP target. Must
+    /// be owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Optional JSON arguments forwarded to function predicates.
+    #[serde(default)]
+    pub args: Option<Vec<serde_json::Value>>,
+    /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Poll interval in milliseconds. Defaults to 100 ms.
+    #[serde(default)]
+    pub polling_interval_ms: Option<u64>,
+}
+
+/// Response for `browser_wait_for_function`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForFunctionResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub condition_met: bool,
+    pub elapsed_ms: u64,
+    pub timeout_ms: u64,
+    pub polling_interval_ms: u64,
+    pub poll_count: u64,
+    pub expression_len: usize,
+    pub arg_count: usize,
+    /// Final predicate value converted to a JSON-safe representation where
+    /// possible.
+    pub value: serde_json::Value,
+    /// JavaScript `typeof` for the final predicate value.
+    pub value_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unserializable_value: Option<String>,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Parameters for `browser_content` (#1158): return the full serialized HTML of
 /// the calling session's owned CDP page target.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
