@@ -651,6 +651,380 @@ pub struct CdpSetNodeTextReadback {
     pub cleared_with_delete: bool,
 }
 
+/// DOM primitive result for Playwright-style `clear`, `focus`, `blur`, and
+/// `selectText` actions on an observed CDP backend node.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CdpDomPrimitiveResult {
+    pub action: String,
+    pub before_element: Value,
+    pub after_element: Value,
+    pub before_active_element: Value,
+    pub after_active_element: Value,
+    pub events_dispatched: Vec<String>,
+    pub action_readback: Value,
+}
+
+const CDP_DOM_PRIMITIVE_FUNCTION: &str = r#"(el, requestedAction) => {
+    const action = normalizeAction(requestedAction);
+    if (!el || !el.isConnected) {
+        throw new Error("resolved backend node is detached");
+    }
+    const events = [];
+    const beforeElement = elementSummary(el);
+    const beforeActiveElement = activeElementSummary(el.ownerDocument, el);
+    let actionReadback = {};
+    if (action === "clear") {
+        actionReadback = performClear(el, events);
+    } else if (action === "focus") {
+        actionReadback = performFocus(el, events);
+    } else if (action === "blur") {
+        actionReadback = performBlur(el, events);
+    } else if (action === "select_text") {
+        actionReadback = performSelectText(el, events);
+    } else {
+        throw new Error(`unsupported DOM primitive ${JSON.stringify(requestedAction)}`);
+    }
+    return {
+        action,
+        before_element: beforeElement,
+        after_element: el.isConnected ? elementSummary(el) : null,
+        before_active_element: beforeActiveElement,
+        after_active_element: activeElementSummary(el.ownerDocument, el),
+        events_dispatched: events,
+        action_readback: actionReadback
+    };
+
+    function normalizeAction(value) {
+        const normalized = String(value || "").trim().toLowerCase();
+        if (normalized === "selecttext" || normalized === "select-text") {
+            return "select_text";
+        }
+        if (["clear", "focus", "blur", "select_text"].includes(normalized)) {
+            return normalized;
+        }
+        throw new Error(`unsupported DOM primitive ${JSON.stringify(value)}`);
+    }
+
+    function performClear(element, events) {
+        const editable = editableKind(element);
+        if (!editable) {
+            throw new Error(`clear supports editable input/textarea/contenteditable targets only; resolved ${tag(element)}`);
+        }
+        if (element.disabled || element.readOnly) {
+            throw new Error("clear target is disabled or readonly");
+        }
+        try {
+            if (typeof element.focus === "function") {
+                element.focus({ preventScroll: true });
+                events.push("focus");
+            }
+        } catch (_) {
+            // Value mutation and readback are the source of truth.
+        }
+        const beforeValue = elementTextValue(element);
+        const beforeInput = dispatchInputLikeEvent(element, "beforeinput", null, "deleteContentBackward", true);
+        events.push("beforeinput");
+        if (!beforeInput) {
+            throw new Error("clear was cancelled by a beforeinput listener");
+        }
+        if (editable === "value") {
+            setNativeValue(element, "");
+            try {
+                if (typeof element.setSelectionRange === "function") {
+                    element.setSelectionRange(0, 0);
+                }
+            } catch (_) {
+                // Some input types expose value but reject text selection.
+            }
+        } else {
+            element.textContent = "";
+        }
+        dispatchInputLikeEvent(element, "input", null, "deleteContentBackward", false);
+        events.push("input");
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+        events.push("change");
+        const afterValue = elementTextValue(element);
+        if (afterValue !== "") {
+            throw new Error(`clear postcondition failed: after value/text length ${afterValue.length} was not zero`);
+        }
+        return {
+            before_value_len: beforeValue.length,
+            after_value_len: afterValue.length,
+            input_fired: true,
+            change_fired: true
+        };
+    }
+
+    function performFocus(element, events) {
+        if (typeof element.focus !== "function") {
+            throw new Error(`resolved ${tag(element)} element has no focus() method`);
+        }
+        try {
+            element.focus({ preventScroll: true });
+        } catch (_) {
+            element.focus();
+        }
+        events.push("focus");
+        const after = activeElementSummary(element.ownerDocument, element);
+        if (!after.is_target) {
+            throw new Error(`focus postcondition failed: activeElement is ${after.tag_name || "none"}#${after.id || ""}`);
+        }
+        return {
+            active_element_is_target: true
+        };
+    }
+
+    function performBlur(element, events) {
+        if (typeof element.blur !== "function") {
+            throw new Error(`resolved ${tag(element)} element has no blur() method`);
+        }
+        element.blur();
+        events.push("blur");
+        const after = activeElementSummary(element.ownerDocument, element);
+        if (after.is_target) {
+            throw new Error("blur postcondition failed: target remained document.activeElement");
+        }
+        return {
+            active_element_is_target: false
+        };
+    }
+
+    function performSelectText(element, events) {
+        const beforeSelection = selectionSummary(element);
+        let readback;
+        if (isSelectableValueControl(element)) {
+            try {
+                if (typeof element.focus === "function") {
+                    element.focus({ preventScroll: true });
+                    events.push("focus");
+                }
+            } catch (_) {
+                // select() may still work for some controls.
+            }
+            element.select();
+            element.dispatchEvent(new Event("select", { bubbles: true }));
+            events.push("select");
+            element.ownerDocument.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+            events.push("selectionchange");
+            const value = elementTextValue(element);
+            const start = typeof element.selectionStart === "number" ? element.selectionStart : null;
+            const end = typeof element.selectionEnd === "number" ? element.selectionEnd : null;
+            const selected = start === null || end === null ? "" : value.slice(start, end);
+            if (selected !== value) {
+                throw new Error(`selectText postcondition failed: selected ${selected.length} of ${value.length} chars`);
+            }
+            readback = {
+                selection_mode: "value_control_select",
+                text_len: value.length,
+                selection_start: start,
+                selection_end: end,
+                selected_text: selected
+            };
+        } else {
+            const doc = element.ownerDocument;
+            const selection = doc.defaultView && doc.defaultView.getSelection ? doc.defaultView.getSelection() : null;
+            if (!selection) {
+                throw new Error("selectText requires document.getSelection()");
+            }
+            const range = doc.createRange();
+            range.selectNodeContents(element);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            doc.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+            events.push("selectionchange");
+            const expected = String(element.textContent || "");
+            const selected = String(selection.toString() || "");
+            if (selected !== expected) {
+                throw new Error(`selectText postcondition failed: selected ${selected.length} of ${expected.length} chars`);
+            }
+            readback = {
+                selection_mode: "dom_range_select_node_contents",
+                text_len: expected.length,
+                selection_start: null,
+                selection_end: null,
+                selected_text: selected
+            };
+        }
+        return {
+            before_selection: beforeSelection,
+            after_selection: selectionSummary(element),
+            ...readback
+        };
+    }
+
+    function editableKind(element) {
+        const lower = tag(element);
+        if (lower === "textarea") {
+            return "value";
+        }
+        if (lower === "input") {
+            const type = String(element.getAttribute("type") || "text").toLowerCase();
+            const nonText = ["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image", "hidden"];
+            return nonText.includes(type) ? null : "value";
+        }
+        if (
+            element.isContentEditable ||
+            String(element.getAttribute("contenteditable") || "").toLowerCase() === "true" ||
+            String(element.getAttribute("role") || "").toLowerCase() === "textbox"
+        ) {
+            return "contenteditable";
+        }
+        return null;
+    }
+
+    function isSelectableValueControl(element) {
+        const lower = tag(element);
+        if (!["input", "textarea"].includes(lower) || typeof element.select !== "function" || !("value" in element)) {
+            return false;
+        }
+        if (lower === "textarea") {
+            return true;
+        }
+        const type = String(element.getAttribute("type") || "text").toLowerCase();
+        const nonSelectable = ["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image", "hidden"];
+        return !nonSelectable.includes(type);
+    }
+
+    function elementTextValue(element) {
+        if ("value" in element) {
+            return String(element.value ?? "");
+        }
+        return String(element.textContent || "");
+    }
+
+    function setNativeValue(element, value) {
+        const lower = tag(element);
+        const win = element.ownerDocument.defaultView || window;
+        const proto =
+            lower === "input"
+                ? win.HTMLInputElement && win.HTMLInputElement.prototype
+                : lower === "textarea"
+                    ? win.HTMLTextAreaElement && win.HTMLTextAreaElement.prototype
+                    : null;
+        const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+        if (descriptor && typeof descriptor.set === "function") {
+            descriptor.set.call(element, value);
+        } else {
+            element.value = value;
+        }
+    }
+
+    function dispatchInputLikeEvent(element, type, data, inputType, cancelable) {
+        const win = element.ownerDocument.defaultView || window;
+        let event;
+        try {
+            event = new win.InputEvent(type, {
+                bubbles: true,
+                cancelable,
+                data,
+                inputType
+            });
+        } catch (_) {
+            event = new win.Event(type, { bubbles: true, cancelable });
+        }
+        return element.dispatchEvent(event);
+    }
+
+    function activeElementSummary(doc, target) {
+        const active = doc && doc.activeElement ? doc.activeElement : null;
+        if (!active) {
+            return {
+                has_active_element: false,
+                tag_name: "",
+                id: "",
+                name_attr: "",
+                is_target: false
+            };
+        }
+        return {
+            has_active_element: true,
+            tag_name: tag(active),
+            id: String(active.id || ""),
+            name_attr: String(active.getAttribute("name") || ""),
+            is_target: active === target
+        };
+    }
+
+    function selectionSummary(element) {
+        const value = elementTextValue(element);
+        if (typeof element.selectionStart === "number" && typeof element.selectionEnd === "number") {
+            return {
+                selection_mode: "value_control",
+                selection_start: element.selectionStart,
+                selection_end: element.selectionEnd,
+                selected_text: value.slice(element.selectionStart, element.selectionEnd)
+            };
+        }
+        const selection = element.ownerDocument.defaultView && element.ownerDocument.defaultView.getSelection
+            ? element.ownerDocument.defaultView.getSelection()
+            : null;
+        return {
+            selection_mode: "dom_selection",
+            selection_start: null,
+            selection_end: null,
+            selected_text: selection ? String(selection.toString() || "") : ""
+        };
+    }
+
+    function elementSummary(element) {
+        const value = "value" in element ? String(element.value ?? "") : String(element.textContent || "");
+        return {
+            tag_name: tag(element),
+            id: String(element.id || ""),
+            name_attr: String(element.getAttribute("name") || ""),
+            type_attr: String(element.getAttribute("type") || ""),
+            value_len: value.length,
+            text_len: String(element.textContent || "").length,
+            disabled: Boolean(element.disabled),
+            readonly: Boolean(element.readOnly)
+        };
+    }
+
+    function tag(element) {
+        return String(element && element.tagName || "").toLowerCase();
+    }
+}"#;
+
+/// Performs a Playwright-style DOM primitive against an observed CDP backend
+/// node without activating the browser window.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the node cannot be resolved, the primitive fails
+/// its DOM postcondition, or the structured readback cannot be decoded.
+pub async fn cdp_dom_primitive_node(
+    endpoint: &str,
+    target_id: &str,
+    backend_node_id: i64,
+    action: &str,
+) -> A11yResult<CdpDomPrimitiveResult> {
+    let normalized = match action.trim().to_ascii_lowercase().as_str() {
+        "selecttext" | "select-text" => "select_text".to_owned(),
+        "clear" | "focus" | "blur" | "select_text" => action.trim().to_ascii_lowercase(),
+        other => {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!("unsupported CDP DOM primitive {other:?}"),
+            });
+        }
+    };
+    let result = cdp_evaluate_on_element(
+        endpoint,
+        target_id,
+        backend_node_id,
+        CDP_DOM_PRIMITIVE_FUNCTION,
+        &[json!(normalized)],
+        false,
+        true,
+    )
+    .await?;
+    serde_json::from_value::<CdpDomPrimitiveResult>(result.value).map_err(|err| {
+        A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.callFunctionOn DOM primitive decode: {err}"),
+        }
+    })
+}
+
 /// JS run on the resolved node to select its full content before the replace.
 /// Mirrors the Playwright `fill` strategy: value controls use `select()`, a
 /// contenteditable host gets a DOM range over its contents. Returns a wire

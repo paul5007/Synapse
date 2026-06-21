@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-dispatch-event-v1";
-const BRIDGE_BUILD_SHA256 = "6927167c6562db4dc9f09d659b14e14b9331b3cf6e1cd476302a3a5b58869b33";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-element-primitives-v1";
+const BRIDGE_BUILD_SHA256 = "4f94fd969f23e3cb64b01ce58b4e6da262e562951a83cae8f68e6cddc8678d06";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -2833,12 +2833,15 @@ function normalizeDomAction(action) {
   if (normalized === "dispatchevent" || normalized === "dispatch-event") {
     return "dispatch_event";
   }
-  if (["click", "press", "select", "submit", "dispatch_event"].includes(normalized)) {
+  if (normalized === "selecttext" || normalized === "select-text") {
+    return "select_text";
+  }
+  if (["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text"].includes(normalized)) {
     return normalized;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `domAction action must be one of click, press, select, submit, dispatch_event; got ${JSON.stringify(action)}`
+    `domAction action must be one of click, press, select, submit, dispatch_event, clear, focus, blur, select_text; got ${JSON.stringify(action)}`
   );
 }
 
@@ -2941,7 +2944,7 @@ function performDomActionInPage(request) {
     ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
     : 4096;
 
-  if (!["click", "press", "select", "submit", "dispatch_event"].includes(action)) {
+  if (!["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text"].includes(action)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
   }
   if (action === "dispatch_event" && !eventType) {
@@ -2957,14 +2960,15 @@ function performDomActionInPage(request) {
   const element = resolved.element;
   const beforeElement = elementSummary(element);
 
-  if (action !== "dispatch_event" && !isElementEnabled(element)) {
+  const bypassActionability = ["dispatch_event", "focus", "blur", "select_text"].includes(action);
+  if (!bypassActionability && !isElementEnabled(element)) {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is disabled or aria-disabled", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
       before_element: beforeElement
     });
   }
-  if (action !== "dispatch_event" && !isElementVisible(element) && action !== "submit") {
+  if (!bypassActionability && !isElementVisible(element) && action !== "submit") {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is not visible/actionable", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
@@ -2999,6 +3003,14 @@ function performDomActionInPage(request) {
       actionReadback = performSubmit(element, eventsDispatched);
     } else if (action === "dispatch_event") {
       actionReadback = performDispatchEvent(element, eventType, eventInit, eventsDispatched);
+    } else if (action === "clear") {
+      actionReadback = performClear(element, eventsDispatched);
+    } else if (action === "focus") {
+      actionReadback = performFocus(element, eventsDispatched);
+    } else if (action === "blur") {
+      actionReadback = performBlur(element, eventsDispatched);
+    } else if (action === "select_text") {
+      actionReadback = performSelectText(element, eventsDispatched);
     }
   } catch (error) {
     return fail(error?.code || ERROR_ACTION_UNSUPPORTED, errorMessageLocal(error), {
@@ -3085,8 +3097,11 @@ function performDomActionInPage(request) {
   }
 
   function semanticCandidates(actionName) {
-    if (actionName === "dispatch_event") {
+    if (["dispatch_event", "focus", "blur", "select_text"].includes(actionName)) {
       return Array.from(document.querySelectorAll("*"));
+    }
+    if (actionName === "clear") {
+      return Array.from(document.querySelectorAll("input,textarea,[contenteditable],[role='textbox']"));
     }
     if (actionName === "select") {
       return Array.from(document.querySelectorAll("select,[role='combobox'],[role='listbox']"));
@@ -3130,6 +3145,180 @@ function performDomActionInPage(request) {
       cancelable: Boolean(event.cancelable),
       composed: Boolean(event.composed),
       detail: "detail" in event ? event.detail : null
+    };
+  }
+
+  function performClear(element, events) {
+    const editable = editableKind(element);
+    if (!editable) {
+      throw actionError(
+        ERROR_ACTION_UNSUPPORTED,
+        `domAction clear supports editable input/textarea/contenteditable targets only; resolved ${tag(element)} role=${inferRole(element)}`
+      );
+    }
+    if (element.disabled || element.readOnly) {
+      throw actionError(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved editable element is disabled or readonly");
+    }
+    try {
+      if (typeof element.focus === "function") {
+        element.focus({ preventScroll: true });
+        events.push("focus");
+      }
+    } catch (_) {
+      // A failed focus does not prove the DOM value cannot be cleared.
+    }
+
+    const beforeValue = elementTextValue(element);
+    const beforeInput = dispatchInputLikeEvent(element, "beforeinput", null, "deleteContentBackward", true);
+    events.push("beforeinput");
+    if (!beforeInput) {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, "clear was cancelled by a beforeinput listener");
+    }
+
+    if (editable === "value") {
+      setNativeValue(element, "");
+      try {
+        if (typeof element.setSelectionRange === "function") {
+          element.setSelectionRange(0, 0);
+        }
+      } catch (_) {
+        // Some input types expose value but reject text selection.
+      }
+    } else {
+      element.textContent = "";
+    }
+
+    dispatchInputLikeEvent(element, "input", null, "deleteContentBackward", false);
+    events.push("input");
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    events.push("change");
+
+    const afterValue = elementTextValue(element);
+    if (afterValue !== "") {
+      throw actionError(
+        ERROR_POSTCONDITION_FAILED,
+        `clear postcondition failed: after value/text length ${afterValue.length} was not zero`
+      );
+    }
+    return {
+      before_value_len: beforeValue.length,
+      after_value_len: afterValue.length,
+      input_fired: true,
+      change_fired: true
+    };
+  }
+
+  function performFocus(element, events) {
+    const beforeActive = activeElementSummary(element.ownerDocument, element);
+    if (typeof element.focus !== "function") {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, `resolved ${tag(element)} element has no focus() method`);
+    }
+    try {
+      element.focus({ preventScroll: true });
+    } catch (_) {
+      element.focus();
+    }
+    events.push("focus");
+    const afterActive = activeElementSummary(element.ownerDocument, element);
+    if (element.ownerDocument.activeElement !== element) {
+      throw actionError(
+        ERROR_POSTCONDITION_FAILED,
+        `focus postcondition failed: activeElement is ${afterActive.tag_name || "none"}#${afterActive.id || ""}`
+      );
+    }
+    return {
+      before_active_element: beforeActive,
+      after_active_element: afterActive,
+      active_element_is_target: true
+    };
+  }
+
+  function performBlur(element, events) {
+    const beforeActive = activeElementSummary(element.ownerDocument, element);
+    if (typeof element.blur !== "function") {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, `resolved ${tag(element)} element has no blur() method`);
+    }
+    element.blur();
+    events.push("blur");
+    const afterActive = activeElementSummary(element.ownerDocument, element);
+    if (element.ownerDocument.activeElement === element) {
+      throw actionError(ERROR_POSTCONDITION_FAILED, "blur postcondition failed: target remained document.activeElement");
+    }
+    return {
+      before_active_element: beforeActive,
+      after_active_element: afterActive,
+      active_element_is_target: false
+    };
+  }
+
+  function performSelectText(element, events) {
+    const beforeSelection = selectionSummary(element);
+    let readback;
+    if (isSelectableValueControl(element)) {
+      try {
+        if (typeof element.focus === "function") {
+          element.focus({ preventScroll: true });
+          events.push("focus");
+        }
+      } catch (_) {
+        // select() may still work for some controls.
+      }
+      try {
+        element.select();
+      } catch (error) {
+        throw actionError(ERROR_ACTION_UNSUPPORTED, `selectText value-control select() failed: ${errorMessageLocal(error)}`);
+      }
+      element.dispatchEvent(new Event("select", { bubbles: true }));
+      events.push("select");
+      element.ownerDocument.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+      events.push("selectionchange");
+      const value = elementTextValue(element);
+      const start = typeof element.selectionStart === "number" ? element.selectionStart : null;
+      const end = typeof element.selectionEnd === "number" ? element.selectionEnd : null;
+      readback = {
+        selection_mode: "value_control_select",
+        text_len: value.length,
+        selection_start: start,
+        selection_end: end,
+        selected_text: start === null || end === null ? "" : value.slice(start, end)
+      };
+      if (readback.selected_text !== value) {
+        throw actionError(
+          ERROR_POSTCONDITION_FAILED,
+          `selectText postcondition failed: selected ${readback.selected_text.length} of ${value.length} chars`
+        );
+      }
+    } else {
+      const doc = element.ownerDocument;
+      const selection = doc.defaultView?.getSelection?.();
+      if (!selection) {
+        throw actionError(ERROR_ACTION_UNSUPPORTED, "selectText requires document.getSelection()");
+      }
+      const range = doc.createRange();
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      doc.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+      events.push("selectionchange");
+      const expected = String(element.textContent || "");
+      readback = {
+        selection_mode: "dom_range_select_node_contents",
+        text_len: expected.length,
+        selection_start: null,
+        selection_end: null,
+        selected_text: String(selection.toString() || "")
+      };
+      if (readback.selected_text !== expected) {
+        throw actionError(
+          ERROR_POSTCONDITION_FAILED,
+          `selectText postcondition failed: selected ${readback.selected_text.length} of ${expected.length} chars`
+        );
+      }
+    }
+    return {
+      before_selection: beforeSelection,
+      after_selection: selectionSummary(element),
+      ...readback
     };
   }
 
@@ -3257,6 +3446,126 @@ function performDomActionInPage(request) {
       return type === "submit" || type === "image";
     }
     return false;
+  }
+
+  function editableKind(element) {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+    const lower = tag(element);
+    if (lower === "textarea") {
+      return "value";
+    }
+    if (lower === "input") {
+      const type = String(element.getAttribute("type") || "text").toLowerCase();
+      const nonText = ["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image", "hidden"];
+      return nonText.includes(type) ? null : "value";
+    }
+    if (
+      element.isContentEditable ||
+      String(element.getAttribute("contenteditable") || "").toLowerCase() === "true" ||
+      String(element.getAttribute("role") || "").toLowerCase() === "textbox"
+    ) {
+      return "contenteditable";
+    }
+    return null;
+  }
+
+  function isSelectableValueControl(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    const lower = tag(element);
+    if (!["input", "textarea"].includes(lower) || typeof element.select !== "function" || !("value" in element)) {
+      return false;
+    }
+    if (lower === "textarea") {
+      return true;
+    }
+    const type = String(element.getAttribute("type") || "text").toLowerCase();
+    const nonSelectable = ["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image", "hidden"];
+    return !nonSelectable.includes(type);
+  }
+
+  function elementTextValue(element) {
+    if ("value" in element) {
+      return String(element.value ?? "");
+    }
+    return String(element.innerText || element.textContent || "");
+  }
+
+  function setNativeValue(element, value) {
+    const lower = tag(element);
+    const proto =
+      lower === "input"
+        ? window.HTMLInputElement?.prototype
+        : lower === "textarea"
+          ? window.HTMLTextAreaElement?.prototype
+          : null;
+    const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+    if (descriptor && typeof descriptor.set === "function") {
+      descriptor.set.call(element, value);
+    } else {
+      element.value = value;
+    }
+  }
+
+  function dispatchInputLikeEvent(element, type, data, inputType, cancelable) {
+    let event;
+    try {
+      event = new InputEvent(type, {
+        bubbles: true,
+        cancelable,
+        data,
+        inputType
+      });
+    } catch (_) {
+      event = new Event(type, { bubbles: true, cancelable });
+    }
+    return element.dispatchEvent(event);
+  }
+
+  function activeElementSummary(doc, target) {
+    const active = doc?.activeElement || null;
+    if (!(active instanceof Element)) {
+      return {
+        has_active_element: false,
+        tag_name: "",
+        id: "",
+        role: "",
+        name_attr: "",
+        accessible_name: "",
+        is_target: false
+      };
+    }
+    return {
+      has_active_element: true,
+      tag_name: tag(active),
+      id: String(active.id || ""),
+      role: inferRole(active),
+      name_attr: String(active.getAttribute("name") || ""),
+      accessible_name: trimForReadback(accessibleName(active), 160),
+      is_target: active === target
+    };
+  }
+
+  function selectionSummary(element) {
+    const value = elementTextValue(element);
+    if (typeof element.selectionStart === "number" && typeof element.selectionEnd === "number") {
+      return {
+        selection_mode: "value_control",
+        selection_start: element.selectionStart,
+        selection_end: element.selectionEnd,
+        selected_text: value.slice(element.selectionStart, element.selectionEnd)
+      };
+    }
+    const selection = element.ownerDocument?.defaultView?.getSelection?.();
+    return {
+      selection_mode: "dom_selection",
+      selection_start: null,
+      selection_end: null,
+      selected_text: selection ? String(selection.toString() || "") : ""
+    };
   }
 
   function accessibleName(element) {

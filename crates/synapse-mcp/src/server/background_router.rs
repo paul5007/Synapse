@@ -47,7 +47,7 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, tap, dispatch_event, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, tap, dispatch_event, clear, focus, blur, select_text, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -82,8 +82,9 @@ pub struct TargetActParams {
     #[serde(default)]
     pub path: Option<String>,
     /// `set_field`: target element id (from observe/find), for the UIA/CDP-id
-    /// background tiers. `click` can also use this as an observed element id;
-    /// DOM actions treat it as a page element id.
+    /// background tiers. `click` can also use this as an observed element id.
+    /// Browser DOM actions use observed CDP ids when possible and otherwise
+    /// treat this as a page element id.
     #[serde(default)]
     pub element_id: Option<String>,
     /// `set_field` / browser DOM action: strict CSS selector routed to the safe
@@ -213,7 +214,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a raw-CDP browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a raw-CDP browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -466,6 +467,19 @@ impl SynapseService {
             "tap" => target_act_touch_tap(self, &params, &request_context).await?,
             "dispatch_event" | "dispatchevent" => {
                 target_act_browser_dom_action(self, "dispatch_event", &params, &request_context)
+                    .await?
+            }
+            "clear" => {
+                target_act_browser_dom_primitive(self, "clear", &params, &request_context).await?
+            }
+            "focus" => {
+                target_act_browser_dom_primitive(self, "focus", &params, &request_context).await?
+            }
+            "blur" => {
+                target_act_browser_dom_primitive(self, "blur", &params, &request_context).await?
+            }
+            "select_text" | "selecttext" => {
+                target_act_browser_dom_primitive(self, "select_text", &params, &request_context)
                     .await?
             }
             "type" => {
@@ -2201,6 +2215,306 @@ fn target_act_session_id(
             format!("target_act verb={verb} requires an MCP session id"),
         )
     })
+}
+
+async fn target_act_browser_dom_primitive(
+    service: &SynapseService,
+    action: &'static str,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    target_act_validate_dom_primitive_params(action, params)?;
+    if let Some(raw_element_id) = params
+        .element_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        match ElementId::parse(raw_element_id) {
+            Ok(element_id) => {
+                if synapse_a11y::cdp_backend_from_element_id(&element_id).is_some() {
+                    return target_act_cdp_dom_primitive(
+                        service,
+                        action,
+                        element_id,
+                        request_context,
+                    )
+                    .await;
+                }
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "target_act verb={action} supports browser DOM/CDP targets only; native/UIA element_id {raw_element_id:?} is not supported by this primitive"
+                    ),
+                ));
+            }
+            Err(error) if !target_act_click_element_id_can_be_dom_id(raw_element_id) => {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("target_act verb={action} element_id is invalid: {error}"),
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    target_act_browser_dom_action(service, action, params, request_context).await
+}
+
+fn target_act_validate_dom_primitive_params(
+    action: &str,
+    params: &TargetActParams,
+) -> Result<(), ErrorData> {
+    if target_act_coordinate(params)?.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb={action} does not accept x/y coordinates"),
+        ));
+    }
+    if target_act_has_key_chord(params) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb={action} does not accept key(s); use verb=key for raw keyboard chords"
+            ),
+        ));
+    }
+    if params.clicks.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb={action} does not accept clicks"),
+        ));
+    }
+    if params.text.as_ref().is_some_and(|value| !value.is_empty()) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb={action} does not accept text"),
+        ));
+    }
+    if params
+        .option
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb={action} does not accept option"),
+        ));
+    }
+    if params
+        .event_type
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || params.event_init.is_some()
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb={action} does not accept event_type/event_init"),
+        ));
+    }
+    if params.selection_start.is_some() || params.selection_end.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb={action} selects the whole element and does not accept selection_start/selection_end"
+            ),
+        ));
+    }
+    target_act_validate_dom_locator(action, params)
+}
+
+#[cfg(windows)]
+async fn target_act_cdp_dom_primitive(
+    service: &SynapseService,
+    action: &'static str,
+    element_id: ElementId,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let session_id = target_act_session_id(request_context, action)?;
+    let backend_node_id =
+        synapse_a11y::cdp_backend_from_element_id(&element_id).ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("target_act verb={action} element_id is not a CDP-backed web element"),
+            )
+        })?;
+    let element_target_id =
+        synapse_a11y::cdp_target_from_element_id(&element_id).ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act verb={action} web element_id must include an embedded CDP target id; re-resolve it against the owned tab"
+                ),
+            )
+        })?;
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": action,
+        "element_id": element_id.to_string(),
+        "backend_node_id": backend_node_id,
+        "cdp_target_id": &element_target_id,
+        "delegated_tool": "synapse_a11y.cdp_dom_primitive_node",
+        "required_foreground": false,
+    });
+    let Some(target) = service.session_target(Some(&session_id))? else {
+        let error = mcp_error(
+            error_codes::TARGET_NOT_SET,
+            format!(
+                "target_act verb={action} requires this MCP session to own a CDP browser target; bind one with cdp_open_tab/set_target first"
+            ),
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_dom_primitive_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    };
+    let (window_hwnd, cdp_target_id) = match &target {
+        SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        } => (*window_hwnd, cdp_target_id.clone()),
+        SessionTarget::Window { .. } => {
+            let error = mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "target_act verb={action} with an observed web element_id requires a session-owned CDP target, not a native/window target"
+                ),
+            );
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &request_details,
+                &session_id,
+            );
+            return Ok((
+                "synapse_a11y.cdp_dom_primitive_node",
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        }
+    };
+    if cdp_target_id != element_target_id {
+        let error = mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb={action} element_id belongs to CDP target {element_target_id:?}, but this session owns {cdp_target_id:?}"
+            ),
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_dom_primitive_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    }
+    if let Err(error) =
+        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+    {
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_dom_primitive_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    }
+    let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+        let error = mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb={action} requires a raw CDP debugging endpoint for window 0x{window_hwnd:x}; re-resolve by selector/role/name to use the normal Chrome bridge path"
+            ),
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "synapse_a11y.cdp_dom_primitive_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    };
+    service.audit_action_started_with_details_for_session(
+        "target_act",
+        &request_details,
+        &session_id,
+    )?;
+    let result =
+        synapse_a11y::cdp_dom_primitive_node(&endpoint, &cdp_target_id, backend_node_id, action)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("target_act CDP {action} failed: {error}"),
+                )
+            });
+    service.audit_action_result_for_session("target_act", &result, &session_id)?;
+    match result {
+        Ok(readback) => {
+            let mut value = target_act_result(&readback)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("element_id".to_owned(), json!(element_id.to_string()));
+                object.insert("backend_node_id".to_owned(), json!(backend_node_id));
+                object.insert("target_id".to_owned(), json!(cdp_target_id));
+                object.insert("window_hwnd".to_owned(), json!(window_hwnd));
+            }
+            Ok((
+                "synapse_a11y.cdp_dom_primitive_node",
+                true,
+                TARGET_ACT_STATUS_OK,
+                value,
+            ))
+        }
+        Err(error) => Ok((
+            "synapse_a11y.cdp_dom_primitive_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("synapse_a11y.cdp_dom_primitive_node", error),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+async fn target_act_cdp_dom_primitive(
+    _service: &SynapseService,
+    action: &'static str,
+    _element_id: ElementId,
+    _request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let error = mcp_error(
+        error_codes::ACTION_TARGET_INVALID,
+        format!(
+            "target_act verb={action} observed CDP element_id primitives require Windows CDP action support"
+        ),
+    );
+    Ok((
+        "synapse_a11y.cdp_dom_primitive_node",
+        false,
+        target_act_error_status(&error),
+        target_act_error_result("synapse_a11y.cdp_dom_primitive_node", error),
+    ))
 }
 
 async fn target_act_browser_dom_action(
@@ -4991,6 +5305,40 @@ mod tests {
         );
         target_act_validate_dom_locator("dispatch_event", &dispatch_event)
             .expect("dispatch_event locator should validate");
+
+        for verb in ["clear", "focus", "blur", "select_text", "selectText"] {
+            let params: TargetActParams = serde_json::from_value(json!({
+                "verb": verb,
+                "selector": "#token"
+            }))
+            .expect("primitive params should deserialize");
+            let expected = if verb == "selectText" {
+                "selecttext"
+            } else {
+                verb
+            };
+            assert_eq!(params.verb.as_str(), expected);
+            let action = if verb == "selectText" {
+                "select_text"
+            } else {
+                verb
+            };
+            target_act_validate_dom_primitive_params(action, &params)
+                .expect("primitive locator should validate");
+        }
+
+        let clear_with_text: TargetActParams = serde_json::from_value(json!({
+            "verb": "clear",
+            "selector": "#token",
+            "text": "ignored"
+        }))
+        .expect("clear params should deserialize");
+        let error = target_act_validate_dom_primitive_params("clear", &clear_with_text)
+            .expect_err("clear should reject unused text");
+        assert!(
+            error.message.contains("does not accept text"),
+            "clear validation should reject ignored text: {error:?}"
+        );
     }
 
     #[test]
