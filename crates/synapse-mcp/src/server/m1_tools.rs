@@ -1,5 +1,6 @@
 use super::{
-    BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAdoptActiveTabParams,
+    BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAddScriptTagParams,
+    BrowserAddStyleTagParams, BrowserAddTagResponse, BrowserAdoptActiveTabParams,
     BrowserAdoptActiveTabResponse, BrowserConsoleMessagesParams, BrowserConsoleMessagesResponse,
     BrowserContentParams, BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse,
     BrowserInitScriptOperation, BrowserInspectParams, BrowserInspectResponse,
@@ -1854,6 +1855,150 @@ impl SynapseService {
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .browser_add_init_script_impl(&session_id, window_hwnd, &cdp_target_id, &params.0)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Inject a Playwright-style <script> tag into the calling session's owned current document from exactly one source: url, content, or local UTF-8 path. URL sources wait for onload/onerror and surface load failures as structured MCP errors; inline/path sources append synchronously. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_add_script_tag(
+        &self,
+        params: Parameters<BrowserAddScriptTagParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserAddTagResponse>, ErrorData> {
+        const TOOL: &str = "browser_add_script_tag";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_add_script_tag"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        validate_browser_add_script_tag_params(&params.0)?;
+        let source = resolve_browser_tag_source(
+            TOOL,
+            params.0.url.as_deref(),
+            params.0.content.as_deref(),
+            params.0.path.as_deref(),
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "source_kind": source.kind.as_str(),
+            "requested_url": source.requested_url.as_deref(),
+            "path": source.path.as_deref(),
+            "content_len": source.content_len,
+            "script_type": params.0.script_type.as_deref(),
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "source_kind": source.kind.as_str(),
+            "requested_url": source.requested_url.as_deref(),
+            "path": source.path.as_deref(),
+            "content_len": source.content_len,
+            "script_type": params.0.script_type.as_deref(),
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_add_tag_impl(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                TOOL,
+                BrowserTagKind::Script,
+                &source,
+                params.0.script_type.as_deref(),
+            )
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Inject a Playwright-style stylesheet into the calling session's owned current document from exactly one source: url, content, or local UTF-8 path. URL sources create <link rel=stylesheet> and wait for onload/onerror; inline/path sources create <style>. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_add_style_tag(
+        &self,
+        params: Parameters<BrowserAddStyleTagParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserAddTagResponse>, ErrorData> {
+        const TOOL: &str = "browser_add_style_tag";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_add_style_tag"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        validate_browser_add_style_tag_params(&params.0)?;
+        let source = resolve_browser_tag_source(
+            TOOL,
+            params.0.url.as_deref(),
+            params.0.content.as_deref(),
+            params.0.path.as_deref(),
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "source_kind": source.kind.as_str(),
+            "requested_url": source.requested_url.as_deref(),
+            "path": source.path.as_deref(),
+            "content_len": source.content_len,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "source_kind": source.kind.as_str(),
+            "requested_url": source.requested_url.as_deref(),
+            "path": source.path.as_deref(),
+            "content_len": source.content_len,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_add_tag_impl(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                TOOL,
+                BrowserTagKind::Style,
+                &source,
+                None,
+            )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -4161,6 +4306,97 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_add_tag_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        tool: &str,
+        tag_kind: BrowserTagKind,
+        source: &ResolvedBrowserTagSource,
+        script_type: Option<&str>,
+    ) -> Result<BrowserAddTagResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(tool, window_hwnd));
+        };
+        let marker = browser_tag_marker(tool, cdp_target_id);
+        let expression =
+            build_browser_add_tag_expression(tool, tag_kind, source, script_type, &marker)?;
+        let evaluated = synapse_a11y::cdp_evaluate_expression(
+            &endpoint,
+            cdp_target_id,
+            &expression,
+            true,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("{tool} raw CDP Runtime.evaluate failed: {error}"),
+            )
+        })?;
+        let payload: BrowserAddTagPayload = serde_json::from_value(evaluated.value.clone())
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    format!("{tool} payload decode failed: {error}"),
+                )
+            })?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_TAG_INJECT",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %evaluated.target_id,
+            tag_name = %payload.tag_name,
+            source_kind = %payload.source_kind,
+            content_len = payload.content_len,
+            element_marker = %payload.element_marker,
+            target_url = %evaluated.url,
+            "readback=Runtime.evaluate+tag.onload/onerror outcome=tag_injected"
+        );
+        Ok(BrowserAddTagResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: evaluated.target_id,
+            tag_name: payload.tag_name,
+            source_kind: payload.source_kind,
+            requested_url: payload.requested_url,
+            resolved_url: payload.resolved_url,
+            path: source.path.clone(),
+            script_type: script_type.map(ToOwned::to_owned),
+            content_len: payload.content_len,
+            element_marker: payload.element_marker,
+            url: evaluated.url,
+            title: evaluated.title,
+            ready_state: evaluated.ready_state,
+            readback_backend: "Runtime.evaluate+tag.onload/onerror".to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_add_tag_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        tool: &str,
+        _tag_kind: BrowserTagKind,
+        _source: &ResolvedBrowserTagSource,
+        _script_type: Option<&str>,
+    ) -> Result<BrowserAddTagResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            format!("{tool} is only available on Windows in this build"),
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_content_impl(
         &self,
         session_id: &str,
@@ -5585,6 +5821,53 @@ const BROWSER_EVALUATE_MAX_EXPRESSION_BYTES: usize = 1_048_576;
 const BROWSER_INIT_SCRIPT_MAX_SOURCE_BYTES: usize = BROWSER_EVALUATE_MAX_EXPRESSION_BYTES;
 const BROWSER_INIT_SCRIPT_MAX_IDENTIFIER_CHARS: usize = 512;
 const BROWSER_INIT_SCRIPT_MAX_WORLD_NAME_CHARS: usize = 256;
+const BROWSER_TAG_MAX_CONTENT_BYTES: usize = BROWSER_EVALUATE_MAX_EXPRESSION_BYTES - (16 * 1024);
+const BROWSER_TAG_MAX_URL_CHARS: usize = 8192;
+const BROWSER_TAG_MAX_PATH_CHARS: usize = 4096;
+const BROWSER_TAG_MAX_SCRIPT_TYPE_CHARS: usize = 128;
+
+#[derive(Clone, Copy, Debug)]
+enum BrowserTagKind {
+    Script,
+    Style,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserTagSourceKind {
+    Url,
+    Content,
+    Path,
+}
+
+impl BrowserTagSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::Content => "content",
+            Self::Path => "path",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedBrowserTagSource {
+    kind: BrowserTagSourceKind,
+    requested_url: Option<String>,
+    path: Option<String>,
+    content: String,
+    content_len: usize,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct BrowserAddTagPayload {
+    tag_name: String,
+    source_kind: String,
+    requested_url: Option<String>,
+    resolved_url: Option<String>,
+    content_len: usize,
+    element_marker: String,
+}
 
 fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<(), ErrorData> {
     if params.expression.trim().is_empty() {
@@ -5617,6 +5900,442 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
         ));
     }
     Ok(())
+}
+
+fn validate_browser_add_script_tag_params(
+    params: &BrowserAddScriptTagParams,
+) -> Result<(), ErrorData> {
+    validate_browser_tag_common_params(
+        "browser_add_script_tag",
+        params.cdp_target_id.as_deref(),
+        params.url.as_deref(),
+        params.content.as_deref(),
+        params.path.as_deref(),
+    )?;
+    if let Some(script_type) = params.script_type.as_deref() {
+        validate_browser_tag_script_type(script_type)?;
+    }
+    Ok(())
+}
+
+fn validate_browser_add_style_tag_params(
+    params: &BrowserAddStyleTagParams,
+) -> Result<(), ErrorData> {
+    validate_browser_tag_common_params(
+        "browser_add_style_tag",
+        params.cdp_target_id.as_deref(),
+        params.url.as_deref(),
+        params.content.as_deref(),
+        params.path.as_deref(),
+    )
+}
+
+fn validate_browser_tag_common_params(
+    tool: &str,
+    cdp_target_id: Option<&str>,
+    url: Option<&str>,
+    content: Option<&str>,
+    path: Option<&str>,
+) -> Result<(), ErrorData> {
+    if let Some(target_id) = cdp_target_id {
+        validate_cdp_target_id(target_id)?;
+    }
+    let source_count = [url.is_some(), content.is_some(), path.is_some()]
+        .into_iter()
+        .filter(|supplied| *supplied)
+        .count();
+    if source_count != 1 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} requires exactly one of url, content, or path"),
+        ));
+    }
+    if let Some(url) = url {
+        validate_browser_tag_url(tool, url)?;
+    }
+    if let Some(content) = content {
+        validate_browser_tag_content(tool, "content", content)?;
+    }
+    if let Some(path) = path {
+        validate_browser_tag_path_param(tool, path)?;
+    }
+    Ok(())
+}
+
+fn validate_browser_tag_url(tool: &str, url: &str) -> Result<(), ErrorData> {
+    if url.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} url must not be empty"),
+        ));
+    }
+    if url.chars().count() > BROWSER_TAG_MAX_URL_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} url must be at most {BROWSER_TAG_MAX_URL_CHARS} Unicode scalar values"),
+        ));
+    }
+    if url.contains('\0') {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} url must not contain NUL"),
+        ));
+    }
+    if url.trim() != url {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} url must not contain leading or trailing whitespace"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_browser_tag_content(tool: &str, field: &str, content: &str) -> Result<(), ErrorData> {
+    if content.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} {field} must not be empty"),
+        ));
+    }
+    if content.len() > BROWSER_TAG_MAX_CONTENT_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} {field} is {} bytes; the maximum is {BROWSER_TAG_MAX_CONTENT_BYTES} bytes",
+                content.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_browser_tag_path_param(tool: &str, path: &str) -> Result<(), ErrorData> {
+    if path.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} path must not be empty"),
+        ));
+    }
+    if path.chars().count() > BROWSER_TAG_MAX_PATH_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} path must be at most {BROWSER_TAG_MAX_PATH_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    if path.contains('\0') {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} path must not contain NUL"),
+        ));
+    }
+    if path.trim() != path {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} path must not contain leading or trailing whitespace"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_browser_tag_script_type(script_type: &str) -> Result<(), ErrorData> {
+    if script_type.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_add_script_tag script_type must not be empty when supplied",
+        ));
+    }
+    if script_type.chars().count() > BROWSER_TAG_MAX_SCRIPT_TYPE_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_add_script_tag script_type must be at most {BROWSER_TAG_MAX_SCRIPT_TYPE_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    if script_type.contains('\0') {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_add_script_tag script_type must not contain NUL",
+        ));
+    }
+    if script_type.trim() != script_type {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_add_script_tag script_type must not contain leading or trailing whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_browser_tag_source(
+    tool: &str,
+    url: Option<&str>,
+    content: Option<&str>,
+    path: Option<&str>,
+) -> Result<ResolvedBrowserTagSource, ErrorData> {
+    if let Some(url) = url {
+        return Ok(ResolvedBrowserTagSource {
+            kind: BrowserTagSourceKind::Url,
+            requested_url: Some(url.to_owned()),
+            path: None,
+            content: String::new(),
+            content_len: 0,
+        });
+    }
+    if let Some(content) = content {
+        return Ok(ResolvedBrowserTagSource {
+            kind: BrowserTagSourceKind::Content,
+            requested_url: None,
+            path: None,
+            content: content.to_owned(),
+            content_len: content.len(),
+        });
+    }
+    let Some(path) = path else {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} requires exactly one of url, content, or path"),
+        ));
+    };
+    let requested = PathBuf::from(path);
+    let canonical = std::fs::canonicalize(&requested).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} path must be an existing file, got {path:?}: {error}"),
+        )
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} failed to read metadata for {}: {error}",
+                canonical.display()
+            ),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} path must be a file, got {}", canonical.display()),
+        ));
+    }
+    if metadata.len() > BROWSER_TAG_MAX_CONTENT_BYTES as u64 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} path content is {} bytes; the maximum is {BROWSER_TAG_MAX_CONTENT_BYTES} bytes",
+                metadata.len()
+            ),
+        ));
+    }
+    let bytes = std::fs::read(&canonical).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} failed to read {}: {error}", canonical.display()),
+        )
+    })?;
+    if bytes.len() > BROWSER_TAG_MAX_CONTENT_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} path content is {} bytes; the maximum is {BROWSER_TAG_MAX_CONTENT_BYTES} bytes",
+                bytes.len()
+            ),
+        ));
+    }
+    let content = String::from_utf8(bytes).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} path must contain UTF-8 text: {error}"),
+        )
+    })?;
+    validate_browser_tag_content(tool, "path content", &content)?;
+    let content_len = content.len();
+    Ok(ResolvedBrowserTagSource {
+        kind: BrowserTagSourceKind::Path,
+        requested_url: None,
+        path: Some(canonical.to_string_lossy().into_owned()),
+        content,
+        content_len,
+    })
+}
+
+#[cfg(windows)]
+fn browser_tag_marker(tool: &str, cdp_target_id: &str) -> String {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let digest = sha256_hex(format!("{tool}:{cdp_target_id}:{timestamp_ms}").as_bytes());
+    format!("synapse-{tool}-{timestamp_ms}-{}", &digest[..12])
+}
+
+#[cfg(windows)]
+fn browser_tag_json_string(tool: &str, field: &str, value: &str) -> Result<String, ErrorData> {
+    serde_json::to_string(value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} failed to encode {field} for injection: {error}"),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn build_browser_add_tag_expression(
+    tool: &str,
+    tag_kind: BrowserTagKind,
+    source: &ResolvedBrowserTagSource,
+    script_type: Option<&str>,
+    marker: &str,
+) -> Result<String, ErrorData> {
+    let marker_json = browser_tag_json_string(tool, "element marker", marker)?;
+    let expression = match (tag_kind, source.kind) {
+        (BrowserTagKind::Script, BrowserTagSourceKind::Url) => {
+            let url_json = browser_tag_json_string(
+                tool,
+                "url",
+                source.requested_url.as_deref().unwrap_or_default(),
+            )?;
+            let script_type_json =
+                browser_tag_json_string(tool, "script_type", script_type.unwrap_or_default())?;
+            format!(
+                r#"(() => new Promise((resolve, reject) => {{
+                    const marker = {marker_json};
+                    const requestedUrl = {url_json};
+                    const scriptType = {script_type_json};
+                    const parent = document.head || document.documentElement || document.body;
+                    if (!parent) {{
+                        reject(new Error("{tool} failed: document has no append target"));
+                        return;
+                    }}
+                    const el = document.createElement("script");
+                    el.setAttribute("data-synapse-tag-id", marker);
+                    if (scriptType) {{
+                        el.type = scriptType;
+                    }}
+                    el.onload = () => resolve({{
+                        tag_name: el.tagName.toLowerCase(),
+                        source_kind: "url",
+                        requested_url: requestedUrl,
+                        resolved_url: el.src || "",
+                        content_len: 0,
+                        element_marker: marker
+                    }});
+                    el.onerror = () => reject(new Error("{tool} url load failed: " + requestedUrl));
+                    el.src = requestedUrl;
+                    parent.appendChild(el);
+                }}))()"#
+            )
+        }
+        (BrowserTagKind::Script, BrowserTagSourceKind::Content | BrowserTagSourceKind::Path) => {
+            let content_json = browser_tag_json_string(tool, "content", &source.content)?;
+            let source_kind_json =
+                browser_tag_json_string(tool, "source_kind", source.kind.as_str())?;
+            let script_type_json =
+                browser_tag_json_string(tool, "script_type", script_type.unwrap_or_default())?;
+            let content_len = source.content_len;
+            format!(
+                r#"(() => {{
+                    const marker = {marker_json};
+                    const source = {content_json};
+                    const sourceKind = {source_kind_json};
+                    const scriptType = {script_type_json};
+                    const parent = document.head || document.documentElement || document.body;
+                    if (!parent) {{
+                        throw new Error("{tool} failed: document has no append target");
+                    }}
+                    const el = document.createElement("script");
+                    el.setAttribute("data-synapse-tag-id", marker);
+                    if (scriptType) {{
+                        el.type = scriptType;
+                    }}
+                    el.textContent = source;
+                    parent.appendChild(el);
+                    return {{
+                        tag_name: el.tagName.toLowerCase(),
+                        source_kind: sourceKind,
+                        requested_url: null,
+                        resolved_url: null,
+                        content_len: {content_len},
+                        element_marker: marker
+                    }};
+                }})()"#
+            )
+        }
+        (BrowserTagKind::Style, BrowserTagSourceKind::Url) => {
+            let url_json = browser_tag_json_string(
+                tool,
+                "url",
+                source.requested_url.as_deref().unwrap_or_default(),
+            )?;
+            format!(
+                r#"(() => new Promise((resolve, reject) => {{
+                    const marker = {marker_json};
+                    const requestedUrl = {url_json};
+                    const parent = document.head || document.documentElement || document.body;
+                    if (!parent) {{
+                        reject(new Error("{tool} failed: document has no append target"));
+                        return;
+                    }}
+                    const el = document.createElement("link");
+                    el.setAttribute("data-synapse-tag-id", marker);
+                    el.rel = "stylesheet";
+                    el.onload = () => resolve({{
+                        tag_name: el.tagName.toLowerCase(),
+                        source_kind: "url",
+                        requested_url: requestedUrl,
+                        resolved_url: el.href || "",
+                        content_len: 0,
+                        element_marker: marker
+                    }});
+                    el.onerror = () => reject(new Error("{tool} url load failed: " + requestedUrl));
+                    el.href = requestedUrl;
+                    parent.appendChild(el);
+                }}))()"#
+            )
+        }
+        (BrowserTagKind::Style, BrowserTagSourceKind::Content | BrowserTagSourceKind::Path) => {
+            let content_json = browser_tag_json_string(tool, "content", &source.content)?;
+            let source_kind_json =
+                browser_tag_json_string(tool, "source_kind", source.kind.as_str())?;
+            let content_len = source.content_len;
+            format!(
+                r#"(() => {{
+                    const marker = {marker_json};
+                    const source = {content_json};
+                    const sourceKind = {source_kind_json};
+                    const parent = document.head || document.documentElement || document.body;
+                    if (!parent) {{
+                        throw new Error("{tool} failed: document has no append target");
+                    }}
+                    const el = document.createElement("style");
+                    el.setAttribute("data-synapse-tag-id", marker);
+                    el.textContent = source;
+                    parent.appendChild(el);
+                    return {{
+                        tag_name: el.tagName.toLowerCase(),
+                        source_kind: sourceKind,
+                        requested_url: null,
+                        resolved_url: null,
+                        content_len: {content_len},
+                        element_marker: marker
+                    }};
+                }})()"#
+            )
+        }
+    };
+    if expression.len() > BROWSER_EVALUATE_MAX_EXPRESSION_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} generated Runtime.evaluate expression is {} bytes after JSON escaping; the maximum is {BROWSER_EVALUATE_MAX_EXPRESSION_BYTES} bytes",
+                expression.len()
+            ),
+        ));
+    }
+    Ok(expression)
 }
 
 fn validate_browser_add_init_script_params(
@@ -8313,21 +9032,24 @@ fn escape_json_pointer(segment: &str) -> String {
 mod tests {
     use super::{
         BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, BROWSER_INIT_SCRIPT_MAX_SOURCE_BYTES,
-        CdpTargetOwner, MAX_BROWSER_SET_CONTENT_HTML_BYTES, SessionTarget, SynapseService,
-        TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
+        BROWSER_TAG_MAX_CONTENT_BYTES, BrowserTagSourceKind, CdpTargetOwner,
+        MAX_BROWSER_SET_CONTENT_HTML_BYTES, SessionTarget, SynapseService, TargetWire,
+        attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
         cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
         chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
         hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
-        page_text_info_from_parts, perception_window_hwnd, resolve_capture_target_window_context,
-        select_single_active_browser_tab, sha256_hex, target_wire, template_value,
-        unavailable_page_vitals_info, validate_browser_add_init_script_params,
-        validate_browser_evaluate_params, validate_browser_set_content_params,
-        validate_target_window,
+        page_text_info_from_parts, perception_window_hwnd, resolve_browser_tag_source,
+        resolve_capture_target_window_context, select_single_active_browser_tab, sha256_hex,
+        target_wire, template_value, unavailable_page_vitals_info,
+        validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
+        validate_browser_add_style_tag_params, validate_browser_evaluate_params,
+        validate_browser_set_content_params, validate_target_window,
     };
     use crate::m1::{
-        BrowserAddInitScriptParams, BrowserEvaluateParams, BrowserInitScriptOperation,
-        BrowserSetContentParams, BrowserTabEntry, BrowserTabsResponse, CdpActivateTabParams,
-        CdpTargetInfoParams, FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
+        BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
+        BrowserEvaluateParams, BrowserInitScriptOperation, BrowserSetContentParams,
+        BrowserTabEntry, BrowserTabsResponse, CdpActivateTabParams, CdpTargetInfoParams,
+        FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
         HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
@@ -8651,6 +9373,142 @@ mod tests {
         println!(
             "readback=browser_add_init_script validation edges all rejected with TOOL_PARAMS_INVALID"
         );
+    }
+
+    #[test]
+    fn browser_add_tag_params_validation_edges() {
+        assert!(
+            validate_browser_add_script_tag_params(&BrowserAddScriptTagParams {
+                cdp_target_id: Some("target-123".to_owned()),
+                content: Some("window.__synapseTag = 1;".to_owned()),
+                script_type: Some("module".to_owned()),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_browser_add_style_tag_params(&BrowserAddStyleTagParams {
+                url: Some("https://example.test/style.css".to_owned()),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        let style_path = temp.path().join("synapse-tag.css");
+        std::fs::write(&style_path, "body { color: rgb(1, 2, 3); }").expect("write style");
+        let style_path = style_path.to_string_lossy().into_owned();
+        let source = resolve_browser_tag_source(
+            "browser_add_style_tag",
+            None,
+            None,
+            Some(style_path.as_str()),
+        )
+        .expect("valid path source resolves");
+        assert_eq!(source.kind, BrowserTagSourceKind::Path);
+        assert_eq!(source.content_len, "body { color: rgb(1, 2, 3); }".len());
+        assert!(
+            source
+                .path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("synapse-tag.css"))
+        );
+
+        let error = validate_browser_add_script_tag_params(&BrowserAddScriptTagParams {
+            ..Default::default()
+        })
+        .expect_err("missing source must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_add_script_tag_params(&BrowserAddScriptTagParams {
+            url: Some("https://example.test/script.js".to_owned()),
+            content: Some("window.__synapseTag = 1;".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("multiple sources must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_add_style_tag_params(&BrowserAddStyleTagParams {
+            url: Some("   ".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("blank url must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let oversize = "x".repeat(BROWSER_TAG_MAX_CONTENT_BYTES + 1);
+        let error = validate_browser_add_script_tag_params(&BrowserAddScriptTagParams {
+            content: Some(oversize),
+            ..Default::default()
+        })
+        .expect_err("oversize content must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_add_script_tag_params(&BrowserAddScriptTagParams {
+            cdp_target_id: Some("   ".to_owned()),
+            content: Some("window.__synapseTag = 1;".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("blank cdp_target_id must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_add_script_tag_params(&BrowserAddScriptTagParams {
+            content: Some("window.__synapseTag = 1;".to_owned()),
+            script_type: Some("   ".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("blank script_type must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let missing_path = temp
+            .path()
+            .join("missing.css")
+            .to_string_lossy()
+            .into_owned();
+        let error = resolve_browser_tag_source(
+            "browser_add_style_tag",
+            None,
+            None,
+            Some(missing_path.as_str()),
+        )
+        .expect_err("missing path must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        println!("readback=browser_add_tag validation edges all rejected with TOOL_PARAMS_INVALID");
     }
 
     #[test]

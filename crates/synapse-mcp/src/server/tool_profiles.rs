@@ -48,6 +48,8 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "approval_request",
     "audit_intelligence_query",
     "browser_add_init_script",
+    "browser_add_script_tag",
+    "browser_add_style_tag",
     "browser_adopt_active_tab",
     "browser_console_messages",
     "browser_content",
@@ -119,6 +121,8 @@ const NORMAL_ALLOWED_PREFIXES: &[&str] = &["agent_template_", "task_"];
 const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "approval_list",
     "browser_add_init_script",
+    "browser_add_script_tag",
+    "browser_add_style_tag",
     "browser_adopt_active_tab",
     "browser_console_messages",
     "browser_content",
@@ -1234,6 +1238,8 @@ mod tests {
                 "session_list",
                 "target_act",
                 "browser_add_init_script",
+                "browser_add_script_tag",
+                "browser_add_style_tag",
                 "browser_evaluate",
                 "browser_set_content",
                 "browser_set_value",
@@ -1256,6 +1262,8 @@ mod tests {
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
+        assert!(visible.contains(&"browser_add_script_tag".to_owned()));
+        assert!(visible.contains(&"browser_add_style_tag".to_owned()));
         assert!(visible.contains(&"browser_set_content".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
         assert!(visible.contains(&"control_lease_acquire".to_owned()));
@@ -1315,6 +1323,8 @@ mod tests {
         assert!(visible.contains(&"session_list".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
+        assert!(visible.contains(&"browser_add_script_tag".to_owned()));
+        assert!(visible.contains(&"browser_add_style_tag".to_owned()));
         assert!(visible.contains(&"browser_set_content".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
         assert!(visible.contains(&"control_lease_acquire".to_owned()));

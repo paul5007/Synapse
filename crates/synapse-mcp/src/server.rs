@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     http::sse::SseState,
     m1::{
-        BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAdoptActiveTabParams,
+        BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAddScriptTagParams,
+        BrowserAddStyleTagParams, BrowserAddTagResponse, BrowserAdoptActiveTabParams,
         BrowserAdoptActiveTabResponse, BrowserConsoleMessagesParams,
         BrowserConsoleMessagesResponse, BrowserContentParams, BrowserContentResponse,
         BrowserEvaluateParams, BrowserEvaluateResponse, BrowserInitScriptOperation,

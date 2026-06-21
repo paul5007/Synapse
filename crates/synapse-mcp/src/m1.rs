@@ -1288,6 +1288,88 @@ pub struct BrowserAddInitScriptResponse {
     pub required_foreground: bool,
 }
 
+/// Parameters for `browser_add_script_tag` (#1070): inject a `<script>` into the
+/// current document from exactly one of `url`, `content`, or `path`.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAddScriptTagParams {
+    /// CDP TargetID to mutate. Defaults to the active session CDP target. Must be
+    /// owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Remote script URL to load into a `<script src=...>`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Inline script source.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Local UTF-8 file path to read and inject as inline script source.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Optional script `type` attribute, e.g. `module`.
+    #[serde(default)]
+    pub script_type: Option<String>,
+}
+
+/// Parameters for `browser_add_style_tag` (#1070): inject a stylesheet into the
+/// current document from exactly one of `url`, `content`, or `path`.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAddStyleTagParams {
+    /// CDP TargetID to mutate. Defaults to the active session CDP target. Must be
+    /// owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Remote stylesheet URL to load into a `<link rel=stylesheet href=...>`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Inline CSS source.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Local UTF-8 file path to read and inject as inline CSS source.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Response for `browser_add_script_tag` / `browser_add_style_tag`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAddTagResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub tag_name: String,
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_type: Option<String>,
+    pub content_len: usize,
+    pub element_marker: String,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Parameters for `browser_content` (#1158): return the full serialized HTML of
 /// the calling session's owned CDP page target.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
