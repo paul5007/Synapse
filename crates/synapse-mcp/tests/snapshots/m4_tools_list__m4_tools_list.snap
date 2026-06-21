@@ -4,7 +4,7 @@ assertion_line: 56
 expression: snapshot
 ---
 {
-  "count": 202,
+  "count": 203,
   "m4_defaults": [
     {
       "actual": 33,
@@ -274,6 +274,7 @@ expression: snapshot
     "browser_tabs",
     "browser_wait_for",
     "browser_wait_for_function",
+    "browser_wait_for_selector",
     "capture_screenshot",
     "cdp_activate_tab",
     "cdp_bridge_reload",

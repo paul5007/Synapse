@@ -7,9 +7,10 @@ use super::{
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
     BrowserSetContentParams, BrowserSetContentResponse, BrowserTabEntry, BrowserTabsParams,
     BrowserTabsResponse, BrowserWaitForFunctionParams, BrowserWaitForFunctionResponse,
-    BrowserWaitForParams, BrowserWaitForResponse, BrowserWaitForState, CaptureScreenshotFormat,
-    CaptureScreenshotParams, CaptureScreenshotResponse, CdpActivateTabParams,
-    CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
+    BrowserWaitForParams, BrowserWaitForResponse, BrowserWaitForSelectorParams,
+    BrowserWaitForSelectorResponse, BrowserWaitForSelectorState, BrowserWaitForState,
+    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
+    CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
     CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
     CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
     CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
@@ -2058,6 +2059,101 @@ impl SynapseService {
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .browser_wait_for_impl(&session_id, window_hwnd, &cdp_target_id, &wait)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Wait for a Playwright-style selector in the calling session's owned browser tab to reach state attached | visible | hidden | detached. Uses the same selector engines/options as browser_locate (css/xpath/text/role/label/placeholder/alttext/title/testid/layout), returns an element_id when the satisfied state has a concrete matched element, and returns BROWSER_WAIT_TIMEOUT on timeout. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_wait_for_selector(
+        &self,
+        params: Parameters<BrowserWaitForSelectorParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserWaitForSelectorResponse>, ErrorData> {
+        const TOOL: &str = "browser_wait_for_selector";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_wait_for_selector"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let wait = validate_browser_wait_for_selector_params(&params.0)?;
+        let root_element = wait
+            .locate
+            .root_element_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(parse_browser_evaluate_element)
+            .transpose()?;
+        if let (Some((_, root_target)), Some(explicit)) =
+            (root_element.as_ref(), wait.locate.cdp_target_id.as_deref())
+            && !root_target.eq_ignore_ascii_case(explicit)
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_wait_for_selector root_element_id resolves to CDP target {root_target:?} but cdp_target_id {explicit:?} was also supplied; they must match"
+                ),
+            ));
+        }
+        let resolution_target = wait
+            .locate
+            .cdp_target_id
+            .clone()
+            .or_else(|| root_element.as_ref().map(|(_, target)| target.clone()));
+        let root_backend_node_id = root_element.as_ref().map(|(backend, _)| *backend);
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": wait.locate.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(resolution_target.as_deref()),
+            "engine": wait.locate.engine,
+            "query_len": wait.locate.query.len(),
+            "state": wait.state,
+            "root_element_id": wait.locate.root_element_id,
+            "limit": wait.limit,
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            wait.locate.window_hwnd,
+            resolution_target.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "engine": wait.locate.engine,
+            "query_len": wait.locate.query.len(),
+            "state": wait.state,
+            "root_element_id": wait.locate.root_element_id,
+            "nth": wait.locate.nth,
+            "strict": wait.locate.strict,
+            "limit": wait.limit,
+            "timeout_ms": wait.timeout_ms,
+            "polling_interval_ms": wait.polling_interval_ms,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_wait_for_selector_impl(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                &wait,
+                root_backend_node_id,
+            )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -4605,6 +4701,111 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_wait_for_selector_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        wait: &NormalizedBrowserWaitForSelectorParams,
+        root_backend_node_id: Option<i64>,
+    ) -> Result<BrowserWaitForSelectorResponse, ErrorData> {
+        const TOOL: &str = "browser_wait_for_selector";
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
+        };
+        let started = Instant::now();
+        let mut poll_count = 0u64;
+        loop {
+            poll_count = poll_count.saturating_add(1);
+            let poll = browser_wait_for_selector_poll(
+                &endpoint,
+                window_hwnd,
+                cdp_target_id,
+                wait,
+                root_backend_node_id,
+            )
+            .await?;
+            if poll.condition_met {
+                let elapsed_ms = duration_millis_u64(started.elapsed());
+                tracing::info!(
+                    code = "CDP_BACKGROUND_WAIT_FOR_SELECTOR",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    endpoint = %endpoint,
+                    cdp_target_id = %poll.cdp_target_id,
+                    engine = %poll.engine,
+                    state = ?wait.state,
+                    match_count = poll.match_count,
+                    returned_count = poll.returned_count,
+                    visible_count = poll.visible_count,
+                    poll_count,
+                    target_url = %poll.url,
+                    "readback=cdp_locate+Runtime.callFunctionOn(browser_wait_for_selector) outcome=wait_satisfied"
+                );
+                return Ok(BrowserWaitForSelectorResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "raw_cdp".to_owned(),
+                    endpoint,
+                    cdp_target_id: poll.cdp_target_id,
+                    engine: poll.engine,
+                    query: poll.query,
+                    state: wait.state,
+                    condition_met: true,
+                    elapsed_ms,
+                    timeout_ms: wait.timeout_ms,
+                    polling_interval_ms: wait.polling_interval_ms,
+                    poll_count,
+                    match_count: poll.match_count,
+                    returned_count: poll.returned_count,
+                    visible_count: poll.visible_count,
+                    truncated: poll.truncated,
+                    element_id: poll.element_id,
+                    url: poll.url,
+                    title: poll.title,
+                    readback_backend:
+                        "cdp_locate + Runtime.callFunctionOn(browser_wait_for_selector)".to_owned(),
+                    backend_tier_used: "cdp".to_owned(),
+                    required_foreground: false,
+                });
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(wait.timeout_ms) {
+                let elapsed_ms = duration_millis_u64(started.elapsed());
+                return Err(mcp_error(
+                    error_codes::BROWSER_WAIT_TIMEOUT,
+                    format!(
+                        "browser_wait_for_selector timed out after {} ms waiting for {:?}; elapsed_ms={} poll_count={} match_count={} returned_count={} visible_count={} truncated={}",
+                        wait.timeout_ms,
+                        wait.state,
+                        elapsed_ms,
+                        poll_count,
+                        poll.match_count,
+                        poll.returned_count,
+                        poll.visible_count,
+                        poll.truncated
+                    ),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(wait.polling_interval_ms)).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_wait_for_selector_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _wait: &NormalizedBrowserWaitForSelectorParams,
+        _root_backend_node_id: Option<i64>,
+    ) -> Result<BrowserWaitForSelectorResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_wait_for_selector is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_wait_for_function_impl(
         &self,
         session_id: &str,
@@ -5078,32 +5279,7 @@ impl SynapseService {
                 window_hwnd,
             ));
         };
-        let engine = browser_locate_engine_to_a11y(params.engine);
-        let request = synapse_a11y::CdpLocateRequest {
-            engine,
-            query: params.query.clone(),
-            exact: params.exact.unwrap_or(false),
-            regex: params.regex.unwrap_or(false),
-            name: params.name.clone(),
-            name_exact: params.name_exact.unwrap_or(false),
-            name_regex: params.name_regex.unwrap_or(false),
-            testid_attribute: params.testid_attribute.clone(),
-            checked: params.checked,
-            pressed: params.pressed,
-            expanded: params.expanded,
-            selected: params.selected,
-            disabled: params.disabled,
-            level: params.level,
-            include_hidden: params.include_hidden.unwrap_or(false),
-            relation: params.relation.map(browser_layout_relation_to_a11y),
-            anchor: params.anchor.clone(),
-            max_distance: params.max_distance,
-            has_text: params.has_text.clone(),
-            nth: params.nth,
-            strict: params.strict.unwrap_or(false),
-            root_backend_node_id,
-            limit,
-        };
+        let request = browser_locate_cdp_request(params, root_backend_node_id, limit);
         let located = synapse_a11y::cdp_locate(&endpoint, cdp_target_id, request)
             .await
             .map_err(|error| {
@@ -6192,6 +6368,23 @@ struct NormalizedBrowserWaitForParams {
     polling_interval_ms: u64,
 }
 
+#[derive(Debug)]
+struct NormalizedBrowserWaitForSelectorParams {
+    locate: BrowserLocateParams,
+    state: BrowserWaitForSelectorState,
+    timeout_ms: u64,
+    polling_interval_ms: u64,
+    limit: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BrowserWaitForSelectorObservation {
+    returned_backend_node_ids: Vec<i64>,
+    visible_backend_node_ids: Vec<i64>,
+    hidden_backend_node_ids: Vec<i64>,
+    truncated: bool,
+}
+
 #[cfg(windows)]
 #[derive(Deserialize)]
 struct BrowserWaitForPayload {
@@ -6223,6 +6416,29 @@ struct BrowserWaitForFunctionPayload {
     unserializable_value: Option<String>,
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct BrowserWaitForSelectorPoll {
+    condition_met: bool,
+    cdp_target_id: String,
+    engine: String,
+    query: String,
+    match_count: usize,
+    returned_count: usize,
+    visible_count: usize,
+    truncated: bool,
+    element_id: Option<String>,
+    url: String,
+    title: String,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct BrowserWaitForSelectorElementState {
+    is_connected: bool,
+    is_visible: bool,
+}
+
 fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<(), ErrorData> {
     if params.expression.trim().is_empty() {
         return Err(mcp_error(
@@ -6252,6 +6468,86 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
                 args.len()
             ),
         ));
+    }
+    Ok(())
+}
+
+fn validate_browser_wait_for_selector_params(
+    params: &BrowserWaitForSelectorParams,
+) -> Result<NormalizedBrowserWaitForSelectorParams, ErrorData> {
+    let locate = browser_wait_for_selector_locate_params(params);
+    validate_browser_locate_like_params("browser_wait_for_selector", &locate)?;
+    let timeout_ms = validate_browser_wait_timeout("browser_wait_for_selector", params.timeout_ms)?;
+    let polling_interval_ms = validate_browser_wait_polling_interval(
+        "browser_wait_for_selector",
+        params.polling_interval_ms,
+    )?;
+    let limit = locate
+        .limit
+        .unwrap_or(DEFAULT_BROWSER_LOCATE_LIMIT)
+        .clamp(1, MAX_BROWSER_LOCATE_LIMIT);
+    Ok(NormalizedBrowserWaitForSelectorParams {
+        locate,
+        state: params.state.unwrap_or_default(),
+        timeout_ms,
+        polling_interval_ms,
+        limit,
+    })
+}
+
+fn validate_browser_locate_like_params(
+    tool: &str,
+    params: &BrowserLocateParams,
+) -> Result<(), ErrorData> {
+    if params.query.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} requires a non-empty query"),
+        ));
+    }
+    if params.query.len() > BROWSER_LOCATE_MAX_SELECTOR_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} query is {} bytes; the maximum is {BROWSER_LOCATE_MAX_SELECTOR_BYTES}",
+                params.query.len()
+            ),
+        ));
+    }
+    if params.exact == Some(true) && params.regex == Some(true) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} exact and regex are mutually exclusive"),
+        ));
+    }
+    if params.name_exact == Some(true) && params.name_regex == Some(true) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} name_exact and name_regex are mutually exclusive"),
+        ));
+    }
+    if params.engine == BrowserLocateEngine::Layout {
+        if params.relation.is_none() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "{tool} layout engine requires `relation` (near|right-of|left-of|above|below)"
+                ),
+            ));
+        }
+        if params
+            .anchor
+            .as_deref()
+            .is_none_or(|anchor| anchor.trim().is_empty())
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{tool} layout engine requires a non-empty `anchor` CSS selector"),
+            ));
+        }
+    }
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
     }
     Ok(())
 }
@@ -6386,6 +6682,38 @@ fn validate_browser_wait_polling_interval(
         ));
     }
     Ok(polling_interval_ms)
+}
+
+fn browser_wait_for_selector_locate_params(
+    params: &BrowserWaitForSelectorParams,
+) -> BrowserLocateParams {
+    BrowserLocateParams {
+        query: params.query.clone(),
+        engine: params.engine,
+        exact: params.exact,
+        regex: params.regex,
+        name: params.name.clone(),
+        name_exact: params.name_exact,
+        name_regex: params.name_regex,
+        testid_attribute: params.testid_attribute.clone(),
+        checked: params.checked,
+        pressed: params.pressed,
+        expanded: params.expanded,
+        selected: params.selected,
+        disabled: params.disabled,
+        level: params.level,
+        include_hidden: params.include_hidden,
+        relation: params.relation,
+        anchor: params.anchor.clone(),
+        max_distance: params.max_distance,
+        has_text: params.has_text.clone(),
+        nth: params.nth,
+        strict: params.strict,
+        root_element_id: params.root_element_id.clone(),
+        cdp_target_id: params.cdp_target_id.clone(),
+        window_hwnd: params.window_hwnd,
+        limit: params.limit,
+    }
 }
 
 #[cfg(windows)]
@@ -7130,6 +7458,39 @@ fn browser_locate_engine_to_a11y(engine: BrowserLocateEngine) -> synapse_a11y::C
     }
 }
 
+#[cfg(windows)]
+fn browser_locate_cdp_request(
+    params: &BrowserLocateParams,
+    root_backend_node_id: Option<i64>,
+    limit: usize,
+) -> synapse_a11y::CdpLocateRequest {
+    synapse_a11y::CdpLocateRequest {
+        engine: browser_locate_engine_to_a11y(params.engine),
+        query: params.query.clone(),
+        exact: params.exact.unwrap_or(false),
+        regex: params.regex.unwrap_or(false),
+        name: params.name.clone(),
+        name_exact: params.name_exact.unwrap_or(false),
+        name_regex: params.name_regex.unwrap_or(false),
+        testid_attribute: params.testid_attribute.clone(),
+        checked: params.checked,
+        pressed: params.pressed,
+        expanded: params.expanded,
+        selected: params.selected,
+        disabled: params.disabled,
+        level: params.level,
+        include_hidden: params.include_hidden.unwrap_or(false),
+        relation: params.relation.map(browser_layout_relation_to_a11y),
+        anchor: params.anchor.clone(),
+        max_distance: params.max_distance,
+        has_text: params.has_text.clone(),
+        nth: params.nth,
+        strict: params.strict.unwrap_or(false),
+        root_backend_node_id,
+        limit,
+    }
+}
+
 /// Maps the MCP layout relation onto the a11y layout relation.
 #[cfg(windows)]
 fn browser_layout_relation_to_a11y(
@@ -7254,6 +7615,149 @@ const BROWSER_INSPECT_FUNCTION: &str = r#"(el, maxBytes) => {
         device_pixel_ratio: (typeof window !== "undefined" && window.devicePixelRatio) || 1
     };
 }"#;
+
+#[cfg(windows)]
+const BROWSER_WAIT_FOR_SELECTOR_STATE_FUNCTION: &str = r#"(el) => {
+    const connected = !!(el && el.isConnected);
+    const rect = el && el.getBoundingClientRect ? el.getBoundingClientRect() : { width: 0, height: 0 };
+    const cs = (el && el.nodeType === 1 && el.ownerDocument && el.ownerDocument.defaultView)
+        ? el.ownerDocument.defaultView.getComputedStyle(el) : null;
+    const hasLayout = !!(el && (el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length)));
+    const visible = connected && hasLayout && rect.width >= 0 && rect.height >= 0 &&
+        (!cs || (cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0"));
+    return { is_connected: connected, is_visible: visible };
+}"#;
+
+#[cfg(windows)]
+async fn browser_wait_for_selector_poll(
+    endpoint: &str,
+    window_hwnd: i64,
+    cdp_target_id: &str,
+    wait: &NormalizedBrowserWaitForSelectorParams,
+    root_backend_node_id: Option<i64>,
+) -> Result<BrowserWaitForSelectorPoll, ErrorData> {
+    let request = browser_locate_cdp_request(&wait.locate, root_backend_node_id, wait.limit);
+    let located = synapse_a11y::cdp_locate(endpoint, cdp_target_id, request)
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_wait_for_selector raw CDP selector resolution failed: {error}"),
+            )
+        })?;
+    let mut observation = BrowserWaitForSelectorObservation {
+        returned_backend_node_ids: located.backend_node_ids.clone(),
+        truncated: located.truncated,
+        ..Default::default()
+    };
+    if matches!(
+        wait.state,
+        BrowserWaitForSelectorState::Visible | BrowserWaitForSelectorState::Hidden
+    ) {
+        for backend_node_id in &located.backend_node_ids {
+            if browser_wait_for_selector_backend_visible(endpoint, cdp_target_id, *backend_node_id)
+                .await?
+            {
+                observation.visible_backend_node_ids.push(*backend_node_id);
+            } else {
+                observation.hidden_backend_node_ids.push(*backend_node_id);
+            }
+        }
+    }
+    let (condition_met, satisfied_backend_node_id) =
+        browser_wait_for_selector_condition(wait.state, &observation);
+    let element_id = satisfied_backend_node_id.map(|backend| {
+        synapse_a11y::cdp_element_id_for_target(window_hwnd, &located.target_id, backend)
+            .to_string()
+    });
+    Ok(BrowserWaitForSelectorPoll {
+        condition_met,
+        cdp_target_id: located.target_id,
+        engine: located.engine,
+        query: located.query,
+        match_count: located.match_count,
+        returned_count: located.returned_count,
+        visible_count: observation.visible_backend_node_ids.len(),
+        truncated: located.truncated,
+        element_id,
+        url: located.url,
+        title: located.title,
+    })
+}
+
+#[cfg(windows)]
+async fn browser_wait_for_selector_backend_visible(
+    endpoint: &str,
+    cdp_target_id: &str,
+    backend_node_id: i64,
+) -> Result<bool, ErrorData> {
+    let evaluated = match synapse_a11y::cdp_evaluate_on_element(
+        endpoint,
+        cdp_target_id,
+        backend_node_id,
+        BROWSER_WAIT_FOR_SELECTOR_STATE_FUNCTION,
+        &[],
+        true,
+        true,
+    )
+    .await
+    {
+        Ok(evaluated) => evaluated,
+        Err(error) => {
+            let detail = error.to_string();
+            if detail.contains("returned no objectId")
+                || detail.contains("not present")
+                || detail.contains("detached")
+            {
+                return Ok(false);
+            }
+            return Err(mcp_error(
+                error.code(),
+                format!(
+                    "browser_wait_for_selector element visibility readback failed for backendNodeId {backend_node_id}: {error}"
+                ),
+            ));
+        }
+    };
+    let state: BrowserWaitForSelectorElementState = serde_json::from_value(evaluated.value.clone())
+        .map_err(|error| {
+            mcp_error(
+                error_codes::OBSERVE_INTERNAL,
+                format!(
+                    "browser_wait_for_selector visibility payload decode failed for backendNodeId {backend_node_id}: {error}"
+                ),
+            )
+        })?;
+    Ok(state.is_connected && state.is_visible)
+}
+
+fn browser_wait_for_selector_condition(
+    state: BrowserWaitForSelectorState,
+    observation: &BrowserWaitForSelectorObservation,
+) -> (bool, Option<i64>) {
+    let first_returned = observation.returned_backend_node_ids.first().copied();
+    let first_visible = observation.visible_backend_node_ids.first().copied();
+    let first_hidden = observation.hidden_backend_node_ids.first().copied();
+    match state {
+        BrowserWaitForSelectorState::Attached => (first_returned.is_some(), first_returned),
+        BrowserWaitForSelectorState::Visible => (first_visible.is_some(), first_visible),
+        BrowserWaitForSelectorState::Hidden => {
+            if first_returned.is_none() {
+                (true, None)
+            } else if observation.visible_backend_node_ids.is_empty() && !observation.truncated {
+                (true, first_hidden.or(first_returned))
+            } else {
+                (false, None)
+            }
+        }
+        BrowserWaitForSelectorState::Detached => (first_returned.is_none(), None),
+    }
+}
+
+#[cfg(windows)]
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Parses a browser `element_id` into its `(backendNodeId, cdp_target_id)` for
 /// element-scoped evaluation, failing loud when it is not a CDP web element.
@@ -9690,28 +10194,31 @@ mod tests {
     use super::{
         BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, BROWSER_INIT_SCRIPT_MAX_SOURCE_BYTES,
         BROWSER_TAG_MAX_CONTENT_BYTES, BROWSER_WAIT_MAX_TEXT_BYTES, BrowserTagSourceKind,
-        CdpTargetOwner, DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
+        BrowserWaitForSelectorObservation, CdpTargetOwner,
+        DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
         MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
         MAX_BROWSER_WAIT_TIMEOUT_MS, MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionTarget,
         SynapseService, TargetWire, attach_find_hygiene_annotations,
-        attach_ocr_hygiene_annotations, cdp_activate_resolution_request_details,
-        cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
-        chrome_page_vitals_info, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
-        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
-        resolve_browser_tag_source, resolve_capture_target_window_context,
-        select_single_active_browser_tab, sha256_hex, target_wire, template_value,
-        unavailable_page_vitals_info, validate_browser_add_init_script_params,
-        validate_browser_add_script_tag_params, validate_browser_add_style_tag_params,
-        validate_browser_evaluate_params, validate_browser_set_content_params,
-        validate_browser_wait_for_function_params, validate_browser_wait_for_params,
+        attach_ocr_hygiene_annotations, browser_wait_for_selector_condition,
+        cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
+        chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
+        hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
+        page_text_info_from_parts, perception_window_hwnd, resolve_browser_tag_source,
+        resolve_capture_target_window_context, select_single_active_browser_tab, sha256_hex,
+        target_wire, template_value, unavailable_page_vitals_info,
+        validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
+        validate_browser_add_style_tag_params, validate_browser_evaluate_params,
+        validate_browser_set_content_params, validate_browser_wait_for_function_params,
+        validate_browser_wait_for_params, validate_browser_wait_for_selector_params,
         validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
         BrowserEvaluateParams, BrowserInitScriptOperation, BrowserSetContentParams,
         BrowserTabEntry, BrowserTabsResponse, BrowserWaitForFunctionParams, BrowserWaitForParams,
-        BrowserWaitForState, CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult,
-        FindResultKind, HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
+        BrowserWaitForSelectorParams, BrowserWaitForSelectorState, BrowserWaitForState,
+        CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult, FindResultKind,
+        HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
     use base64::Engine as _;
@@ -10399,6 +10906,189 @@ mod tests {
 
         println!(
             "readback=browser_wait_for_function validation edges all rejected with TOOL_PARAMS_INVALID"
+        );
+    }
+
+    #[test]
+    fn browser_wait_for_selector_params_validation_edges() {
+        let ok = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: "#ready".to_owned(),
+            state: Some(BrowserWaitForSelectorState::Attached),
+            timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS),
+            polling_interval_ms: Some(MIN_BROWSER_WAIT_POLLING_INTERVAL_MS),
+            cdp_target_id: Some("target-123".to_owned()),
+            ..Default::default()
+        })
+        .expect("valid waitForSelector params pass");
+        assert_eq!(ok.locate.query, "#ready");
+        assert_eq!(ok.locate.engine, crate::m1::BrowserLocateEngine::Css);
+        assert_eq!(ok.state, BrowserWaitForSelectorState::Attached);
+        assert_eq!(ok.timeout_ms, MAX_BROWSER_WAIT_TIMEOUT_MS);
+        assert_eq!(ok.polling_interval_ms, MIN_BROWSER_WAIT_POLLING_INTERVAL_MS);
+
+        let error = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: "   ".to_owned(),
+            ..Default::default()
+        })
+        .expect_err("blank query must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let oversize = "x".repeat(super::BROWSER_LOCATE_MAX_SELECTOR_BYTES + 1);
+        let error = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: oversize,
+            ..Default::default()
+        })
+        .expect_err("oversize query must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: "Submit".to_owned(),
+            exact: Some(true),
+            regex: Some(true),
+            ..Default::default()
+        })
+        .expect_err("exact and regex must be rejected together");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: "button".to_owned(),
+            engine: crate::m1::BrowserLocateEngine::Layout,
+            relation: Some(crate::m1::BrowserLayoutRelation::Near),
+            ..Default::default()
+        })
+        .expect_err("layout without anchor must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: "#ready".to_owned(),
+            cdp_target_id: Some("   ".to_owned()),
+            ..Default::default()
+        })
+        .expect_err("blank cdp_target_id must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: "#ready".to_owned(),
+            timeout_ms: Some(MAX_BROWSER_WAIT_TIMEOUT_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize timeout must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_wait_for_selector_params(&BrowserWaitForSelectorParams {
+            query: "#ready".to_owned(),
+            polling_interval_ms: Some(MAX_BROWSER_WAIT_POLLING_INTERVAL_MS + 1),
+            ..Default::default()
+        })
+        .expect_err("oversize polling interval must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        println!(
+            "readback=browser_wait_for_selector validation edges all rejected with TOOL_PARAMS_INVALID"
+        );
+    }
+
+    #[test]
+    fn browser_wait_for_selector_state_conditions_match_playwright_states() {
+        let absent = BrowserWaitForSelectorObservation::default();
+        assert_eq!(
+            browser_wait_for_selector_condition(BrowserWaitForSelectorState::Detached, &absent),
+            (true, None)
+        );
+        assert_eq!(
+            browser_wait_for_selector_condition(BrowserWaitForSelectorState::Hidden, &absent),
+            (true, None)
+        );
+
+        let attached_hidden = BrowserWaitForSelectorObservation {
+            returned_backend_node_ids: vec![41],
+            hidden_backend_node_ids: vec![41],
+            ..Default::default()
+        };
+        assert_eq!(
+            browser_wait_for_selector_condition(
+                BrowserWaitForSelectorState::Attached,
+                &attached_hidden
+            ),
+            (true, Some(41))
+        );
+        assert_eq!(
+            browser_wait_for_selector_condition(
+                BrowserWaitForSelectorState::Hidden,
+                &attached_hidden
+            ),
+            (true, Some(41))
+        );
+        assert_eq!(
+            browser_wait_for_selector_condition(
+                BrowserWaitForSelectorState::Visible,
+                &attached_hidden
+            ),
+            (false, None)
+        );
+
+        let visible = BrowserWaitForSelectorObservation {
+            returned_backend_node_ids: vec![41, 42],
+            visible_backend_node_ids: vec![42],
+            hidden_backend_node_ids: vec![41],
+            ..Default::default()
+        };
+        assert_eq!(
+            browser_wait_for_selector_condition(BrowserWaitForSelectorState::Visible, &visible),
+            (true, Some(42))
+        );
+        assert_eq!(
+            browser_wait_for_selector_condition(BrowserWaitForSelectorState::Hidden, &visible),
+            (false, None)
+        );
+
+        let truncated_hidden = BrowserWaitForSelectorObservation {
+            returned_backend_node_ids: vec![41],
+            hidden_backend_node_ids: vec![41],
+            truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            browser_wait_for_selector_condition(
+                BrowserWaitForSelectorState::Hidden,
+                &truncated_hidden
+            ),
+            (false, None)
         );
     }
 

@@ -1501,6 +1501,138 @@ pub struct BrowserWaitForFunctionResponse {
     pub required_foreground: bool,
 }
 
+/// Desired selector state for `browser_wait_for_selector` (#1128).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserWaitForSelectorState {
+    /// Element exists in the DOM, regardless of rendered visibility.
+    Attached,
+    /// Element is attached and rendered with a non-empty visible box.
+    #[default]
+    Visible,
+    /// Element is absent, or attached but not visibly rendered.
+    Hidden,
+    /// Element is absent from the DOM.
+    Detached,
+}
+
+/// Parameters for `browser_wait_for_selector` (#1128): poll a Playwright-style
+/// selector until it reaches attached / visible / hidden / detached state in
+/// the calling session's owned CDP target.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForSelectorParams {
+    /// The primary query, with the same semantics as `browser_locate`.
+    pub query: String,
+    /// Which selector engine interprets `query` (default `css`).
+    #[serde(default)]
+    pub engine: BrowserLocateEngine,
+    /// Desired selector state. Defaults to `visible`.
+    #[serde(default)]
+    pub state: Option<BrowserWaitForSelectorState>,
+    /// Exact match for text/attribute engines.
+    #[serde(default)]
+    pub exact: Option<bool>,
+    /// Interpret `query` as a JS regular expression body.
+    #[serde(default)]
+    pub regex: Option<bool>,
+    /// `role` only: accessible-name filter.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `role` only: exact accessible-name match.
+    #[serde(default)]
+    pub name_exact: Option<bool>,
+    /// `role` only: interpret `name` as a regular expression.
+    #[serde(default)]
+    pub name_regex: Option<bool>,
+    /// `testid` only: attribute name to read (default `data-testid`).
+    #[serde(default)]
+    pub testid_attribute: Option<String>,
+    /// `role` only: ARIA state filters.
+    #[serde(default)]
+    pub checked: Option<bool>,
+    #[serde(default)]
+    pub pressed: Option<bool>,
+    #[serde(default)]
+    pub expanded: Option<bool>,
+    #[serde(default)]
+    pub selected: Option<bool>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+    #[serde(default)]
+    pub level: Option<i64>,
+    #[serde(default)]
+    pub include_hidden: Option<bool>,
+    /// `layout` only: relation to the anchor.
+    #[serde(default)]
+    pub relation: Option<BrowserLayoutRelation>,
+    /// `layout` only: the anchor CSS selector.
+    #[serde(default)]
+    pub anchor: Option<String>,
+    /// `layout` only: maximum CSS-pixel distance.
+    #[serde(default)]
+    pub max_distance: Option<f64>,
+    /// `.filter({ hasText })` equivalent for JS-resolved engines.
+    #[serde(default)]
+    pub has_text: Option<String>,
+    /// Positional pick (`.nth`/`.first`/`.last`): 0-based; negative from end.
+    #[serde(default)]
+    pub nth: Option<i64>,
+    /// Strict mode: error when more than one element matches (unless `nth` set).
+    #[serde(default)]
+    pub strict: Option<bool>,
+    /// Resolve only within this element id (chaining / scoping).
+    #[serde(default)]
+    pub root_element_id: Option<String>,
+    /// CDP TargetID to query. Defaults to the active session CDP target.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Maximum matches to inspect per poll (default 50, capped at 500).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Poll interval in milliseconds. Defaults to 100 ms.
+    #[serde(default)]
+    pub polling_interval_ms: Option<u64>,
+}
+
+/// Response for `browser_wait_for_selector`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitForSelectorResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub engine: String,
+    pub query: String,
+    pub state: BrowserWaitForSelectorState,
+    pub condition_met: bool,
+    pub elapsed_ms: u64,
+    pub timeout_ms: u64,
+    pub polling_interval_ms: u64,
+    pub poll_count: u64,
+    pub match_count: usize,
+    pub returned_count: usize,
+    pub visible_count: usize,
+    pub truncated: bool,
+    /// Present when the satisfied state has a concrete matched element. Hidden
+    /// and detached can resolve with no element when the selector is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_id: Option<String>,
+    pub url: String,
+    pub title: String,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Parameters for `browser_content` (#1158): return the full serialized HTML of
 /// the calling session's owned CDP page target.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
