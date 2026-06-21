@@ -25,7 +25,7 @@ use chromiumoxide::cdp::browser_protocol::input::{
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, GetLayoutMetricsParams, GetNavigationHistoryParams, NavigateParams,
-    NavigateToHistoryEntryParams, ReloadParams, Viewport,
+    NavigateToHistoryEntryParams, ReloadParams, SetDocumentContentParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
@@ -340,6 +340,15 @@ pub struct CdpPageNavigationResult {
     pub after: CdpPageState,
     pub navigation_error_text: Option<String>,
     pub is_download: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CdpSetDocumentContentResult {
+    pub target_id: String,
+    pub frame_id: String,
+    pub html_len: usize,
+    pub before: CdpPageState,
+    pub after: CdpPageState,
 }
 
 #[derive(Clone, Debug)]
@@ -1900,6 +1909,56 @@ pub async fn cdp_navigate_page_target(
             after,
             navigation_error_text,
             is_download,
+        })
+    })
+    .await
+}
+
+/// Replaces a CDP page target's main-frame document HTML and returns a
+/// post-command page-state readback. Background-safe: this never activates the
+/// tab or uses OS foreground input.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the main frame cannot be resolved,
+/// `Page.setDocumentContent` fails, or the page does not settle within
+/// `wait_timeout_ms`.
+pub async fn cdp_set_document_content_target(
+    endpoint: &str,
+    target_id: &str,
+    html: &str,
+    wait_timeout_ms: u64,
+) -> A11yResult<CdpSetDocumentContentResult> {
+    let html = html.to_owned();
+    with_target_page(endpoint, target_id, |page| async move {
+        let target_id = page.target_id().inner().clone();
+        let before = read_page_state(&page).await?;
+        let frame_id = page
+            .mainframe()
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Page main frame readback before setDocumentContent: {err}"),
+            })?
+            .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                detail: "Page.setDocumentContent requires a main frame, but none was reported"
+                    .to_owned(),
+            })?;
+        let frame_id_text = frame_id.inner().clone();
+        page.execute(SetDocumentContentParams::new(frame_id, html.clone()))
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Page.setDocumentContent: {err}"),
+            })?;
+        let after =
+            wait_for_page_readback(&page, wait_timeout_ms, &CdpPageReadbackExpectation::Stable)
+                .await?;
+        Ok(CdpSetDocumentContentResult {
+            target_id,
+            frame_id: frame_id_text,
+            html_len: html.len(),
+            before,
+            after,
         })
     })
     .await

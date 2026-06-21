@@ -53,6 +53,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "browser_evaluate",
     "browser_inspect",
     "browser_locate",
+    "browser_set_content",
     "browser_set_value",
     "browser_tabs",
     "capture_screenshot",
@@ -122,6 +123,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_evaluate",
     "browser_inspect",
     "browser_locate",
+    "browser_set_content",
     "browser_set_value",
     "browser_tabs",
     "capture_screenshot",
@@ -1230,6 +1232,7 @@ mod tests {
                 "session_list",
                 "target_act",
                 "browser_evaluate",
+                "browser_set_content",
                 "browser_set_value",
                 "control_lease_acquire",
                 "control_lease_release",
@@ -1249,6 +1252,7 @@ mod tests {
         assert!(visible.contains(&"act_launch".to_owned()));
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
+        assert!(visible.contains(&"browser_set_content".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
         assert!(visible.contains(&"control_lease_acquire".to_owned()));
         assert!(visible.contains(&"tool_profile_set".to_owned()));
@@ -1306,6 +1310,7 @@ mod tests {
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"session_list".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
+        assert!(visible.contains(&"browser_set_content".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
         assert!(visible.contains(&"control_lease_acquire".to_owned()));
         assert!(visible.contains(&"control_lease_release".to_owned()));

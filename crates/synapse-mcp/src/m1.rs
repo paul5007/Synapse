@@ -1255,6 +1255,51 @@ pub struct BrowserContentResponse {
     pub required_foreground: bool,
 }
 
+/// Parameters for `browser_set_content` (#1159): replace the main-frame HTML of
+/// the calling session's owned CDP page target.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserSetContentParams {
+    /// CDP TargetID to mutate. Defaults to the active session CDP target. Must be
+    /// owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Full replacement HTML for the target's main frame.
+    pub html: String,
+    /// Optional caller load/readback budget. Defaults to the bridge/CDP command
+    /// budget and is capped by the daemon command timeout.
+    #[serde(default)]
+    pub wait_timeout_ms: Option<u64>,
+}
+
+/// Response for `browser_set_content`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserSetContentResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub frame_id: String,
+    pub html_len: usize,
+    pub before_url: String,
+    pub before_title: String,
+    pub after_url: String,
+    pub after_title: String,
+    pub ready_state: String,
+    pub history_current_index: i64,
+    pub history_entry_count: u32,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Parameters for `browser_console_messages` (#1091/#1092/#1093/#1094): list the
 /// console output + page errors captured from the calling session's owned CDP
 /// page target. The first call arms a persistent per-target capture; subsequent

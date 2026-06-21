@@ -3,23 +3,23 @@ use super::{
     BrowserConsoleMessagesResponse, BrowserContentParams, BrowserContentResponse,
     BrowserEvaluateParams, BrowserEvaluateResponse, BrowserInspectParams, BrowserInspectResponse,
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
-    BrowserTabEntry, BrowserTabsParams, BrowserTabsResponse, CaptureScreenshotFormat,
-    CaptureScreenshotParams, CaptureScreenshotResponse, CdpActivateTabParams,
-    CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
-    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
-    CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
-    CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
-    CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage,
-    ElementInspection, ErrorData, FindParams, FindResponse, Health, HiddenDesktopPipFrameParams,
-    HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
-    ReadTextParams, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
-    SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
-    SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
-    WindowListResponse, empty_input_schema, mcp_error, observe_include, observe_input,
-    populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
-    populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
-    set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
-    tool_router,
+    BrowserSetContentParams, BrowserSetContentResponse, BrowserTabEntry, BrowserTabsParams,
+    BrowserTabsResponse, CaptureScreenshotFormat, CaptureScreenshotParams,
+    CaptureScreenshotResponse, CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo,
+    CdpBridgeHostReadback, CdpBridgeReloadAckReadback, CdpBridgeReloadParams,
+    CdpBridgeReloadResponse, CdpCloseTabParams, CdpCloseTabResponse, CdpLargestContentfulPaintInfo,
+    CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams,
+    CdpOpenTabResponse, CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams,
+    CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage, ElementInspection, ErrorData,
+    FindParams, FindResponse, Health, HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse,
+    HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters, ReadTextParams, SessionTarget,
+    SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
+    SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
+    TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
+    mcp_error, observe_include, observe_input, populate_audio_summary, populate_clipboard_summary,
+    populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
+    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
+    set_target_input_schema, tool, tool_router,
 };
 use crate::m1::{
     ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
@@ -1850,6 +1850,66 @@ impl SynapseService {
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .browser_content_impl(&session_id, window_hwnd, &cdp_target_id, max_bytes)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Replace the full document HTML of the calling session's owned background browser tab via raw CDP Page.setDocumentContent, then read back URL/title/readyState/history from the same target. This is Playwright setContent-style main-frame content replacement for session-owned targets only: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+    )]
+    pub async fn browser_set_content(
+        &self,
+        params: Parameters<BrowserSetContentParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserSetContentResponse>, ErrorData> {
+        const TOOL: &str = "browser_set_content";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_set_content"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        validate_browser_set_content_params(&params.0)?;
+        let wait_timeout_ms = validate_cdp_navigation_wait_timeout(params.0.wait_timeout_ms)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "html_len": params.0.html.len(),
+            "wait_timeout_ms": wait_timeout_ms,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "html_len": params.0.html.len(),
+            "wait_timeout_ms": wait_timeout_ms,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_set_content_impl(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                &params.0.html,
+                wait_timeout_ms,
+            )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -4012,6 +4072,83 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_set_content_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        html: &str,
+        wait_timeout_ms: u64,
+    ) -> Result<BrowserSetContentResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(
+                "browser_set_content",
+                window_hwnd,
+            ));
+        };
+        let set = synapse_a11y::cdp_set_document_content_target(
+            &endpoint,
+            cdp_target_id,
+            html,
+            wait_timeout_ms,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_set_content raw CDP Page.setDocumentContent failed: {error}"),
+            )
+        })?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_SET_CONTENT",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %set.target_id,
+            frame_id = %set.frame_id,
+            html_len = set.html_len,
+            before_url = %set.before.url,
+            after_url = %set.after.url,
+            ready_state = %set.after.ready_state,
+            "readback=Page.setDocumentContent+Runtime.evaluate outcome=content_set"
+        );
+        Ok(BrowserSetContentResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: set.target_id,
+            frame_id: set.frame_id,
+            html_len: set.html_len,
+            before_url: set.before.url,
+            before_title: set.before.title,
+            after_url: set.after.url,
+            after_title: set.after.title,
+            ready_state: set.after.ready_state,
+            history_current_index: set.after.history_current_index,
+            history_entry_count: set.after.history_entry_count,
+            readback_backend: "Page.setDocumentContent+Runtime.evaluate".to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_set_content_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _html: &str,
+        _wait_timeout_ms: u64,
+    ) -> Result<BrowserSetContentResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_set_content is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_console_messages_impl(
         &self,
         session_id: &str,
@@ -5342,8 +5479,31 @@ fn browser_layout_relation_to_a11y(
 
 const DEFAULT_BROWSER_CONTENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BROWSER_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BROWSER_SET_CONTENT_HTML_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_BROWSER_INSPECT_HTML_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_INSPECT_HTML_BYTES: usize = 4 * 1024 * 1024;
+
+fn validate_browser_set_content_params(params: &BrowserSetContentParams) -> Result<(), ErrorData> {
+    if params.html.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_set_content requires non-empty html",
+        ));
+    }
+    if params.html.len() > MAX_BROWSER_SET_CONTENT_HTML_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_set_content html is {} bytes; the maximum is {MAX_BROWSER_SET_CONTENT_HTML_BYTES} bytes",
+                params.html.len()
+            ),
+        ));
+    }
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    Ok(())
+}
 
 /// In-page payload returned by `browser_content`'s evaluation.
 #[cfg(windows)]
@@ -7861,19 +8021,21 @@ fn escape_json_pointer(segment: &str) -> String {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, CdpTargetOwner, SessionTarget, SynapseService,
-        TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
-        cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
-        chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
-        hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
-        page_text_info_from_parts, perception_window_hwnd, resolve_capture_target_window_context,
-        select_single_active_browser_tab, sha256_hex, target_wire, template_value,
-        unavailable_page_vitals_info, validate_browser_evaluate_params, validate_target_window,
+        BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, CdpTargetOwner, MAX_BROWSER_SET_CONTENT_HTML_BYTES,
+        SessionTarget, SynapseService, TargetWire, attach_find_hygiene_annotations,
+        attach_ocr_hygiene_annotations, cdp_activate_resolution_request_details,
+        cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
+        chrome_page_vitals_info, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
+        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
+        resolve_capture_target_window_context, select_single_active_browser_tab, sha256_hex,
+        target_wire, template_value, unavailable_page_vitals_info,
+        validate_browser_evaluate_params, validate_browser_set_content_params,
+        validate_target_window,
     };
     use crate::m1::{
-        BrowserEvaluateParams, BrowserTabEntry, BrowserTabsResponse, CdpActivateTabParams,
-        CdpTargetInfoParams, FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
-        HiddenDesktopPipStreamStatus,
+        BrowserEvaluateParams, BrowserSetContentParams, BrowserTabEntry, BrowserTabsResponse,
+        CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult, FindResultKind,
+        HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
     use base64::Engine as _;
@@ -8065,6 +8227,67 @@ mod tests {
         assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
         println!(
             "readback=browser_evaluate validation edges all rejected with TOOL_PARAMS_INVALID"
+        );
+    }
+
+    #[test]
+    fn browser_set_content_params_validation_edges() {
+        assert!(
+            validate_browser_set_content_params(&BrowserSetContentParams {
+                cdp_target_id: Some("target-123".to_owned()),
+                window_hwnd: None,
+                html: "<!doctype html><title>ok</title>".to_owned(),
+                wait_timeout_ms: None,
+            })
+            .is_ok()
+        );
+
+        for blank in ["", "   ", "\t\n"] {
+            let error = validate_browser_set_content_params(&BrowserSetContentParams {
+                cdp_target_id: None,
+                window_hwnd: None,
+                html: blank.to_owned(),
+                wait_timeout_ms: None,
+            })
+            .expect_err("blank html must be rejected");
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+
+        let oversize = "x".repeat(MAX_BROWSER_SET_CONTENT_HTML_BYTES + 1);
+        let error = validate_browser_set_content_params(&BrowserSetContentParams {
+            cdp_target_id: None,
+            window_hwnd: None,
+            html: oversize,
+            wait_timeout_ms: None,
+        })
+        .expect_err("oversize html must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let error = validate_browser_set_content_params(&BrowserSetContentParams {
+            cdp_target_id: Some("   ".to_owned()),
+            window_hwnd: None,
+            html: "<html></html>".to_owned(),
+            wait_timeout_ms: None,
+        })
+        .expect_err("blank cdp_target_id must be rejected");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        println!(
+            "readback=browser_set_content validation edges all rejected with TOOL_PARAMS_INVALID"
         );
     }
 
