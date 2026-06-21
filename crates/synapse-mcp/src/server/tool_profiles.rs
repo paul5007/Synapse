@@ -54,6 +54,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "browser_console_messages",
     "browser_content",
     "browser_evaluate",
+    "browser_handle_dialog",
     "browser_inspect",
     "browser_locate",
     "browser_network_overrides",
@@ -138,6 +139,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_console_messages",
     "browser_content",
     "browser_evaluate",
+    "browser_handle_dialog",
     "browser_inspect",
     "browser_locate",
     "browser_network_overrides",
@@ -1263,6 +1265,7 @@ mod tests {
                 "browser_add_script_tag",
                 "browser_add_style_tag",
                 "browser_evaluate",
+                "browser_handle_dialog",
                 "browser_network_overrides",
                 "browser_network_request",
                 "browser_network_requests",
@@ -1297,6 +1300,7 @@ mod tests {
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
         assert!(visible.contains(&"browser_add_script_tag".to_owned()));
         assert!(visible.contains(&"browser_add_style_tag".to_owned()));
+        assert!(visible.contains(&"browser_handle_dialog".to_owned()));
         assert!(visible.contains(&"browser_network_overrides".to_owned()));
         assert!(visible.contains(&"browser_network_request".to_owned()));
         assert!(visible.contains(&"browser_network_requests".to_owned()));
@@ -1369,6 +1373,7 @@ mod tests {
         assert!(visible.contains(&"browser_add_init_script".to_owned()));
         assert!(visible.contains(&"browser_add_script_tag".to_owned()));
         assert!(visible.contains(&"browser_add_style_tag".to_owned()));
+        assert!(visible.contains(&"browser_handle_dialog".to_owned()));
         assert!(visible.contains(&"browser_network_overrides".to_owned()));
         assert!(visible.contains(&"browser_network_request".to_owned()));
         assert!(visible.contains(&"browser_network_requests".to_owned()));

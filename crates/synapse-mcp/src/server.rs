@@ -203,6 +203,7 @@ pub(crate) mod command_audit;
 mod context;
 pub(crate) use context::AgentTranscriptSnapshotRow;
 mod background_router;
+mod browser_dialog;
 mod browser_field;
 mod browser_network;
 mod data_cleaning;
@@ -611,6 +612,7 @@ impl SynapseService {
             + Self::permission_gate_tool_router()
             + Self::escalation_tool_router()
             + Self::background_router_tool_router()
+            + Self::browser_dialog_tool_router()
             + Self::browser_field_tool_router()
             + Self::browser_network_tool_router()
             + Self::tool_profile_tool_router();
