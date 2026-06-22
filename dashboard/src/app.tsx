@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { flexRender, getCoreRowModel, getSortedRowModel, useReactTable, type ColumnDef, type SortingState } from "@tanstack/react-table";
 import { Terminal as XTerm } from "@xterm/xterm";
@@ -66,9 +66,12 @@ import {
 } from "@/primitives";
 import {
   buildAgents,
+  buildTaskRows,
   buildToolCalls,
   attachedAgentRegistry,
+  cancelAgentTask,
   claimDashboardAssetReload,
+  createAgentTask,
   dashboardAssetReloadDecision,
   dashboardAssetReloadUrl,
   decideApproval,
@@ -82,6 +85,7 @@ import {
   fetchSavedViews,
   forceReleaseLease,
   handoffLease,
+  dispatchAgentTaskOnce,
   killAgent,
   panelData,
   pauseTimeline,
@@ -92,6 +96,10 @@ import {
   runStorageGc,
   saveDashboardView,
   spawnAgent,
+  updateAgentTask,
+  type AgentTaskAttempt,
+  type AgentTaskRow,
+  type AgentTaskState,
   type AgentSummary,
   type AgentUsageSummary,
   type AuditQueryFilters,
@@ -517,7 +525,16 @@ export function App() {
         />
       ) : null}
       {normalizedRoute === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} onAuditKeySelect={focusAuditKey} /> : null}
-      {normalizedRoute === "tasks" ? <TasksView agents={agents} attentionCount={attentionCount} /> : null}
+      {normalizedRoute === "tasks" ? (
+        <TasksView
+          state={state}
+          agents={agents}
+          attentionCount={attentionCount}
+          onRefresh={() => query.refetch()}
+          setRoute={setRoute}
+          setSelectedAgentId={setSelectedAgentId}
+        />
+      ) : null}
       {normalizedRoute === "system" ? (
         <SystemView
           state={state}
@@ -1303,29 +1320,474 @@ function terminalFrameBytes(data: unknown, encoder: TextEncoder): Uint8Array {
   return encoder.encode(String(data ?? ""));
 }
 
-function TasksView({ agents, attentionCount }: { agents: AgentSummary[]; attentionCount: number }) {
-  const reviewAgents = agents.filter((agent) => agent.status === "ready_for_review").length;
+function TasksView({
+  state,
+  agents,
+  attentionCount,
+  onRefresh,
+  setRoute,
+  setSelectedAgentId
+}: {
+  state?: DashboardState;
+  agents: AgentSummary[];
+  attentionCount: number;
+  onRefresh: () => void;
+  setRoute: (route: DashboardRouteId) => void;
+  setSelectedAgentId: (id: string | null) => void;
+}) {
+  const taskPanel = state?.tasks;
+  const taskData = asRecord(panelData(taskPanel));
+  const tasks = buildTaskRows(state);
+  const next = asRecord(taskData.next);
+  const nextTask = asRecord(next.task);
+  const nextTaskId = rawText(nextTask.task_id);
+  const source = rawText(taskData.source_of_truth || taskPanel?.source || "CF_KV agent-task/v1");
+  const reconciledOrphans = asArray(taskData.reconciled_orphans).map(rawText).filter(Boolean);
+  const [form, setForm] = useState({
+    task_id: "",
+    title: "",
+    template_id: "",
+    priority: "3",
+    acceptance: "",
+    description: "",
+    template_params: "{}"
+  });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedAttempts, setSelectedAttempts] = useState<Record<string, number>>({});
+  const counts = taskStateColumns.map((column) => ({
+    ...column,
+    count: tasks.filter((task) => task.state === column.state).length
+  }));
+  const reviewTaskCount = counts.find((column) => column.state === "review")?.count ?? 0;
+  const inFlightTaskCount = counts.find((column) => column.state === "in_progress")?.count ?? 0;
+  const nextDecision = rawText(next.decision || "unknown");
+  const cap = Number(next.concurrency_cap || 0);
+  const inFlight = Number(next.in_flight || inFlightTaskCount);
+  const agentsById = useMemo(() => buildAgentLookup(agents), [agents]);
+
+  const runAction = async (label: string, action: () => Promise<string | undefined>) => {
+    setBusy(label);
+    setError(null);
+    setNotice(null);
+    try {
+      const message = await action();
+      setNotice(message || `${label} complete`);
+      onRefresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : rawText(caught) || String(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const createTask = async (event: FormEvent) => {
+    event.preventDefault();
+    await runAction("Create task", async () => {
+      const title = form.title.trim();
+      const templateId = form.template_id.trim();
+      const taskId = (form.task_id.trim() || taskSlug(title)).trim();
+      let templateParams: Record<string, string> = {};
+      if (form.template_params.trim()) {
+        const parsed = JSON.parse(form.template_params);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("template_params must be a JSON object");
+        templateParams = Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, String(value)]));
+      }
+      const readback = await createAgentTask({
+        task_id: taskId,
+        title,
+        template_id: templateId,
+        priority: Number(form.priority),
+        acceptance: form.acceptance.trim() || undefined,
+        description: form.description.trim() || undefined,
+        template_params: templateParams
+      });
+      setForm({ task_id: "", title: "", template_id: "", priority: "3", acceptance: "", description: "", template_params: "{}" });
+      return `Created ${readback.task.task_id}`;
+    });
+  };
+
+  const dispatchNext = (task?: AgentTaskRow) =>
+    runAction("Dispatch task", async () => {
+      if (task && nextTaskId && nextTaskId !== task.task_id) {
+        throw new Error(`dispatcher will select ${nextTaskId} before ${task.task_id}`);
+      }
+      const readback = await dispatchAgentTaskOnce({ concurrency_cap: cap || undefined });
+      return readback.task ? `Dispatched ${readback.task.task_id}` : `Dispatch ${readback.decision}`;
+    });
+
+  const transitionTask = (task: AgentTaskRow, target: AgentTaskState, reason: string) =>
+    runAction(`Move ${task.task_id}`, async () => {
+      const readback = await updateAgentTask({ task_id: task.task_id, state: target, reason });
+      return `${readback.task.task_id} -> ${readback.task.state}`;
+    });
+
+  const cancelTask = (task: AgentTaskRow, reason = "dashboard board cancel") =>
+    runAction(`Cancel ${task.task_id}`, async () => {
+      const readback = await cancelAgentTask({ task_id: task.task_id, reason });
+      return readback.interrupt ? `Cancelled ${readback.cancel.task.task_id} and interrupted live attempt` : `Cancelled ${readback.cancel.task.task_id}`;
+    });
+
+  const openAttemptAgent = (attempt: AgentTaskAttempt) => {
+    const id = rawText(attempt.spawn_id || attempt.session_id);
+    if (!id) return;
+    setSelectedAgentId(agentForAttempt(agentsById, attempt)?.id ?? id);
+    setRoute("agent");
+  };
+
+  const onDropTask = (event: DragEvent<HTMLDivElement>, target: AgentTaskState) => {
+    event.preventDefault();
+    const taskId = event.dataTransfer.getData("text/plain");
+    const task = tasks.find((row) => row.task_id === taskId);
+    if (!task || task.state === target) return;
+    if (!canDropTask(task, target)) {
+      setError(`${task.task_id} cannot move ${task.state} -> ${target} from the board`);
+      return;
+    }
+    if (target === "cancelled") {
+      void cancelTask(task, "dashboard drag to cancelled");
+    } else if (task.state === "todo" && target === "in_progress") {
+      void dispatchNext(task);
+    } else {
+      void transitionTask(task, target, `dashboard drag to ${target}`);
+    }
+  };
+
   return (
     <>
       <Section
         title="Task Queue"
         tier="overview"
-        questions={["How many review items need action?", "Which rows are attention candidates?", "Is the shell route stable for #924?"]}
+        questions={["How many review items need action?", "Which rows are attention candidates?", "Is the queue backed by durable state?"]}
+        actions={
+          <Button type="button" variant="ghost" size="sm" onClick={onRefresh}>
+            <RefreshCw aria-hidden="true" className="h-4 w-4" />
+            Refresh
+          </Button>
+        }
       >
-        <div className="grid gap-4 md:grid-cols-3">
-          <StatCard label="Attention" value={attentionCount} status={attentionCount ? "needs_input" : "done"} />
-          <StatCard label="Review" value={reviewAgents} status={reviewAgents ? "ready_for_review" : "idle"} />
-          <StatCard label="Shell" value="ready" status="working" />
+        <div className="grid gap-4 md:grid-cols-4">
+          <StatCard label="Attention" value={attentionCount} status={attentionCount ? "needs_input" : "done"} delta="Approval and fleet attention" />
+          <StatCard label="Review" value={reviewTaskCount} status={reviewTaskCount ? "ready_for_review" : "idle"} delta="Task review lane" />
+          <StatCard label="In Flight" value={inFlight} status={inFlight ? "working" : "idle"} delta={cap ? `Cap ${cap}` : "Default cap"} />
+          <StatCard label="Source" value={tasks.length} status={taskPanel?.status === "ok" ? "working" : "stuck"} delta={source} />
+        </div>
+        <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(20rem,28rem)]">
+          <div className="rounded-lg border border-border bg-surface-1 p-3">
+            <div className="grid gap-2 sm:grid-cols-5">
+              {counts.map((column) => (
+                <MetricRow key={column.state} label={column.label} value={column.count} />
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-secondary">
+              <span className="font-mono">next={nextDecision}</span>
+              {nextTaskId ? <span className="font-mono">task={nextTaskId}</span> : null}
+              {reconciledOrphans.length ? <span className="text-warning-fg">orphans: {reconciledOrphans.join(", ")}</span> : null}
+            </div>
+            {notice ? <div className="mt-3 text-sm text-success-fg">{notice}</div> : null}
+            {error ? <div className="mt-3 text-sm text-danger-fg">{error}</div> : null}
+          </div>
+          <form className="rounded-lg border border-border bg-surface-1 p-3" onSubmit={createTask}>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="text-sm text-secondary">
+                Title
+                <input className="mt-1 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-primary" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
+              </label>
+              <label className="text-sm text-secondary">
+                Task ID
+                <input className="mt-1 w-full rounded-md border border-border bg-surface-2 px-3 py-2 font-mono text-primary" value={form.task_id} onChange={(event) => setForm({ ...form, task_id: event.target.value })} placeholder="auto-from-title" />
+              </label>
+              <label className="text-sm text-secondary">
+                Template
+                <input className="mt-1 w-full rounded-md border border-border bg-surface-2 px-3 py-2 font-mono text-primary" value={form.template_id} onChange={(event) => setForm({ ...form, template_id: event.target.value })} required />
+              </label>
+              <label className="text-sm text-secondary">
+                Priority
+                <select className="mt-1 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-primary" value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })}>
+                  {[1, 2, 3, 4, 5].map((priority) => (
+                    <option key={priority} value={priority}>
+                      {priority}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label className="mt-2 block text-sm text-secondary">
+              Acceptance
+              <textarea className="mt-1 min-h-20 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-primary" value={form.acceptance} onChange={(event) => setForm({ ...form, acceptance: event.target.value })} />
+            </label>
+            <details className="mt-2">
+              <summary className="cursor-pointer text-sm text-secondary">Description and params</summary>
+              <textarea className="mt-2 min-h-16 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-primary" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} />
+              <textarea className="mt-2 min-h-16 w-full rounded-md border border-border bg-surface-2 px-3 py-2 font-mono text-primary" value={form.template_params} onChange={(event) => setForm({ ...form, template_params: event.target.value })} />
+            </details>
+            <Button type="submit" size="sm" className="mt-3" disabled={Boolean(busy)}>
+              <Plus aria-hidden="true" className="h-4 w-4" />
+              Create
+            </Button>
+          </form>
         </div>
       </Section>
       <Section
         title="Board"
         tier="triage"
         questions={["Which task lane is populated?", "Which attempt needs review?", "Where will queue transitions appear?"]}
+        actions={
+          <Button type="button" variant="secondary" size="sm" onClick={() => dispatchNext()} disabled={Boolean(busy) || nextDecision !== "dispatch"}>
+            <Rocket aria-hidden="true" className="h-4 w-4" />
+            Dispatch next
+          </Button>
+        }
       >
-        <EmptyStateArt title="No task board rows in this shell feed" />
+        {tasks.length ? (
+          <div className="grid gap-3 xl:grid-cols-5">
+            {taskStateColumns.map((column) => {
+              const laneTasks = tasks.filter((task) => task.state === column.state);
+              return (
+                <div
+                  key={column.state}
+                  className="min-h-64 rounded-lg border border-border bg-surface-1 p-2"
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => onDropTask(event, column.state)}
+                >
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <h3 className="text-sm font-semibold text-primary">{column.label}</h3>
+                    <span className="font-mono text-xs text-muted">{laneTasks.length}</span>
+                  </div>
+                  <div className="grid gap-2">
+                    {laneTasks.map((task) => (
+                      <TaskCard
+                        key={task.task_id}
+                        task={task}
+                        nextTaskId={nextTaskId}
+                        busy={busy}
+                        agentsById={agentsById}
+                        selectedAttemptId={selectedAttempts[task.task_id]}
+                        onSelectAttempt={(attemptId) => setSelectedAttempts({ ...selectedAttempts, [task.task_id]: attemptId })}
+                        onDispatch={() => dispatchNext(task)}
+                        onMove={(target, reason) => transitionTask(task, target, reason)}
+                        onCancel={(reason) => cancelTask(task, reason)}
+                        onOpenAttemptAgent={openAttemptAgent}
+                      />
+                    ))}
+                    {!laneTasks.length ? <div className="min-h-24 rounded-md border border-dashed border-border-subtle" /> : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <EmptyStateArt title={taskPanel?.status === "error" ? rawText(taskPanel.error) || "Task queue unavailable" : "No durable task rows"} />
+        )}
+        <RawValue value={taskPanel ?? { source, tasks }} label="Task queue readback" />
       </Section>
     </>
+  );
+}
+
+const taskStateColumns: { state: AgentTaskState; label: string }[] = [
+  { state: "todo", label: "Todo" },
+  { state: "in_progress", label: "In Progress" },
+  { state: "review", label: "Review" },
+  { state: "done", label: "Done" },
+  { state: "cancelled", label: "Cancelled" }
+];
+
+function TaskCard({
+  task,
+  nextTaskId,
+  busy,
+  agentsById,
+  selectedAttemptId,
+  onSelectAttempt,
+  onDispatch,
+  onMove,
+  onCancel,
+  onOpenAttemptAgent
+}: {
+  task: AgentTaskRow;
+  nextTaskId: string;
+  busy: string | null;
+  agentsById: Map<string, AgentSummary>;
+  selectedAttemptId?: number;
+  onSelectAttempt: (attemptId: number) => void;
+  onDispatch: () => void;
+  onMove: (target: AgentTaskState, reason: string) => void;
+  onCancel: (reason: string) => void;
+  onOpenAttemptAgent: (attempt: AgentTaskAttempt) => void;
+}) {
+  const attempt = selectedTaskAttempt(task, selectedAttemptId);
+  const agent = attempt ? agentForAttempt(agentsById, attempt) : undefined;
+  const elapsed = attempt ? taskAttemptElapsed(attempt) : taskAge(task);
+  const actionDisabled = Boolean(busy);
+  return (
+    <article
+      className="rounded-md border border-border bg-surface-2 p-3"
+      draggable={!actionDisabled && !["done", "cancelled"].includes(task.state)}
+      onDragStart={(event) => event.dataTransfer.setData("text/plain", task.task_id)}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h4 className="break-words text-sm font-semibold text-primary">{task.title}</h4>
+          <div className="mt-1 flex flex-wrap gap-2 font-mono text-xs text-muted">
+            <span>{task.task_id}</span>
+            <span>p{task.priority}</span>
+            <span>{task.template_id}</span>
+          </div>
+        </div>
+        <StatusBadge status={taskStatus(task.state)} />
+      </div>
+      {task.acceptance ? <p className="mt-2 line-clamp-3 text-sm text-secondary">{task.acceptance}</p> : null}
+      <div className="mt-3 grid gap-1 text-xs text-muted">
+        <span>Elapsed {elapsed}</span>
+        <span>Attempts {task.attempts.length}</span>
+        {task.review_reason ? <span className="text-warning-fg">Review: {task.review_reason}</span> : null}
+        {agent ? (
+          <span>
+            {formatAgentTokens(agent.usage)} / {formatAgentCost(agent.usage)} / diff {agent.diffStats.actions}:{agent.diffStats.transcripts}
+          </span>
+        ) : null}
+      </div>
+      {task.attempts.length ? (
+        <div className="mt-3 rounded-md border border-border-subtle p-2">
+          <div className="mb-2 flex flex-wrap gap-1">
+            {task.attempts.map((item) => (
+              <Button
+                key={item.attempt_id}
+                type="button"
+                variant={attempt?.attempt_id === item.attempt_id ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => onSelectAttempt(item.attempt_id)}
+              >
+                <Rows3 aria-hidden="true" className="h-4 w-4" />
+                {item.attempt_id}
+              </Button>
+            ))}
+          </div>
+          {attempt ? (
+            <div className="grid gap-1 text-xs text-secondary">
+              <span className="font-mono">{attempt.outcome}</span>
+              <span className="font-mono">{rawText(attempt.spawn_id || attempt.session_id) || "unbound"}</span>
+              {attempt.reason ? <span>{attempt.reason}</span> : null}
+              <div className="mt-1 flex flex-wrap gap-2">
+                <Button type="button" variant="ghost" size="sm" onClick={() => onOpenAttemptAgent(attempt)} disabled={!rawText(attempt.spawn_id || attempt.session_id)}>
+                  <UserRound aria-hidden="true" className="h-4 w-4" />
+                  Agent
+                </Button>
+                {task.state === "review" ? (
+                  <Button type="button" variant="secondary" size="sm" onClick={() => onMove("done", `dashboard picked attempt ${attempt.attempt_id}`)} disabled={actionDisabled}>
+                    <CheckCircle2 aria-hidden="true" className="h-4 w-4" />
+                    Pick
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="mt-3 flex flex-wrap gap-2">
+        {task.state === "todo" ? (
+          <>
+            <Button type="button" variant="secondary" size="sm" onClick={onDispatch} disabled={actionDisabled || (nextTaskId !== "" && nextTaskId !== task.task_id)}>
+              <Play aria-hidden="true" className="h-4 w-4" />
+              Dispatch
+            </Button>
+            <Button type="button" variant="ghost" size="sm" onClick={() => onCancel("dashboard cancelled todo task")} disabled={actionDisabled}>
+              <X aria-hidden="true" className="h-4 w-4" />
+              Cancel
+            </Button>
+          </>
+        ) : null}
+        {task.state === "in_progress" ? (
+          <>
+            <Button type="button" variant="secondary" size="sm" onClick={() => onMove("review", "dashboard sent to review")} disabled={actionDisabled}>
+              <ClipboardList aria-hidden="true" className="h-4 w-4" />
+              Review
+            </Button>
+            <Button type="button" variant="ghost" size="sm" onClick={() => onCancel("dashboard cancelled in-progress task")} disabled={actionDisabled}>
+              <X aria-hidden="true" className="h-4 w-4" />
+              Cancel
+            </Button>
+          </>
+        ) : null}
+        {task.state === "review" ? (
+          <>
+            <Button type="button" variant="secondary" size="sm" onClick={() => onMove("done", "dashboard accepted review")} disabled={actionDisabled}>
+              <CheckCircle2 aria-hidden="true" className="h-4 w-4" />
+              Done
+            </Button>
+            <Button type="button" variant="ghost" size="sm" onClick={() => onMove("todo", "dashboard requeued from review")} disabled={actionDisabled}>
+              <RefreshCw aria-hidden="true" className="h-4 w-4" />
+              Requeue
+            </Button>
+            <Button type="button" variant="ghost" size="sm" onClick={() => onCancel("dashboard cancelled review task")} disabled={actionDisabled}>
+              <X aria-hidden="true" className="h-4 w-4" />
+              Cancel
+            </Button>
+          </>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function canDropTask(task: AgentTaskRow, target: AgentTaskState): boolean {
+  if (task.state === target) return true;
+  if (target === "cancelled") return task.state !== "done" && task.state !== "cancelled";
+  if (task.state === "todo" && target === "in_progress") return true;
+  if (task.state === "in_progress" && target === "review") return true;
+  if (task.state === "review" && ["done", "todo", "cancelled"].includes(target)) return true;
+  return false;
+}
+
+function buildAgentLookup(agents: AgentSummary[]): Map<string, AgentSummary> {
+  const lookup = new Map<string, AgentSummary>();
+  for (const agent of agents) {
+    for (const id of [agent.id, agent.spawnId, agent.killId]) {
+      if (id) lookup.set(id, agent);
+    }
+  }
+  return lookup;
+}
+
+function agentForAttempt(agentsById: Map<string, AgentSummary>, attempt: AgentTaskAttempt): AgentSummary | undefined {
+  return agentsById.get(rawText(attempt.spawn_id)) ?? agentsById.get(rawText(attempt.session_id));
+}
+
+function selectedTaskAttempt(task: AgentTaskRow, selectedAttemptId?: number): AgentTaskAttempt | undefined {
+  return task.attempts.find((attempt) => attempt.attempt_id === selectedAttemptId) ?? task.attempts[task.attempts.length - 1];
+}
+
+function taskStatus(state: AgentTaskState): FleetStatus {
+  if (state === "in_progress") return "working";
+  if (state === "review") return "ready_for_review";
+  if (state === "done") return "done";
+  if (state === "cancelled") return "failed";
+  return "idle";
+}
+
+function taskAge(task: AgentTaskRow): string {
+  const started = Number(task.created_unix_ms);
+  if (!Number.isFinite(started) || started <= 0) return "unknown";
+  return timeAgo(Date.now() - started);
+}
+
+function taskAttemptElapsed(attempt: AgentTaskAttempt): string {
+  const started = Number(attempt.started_unix_ms);
+  if (!Number.isFinite(started) || started <= 0) return "unknown";
+  const ended = Number(attempt.ended_unix_ms || Date.now());
+  return timeAgo(Math.max(0, ended - started));
+}
+
+function taskSlug(title: string): string {
+  return (
+    title
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80) || `task-${Date.now()}`
   );
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { buildAgents, type DashboardState } from "../src/lib/dashboard-state";
+import { buildAgents, buildTaskRows, type DashboardState } from "../src/lib/dashboard-state";
 
 function panel(data: unknown) {
   return { status: "ok" as const, source: "test", data };
@@ -206,5 +206,44 @@ describe("buildAgents live session status", () => {
       totalCostMicroUsd: 12345,
       sourceLine: 2
     });
+  });
+});
+
+describe("buildTaskRows", () => {
+  test("reads durable dashboard task rows without inventing UI state", () => {
+    const state = dashboardState({
+      sessions: [],
+      unbound_agent_states: []
+    });
+    state.tasks = panel({
+      source_of_truth: "CF_KV agent-task/v1",
+      row_count: 2,
+      tasks: [
+        {
+          schema_version: 1,
+          task_id: "issue-924-board",
+          state: "review",
+          title: "Verify task board",
+          priority: 2,
+          template_id: "codex-default",
+          template_params: {},
+          enqueue_seq: 7,
+          attempts: [],
+          created_unix_ms: 10,
+          updated_unix_ms: 20
+        },
+        {
+          schema_version: 1,
+          state: "todo",
+          title: "corrupt missing id"
+        }
+      ]
+    });
+
+    const rows = buildTaskRows(state);
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].task_id, "issue-924-board");
+    assert.equal(rows[0].state, "review");
   });
 });

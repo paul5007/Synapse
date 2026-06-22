@@ -578,6 +578,28 @@ fn router(
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/dashboard/tasks/create",
+            post(dashboard_task_create).layer(DefaultBodyLimit::max(
+                DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/dashboard/tasks/update",
+            post(dashboard_task_update).layer(DefaultBodyLimit::max(
+                DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/dashboard/tasks/cancel",
+            post(dashboard_task_cancel)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/tasks/dispatch-once",
+            post(dashboard_task_dispatch_once)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/dashboard/timeline/pause",
             post(dashboard_timeline_pause)
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
@@ -1466,6 +1488,7 @@ struct DashboardStateResponse {
     cdp_attachments: DashboardPanel,
     shell_jobs: DashboardPanel,
     command_audit: DashboardPanel,
+    tasks: DashboardPanel,
     approvals: DashboardPanel,
     suggestions: DashboardPanel,
     armed_runs: DashboardPanel,
@@ -1814,6 +1837,17 @@ struct DashboardLocalModelSurface {
     rows: Vec<crate::m3::local_models::LocalModelRegistryRow>,
 }
 
+#[derive(Serialize)]
+struct DashboardTaskSurface {
+    tool: &'static str,
+    available: bool,
+    source_of_truth: &'static str,
+    row_count: usize,
+    tasks: Vec<crate::server::agent_tasks::AgentTask>,
+    reconciled_orphans: Vec<String>,
+    next: crate::server::agent_tasks::TaskNextResponse,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DashboardLocalModelSpawnRequest {
@@ -1860,6 +1894,15 @@ struct DashboardSpawnAgentRequest {
     /// (#927). Defaults true; the dashboard may send false for trusted spawns.
     #[serde(default)]
     require_approval_gate: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardTaskDispatchOnceRequest {
+    #[serde(default)]
+    concurrency_cap: Option<usize>,
+    #[serde(default)]
+    wait_timeout_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -2829,6 +2872,7 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         cdp_attachments,
         shell_jobs,
         command_audit: command_audit_panel(&state),
+        tasks: tasks_panel(&state, &tool_names),
         approvals: approval_panel(&state, &tool_names, None),
         suggestions: approval_panel(
             &state,
@@ -3372,6 +3416,125 @@ async fn dashboard_agent_kill(
                 source_of_truth:
                     "OS process table, session registry, CF_AGENT_EVENTS, command audit rows, agent spawn artifacts",
                 kill,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_task_create(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::server::agent_tasks::TaskCreateParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_task_create(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.task_create",
+                source_of_truth: "CF_KV agent-task/v1 rows",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_task_update(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::server::agent_tasks::TaskUpdateParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_task_update(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.task_update",
+                source_of_truth: "CF_KV agent-task/v1 rows",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_task_cancel(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::server::agent_tasks::TaskCancelParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_task_cancel(params).await {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.task_cancel",
+                source_of_truth:
+                    "CF_KV agent-task/v1 rows plus OS process table/session registry for live-attempt interrupt",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_task_dispatch_once(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardTaskDispatchOnceRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = crate::server::agent_tasks::TaskDispatchOnceParams {
+        concurrency_cap: request
+            .concurrency_cap
+            .unwrap_or_else(crate::server::agent_tasks::default_cap),
+        mcp_url: crate::m4::agent_spawn_mcp_url_for_bind(state.bind_addr),
+        wait_timeout_ms: request
+            .wait_timeout_ms
+            .unwrap_or_else(crate::m4::default_agent_spawn_wait_timeout_ms),
+    };
+    match state.health_service.dashboard_task_dispatch_once(params).await {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.task_dispatch_once",
+                source_of_truth:
+                    "CF_KV agent-task/v1 rows, CF_AGENT_EVENTS, session registry, and agent spawn artifacts",
+                readback,
             })
             .into_response(),
         ),
@@ -4435,6 +4598,35 @@ fn approval_panel(
     }
 }
 
+fn tasks_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
+    if !tool_names.contains("task_list") {
+        return deferred_panel("task_list", tool_names);
+    }
+    let list = match state.health_service.dashboard_task_snapshot(1000) {
+        Ok(list) => list,
+        Err(error) => return DashboardPanel::error("task_list", format!("{error:?}")),
+    };
+    let next = match state
+        .health_service
+        .dashboard_task_next(crate::server::agent_tasks::default_cap())
+    {
+        Ok(next) => next,
+        Err(error) => return DashboardPanel::error("task_next", format!("{error:?}")),
+    };
+    DashboardPanel::ok(
+        "CF_KV agent-task/v1 via task_list",
+        DashboardTaskSurface {
+            tool: "task_list",
+            available: true,
+            source_of_truth: "CF_KV agent-task/v1",
+            row_count: list.count,
+            tasks: list.tasks,
+            reconciled_orphans: list.reconciled_orphans,
+            next,
+        },
+    )
+}
+
 fn local_model_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
     if !tool_names.contains("local_model_list") {
         return deferred_panel("local_model_list", tool_names);
@@ -4560,12 +4752,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-eG7sayus.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-C4M-_bne.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-C95PIXH6.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-B_4_Y-7p.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-eG7sayus.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-C4M-_bne.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-C95PIXH6.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-B_4_Y-7p.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

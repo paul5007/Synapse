@@ -351,7 +351,7 @@ pub struct TaskNextParams {
     pub concurrency_cap: usize,
 }
 
-fn default_cap() -> usize {
+pub(crate) fn default_cap() -> usize {
     DEFAULT_CONCURRENCY_CAP
 }
 
@@ -422,6 +422,18 @@ pub struct TaskDispatchOnceResponse {
     pub spawn: Option<DispatchSpawnReadback>,
     pub in_flight: usize,
     pub concurrency_cap: usize,
+}
+
+/// Dashboard-specific cancel readback. The durable row transition is still the
+/// source of truth, with an optional physical agent interrupt/kill readback
+/// when the task had a live pending spawned attempt.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardTaskCancelResponse {
+    pub ok: bool,
+    pub cancel: TaskMutationResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt: Option<super::agent_control::AgentKillResponse>,
 }
 
 // ---- key encoding & validation -------------------------------------------
@@ -1285,6 +1297,205 @@ impl SynapseService {
             template_id = %task.template_id,
             template_version = response.template_version.unwrap_or(0),
             "readback=agent_tasks edge=dispatch"
+        );
+
+        Ok(TaskDispatchOnceResponse {
+            ok: true,
+            decision: "dispatched".to_owned(),
+            task: Some(claimed),
+            spawn: Some(DispatchSpawnReadback {
+                spawn_id: response.spawn_id,
+                session_id: response.session_id,
+                template_id: response.template_id,
+                template_version: response.template_version,
+                agent_process_id: response.agent_process_id,
+                launched_at_unix_ms: response.launched_at_unix_ms,
+                task_started_at_unix_ms: response.task_started_at_unix_ms,
+            }),
+            in_flight: in_flight + 1,
+            concurrency_cap: params.concurrency_cap,
+        })
+    }
+
+    pub(crate) fn dashboard_task_snapshot(
+        &self,
+        max: usize,
+    ) -> Result<TaskListResponse, ErrorData> {
+        self.task_list_impl(TaskListParams { state: None, max })
+    }
+
+    pub(crate) fn dashboard_task_next(
+        &self,
+        concurrency_cap: usize,
+    ) -> Result<TaskNextResponse, ErrorData> {
+        self.task_next_impl(TaskNextParams { concurrency_cap })
+    }
+
+    pub(crate) fn dashboard_task_create(
+        &self,
+        params: TaskCreateParams,
+    ) -> Result<TaskMutationResponse, ErrorData> {
+        self.task_create_impl(params)
+    }
+
+    pub(crate) fn dashboard_task_update(
+        &self,
+        params: TaskUpdateParams,
+    ) -> Result<TaskMutationResponse, ErrorData> {
+        self.task_update_impl(params)
+    }
+
+    pub(crate) async fn dashboard_task_cancel(
+        &self,
+        params: TaskCancelParams,
+    ) -> Result<DashboardTaskCancelResponse, ErrorData> {
+        let db = self.agent_task_db()?;
+        let before = Self::read_task(&db, &params.task_id)?
+            .ok_or_else(|| task_not_found(&params.task_id))?;
+        let interrupt_target = before.live_attempt().and_then(|attempt| {
+            attempt
+                .spawn_id
+                .as_ref()
+                .filter(|spawn_id| !spawn_id.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    (!attempt.session_id.trim().is_empty()).then(|| attempt.session_id.clone())
+                })
+        });
+        let interrupt = if let Some(session_id) = interrupt_target {
+            Some(
+                self.dashboard_agent_kill_request(super::agent_control::AgentKillParams {
+                    session_id,
+                    grace_ms: 3_000,
+                    interrupt_first: true,
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
+        let cancel = self.task_cancel_impl(params)?;
+        Ok(DashboardTaskCancelResponse {
+            ok: true,
+            cancel,
+            interrupt,
+        })
+    }
+
+    pub(crate) async fn dashboard_task_dispatch_once(
+        &self,
+        params: TaskDispatchOnceParams,
+    ) -> Result<TaskDispatchOnceResponse, ErrorData> {
+        let db = self.agent_task_db()?;
+        self.reconcile_tasks(&db)?;
+        let tasks = Self::read_all_tasks(&db)?;
+        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
+        let task_id = match dispatch_decision(&tasks, params.concurrency_cap) {
+            DispatchDecision::Empty => {
+                return Ok(TaskDispatchOnceResponse {
+                    ok: true,
+                    decision: "empty".to_owned(),
+                    task: None,
+                    spawn: None,
+                    in_flight,
+                    concurrency_cap: params.concurrency_cap,
+                });
+            }
+            DispatchDecision::AtCapacity { in_flight } => {
+                return Ok(TaskDispatchOnceResponse {
+                    ok: true,
+                    decision: format!("at_capacity:{in_flight}"),
+                    task: None,
+                    spawn: None,
+                    in_flight,
+                    concurrency_cap: params.concurrency_cap,
+                });
+            }
+            DispatchDecision::Dispatch { task_id } => task_id,
+        };
+
+        let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
+        let request = ActSpawnAgentRequest {
+            template_id: Some(task.template_id.clone()),
+            template_version: None,
+            template_params: task.template_params.clone(),
+            cli: None,
+            kind: None,
+            model: None,
+            model_ref: None,
+            prompt: None,
+            target: None,
+            working_dir: None,
+            mcp_url: params.mcp_url,
+            wait_timeout_ms: params.wait_timeout_ms,
+            hold_open_ms: default_agent_spawn_hold_open_ms(),
+            require_approval_gate: crate::m4::default_require_approval_gate(),
+        };
+
+        tracing::info!(
+            code = "AGENT_TASK_DASHBOARD_DISPATCH_SPAWN",
+            task_id = %task_id,
+            template_id = %task.template_id,
+            "readback=agent_tasks edge=dashboard_dispatch_spawn_begin"
+        );
+
+        let response = match self.dashboard_spawn_agent_request(request).await {
+            Ok(response) => response,
+            Err(spawn_error) => {
+                let error_code = error_code_str(&spawn_error);
+                let reason = format!(
+                    "dashboard dispatch spawn failed [{error_code}]: {}",
+                    spawn_error.message
+                );
+                Self::record_failed_attempt_internal(&db, &task_id, reason.clone())?;
+                tracing::error!(
+                    code = "AGENT_TASK_DASHBOARD_DISPATCH_SPAWN_FAILED",
+                    task_id = %task_id,
+                    template_id = %task.template_id,
+                    error_code = %error_code,
+                    "readback=agent_tasks edge=dashboard_dispatch_spawn_failed reason={reason}"
+                );
+                return Err(spawn_error);
+            }
+        };
+
+        let claimed = match Self::claim_internal(
+            &db,
+            &task_id,
+            &response.session_id,
+            Some(response.spawn_id.clone()),
+            response.template_version,
+        ) {
+            Ok(task) => task,
+            Err(claim_error) => {
+                tracing::error!(
+                    code = "AGENT_TASK_DASHBOARD_DISPATCH_ORPHAN",
+                    task_id = %task_id,
+                    spawn_id = %response.spawn_id,
+                    session_id = %response.session_id,
+                    "readback=agent_tasks edge=dashboard_dispatch_claim_failed: live agent is unbound"
+                );
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "dashboard task dispatch spawned agent session {:?} (spawn {:?}) for task {task_id:?} but could not bind the attempt: {}. The agent is live and unbound; use agent_kill on the spawn. Underlying error: {}",
+                        response.session_id,
+                        response.spawn_id,
+                        claim_error.message,
+                        claim_error.message
+                    ),
+                ));
+            }
+        };
+
+        tracing::info!(
+            code = "AGENT_TASK_DASHBOARD_DISPATCH",
+            task_id = %task_id,
+            spawn_id = %response.spawn_id,
+            session_id = %response.session_id,
+            template_id = %task.template_id,
+            template_version = response.template_version.unwrap_or(0),
+            "readback=agent_tasks edge=dashboard_dispatch"
         );
 
         Ok(TaskDispatchOnceResponse {

@@ -25,6 +25,7 @@ export interface DashboardState {
   cdp_attachments: DashboardPanel;
   shell_jobs: DashboardPanel;
   command_audit: DashboardPanel;
+  tasks?: DashboardPanel;
   approvals: DashboardPanel;
   suggestions: DashboardPanel;
   armed_runs: DashboardPanel;
@@ -293,6 +294,110 @@ export interface AgentTemplateRow {
   config_hash: string;
   created_unix_ms: number;
   updated_unix_ms: number;
+}
+
+export type AgentTaskState = "todo" | "in_progress" | "review" | "done" | "cancelled";
+export type AgentTaskAttemptOutcome = "pending" | "succeeded" | "failed" | "orphaned";
+
+export interface AgentTaskAttempt {
+  attempt_id: number;
+  session_id: string;
+  spawn_id?: string | null;
+  template_version?: number | null;
+  outcome: AgentTaskAttemptOutcome;
+  started_unix_ms: number;
+  ended_unix_ms?: number | null;
+  reason?: string | null;
+}
+
+export interface AgentTaskRow {
+  schema_version: number;
+  task_id: string;
+  state: AgentTaskState;
+  title: string;
+  description?: string | null;
+  acceptance?: string | null;
+  priority: number;
+  template_id: string;
+  template_params: Record<string, string>;
+  enqueue_seq: number;
+  attempts: AgentTaskAttempt[];
+  review_reason?: string | null;
+  created_unix_ms: number;
+  updated_unix_ms: number;
+}
+
+export interface AgentTaskNextReadback {
+  ok: boolean;
+  decision: string;
+  task?: AgentTaskRow | null;
+  in_flight: number;
+  concurrency_cap: number;
+}
+
+export interface DashboardTaskSurface {
+  tool: string;
+  available: boolean;
+  source_of_truth: string;
+  row_count: number;
+  tasks: AgentTaskRow[];
+  reconciled_orphans: string[];
+  next: AgentTaskNextReadback;
+}
+
+export interface AgentTaskCreateRequest {
+  task_id: string;
+  title: string;
+  description?: string;
+  acceptance?: string;
+  priority?: number;
+  template_id: string;
+  template_params?: Record<string, string>;
+}
+
+export interface AgentTaskUpdateRequest {
+  task_id: string;
+  state?: AgentTaskState;
+  reason?: string;
+  priority?: number;
+  title?: string;
+  description?: string;
+  acceptance?: string;
+}
+
+export interface AgentTaskCancelRequest {
+  task_id: string;
+  reason?: string;
+}
+
+export interface AgentTaskDispatchOnceRequest {
+  concurrency_cap?: number;
+  wait_timeout_ms?: number;
+}
+
+export interface AgentTaskMutationResponse {
+  ok: boolean;
+  task: AgentTaskRow;
+  written_row: {
+    cf_name: string;
+    row_key: string;
+    value_len_bytes: number;
+  };
+}
+
+export interface AgentTaskDispatchOnceResponse {
+  ok: boolean;
+  decision: string;
+  task?: AgentTaskRow | null;
+  spawn?: Record<string, unknown>;
+  in_flight: number;
+  concurrency_cap: number;
+}
+
+export interface AgentTaskCancelResponse {
+  ok: boolean;
+  cancel: AgentTaskMutationResponse;
+  interrupt?: Record<string, unknown>;
 }
 
 export interface TemplateUpsertRequest {
@@ -808,6 +913,12 @@ export function panelData<T = Record<string, unknown>>(panel?: DashboardPanel): 
   return (panel?.data ?? {}) as T;
 }
 
+export function buildTaskRows(state?: DashboardState): AgentTaskRow[] {
+  if (!state) return [];
+  const data = asRecord(panelData(state.tasks));
+  return asArray<AgentTaskRow>(data.tasks).filter((task) => rawText(task.task_id));
+}
+
 export function buildAgents(state?: DashboardState): AgentSummary[] {
   if (!state) return [];
   const sessionData = asRecord(state.sessions.data);
@@ -963,6 +1074,54 @@ export function buildAgents(state?: DashboardState): AgentSummary[] {
   });
 
   return [...live, ...historical].filter((agent) => agent.id);
+}
+
+export async function createAgentTask(request: AgentTaskCreateRequest): Promise<AgentTaskMutationResponse> {
+  const response = await fetch("/dashboard/tasks/create", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as AgentTaskMutationResponse;
+}
+
+export async function updateAgentTask(request: AgentTaskUpdateRequest): Promise<AgentTaskMutationResponse> {
+  const response = await fetch("/dashboard/tasks/update", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as AgentTaskMutationResponse;
+}
+
+export async function cancelAgentTask(request: AgentTaskCancelRequest): Promise<AgentTaskCancelResponse> {
+  const response = await fetch("/dashboard/tasks/cancel", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as AgentTaskCancelResponse;
+}
+
+export async function dispatchAgentTaskOnce(request: AgentTaskDispatchOnceRequest): Promise<AgentTaskDispatchOnceResponse> {
+  const response = await fetch("/dashboard/tasks/dispatch-once", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as AgentTaskDispatchOnceResponse;
 }
 
 interface TranscriptAgentStats {
