@@ -198,13 +198,16 @@ impl SynapseService {
                     };
                 };
                 match runtime.lock() {
-                    Ok(runtime) => match runtime.storage_cf_sizes() {
+                    Ok(runtime) => match runtime.storage_cf_live_data_size_estimates() {
                         Ok(cf_sizes) => SubsystemHealth {
                             status: storage_pressure_status(runtime.storage_pressure_level()),
-                            detail: Some("storage runtime initialized".to_owned()),
+                            detail: Some(
+                                "storage runtime initialized; cf_sizes use RocksDB live-data estimates"
+                                    .to_owned(),
+                            ),
                             db_path: Some(runtime.storage_path().display().to_string()),
                             schema_version: Some(runtime.schema_version()),
-                            cf_sizes: Some(cf_sizes),
+                            cf_sizes: Some(cf_sizes.0),
                             ..SubsystemHealth::default()
                         },
                         Err(error) => SubsystemHealth {

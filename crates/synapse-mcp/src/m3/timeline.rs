@@ -428,9 +428,9 @@ pub fn timeline_stats_data(
 
     let runtime = lock_runtime(runtime)?;
     let storage_bytes = runtime
-        .storage_cf_sizes()
+        .storage_cf_live_data_size_estimates()
         .ok()
-        .and_then(|sizes| sizes.get(cf::CF_TIMELINE).copied());
+        .and_then(|(sizes, _missing)| sizes.get(cf::CF_TIMELINE).copied());
 
     let mut rows_by_kind: BTreeMap<String, u64> = BTreeMap::new();
     let mut rows_by_day_utc: BTreeMap<String, u64> = BTreeMap::new();

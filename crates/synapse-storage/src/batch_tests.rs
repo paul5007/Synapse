@@ -110,6 +110,25 @@ fn batch_edges_empty_single_byte_and_size_boundary() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn scan_cf_tail_returns_bounded_ascending_key_tail() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let db = Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?;
+    let rows = event_rows(8);
+    db.put_batch(cf::CF_EVENTS, rows.clone())?;
+    db.flush()?;
+
+    let tail = db.scan_cf_tail(cf::CF_EVENTS, 3)?;
+    println!(
+        "regression_state=cf_tail case=bounded expected={:?} observed={:?}",
+        printable_rows(&rows[5..]),
+        printable_rows(&tail)
+    );
+    assert_eq!(tail, rows[5..].to_vec());
+    assert!(db.scan_cf_tail(cf::CF_EVENTS, 0)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn mutate_batch_pressure_bypass_deletes_and_puts_atomically() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let db = Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?;

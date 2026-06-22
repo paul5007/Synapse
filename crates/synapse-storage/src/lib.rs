@@ -35,11 +35,15 @@ const BLOCK_CACHE_BYTES: usize = 64 * MIB;
 const SCHEMA_VERSION_KEY: &[u8] = b"__schema_version";
 const TIMELINE_PERIODIC_COMPACTION_SECONDS: u64 = 86_400;
 const STORAGE_WRITES_SHED_TOTAL: &str = "storage_writes_shed_total";
+const ESTIMATE_LIVE_DATA_SIZE: &str = "rocksdb.estimate-live-data-size";
+const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 
 /// One raw storage row: key bytes and value bytes.
 pub type RawRow = (Vec<u8>, Vec<u8>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
+/// Per-CF integer storage metrics plus CFs whose RocksDB property was absent.
+pub type CfEstimateMap = (BTreeMap<String, u64>, Vec<String>);
 
 /// Opened storage handle.
 pub struct Db {
@@ -445,6 +449,20 @@ impl Db {
         Ok(sizes)
     }
 
+    /// Returns RocksDB's live-data-size estimate for each Synapse column family.
+    ///
+    /// This is metadata-backed and intentionally cheaper than [`Self::cf_sizes`],
+    /// which scans every key/value byte to compute exact logical sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when a column family property cannot
+    /// be read.
+    #[tracing::instrument(skip_all)]
+    pub fn cf_live_data_size_estimates(&self) -> StorageResult<CfEstimateMap> {
+        self.cf_property_estimates(ESTIMATE_LIVE_DATA_SIZE)
+    }
+
     /// Returns exact row counts for each Synapse column family.
     ///
     /// # Errors
@@ -457,6 +475,20 @@ impl Db {
             counts.insert(cf_name.to_owned(), self.scan_cf(cf_name)?.len() as u64);
         }
         Ok(counts)
+    }
+
+    /// Returns RocksDB's estimated row count for each Synapse column family.
+    ///
+    /// This is metadata-backed and intentionally cheaper than [`Self::cf_row_counts`],
+    /// which scans every key in every column family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when a column family property cannot
+    /// be read.
+    #[tracing::instrument(skip_all)]
+    pub fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap> {
+        self.cf_property_estimates(ESTIMATE_NUM_KEYS)
     }
 
     /// Runs one disk-pressure check immediately.
@@ -616,6 +648,36 @@ impl Db {
         Ok((rows, more))
     }
 
+    /// Scans up to `max_rows` rows from the end of one column family.
+    ///
+    /// Returned rows preserve normal ascending key order, matching the tail
+    /// produced by a full forward scan without materializing the whole CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when the column family is missing
+    /// or `RocksDB` iteration fails.
+    #[tracing::instrument(skip_all, fields(cf_name, max_rows))]
+    pub fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>> {
+        if max_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let handle = self.cf_handle(cf_name)?;
+        let mut rows = Vec::new();
+        for item in self.inner.iterator_cf(&handle, IteratorMode::End) {
+            let (key, value) = item.map_err(|source| StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })?;
+            rows.push((key.to_vec(), value.to_vec()));
+            if rows.len() >= max_rows {
+                break;
+            }
+        }
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// Compacts a whole column family.
     ///
     /// # Errors
@@ -653,6 +715,30 @@ impl Db {
                 cf_name: cf_name.to_owned(),
                 detail: "column family handle missing".to_owned(),
             })
+    }
+
+    fn cf_property_estimates(&self, property: &str) -> StorageResult<CfEstimateMap> {
+        let mut values = BTreeMap::new();
+        let mut missing = Vec::new();
+        for cf_name in cf::ALL_COLUMN_FAMILIES {
+            let handle = self.cf_handle(cf_name)?;
+            match self
+                .inner
+                .property_int_value_cf(&handle, property)
+                .map_err(|source| StorageError::ReadFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: source.to_string(),
+                })? {
+                Some(value) => {
+                    values.insert(cf_name.to_owned(), value);
+                }
+                None => {
+                    values.insert(cf_name.to_owned(), 0);
+                    missing.push(cf_name.to_owned());
+                }
+            }
+        }
+        Ok((values, missing))
     }
 }
 

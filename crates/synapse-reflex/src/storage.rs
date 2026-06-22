@@ -45,6 +45,18 @@ impl ReflexRuntime {
         self.db.cf_sizes()
     }
 
+    /// Returns RocksDB's live-data-size estimate for each storage column family.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when a column family property cannot be read.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn storage_cf_live_data_size_estimates(
+        &self,
+    ) -> StorageResult<synapse_storage::CfEstimateMap> {
+        self.db.cf_live_data_size_estimates()
+    }
+
     /// Returns exact row counts for each storage column family.
     ///
     /// # Errors
@@ -53,6 +65,16 @@ impl ReflexRuntime {
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn storage_cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>> {
         self.db.cf_row_counts()
+    }
+
+    /// Returns RocksDB's estimated row count for each storage column family.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when a column family property cannot be read.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn storage_cf_estimated_row_counts(&self) -> StorageResult<synapse_storage::CfEstimateMap> {
+        self.db.cf_estimated_row_counts()
     }
 
     /// Returns the newest rows in one storage column family.
@@ -66,9 +88,7 @@ impl ReflexRuntime {
         cf_name: &str,
         limit: usize,
     ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut rows = self.db.scan_cf(cf_name)?;
-        let keep_from = rows.len().saturating_sub(limit);
-        Ok(rows.split_off(keep_from))
+        self.db.scan_cf_tail(cf_name, limit)
     }
 
     /// Returns rows in one storage column family whose keys start with `prefix`.

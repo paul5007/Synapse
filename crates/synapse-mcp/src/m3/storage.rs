@@ -95,6 +95,20 @@ pub struct StorageInspectResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageSummaryResponse {
+    pub schema_version: u32,
+    pub pressure_level: StoragePressureLevel,
+    pub pressure_transition_codes: Vec<String>,
+    pub audit_retention_policy_count: usize,
+    pub metrics_mode: String,
+    pub cf_sizes: BTreeMap<String, u64>,
+    pub cf_row_counts: BTreeMap<String, u64>,
+    pub missing_cf_size_estimates: Vec<String>,
+    pub missing_cf_row_count_estimates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageRowSample {
     pub key_hex: String,
     pub value_len_bytes: u64,
@@ -216,6 +230,34 @@ pub fn inspect_storage(
 ) -> Result<StorageInspectResponse, ErrorData> {
     let runtime = lock_runtime(runtime)?;
     inspect_locked(&runtime)
+}
+
+pub fn inspect_storage_summary(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+) -> Result<StorageSummaryResponse, ErrorData> {
+    let runtime = lock_runtime(runtime)?;
+    let (cf_sizes, missing_cf_size_estimates) = runtime
+        .storage_cf_live_data_size_estimates()
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let (cf_row_counts, missing_cf_row_count_estimates) = runtime
+        .storage_cf_estimated_row_counts()
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageSummaryResponse {
+        schema_version: runtime.schema_version(),
+        pressure_level: pressure_level(runtime.storage_pressure_level()),
+        pressure_transition_codes: runtime
+            .storage_pressure_transition_codes()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        audit_retention_policy_count: audit_retention_policies().len(),
+        metrics_mode: "rocksdb_property_estimates".to_owned(),
+        cf_sizes,
+        cf_row_counts,
+        missing_cf_size_estimates,
+        missing_cf_row_count_estimates,
+    })
 }
 
 pub fn put_probe_rows(

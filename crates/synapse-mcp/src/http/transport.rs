@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     process::ExitCode,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -1476,6 +1476,7 @@ struct DashboardStateResponse {
     generated_at_unix_ms: u64,
     bind_addr: String,
     token_policy: &'static str,
+    timings: DashboardStateTimings,
     dashboard_assets: DashboardPanel,
     auth: DashboardPanel,
     daemon: DashboardPanel,
@@ -1496,6 +1497,19 @@ struct DashboardStateResponse {
     agent_transcripts: DashboardPanel,
     hygiene: DashboardPanel,
     local_models: DashboardPanel,
+}
+
+#[derive(Serialize)]
+struct DashboardStateTimings {
+    source_of_truth: &'static str,
+    total_elapsed_ms: u64,
+    segments: Vec<DashboardStateTiming>,
+}
+
+#[derive(Serialize)]
+struct DashboardStateTiming {
+    segment: &'static str,
+    elapsed_ms: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1671,9 +1685,12 @@ struct DashboardStorageSummary {
     schema_version: u32,
     pressure_level: crate::m3::storage::StoragePressureLevel,
     pressure_transition_codes: Vec<String>,
+    metrics_mode: String,
     cf_sizes: BTreeMap<String, u64>,
     cf_row_counts: BTreeMap<String, u64>,
     audit_retention_policy_count: usize,
+    missing_cf_size_estimates: Vec<String>,
+    missing_cf_row_count_estimates: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -2803,11 +2820,24 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
     }
+    let state_started = Instant::now();
+    let mut timing_segments = Vec::new();
+    let active_sessions_started = Instant::now();
     let active_sessions = state.session_manager.sessions.read().await.len();
-    let health = state
+    dashboard_push_state_timing(
+        &mut timing_segments,
+        "active_sessions",
+        active_sessions_started,
+    );
+    let health = dashboard_timed_state_segment(&mut timing_segments, "health", || {
+        state
+            .health_service
+            .health_payload_with_http_sessions(Some(active_sessions))
+    });
+    let sessions = dashboard_timed_state_segment(&mut timing_segments, "sessions", || match state
         .health_service
-        .health_payload_with_http_sessions(Some(active_sessions));
-    let sessions = match state.health_service.session_list_impl(false) {
+        .session_list_impl(false)
+    {
         Ok(sessions) => DashboardPanel::ok(
             "session_list dashboard primary agent feed + acknowledged escalation suppression",
             dashboard_primary_session_list_data(
@@ -2816,62 +2846,137 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
             ),
         ),
         Err(error) => DashboardPanel::error("session_list", format!("{error:?}")),
-    };
-    let lease = DashboardPanel::ok("control_lease_status", synapse_action::lease::status());
-    let storage = match state.health_service.storage_inspect_snapshot() {
-        Ok(snapshot) => DashboardPanel::ok(
-            "storage_inspect",
-            DashboardStorageSummary {
-                schema_version: snapshot.schema_version,
-                pressure_level: snapshot.pressure_level,
-                pressure_transition_codes: snapshot.pressure_transition_codes,
-                cf_sizes: snapshot.cf_sizes,
-                cf_row_counts: snapshot.cf_row_counts,
-                audit_retention_policy_count: snapshot.audit_retention_policies.len(),
-            },
-        ),
-        Err(error) => DashboardPanel::error("storage_inspect", format!("{error:?}")),
-    };
-    let target_claims = match state.health_service.target_claim_status_snapshot() {
-        Ok(snapshot) => DashboardPanel::ok("target_claim_status", snapshot),
-        Err(error) => DashboardPanel::error("target_claim_status", format!("{error:?}")),
-    };
-    let timeline = match state.health_service.timeline_stats_snapshot() {
+    });
+    let lease = dashboard_timed_state_segment(&mut timing_segments, "lease", || {
+        DashboardPanel::ok("control_lease_status", synapse_action::lease::status())
+    });
+    let storage = dashboard_timed_state_segment(&mut timing_segments, "storage", || {
+        match state.health_service.storage_summary_snapshot() {
+            Ok(snapshot) => DashboardPanel::ok(
+                "storage_summary",
+                DashboardStorageSummary {
+                    schema_version: snapshot.schema_version,
+                    pressure_level: snapshot.pressure_level,
+                    pressure_transition_codes: snapshot.pressure_transition_codes,
+                    metrics_mode: snapshot.metrics_mode,
+                    cf_sizes: snapshot.cf_sizes,
+                    cf_row_counts: snapshot.cf_row_counts,
+                    audit_retention_policy_count: snapshot.audit_retention_policy_count,
+                    missing_cf_size_estimates: snapshot.missing_cf_size_estimates,
+                    missing_cf_row_count_estimates: snapshot.missing_cf_row_count_estimates,
+                },
+            ),
+            Err(error) => DashboardPanel::error("storage_summary", format!("{error:?}")),
+        }
+    });
+    let target_claims =
+        dashboard_timed_state_segment(&mut timing_segments, "target_claims", || {
+            match state.health_service.target_claim_status_snapshot() {
+                Ok(snapshot) => DashboardPanel::ok("target_claim_status", snapshot),
+                Err(error) => DashboardPanel::error("target_claim_status", format!("{error:?}")),
+            }
+        });
+    let timeline = dashboard_timed_state_segment(&mut timing_segments, "timeline", || match state
+        .health_service
+        .timeline_stats_snapshot()
+    {
         Ok(snapshot) => DashboardPanel::ok("timeline_stats", snapshot),
         Err(error) => DashboardPanel::error("timeline_stats", format!("{error:?}")),
-    };
-    let events = dashboard_events_panel(&state);
-    let hidden_desktops = dashboard_hidden_desktops_panel(&state);
-    let cdp_attachments = dashboard_cdp_attachments_panel(&state);
-    let shell_jobs = dashboard_shell_jobs_panel();
-    let tool_names = health
-        .tool_names
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let response = DashboardStateResponse {
-        schema_version: 1,
-        generated_at_unix_ms: dashboard_unix_time_ms(),
-        bind_addr: state.bind_addr.to_string(),
-        token_policy: "dashboard responses never include bearer tokens",
-        dashboard_assets: DashboardPanel::ok(
-            "embedded dashboard dist assets",
-            DashboardAssetSurface {
-                schema_version: 1,
-                source_of_truth: "synapse-mcp embedded dashboard dist asset constants",
-                js_file: DASHBOARD_JS_FILE,
-                css_file: DASHBOARD_CSS_FILE,
-            },
-        ),
-        auth: DashboardPanel::ok(
+    });
+    let events = dashboard_timed_state_segment(&mut timing_segments, "events", || {
+        dashboard_events_panel(&state)
+    });
+    let hidden_desktops =
+        dashboard_timed_state_segment(&mut timing_segments, "hidden_desktops", || {
+            dashboard_hidden_desktops_panel(&state)
+        });
+    let cdp_attachments =
+        dashboard_timed_state_segment(&mut timing_segments, "cdp_attachments", || {
+            dashboard_cdp_attachments_panel(&state)
+        });
+    let shell_jobs = dashboard_timed_state_segment(&mut timing_segments, "shell_jobs", || {
+        dashboard_shell_jobs_panel()
+    });
+    let tool_names = dashboard_timed_state_segment(&mut timing_segments, "tool_names", || {
+        health
+            .tool_names
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    });
+    let dashboard_assets =
+        dashboard_timed_state_segment(&mut timing_segments, "dashboard_assets", || {
+            DashboardPanel::ok(
+                "embedded dashboard dist assets",
+                DashboardAssetSurface {
+                    schema_version: 1,
+                    source_of_truth: "synapse-mcp embedded dashboard dist asset constants",
+                    js_file: DASHBOARD_JS_FILE,
+                    css_file: DASHBOARD_CSS_FILE,
+                },
+            )
+        });
+    let auth = dashboard_timed_state_segment(&mut timing_segments, "auth", || {
+        DashboardPanel::ok(
             "local-only trust model (loopback bind + Host guard; no app-layer auth)",
             serde_json::json!({
                 "mode": "local_only",
                 "authenticated": true,
                 "source": "loopback bind + Host header guard",
             }),
-        ),
-        daemon: DashboardPanel::ok("health", &health),
+        )
+    });
+    let daemon = dashboard_timed_state_segment(&mut timing_segments, "daemon", || {
+        DashboardPanel::ok("health", &health)
+    });
+    let command_audit =
+        dashboard_timed_state_segment(&mut timing_segments, "command_audit", || {
+            command_audit_panel(&state)
+        });
+    let tasks = dashboard_timed_state_segment(&mut timing_segments, "tasks", || {
+        tasks_panel(&state, &tool_names)
+    });
+    let approvals = dashboard_timed_state_segment(&mut timing_segments, "approvals", || {
+        approval_panel(&state, &tool_names, None)
+    });
+    let suggestions = dashboard_timed_state_segment(&mut timing_segments, "suggestions", || {
+        approval_panel(
+            &state,
+            &tool_names,
+            Some(crate::m3::approvals::ApprovalKind::Suggestion),
+        )
+    });
+    let armed_runs = dashboard_timed_state_segment(&mut timing_segments, "armed_runs", || {
+        approval_panel(
+            &state,
+            &tool_names,
+            Some(crate::m3::approvals::ApprovalKind::ArmedRunReview),
+        )
+    });
+    let agent_transcripts =
+        dashboard_timed_state_segment(&mut timing_segments, "agent_transcripts", || {
+            agent_transcript_panel(&state)
+        });
+    let hygiene = dashboard_timed_state_segment(&mut timing_segments, "hygiene", || {
+        hygiene_panel(&state, &tool_names)
+    });
+    let local_models = dashboard_timed_state_segment(&mut timing_segments, "local_models", || {
+        local_model_panel(&state, &tool_names)
+    });
+    let timings = DashboardStateTimings {
+        source_of_truth: "daemon Instant wall-clock around dashboard_state segments",
+        total_elapsed_ms: dashboard_elapsed_ms(state_started.elapsed()),
+        segments: timing_segments,
+    };
+    let response = DashboardStateResponse {
+        schema_version: 1,
+        generated_at_unix_ms: dashboard_unix_time_ms(),
+        bind_addr: state.bind_addr.to_string(),
+        token_policy: "dashboard responses never include bearer tokens",
+        timings,
+        dashboard_assets,
+        auth,
+        daemon,
         sessions,
         lease,
         storage,
@@ -2881,24 +2986,42 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         hidden_desktops,
         cdp_attachments,
         shell_jobs,
-        command_audit: command_audit_panel(&state),
-        tasks: tasks_panel(&state, &tool_names),
-        approvals: approval_panel(&state, &tool_names, None),
-        suggestions: approval_panel(
-            &state,
-            &tool_names,
-            Some(crate::m3::approvals::ApprovalKind::Suggestion),
-        ),
-        armed_runs: approval_panel(
-            &state,
-            &tool_names,
-            Some(crate::m3::approvals::ApprovalKind::ArmedRunReview),
-        ),
-        agent_transcripts: agent_transcript_panel(&state),
-        hygiene: hygiene_panel(&state, &tool_names),
-        local_models: local_model_panel(&state, &tool_names),
+        command_audit,
+        tasks,
+        approvals,
+        suggestions,
+        armed_runs,
+        agent_transcripts,
+        hygiene,
+        local_models,
     };
     with_dashboard_security_headers(Json(response).into_response())
+}
+
+fn dashboard_timed_state_segment<T>(
+    timings: &mut Vec<DashboardStateTiming>,
+    segment: &'static str,
+    action: impl FnOnce() -> T,
+) -> T {
+    let started = Instant::now();
+    let result = action();
+    dashboard_push_state_timing(timings, segment, started);
+    result
+}
+
+fn dashboard_push_state_timing(
+    timings: &mut Vec<DashboardStateTiming>,
+    segment: &'static str,
+    started: Instant,
+) {
+    timings.push(DashboardStateTiming {
+        segment,
+        elapsed_ms: dashboard_elapsed_ms(started.elapsed()),
+    });
+}
+
+fn dashboard_elapsed_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn dashboard_events_subscribe(
