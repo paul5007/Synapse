@@ -2031,7 +2031,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Fetch one routine by stable id: the full mined record (template steps, schedule signature, support evidence with episode ids resolvable via episode_get), its operator lifecycle state (transitions audit trail, confidence history), and hygiene taint provenance when a hygiene/taint/v1 routine row exists"
+        description = "Fetch one routine by stable id: the full mined record (template steps, schedule signature, support evidence with episode ids resolvable via episode_get), its operator lifecycle state (transitions audit trail, confidence history), hygiene taint provenance, routine automation install state, and armed auto-run state when those rows exist"
     )]
     pub async fn routine_inspect(
         &self,
@@ -2052,7 +2052,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Apply one routine lifecycle mutation (confirm: candidate→confirmed, disable: candidate|confirmed→disabled, enable: disabled|archived→candidate, archive: →archived, rename: set label) to CF_ROUTINE_STATE. Transitions are audit-logged in the row, written synchronously, and read back from storage; disabled routines are never re-promoted by mining"
+        description = "Apply one routine lifecycle/arming mutation. Lifecycle actions (confirm, disable, enable, archive, rename) update CF_ROUTINE_STATE with audit/readback. Arming actions (arm, disarm) update CF_KV armed_routine/v1 for installed routine automations without changing lifecycle: arm_schedule/arm_intent select schedule and live-intent triggers, failure_threshold controls self-disarm after consecutive failed runs."
     )]
     pub async fn routine_update(
         &self,

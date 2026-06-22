@@ -1,6 +1,7 @@
 mod a11y_events;
 pub mod activity_recorder;
 pub mod approvals;
+pub mod armed_routines;
 pub mod audio;
 pub mod audit_export;
 pub mod audit_retention;
@@ -612,7 +613,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 57] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 58] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -666,6 +667,7 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 57] {
         routines::routine_list(),
         routines::routine_inspect(),
         routines::routine_update(),
+        armed_routines::armed_routine_tick(),
         timeline_control::timeline_pause(),
         timeline_control::timeline_resume(),
         timeline_control::timeline_exclusions(),

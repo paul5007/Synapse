@@ -12,14 +12,23 @@ use synapse_core::{error_codes, types::RoutineFeedbackOutcome};
 use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 
 use crate::m1::CdpOpenTabParams;
+use crate::m3::approvals::{
+    ApprovalKind, ApprovalRequestParams, ApprovalTimeoutDecision, request_approval,
+};
+use crate::m3::armed_routines::{
+    ARMED_ROUTINE_SOURCE_OF_TRUTH, ArmedRoutineRunRecord, ArmedRoutineRunStatus,
+    ArmedRoutineTickParams, ArmedRoutineTickResponse, ArmedRoutineTickRun, claim_armed_run,
+    complete_armed_run, dry_run_tick_run, due_armed_runs,
+    required_permissions_tick as required_permissions_armed_tick, tick_run_from_record,
+};
 use crate::m3::episodes::now_ts_ns;
 use crate::m3::plan::{
     PlanBackend, PlanDocument, PlanStep, Postcondition, RoutineCompilePlanParams,
     compile_routine_plan, load_plan,
 };
 use crate::m3::plan_execution::{
-    PlanStepExecutionReport, PlanStepExecutionStatus, build_plan_execution_record,
-    plan_execution_id, write_plan_execution,
+    PlanExecutionRecord, PlanExecutionStatus, PlanStepExecutionReport, PlanStepExecutionStatus,
+    build_plan_execution_record, plan_execution_id, write_plan_execution,
 };
 use crate::m3::suggestions::{
     SuggestionAcceptParams, SuggestionAcceptResponse, SuggestionListParams, SuggestionListResponse,
@@ -32,6 +41,138 @@ use crate::m4::{ActLaunchParams, LaunchWindowState};
 
 const PLAN_REF_PREFIX: &str = "plan/v1/";
 const DEFAULT_EXECUTION_LAUNCH_TIMEOUT_MS: u64 = 10_000;
+pub const ARMED_ROUTINE_INTERVAL_ENV: &str = "SYNAPSE_ARMED_ROUTINE_INTERVAL_SECS";
+pub const ARMED_ROUTINE_STARTUP_DELAY_ENV: &str = "SYNAPSE_ARMED_ROUTINE_STARTUP_DELAY_SECS";
+pub const DEFAULT_ARMED_ROUTINE_INTERVAL_SECS: u64 = 60;
+pub const DEFAULT_ARMED_ROUTINE_STARTUP_DELAY_SECS: u64 = 60;
+
+#[derive(Clone, Debug)]
+struct PlanExecutionOptions {
+    dry_run: bool,
+    browser_window_hwnd: Option<i64>,
+    launch_timeout_ms: Option<u64>,
+    idempotency_prefix: String,
+    caller: &'static str,
+}
+
+impl PlanExecutionOptions {
+    fn suggestion_accept(params: &SuggestionAcceptParams) -> Self {
+        Self {
+            dry_run: params.dry_run,
+            browser_window_hwnd: params.browser_window_hwnd,
+            launch_timeout_ms: params.launch_timeout_ms,
+            idempotency_prefix: "suggestion_accept".to_owned(),
+            caller: "suggestion_accept",
+        }
+    }
+
+    fn armed_run(run_id: &str, params: &ArmedRoutineTickParams) -> Self {
+        Self {
+            dry_run: params.dry_run,
+            browser_window_hwnd: params.browser_window_hwnd,
+            launch_timeout_ms: params.launch_timeout_ms,
+            idempotency_prefix: format!("armed_routine_tick:{run_id}"),
+            caller: "armed_routine_tick",
+        }
+    }
+
+    fn launch_timeout_ms(&self) -> u64 {
+        match self.launch_timeout_ms {
+            Some(timeout_ms) => timeout_ms,
+            None => DEFAULT_EXECUTION_LAUNCH_TIMEOUT_MS,
+        }
+    }
+}
+
+pub(crate) fn spawn_periodic_armed_routine_runner(
+    service: SynapseService,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let interval_secs = parse_secs_env(
+        ARMED_ROUTINE_INTERVAL_ENV,
+        DEFAULT_ARMED_ROUTINE_INTERVAL_SECS,
+    )?;
+    let startup_delay_secs = parse_secs_env(
+        ARMED_ROUTINE_STARTUP_DELAY_ENV,
+        DEFAULT_ARMED_ROUTINE_STARTUP_DELAY_SECS,
+    )?;
+    if interval_secs == 0 {
+        tracing::info!(
+            code = "ARMED_ROUTINE_PERIODIC_DISABLED",
+            "periodic armed routine runner disabled via {ARMED_ROUTINE_INTERVAL_ENV}=0"
+        );
+        return Ok(None);
+    }
+    tracing::info!(
+        code = "ARMED_ROUTINE_PERIODIC_SCHEDULED",
+        interval_secs,
+        startup_delay_secs,
+        "periodic armed routine runner scheduled"
+    );
+    let handle = tokio::spawn(async move {
+        let mut delay = std::time::Duration::from_secs(startup_delay_secs);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!(
+                        code = "ARMED_ROUTINE_PERIODIC_STOPPED",
+                        "periodic armed routine runner stopped by daemon shutdown"
+                    );
+                    return;
+                }
+                () = tokio::time::sleep(delay) => {}
+            }
+            run_periodic_armed_routine_once(&service).await;
+            delay = std::time::Duration::from_secs(interval_secs);
+        }
+    });
+    Ok(Some(handle))
+}
+
+async fn run_periodic_armed_routine_once(service: &SynapseService) {
+    match service
+        .armed_routine_tick_impl(ArmedRoutineTickParams::default(), None)
+        .await
+    {
+        Ok(response) => {
+            tracing::info!(
+                code = "ARMED_ROUTINE_PERIODIC_OK",
+                evaluated = response.evaluated,
+                due = response.due,
+                executed = response.executed,
+                skipped = response.skipped.len(),
+                "periodic armed routine runner completed"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                code = "ARMED_ROUTINE_PERIODIC_FAILED",
+                error_code = %error.code.0,
+                detail = %error.message,
+                "periodic armed routine runner failed; next run keeps the schedule"
+            );
+        }
+    }
+}
+
+fn parse_secs_env(name: &str, default: u64) -> anyhow::Result<u64> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => anyhow::bail!("{name} is not valid unicode: {error}"),
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(default)
+            } else {
+                trimmed.parse::<u64>().map_err(|error| {
+                    anyhow::anyhow!(
+                        "{name} must be an unsigned integer of seconds; got {value:?}: {error}"
+                    )
+                })
+            }
+        }
+    }
+}
 
 #[tool_router(router = suggestions_tool_router, vis = "pub(super)")]
 impl SynapseService {
@@ -94,6 +235,32 @@ impl SynapseService {
             .await
             .map(Json)
     }
+
+    #[tool(
+        description = "Run ONE armed-routine pass (#862). Evaluates enabled armed_routine/v1 rows for due schedule windows and/or live intent matches, claims each trigger before execution so restarts do not double-fire, runs the installed automation plan through the same background-first executor as suggestion_accept, persists plan_execution/v1 plus armed_routine_run/v1 audit rows, queues an armed_run_review approval for human outcome review, and self-disarms after the configured consecutive failure threshold. dry_run computes due runs and routing reports without mutating storage or launching/opening anything."
+    )]
+    pub async fn armed_routine_tick(
+        &self,
+        params: Parameters<ArmedRoutineTickParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<ArmedRoutineTickResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "armed_routine_tick",
+            routine_id = params.0.routine_id.as_deref(),
+            trigger_mode = ?params.0.trigger_mode,
+            dry_run = params.0.dry_run,
+            "tool.invocation kind=armed_routine_tick"
+        );
+        self.require_m3_permissions(
+            "armed_routine_tick",
+            &required_permissions_armed_tick(&params.0),
+        )?;
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
+        self.armed_routine_tick_impl(params.0, session_id)
+            .await
+            .map(Json)
+    }
 }
 
 impl SynapseService {
@@ -127,8 +294,9 @@ impl SynapseService {
             params.dry_run,
         )?;
 
+        let options = PlanExecutionOptions::suggestion_accept(&params);
         let steps = self
-            .execute_accepted_plan_steps(&plan, &params, session_id.as_deref())
+            .execute_plan_steps(&plan, &options, session_id.as_deref())
             .await;
         let completed_ts_ns = now_ts_ns();
         let execution = build_plan_execution_record(
@@ -174,10 +342,159 @@ impl SynapseService {
         })
     }
 
-    async fn execute_accepted_plan_steps(
+    async fn armed_routine_tick_impl(
+        &self,
+        params: ArmedRoutineTickParams,
+        session_id: Option<String>,
+    ) -> Result<ArmedRoutineTickResponse, ErrorData> {
+        let db = self.m3_storage()?;
+        let (now, evaluated, due, skipped) = due_armed_runs(&db, &params)?;
+        let due_count = u32::try_from(due.len()).unwrap_or(u32::MAX);
+        let mut runs: Vec<ArmedRoutineTickRun> = Vec::new();
+
+        for due_run in due {
+            if params.dry_run {
+                runs.push(dry_run_tick_run(&due_run));
+                continue;
+            }
+            let claimed = claim_armed_run(&db, &due_run, now)?;
+            let completed = self
+                .execute_claimed_armed_run(&db, &params, claimed, session_id.clone())
+                .await?;
+            runs.push(tick_run_from_record(&completed));
+        }
+
+        let executed = runs
+            .iter()
+            .filter(|run| run.status != ArmedRoutineRunStatus::DryRun)
+            .count();
+        Ok(ArmedRoutineTickResponse {
+            now_ts_ns: now,
+            dry_run: params.dry_run,
+            evaluated,
+            due: due_count,
+            executed: u32::try_from(executed).unwrap_or(u32::MAX),
+            skipped,
+            runs,
+            source_of_truth: ARMED_ROUTINE_SOURCE_OF_TRUTH.to_owned(),
+        })
+    }
+
+    async fn execute_claimed_armed_run(
+        &self,
+        db: &std::sync::Arc<synapse_storage::Db>,
+        params: &ArmedRoutineTickParams,
+        run: ArmedRoutineRunRecord,
+        session_id: Option<String>,
+    ) -> Result<ArmedRoutineRunRecord, ErrorData> {
+        let plan = match load_or_compile_plan(db, &run.routine_id, true) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return complete_armed_run(
+                    db,
+                    run,
+                    ArmedRoutineRunStatus::Failed,
+                    None,
+                    None,
+                    None,
+                    error_data_code(&error),
+                    Some(error.message.to_string()),
+                    json!({ "error_data": error.data }),
+                );
+            }
+        };
+        let started_ts_ns = now_ts_ns();
+        let execution_id = plan_execution_id(&run.run_id, started_ts_ns);
+        let options = PlanExecutionOptions::armed_run(&run.run_id, params);
+        let steps = self
+            .execute_plan_steps(&plan, &options, session_id.as_deref())
+            .await;
+        let completed_ts_ns = now_ts_ns();
+        let execution = build_plan_execution_record(
+            execution_id,
+            run.run_id.clone(),
+            session_id.clone(),
+            run.started_ts_ns,
+            started_ts_ns,
+            completed_ts_ns,
+            false,
+            plan.clone(),
+            steps,
+        );
+        write_plan_execution(db, &execution)?;
+
+        let approval_id = match queue_armed_run_review(
+            db,
+            &run,
+            &execution,
+            session_id.as_deref().unwrap_or("armed-routine-runner"),
+        ) {
+            Ok(approval_id) => Some(approval_id),
+            Err(error) => {
+                return complete_armed_run(
+                    db,
+                    run,
+                    ArmedRoutineRunStatus::Failed,
+                    Some(format!("{PLAN_REF_PREFIX}{}", plan.routine_id)),
+                    Some(execution.execution_id),
+                    None,
+                    error_data_code(&error),
+                    Some(error.message.to_string()),
+                    json!({
+                        "plan_execution_status": execution.status.as_str(),
+                        "approval_request_error": error.data,
+                    }),
+                );
+            }
+        };
+
+        let status = match execution.status {
+            PlanExecutionStatus::Succeeded => ArmedRoutineRunStatus::Succeeded,
+            PlanExecutionStatus::Failed | PlanExecutionStatus::DryRun => {
+                ArmedRoutineRunStatus::Failed
+            }
+        };
+        let (error_code, error) = if status == ArmedRoutineRunStatus::Failed {
+            (
+                Some("ARMED_ROUTINE_PLAN_EXECUTION_FAILED".to_owned()),
+                Some(format!(
+                    "plan execution {} ended with status {}",
+                    execution.execution_id,
+                    execution.status.as_str()
+                )),
+            )
+        } else {
+            (None, None)
+        };
+        complete_armed_run(
+            db,
+            run,
+            status,
+            Some(format!("{PLAN_REF_PREFIX}{}", plan.routine_id)),
+            Some(execution.execution_id),
+            approval_id,
+            error_code,
+            error,
+            json!({
+                "plan_execution_status": execution.status.as_str(),
+                "succeeded_steps": execution
+                    .steps
+                    .iter()
+                    .filter(|step| step.status == PlanStepExecutionStatus::Succeeded)
+                    .count(),
+                "failed_or_refused_steps": execution
+                    .steps
+                    .iter()
+                    .filter(|step| step.status.is_terminal_failure())
+                    .count(),
+            }),
+        )
+    }
+
+    async fn execute_plan_steps(
         &self,
         plan: &PlanDocument,
-        params: &SuggestionAcceptParams,
+        options: &PlanExecutionOptions,
         session_id: Option<&str>,
     ) -> Vec<PlanStepExecutionReport> {
         let mut reports = Vec::with_capacity(plan.steps.len());
@@ -188,10 +505,10 @@ impl SynapseService {
                     step,
                     "previous step failed or was refused; execution aborted",
                 )
-            } else if params.dry_run {
-                dry_run_step_report(step, params)
+            } else if options.dry_run {
+                dry_run_step_report(step, options)
             } else {
-                self.execute_plan_step(step, params, session_id).await
+                self.execute_plan_step(step, options, session_id).await
             };
             if report.status.is_terminal_failure() {
                 aborted = true;
@@ -204,13 +521,13 @@ impl SynapseService {
     async fn execute_plan_step(
         &self,
         step: &PlanStep,
-        params: &SuggestionAcceptParams,
+        options: &PlanExecutionOptions,
         session_id: Option<&str>,
     ) -> PlanStepExecutionReport {
         match step.backend {
-            PlanBackend::ActLaunch => self.execute_launch_step(step, params, session_id).await,
+            PlanBackend::ActLaunch => self.execute_launch_step(step, options, session_id).await,
             PlanBackend::CdpOpenTab => {
-                self.execute_cdp_open_tab_step(step, params, session_id)
+                self.execute_cdp_open_tab_step(step, options, session_id)
                     .await
             }
             PlanBackend::ShellOpen => refused_step_report(
@@ -226,9 +543,10 @@ impl SynapseService {
                 step,
                 "PLAN_EXECUTOR_AGENT_TASK_REQUIRED",
                 step.agent_task_reason.as_deref().unwrap_or(
-                    "plan step requires agent judgment; no agent was spawned by suggestion_accept",
+                    "plan step requires agent judgment; no agent was spawned by this executor",
                 ),
                 json!({
+                    "caller": options.caller,
                     "agent_task_reason": &step.agent_task_reason,
                     "source_app": &step.source_app,
                     "source_document": &step.source_document,
@@ -240,7 +558,7 @@ impl SynapseService {
     async fn execute_launch_step(
         &self,
         step: &PlanStep,
-        params: &SuggestionAcceptParams,
+        options: &PlanExecutionOptions,
         session_id: Option<&str>,
     ) -> PlanStepExecutionReport {
         let started = now_ts_ns();
@@ -253,12 +571,10 @@ impl SynapseService {
             working_dir: None,
             env: Default::default(),
             wait_for_window_title_regex: Some(".*".to_owned()),
-            timeout_ms: params
-                .launch_timeout_ms
-                .unwrap_or(DEFAULT_EXECUTION_LAUNCH_TIMEOUT_MS),
+            timeout_ms: options.launch_timeout_ms(),
             idempotency_key: Some(format!(
-                "suggestion_accept:{}:step:{}",
-                step.source_app, step.index
+                "{}:{}:step:{}",
+                options.idempotency_prefix, step.source_app, step.index
             )),
             cdp_debug: Some(false),
             force_renderer_accessibility: None,
@@ -311,7 +627,7 @@ impl SynapseService {
     async fn execute_cdp_open_tab_step(
         &self,
         step: &PlanStep,
-        params: &SuggestionAcceptParams,
+        options: &PlanExecutionOptions,
         session_id: Option<&str>,
     ) -> PlanStepExecutionReport {
         let started = now_ts_ns();
@@ -321,7 +637,7 @@ impl SynapseService {
                 step,
                 PlanStepExecutionStatus::Refused,
                 json!({
-                    "browser_window_hwnd": params.browser_window_hwnd,
+                    "browser_window_hwnd": options.browser_window_hwnd,
                     "source_document": &step.source_document,
                 }),
                 Some(error_codes::HTTP_SESSION_INVALID),
@@ -343,7 +659,7 @@ impl SynapseService {
         let result = self
             .cdp_open_tab_for_session(
                 CdpOpenTabParams {
-                    window_hwnd: params.browser_window_hwnd,
+                    window_hwnd: options.browser_window_hwnd,
                     url: requested_url.clone(),
                 },
                 session_id,
@@ -404,6 +720,66 @@ fn validate_suggestion_accept_params(params: &SuggestionAcceptParams) -> Result<
     Ok(())
 }
 
+fn queue_armed_run_review(
+    db: &std::sync::Arc<synapse_storage::Db>,
+    run: &ArmedRoutineRunRecord,
+    execution: &PlanExecutionRecord,
+    by_session: &str,
+) -> Result<String, ErrorData> {
+    let succeeded_steps = execution
+        .steps
+        .iter()
+        .filter(|step| step.status == PlanStepExecutionStatus::Succeeded)
+        .count();
+    let failed_or_refused_steps = execution
+        .steps
+        .iter()
+        .filter(|step| step.status.is_terminal_failure())
+        .count();
+    let payload = json!({
+        "kind": "armed_routine_run_review",
+        "source_of_truth": ARMED_ROUTINE_SOURCE_OF_TRUTH,
+        "routine_id": run.routine_id,
+        "run_id": run.run_id,
+        "trigger_kind": run.trigger_kind,
+        "trigger_key": run.trigger_key,
+        "execution_id": execution.execution_id,
+        "execution_status": execution.status.as_str(),
+        "succeeded_steps": succeeded_steps,
+        "failed_or_refused_steps": failed_or_refused_steps,
+        "plan_execution_ref": format!("plan_execution/v1/{}", execution.execution_id),
+        "armed_run_ref": format!("armed_routine_run/v1/{}", run.run_id),
+    });
+    let payload_json = serde_json::to_string(&payload).map_err(|error| {
+        crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("armed run review payload encoding failed: {error}"),
+        )
+    })?;
+    let status_label = execution.status.as_str();
+    let request = ApprovalRequestParams {
+        kind: ApprovalKind::ArmedRunReview,
+        title: format!("Review armed routine {}", run.routine_id),
+        body: format!(
+            "Armed routine {} fired by {} and finished {status_label}: {} succeeded, {} failed/refused.",
+            run.routine_id,
+            run.trigger_kind.as_str(),
+            succeeded_steps,
+            failed_or_refused_steps
+        ),
+        payload_json: Some(payload_json),
+        dedupe_key: Some(format!("armed_routine_run_review:{}", run.run_id)),
+        timeout_ms: None,
+        timeout_decision: Some(ApprovalTimeoutDecision::Ignored),
+        destructive: false,
+        notify: true,
+        suppress_popup: false,
+        allow: None,
+    };
+    let response = request_approval(db, &request, by_session)?;
+    Ok(response.item.approval_id)
+}
+
 fn load_or_compile_plan(
     db: &std::sync::Arc<synapse_storage::Db>,
     routine_id: &str,
@@ -429,10 +805,7 @@ fn browser_host_for_step(step: &PlanStep) -> Option<String> {
     }
 }
 
-fn dry_run_step_report(
-    step: &PlanStep,
-    params: &SuggestionAcceptParams,
-) -> PlanStepExecutionReport {
+fn dry_run_step_report(step: &PlanStep, options: &PlanExecutionOptions) -> PlanStepExecutionReport {
     let started = now_ts_ns();
     step_report(
         started,
@@ -441,8 +814,9 @@ fn dry_run_step_report(
         json!({
             "dry_run": true,
             "backend": step.backend,
-            "browser_window_hwnd": params.browser_window_hwnd,
-            "launch_timeout_ms": params.launch_timeout_ms.unwrap_or(DEFAULT_EXECUTION_LAUNCH_TIMEOUT_MS),
+            "caller": options.caller,
+            "browser_window_hwnd": options.browser_window_hwnd,
+            "launch_timeout_ms": options.launch_timeout_ms(),
         }),
         None,
         None,

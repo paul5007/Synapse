@@ -261,7 +261,7 @@ pub(crate) mod session_continuity;
 pub(crate) mod session_lifecycle;
 pub(crate) mod session_registry;
 mod session_tools;
-mod suggestions;
+pub(crate) mod suggestions;
 pub(crate) mod target_claims;
 mod target_policy;
 pub(crate) mod terminal_capture;

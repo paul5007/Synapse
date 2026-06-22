@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m3_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 52,
+  "count": 53,
   "m3_defaults": [
     {
       "actual": 33,
@@ -384,6 +384,7 @@ expression: snapshot
     "act_scroll",
     "act_stroke",
     "act_type",
+    "armed_routine_tick",
     "audio_tail",
     "audio_transcribe",
     "audit_export_bundle",

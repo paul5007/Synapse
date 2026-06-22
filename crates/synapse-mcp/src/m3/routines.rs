@@ -45,6 +45,9 @@ use synapse_storage::{Db, cf, decode_json, encode_json, routines as routine_code
 
 use crate::m1::mcp_error;
 
+use super::armed_routines::{
+    ArmRoutineConfig, ArmedRoutineRecord, arm_routine, disarm_routine, load_armed_routine_record,
+};
 use super::episodes::{
     decode_episode_row, hex_encode, key_after, local_day_start, next_local_day_start, now_ts_ns,
 };
@@ -1026,6 +1029,9 @@ pub struct RoutineInspectResponse {
     /// updated by `profile_authoring_decide`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation: Option<RoutineAutomationRecord>,
+    /// Armed auto-run state written by `routine_update action=arm|disarm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed: Option<ArmedRoutineRecord>,
 }
 
 /// Lifecycle operations accepted by `routine_update`.
@@ -1042,6 +1048,10 @@ pub enum RoutineUpdateAction {
     Archive,
     /// Set the operator label; lifecycle unchanged.
     Rename,
+    /// Arm an installed routine automation for schedule and/or intent triggers.
+    Arm,
+    /// Disarm an armed routine automation; lifecycle unchanged.
+    Disarm,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -1056,6 +1066,18 @@ pub struct RoutineUpdateParams {
     /// Free-form audit note recorded on the transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// For action=arm: whether the routine should run on its schedule.
+    /// Defaults to true when both trigger fields are omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_schedule: Option<bool>,
+    /// For action=arm: whether live intent matches should trigger the routine.
+    /// Defaults to true when both trigger fields are omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_intent: Option<bool>,
+    /// For action=arm: consecutive failed runs before automatic disarm.
+    /// Defaults to 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
@@ -1075,6 +1097,9 @@ pub struct RoutineUpdateResponse {
     /// The post-write state row, read back from `CF_ROUTINE_STATE` after
     /// the flush — physical storage truth, not the in-memory value.
     pub state: RoutineStateRecord,
+    /// Post-write armed auto-run state for this routine, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed: Option<ArmedRoutineRecord>,
 }
 
 #[must_use]
@@ -1321,6 +1346,7 @@ pub fn inspect_routine(
     let taint = read_taint_record_from_db(db, "routine", &params.routine_id)?;
     let tainted = taint.is_some();
     let automation = load_routine_automation_record(db, &params.routine_id)?;
+    let armed = load_armed_routine_record(db, &params.routine_id)?;
     Ok(RoutineInspectResponse {
         routine_id: params.routine_id.clone(),
         mined: record.is_some(),
@@ -1330,6 +1356,7 @@ pub fn inspect_routine(
         tainted,
         taint,
         automation,
+        armed,
     })
 }
 
@@ -1865,14 +1892,24 @@ pub fn record_routine_feedback(
     })
 }
 
-const fn action_kind(action: RoutineUpdateAction) -> RoutineStateAction {
+fn action_kind(action: RoutineUpdateAction) -> RoutineStateAction {
     match action {
         RoutineUpdateAction::Confirm => RoutineStateAction::Confirm,
         RoutineUpdateAction::Disable => RoutineStateAction::Disable,
         RoutineUpdateAction::Enable => RoutineStateAction::Enable,
         RoutineUpdateAction::Archive => RoutineStateAction::Archive,
         RoutineUpdateAction::Rename => RoutineStateAction::Rename,
+        RoutineUpdateAction::Arm | RoutineUpdateAction::Disarm => {
+            unreachable!("arm/disarm do not write routine lifecycle transitions")
+        }
     }
+}
+
+const fn is_arm_action(action: RoutineUpdateAction) -> bool {
+    matches!(
+        action,
+        RoutineUpdateAction::Arm | RoutineUpdateAction::Disarm
+    )
 }
 
 /// The lifecycle a legal transition lands in, or a structured refusal.
@@ -1887,6 +1924,7 @@ fn transition_target(
         (RoutineUpdateAction::Enable, Disabled | Archived) => Candidate,
         (RoutineUpdateAction::Archive, Candidate | Confirmed | Disabled) => Archived,
         (RoutineUpdateAction::Rename, current) => current,
+        (RoutineUpdateAction::Arm | RoutineUpdateAction::Disarm, current) => current,
         (action, current) => {
             return Err(invalid(format!(
                 "ROUTINE_TRANSITION_INVALID: action {action:?} is not legal from lifecycle \
@@ -1928,6 +1966,36 @@ fn validate_update_fields(params: &RoutineUpdateParams) -> Result<(), ErrorData>
         }
         _ => {}
     }
+    match params.action {
+        RoutineUpdateAction::Arm => {
+            let config = ArmRoutineConfig::from_optional(
+                params.arm_schedule,
+                params.arm_intent,
+                params.failure_threshold,
+            );
+            super::armed_routines::validate_arm_config(config)?;
+        }
+        _ => {
+            if params.arm_schedule.is_some() {
+                return Err(invalid(format!(
+                    "routine_update arm_schedule is only valid for action=arm; got action={:?}",
+                    params.action
+                )));
+            }
+            if params.arm_intent.is_some() {
+                return Err(invalid(format!(
+                    "routine_update arm_intent is only valid for action=arm; got action={:?}",
+                    params.action
+                )));
+            }
+            if params.failure_threshold.is_some() {
+                return Err(invalid(format!(
+                    "routine_update failure_threshold is only valid for action=arm; got action={:?}",
+                    params.action
+                )));
+            }
+        }
+    }
     if let Some(note) = &params.note {
         if note.trim().is_empty() {
             return Err(invalid("routine_update note must not be blank when set"));
@@ -1942,6 +2010,27 @@ fn validate_update_fields(params: &RoutineUpdateParams) -> Result<(), ErrorData>
     Ok(())
 }
 
+fn routine_state_for_update_response(
+    db: &Arc<Db>,
+    routine_id: &str,
+) -> Result<(RoutineStateRecord, bool), ErrorData> {
+    let existing_state = load_state_row(db, routine_id)?;
+    let state_row_created = existing_state.is_none();
+    let state = match existing_state {
+        Some(state) => state,
+        None => {
+            let Some(record) = load_routine_record(db, routine_id)? else {
+                return Err(invalid(format!(
+                    "ROUTINE_NOT_FOUND: routine_id {routine_id} exists in neither CF_ROUTINES nor \
+                     CF_ROUTINE_STATE; run routine_list to see what exists"
+                )));
+            };
+            synthesized_default_state(&record)
+        }
+    };
+    Ok((state, state_row_created))
+}
+
 /// Applies one lifecycle mutation: legality check, audit-trail append,
 /// synchronous flushed write, and a physical read-back verification.
 pub fn update_routine(
@@ -1951,6 +2040,53 @@ pub fn update_routine(
 ) -> Result<RoutineUpdateResponse, ErrorData> {
     validate_routine_id_param("routine_update", &params.routine_id)?;
     validate_update_fields(params)?;
+
+    if is_arm_action(params.action) {
+        let (state, _state_row_created) =
+            routine_state_for_update_response(db, &params.routine_id)?;
+        let armed = match params.action {
+            RoutineUpdateAction::Arm => {
+                let config = ArmRoutineConfig::from_optional(
+                    params.arm_schedule,
+                    params.arm_intent,
+                    params.failure_threshold,
+                );
+                Some(arm_routine(
+                    db,
+                    &params.routine_id,
+                    config,
+                    by_session,
+                    params.note.clone(),
+                )?)
+            }
+            RoutineUpdateAction::Disarm => Some(disarm_routine(
+                db,
+                &params.routine_id,
+                by_session,
+                params.note.clone(),
+            )?),
+            _ => None,
+        };
+        tracing::info!(
+            code = "ROUTINE_ARMING_UPDATED",
+            routine_id = %params.routine_id,
+            action = ?params.action,
+            lifecycle = ?state.lifecycle,
+            by = by_session,
+            "routine armed automation state persisted and read back"
+        );
+        return Ok(RoutineUpdateResponse {
+            routine_id: params.routine_id.clone(),
+            action: params.action,
+            lifecycle_before: state.lifecycle,
+            lifecycle_after: state.lifecycle,
+            label_before: state.label.clone(),
+            label_after: state.label.clone(),
+            state_row_created: false,
+            state,
+            armed,
+        });
+    }
 
     if !db.pressure_permits_write(cf::CF_ROUTINE_STATE) {
         return Err(mcp_error(
@@ -1964,21 +2100,7 @@ pub fn update_routine(
         ));
     }
 
-    let existing_state = load_state_row(db, &params.routine_id)?;
-    let state_row_created = existing_state.is_none();
-    let mut state = match existing_state {
-        Some(state) => state,
-        None => {
-            let Some(record) = load_routine_record(db, &params.routine_id)? else {
-                return Err(invalid(format!(
-                    "ROUTINE_NOT_FOUND: routine_id {} exists in neither CF_ROUTINES nor \
-                     CF_ROUTINE_STATE; run routine_list to see what exists",
-                    params.routine_id
-                )));
-            };
-            synthesized_default_state(&record)
-        }
-    };
+    let (mut state, state_row_created) = routine_state_for_update_response(db, &params.routine_id)?;
 
     let lifecycle_before = state.lifecycle;
     let label_before = state.label.clone();
@@ -2046,6 +2168,7 @@ pub fn update_routine(
         "routine lifecycle transition persisted and read back"
     );
 
+    let armed = load_armed_routine_record(db, &params.routine_id)?;
     Ok(RoutineUpdateResponse {
         routine_id: params.routine_id.clone(),
         action: params.action,
@@ -2055,6 +2178,7 @@ pub fn update_routine(
         label_after,
         state_row_created,
         state: readback,
+        armed,
     })
 }
 
@@ -2275,6 +2399,9 @@ mod tests {
             action,
             label: None,
             note: None,
+            arm_schedule: None,
+            arm_intent: None,
+            failure_threshold: None,
         };
         let mut rename_missing_label = base(RoutineUpdateAction::Rename);
         let error = validate_update_fields(&rename_missing_label).expect_err("label required");

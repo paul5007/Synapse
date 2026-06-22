@@ -309,6 +309,16 @@ pub(super) async fn serve(
     )
     .context("spawn periodic intent detector")?;
 
+    // Periodic armed routine runner (#862): evaluates persisted arm rows and
+    // executes due installed automations through the same background-first
+    // plan executor as manual suggestion acceptance. Misconfigured schedules
+    // fail startup rather than silently substituting defaults.
+    let _armed_routine_task = crate::server::suggestions::spawn_periodic_armed_routine_runner(
+        service.clone(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic armed routine runner")?;
+
     // Periodic transcript ingester (#900): tails spawned-agent stdout JSONL
     // into CF_AGENT_TRANSCRIPTS. Same contract as the miner: a misconfigured
     // schedule is a startup failure, not a silently substituted default.

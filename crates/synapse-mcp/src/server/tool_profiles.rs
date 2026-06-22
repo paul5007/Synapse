@@ -46,6 +46,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "approval_gate",
     "approval_list",
     "approval_request",
+    "armed_routine_tick",
     "audit_intelligence_query",
     "browser_add_init_script",
     "browser_add_script_tag",

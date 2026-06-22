@@ -126,6 +126,7 @@ fn m3_tool_stub_names_are_stable() {
         "routine_list",
         "routine_inspect",
         "routine_update",
+        "armed_routine_tick",
         "timeline_pause",
         "timeline_resume",
         "timeline_exclusions",
