@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-22-clock-v5";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-22-page-events-v6";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "7adff60166bf13eed322d5e68adbf82fdf0dcf8b2a8fc0e828913e937227c272";
+    "9244ce49a2c34dd02dd6a98d479601f20869750d9330d8c7b564d35f5d823f9a";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -58,6 +58,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "pageContent",
     "setContent",
     "clock",
+    "pageEvents",
     "reloadSelf",
     "targetInfo",
     "targetInfoPageText",
@@ -1765,6 +1766,172 @@ pub(crate) struct ChromeDebuggerClockResult {
     pub frame_result_count: u32,
     pub target_candidate_count: u32,
     pub target_selection_reason: String,
+    pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageEventEntry {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub event_kind: String,
+    #[serde(default)]
+    pub target_id: String,
+    #[serde(default)]
+    pub target_type: Option<String>,
+    #[serde(default)]
+    pub target_attached: Option<bool>,
+    #[serde(default)]
+    pub page_target_id: Option<String>,
+    #[serde(default)]
+    pub opener_id: Option<String>,
+    #[serde(default)]
+    pub opener_frame_id: Option<String>,
+    #[serde(default)]
+    pub can_access_opener: Option<bool>,
+    #[serde(default)]
+    pub browser_context_id: Option<String>,
+    #[serde(default)]
+    pub subtype: Option<String>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    #[serde(default)]
+    pub worker_type: Option<String>,
+    #[serde(default)]
+    pub worker_url: Option<String>,
+    #[serde(default)]
+    pub frame_id: Option<String>,
+    #[serde(default)]
+    pub parent_frame_id: Option<String>,
+    #[serde(default)]
+    pub loader_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub navigation_type: Option<String>,
+    #[serde(default)]
+    pub timestamp_s: Option<f64>,
+    #[serde(default)]
+    pub observed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageTargetSnapshot {
+    #[serde(default)]
+    pub target_id: String,
+    #[serde(default)]
+    pub target_type: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub opener_id: Option<String>,
+    #[serde(default)]
+    pub opener_frame_id: Option<String>,
+    #[serde(default)]
+    pub can_access_opener: bool,
+    #[serde(default)]
+    pub browser_context_id: Option<String>,
+    #[serde(default)]
+    pub subtype: Option<String>,
+    #[serde(default)]
+    pub attached: bool,
+    #[serde(default)]
+    pub destroyed: bool,
+    #[serde(default)]
+    pub first_seen_seq: u64,
+    #[serde(default)]
+    pub last_seen_seq: u64,
+    #[serde(default)]
+    pub first_seen_unix_ms: u64,
+    #[serde(default)]
+    pub last_seen_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerWorkerSnapshot {
+    #[serde(default)]
+    pub worker_id: String,
+    #[serde(default)]
+    pub worker_type: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub attached: bool,
+    #[serde(default)]
+    pub destroyed: bool,
+    #[serde(default)]
+    pub first_seen_seq: u64,
+    #[serde(default)]
+    pub last_seen_seq: u64,
+    #[serde(default)]
+    pub first_seen_unix_ms: u64,
+    #[serde(default)]
+    pub last_seen_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageEventsFilters {
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub event_kind: Option<String>,
+    #[serde(default)]
+    pub worker_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageEventsResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub ready_state: String,
+    #[serde(default)]
+    pub capture_newly_armed: bool,
+    #[serde(default)]
+    pub armed_at_unix_ms: u64,
+    #[serde(default)]
+    pub capacity: usize,
+    #[serde(default)]
+    pub next_cursor: u64,
+    #[serde(default)]
+    pub returned: usize,
+    #[serde(default)]
+    pub total_buffered: usize,
+    #[serde(default)]
+    pub dropped: u64,
+    #[serde(default)]
+    pub filters: ChromeDebuggerPageEventsFilters,
+    #[serde(default)]
+    pub entries: Vec<ChromeDebuggerPageEventEntry>,
+    #[serde(default)]
+    pub pages: Vec<ChromeDebuggerPageTargetSnapshot>,
+    #[serde(default)]
+    pub workers: Vec<ChromeDebuggerWorkerSnapshot>,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub backend_tier_used: String,
+    #[serde(default)]
+    pub required_foreground: bool,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+    #[serde(default)]
     pub extension_id: Option<String>,
 }
 
@@ -3878,6 +4045,35 @@ pub(crate) async fn clock(
     })
 }
 
+pub(crate) async fn page_events(
+    hwnd: i64,
+    target_id: &str,
+    since_seq: Option<u64>,
+    limit: usize,
+    event_kind: Option<&str>,
+    worker_type: Option<&str>,
+) -> Result<ChromeDebuggerPageEventsResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "pageEvents")?;
+    let result = bridge()
+        .send_command(
+            "pageEvents",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+                "sinceSeq": since_seq,
+                "limit": limit,
+                "eventKind": event_kind,
+                "workerType": worker_type,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerPageEventsResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger pageEvents response: {error}"
+        ))
+    })
+}
+
 pub(crate) async fn navigate_tab(
     hwnd: i64,
     target_id: &str,
@@ -4884,6 +5080,25 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "url": result.get("url"),
             "title": result.get("title"),
             "ready_state": result.get("ready_state"),
+            "readback_backend": result.get("readback_backend"),
+            "backend_tier_used": result.get("backend_tier_used"),
+            "target_candidate_count": result.get("target_candidate_count"),
+            "target_selection_reason": result.get("target_selection_reason"),
+            "extension_id": result.get("extension_id"),
+        }),
+        "pageEvents" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "chrome_window_id": result.get("chrome_window_id"),
+            "capture_newly_armed": result.get("capture_newly_armed"),
+            "next_cursor": result.get("next_cursor"),
+            "returned": result.get("returned"),
+            "total_buffered": result.get("total_buffered"),
+            "dropped": result.get("dropped"),
+            "filters": result.get("filters"),
+            "entry_count": result.get("entries").and_then(Value::as_array).map(Vec::len),
+            "page_count": result.get("pages").and_then(Value::as_array).map(Vec::len),
+            "worker_count": result.get("workers").and_then(Value::as_array).map(Vec::len),
             "readback_backend": result.get("readback_backend"),
             "backend_tier_used": result.get("backend_tier_used"),
             "target_candidate_count": result.get("target_candidate_count"),

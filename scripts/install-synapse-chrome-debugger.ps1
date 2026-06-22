@@ -530,6 +530,9 @@ if (-not ($requiredPermissions -contains 'management')) {
 if (-not ($requiredPermissions -contains 'alarms')) {
     throw "SYNAPSE_CHROME_EXTENSION_ALARMS_PERMISSION_MISSING path=$manifestPath remediation=normal end-user bridge requires chrome.alarms so an MV3 service worker suspended after daemon restart can wake and re-register without foreground Chrome automation"
 }
+if (-not ($requiredPermissions -contains 'webNavigation')) {
+    throw "SYNAPSE_CHROME_EXTENSION_WEBNAVIGATION_PERMISSION_MISSING path=$manifestPath remediation=normal bridge requires chrome.webNavigation for target-scoped lifecycle and SPA route event readback without debugger attach"
+}
 if ($optionalPermissions -contains 'alarms') {
     throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_ALARMS_PERMISSION_FORBIDDEN path=$manifestPath remediation=alarms must be a required permission for deterministic bridge wake/readback, not an optional runtime prompt"
 }
@@ -1412,9 +1415,9 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     bridge_self_reload_command = 'cdp_bridge_reload'
-    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-22-clock-v5'
-    bridge_build_sha256_expected = '7adff60166bf13eed322d5e68adbf82fdf0dcf8b2a8fc0e828913e937227c272'
-    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'closeTab', 'clock', 'coordinateClick', 'domAction', 'externalPopupRiskSuppression', 'listTabs', 'navigateTab', 'openTab', 'pageVitals', 'pageContent', 'setContent', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
+    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-22-page-events-v6'
+    bridge_build_sha256_expected = '9244ce49a2c34dd02dd6a98d479601f20869750d9330d8c7b564d35f5d823f9a'
+    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'closeTab', 'clock', 'coordinateClick', 'domAction', 'externalPopupRiskSuppression', 'listTabs', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'setContent', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
     background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_for_typed_dom_actions_no_debugger_no_native_messaging_plus_chrome.management_external_popup_suppression'
     reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'
     attach_popup_prevention = 'normal_bridge_debugger_free_no_chrome.debugger_permission_no_helper_windows_no_nativeMessaging_permission_plus_daemon_side_attach_disabled_for_debugger_commands'
@@ -1426,6 +1429,7 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     required_debugger_permission_present = $false
     optional_debugger_permission_present = $false
     required_management_permission_present = ($requiredPermissions -contains 'management')
+    required_web_navigation_permission_present = ($requiredPermissions -contains 'webNavigation')
     required_native_messaging_permission_present = $false
     optional_native_messaging_permission_present = $false
     localhost_host_permission_present = $true

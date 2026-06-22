@@ -353,7 +353,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Arm and read target-scoped raw CDP page lifecycle, popup/new-page, and worker events for the calling session's owned browser tab. Returns a cursor-delimited buffer of Page.domContentEventFired, Page.loadEventFired, Page.lifecycleEvent, Page.frameNavigated, Page.navigatedWithinDocument / SPA route changes, frame loading events, Target page created/attached/destroyed snapshots for opener-related popups/target=_blank pages, and Target worker/service_worker/shared_worker created/attached/destroyed snapshots. Captured live pages include ready-to-pass set_target payloads and are scoped by opener metadata to the armed page target. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; call before navigation, popup creation, or worker creation for gap-free capture, then poll with since_seq=next_cursor."
+        description = "Arm and read target-scoped page lifecycle, popup/new-page, and worker events for the calling session's owned browser tab. Raw CDP returns Page.domContentEventFired, Page.loadEventFired, Page.lifecycleEvent, Page.frameNavigated, Page.navigatedWithinDocument / SPA route changes, frame loading events, Target page created/attached/destroyed snapshots, and Target worker/service_worker/shared_worker snapshots. The normal Chrome bridge supports chrome-tab:* current-profile targets through a per-tab chrome.webNavigation ring buffer plus a typed MAIN-world worker shim for current-document worker creation/termination readback. Captured live pages include ready-to-pass set_target payloads and are scoped by opener metadata to the armed page target. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Call before navigation, popup creation, or worker creation for gap-free capture, then poll with since_seq=next_cursor."
     )]
     pub async fn browser_page_events(
         &self,
@@ -537,6 +537,73 @@ impl SynapseService {
         params: &NormalizedBrowserPageEventsParams,
     ) -> Result<BrowserPageEventsResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let result = crate::chrome_debugger_bridge::page_events(
+                    window_hwnd,
+                    cdp_target_id,
+                    params.since_seq,
+                    params.limit,
+                    params.event_kind.as_deref(),
+                    params.worker_type.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "{EVENTS_TOOL} normal bridge pageEvents operation failed: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_PAGE_EVENTS_READBACK",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %result.target_id,
+                    returned = result.returned,
+                    page_count = result.pages.len(),
+                    worker_count = result.workers.len(),
+                    "readback=chrome.webNavigation+chrome.scripting.executeScript(MAIN worker shim) outcome=list_returned"
+                );
+                return Ok(BrowserPageEventsResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs"
+                        .to_owned(),
+                    cdp_target_id: result.target_id,
+                    capture_newly_armed: result.capture_newly_armed,
+                    next_cursor: result.next_cursor,
+                    returned: result.returned,
+                    total_buffered: result.total_buffered,
+                    dropped: result.dropped,
+                    filters: BrowserPageEventsFilters {
+                        since_seq: params.since_seq,
+                        limit: params.limit,
+                        event_kind: params.event_kind.clone(),
+                        worker_type: params.worker_type.clone(),
+                    },
+                    entries: result
+                        .entries
+                        .into_iter()
+                        .map(|entry| browser_bridge_page_event_entry(window_hwnd, entry))
+                        .collect(),
+                    pages: result
+                        .pages
+                        .into_iter()
+                        .map(|page| browser_bridge_page_target_snapshot(window_hwnd, page))
+                        .collect(),
+                    workers: result
+                        .workers
+                        .into_iter()
+                        .map(browser_bridge_worker_snapshot)
+                        .collect(),
+                    readback_backend: result.readback_backend,
+                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    required_foreground: false,
+                });
+            }
             return Err(browser_raw_cdp_required_error(EVENTS_TOOL, window_hwnd));
         };
         let status = synapse_a11y::lifecycle_capture_ensure(
@@ -852,6 +919,44 @@ fn browser_page_event_entry(
     }
 }
 
+fn browser_bridge_page_event_entry(
+    window_hwnd: i64,
+    entry: crate::chrome_debugger_bridge::ChromeDebuggerPageEventEntry,
+) -> BrowserPageEventEntry {
+    let adoptable_target = entry.page_target_id.as_ref().and_then(|target_id| {
+        (entry.event_kind != "page_destroyed").then(|| TargetWire::Cdp {
+            window_hwnd,
+            cdp_target_id: target_id.clone(),
+        })
+    });
+    BrowserPageEventEntry {
+        seq: entry.seq,
+        event_kind: entry.event_kind,
+        target_id: entry.target_id,
+        target_type: entry.target_type,
+        target_attached: entry.target_attached,
+        page_target_id: entry.page_target_id,
+        adoptable_target,
+        opener_id: entry.opener_id,
+        opener_frame_id: entry.opener_frame_id,
+        can_access_opener: entry.can_access_opener,
+        browser_context_id: entry.browser_context_id,
+        subtype: entry.subtype,
+        worker_id: entry.worker_id,
+        worker_type: entry.worker_type,
+        worker_url: entry.worker_url,
+        frame_id: entry.frame_id,
+        parent_frame_id: entry.parent_frame_id,
+        loader_id: entry.loader_id,
+        name: entry.name,
+        url: entry.url,
+        title: entry.title,
+        navigation_type: entry.navigation_type,
+        timestamp_s: entry.timestamp_s,
+        observed_at_unix_ms: entry.observed_at_unix_ms,
+    }
+}
+
 fn browser_page_target_snapshot(
     window_hwnd: i64,
     page: synapse_a11y::CdpPageTargetSnapshot,
@@ -880,7 +985,52 @@ fn browser_page_target_snapshot(
     }
 }
 
+fn browser_bridge_page_target_snapshot(
+    window_hwnd: i64,
+    page: crate::chrome_debugger_bridge::ChromeDebuggerPageTargetSnapshot,
+) -> BrowserPageTargetSnapshot {
+    BrowserPageTargetSnapshot {
+        cdp_target_id: page.target_id.clone(),
+        target: TargetWire::Cdp {
+            window_hwnd,
+            cdp_target_id: page.target_id,
+        },
+        target_type: page.target_type,
+        url: page.url,
+        title: page.title,
+        opener_id: page.opener_id,
+        opener_frame_id: page.opener_frame_id,
+        can_access_opener: page.can_access_opener,
+        browser_context_id: page.browser_context_id,
+        subtype: page.subtype,
+        attached: page.attached,
+        adoptable: !page.destroyed,
+        destroyed: page.destroyed,
+        first_seen_seq: page.first_seen_seq,
+        last_seen_seq: page.last_seen_seq,
+        first_seen_unix_ms: page.first_seen_unix_ms,
+        last_seen_unix_ms: page.last_seen_unix_ms,
+    }
+}
+
 fn browser_worker_snapshot(worker: synapse_a11y::CdpWorkerSnapshot) -> BrowserWorkerSnapshot {
+    BrowserWorkerSnapshot {
+        worker_id: worker.worker_id,
+        worker_type: worker.worker_type,
+        url: worker.url,
+        title: worker.title,
+        attached: worker.attached,
+        destroyed: worker.destroyed,
+        first_seen_seq: worker.first_seen_seq,
+        last_seen_seq: worker.last_seen_seq,
+        first_seen_unix_ms: worker.first_seen_unix_ms,
+        last_seen_unix_ms: worker.last_seen_unix_ms,
+    }
+}
+
+fn browser_bridge_worker_snapshot(
+    worker: crate::chrome_debugger_bridge::ChromeDebuggerWorkerSnapshot,
+) -> BrowserWorkerSnapshot {
     BrowserWorkerSnapshot {
         worker_id: worker.worker_id,
         worker_type: worker.worker_type,

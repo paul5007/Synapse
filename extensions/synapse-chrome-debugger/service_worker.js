@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-22-clock-v5";
-const BRIDGE_BUILD_SHA256 = "7adff60166bf13eed322d5e68adbf82fdf0dcf8b2a8fc0e828913e937227c272";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-22-page-events-v6";
+const BRIDGE_BUILD_SHA256 = "9244ce49a2c34dd02dd6a98d479601f20869750d9330d8c7b564d35f5d823f9a";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -15,6 +15,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "pageContent",
   "setContent",
   "clock",
+  "pageEvents",
   "domAction",
   "coordinateClick",
   "reloadSelf",
@@ -52,6 +53,7 @@ const RECONNECT_WAKE_ALARM_PERIOD_MINUTES = 0.5;
 const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
 const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
+const MAX_PAGE_EVENT_BUFFER = 1000;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
 const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessaging"]);
 const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
@@ -67,6 +69,7 @@ let disconnectedKeepAliveTimer = null;
 let permanentlyDisabled = false;
 const agentNavigationClaims = new Map();
 const recentNavigationKeys = [];
+const pageEventBuffers = new Map();
 let popupRiskSuppressionInFlight = null;
 let popupRiskSuppressionState = {
   ok: false,
@@ -308,6 +311,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "pageContent",
     "setContent",
     "clock",
+    "pageEvents",
     "navigateTab",
     "activateTab",
     "domAction",
@@ -659,9 +663,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!changeInfo?.url && !changeInfo?.title && changeInfo?.status !== "complete") {
     return;
   }
+  updatePageEventTabState(tabId, tab, changeInfo);
   postTabNavigationEvent("tabs.onUpdated", tab).catch((error) => {
     console.warn(`Synapse tab navigation event dropped: ${errorMessage(error)}`);
   });
+});
+chrome.tabs.onCreated.addListener((tab) => {
+  recordTabCreatedForPageEvents(tab);
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  recordTabRemovedForPageEvents(tabId);
 });
 chrome.tabs.onActivated.addListener((activeInfo) => {
   chrome.tabs.get(activeInfo.tabId)
@@ -670,6 +681,36 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
       console.warn(`Synapse active tab navigation readback failed: ${errorMessage(error)}`);
     });
 });
+if (chrome.webNavigation?.onBeforeNavigate?.addListener) {
+  chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+    recordWebNavigationPageEvent("framestartednavigating", details);
+  });
+}
+if (chrome.webNavigation?.onCommitted?.addListener) {
+  chrome.webNavigation.onCommitted.addListener((details) => {
+    recordWebNavigationPageEvent("framenavigated", details, {
+      navigation_type: webNavigationTransition(details)
+    });
+  });
+}
+if (chrome.webNavigation?.onDOMContentLoaded?.addListener) {
+  chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
+    recordWebNavigationPageEvent("domcontentloaded", details);
+  });
+}
+if (chrome.webNavigation?.onCompleted?.addListener) {
+  chrome.webNavigation.onCompleted.addListener((details) => {
+    recordWebNavigationPageEvent("load", details);
+    recordWebNavigationPageEvent("framestoppedloading", details);
+  });
+}
+if (chrome.webNavigation?.onHistoryStateUpdated?.addListener) {
+  chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+    recordWebNavigationPageEvent("framenavigated", details, {
+      navigation_type: webNavigationTransition(details) || "history_api"
+    });
+  });
+}
 
 startBridgeFromEvent();
 
@@ -710,6 +751,8 @@ async function handleCommand(command) {
       result = await handleSetContent(params);
     } else if (kind === "clock") {
       result = await handleClock(params);
+    } else if (kind === "pageEvents") {
+      result = await handlePageEvents(params);
     } else if (kind === "typeActiveElement") {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
@@ -1188,6 +1231,100 @@ async function handleClock(params) {
     frame_result_count: frameResults.length,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
+  };
+}
+
+async function handlePageEvents(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const filters = normalizePageEventsFilter(params);
+  const state = await tabPageState(selected.tabId, selected.target);
+  const bufferResult = ensurePageEventBuffer(selected.tabId, state);
+  const workerProbe = await drainPageWorkerEvents(selected.tabId, state);
+  const read = readPageEventBuffer(bufferResult.buffer, filters);
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: state.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: state.chrome_window_id,
+    url: state.url || "",
+    title: state.title || "",
+    ready_state: state.ready_state || "",
+    capture_newly_armed: bufferResult.newlyArmed,
+    armed_at_unix_ms: bufferResult.buffer.armedAtUnixMs,
+    capacity: bufferResult.buffer.capacity,
+    next_cursor: read.next_cursor,
+    returned: read.returned,
+    total_buffered: read.total_buffered,
+    dropped: read.dropped,
+    filters: {
+      since_seq: filters.sinceSeq,
+      limit: filters.limit,
+      event_kind: filters.eventKind,
+      worker_type: filters.workerType
+    },
+    entries: read.entries,
+    pages: read.pages,
+    workers: read.workers,
+    readback_backend: "chrome.webNavigation+chrome.tabs+chrome.scripting.executeScript(MAIN synapse page-events shim)",
+    backend_tier_used: "chrome_tabs_extension",
+    required_foreground: false,
+    web_navigation_available: Boolean(chrome.webNavigation),
+    worker_probe_available: workerProbe.available,
+    worker_probe_error_code: workerProbe.error_code || null,
+    worker_probe_error_detail: workerProbe.error_detail || null,
+    worker_probe_frame_result_count: workerProbe.frame_result_count || 0,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
+async function drainPageWorkerEvents(tabId, state) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return {
+      available: false,
+      error_code: "CHROME_SCRIPTING_UNAVAILABLE",
+      error_detail: "Chrome scripting API is unavailable; extension is missing scripting permission",
+      frame_result_count: 0
+    };
+  }
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: "MAIN",
+      func: runPageEventsWorkerProbe
+    });
+  } catch (error) {
+    return {
+      available: false,
+      error_code: ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      error_detail: errorMessage(error),
+      frame_result_count: 0
+    };
+  }
+  const frames = frameExecutionResults(injected);
+  for (const frame of frames) {
+    const result = frame.result;
+    if (!result || typeof result !== "object" || !Array.isArray(result.events)) {
+      continue;
+    }
+    for (const event of result.events) {
+      pushPageEvent(tabId, {
+        ...event,
+        target_id: state.target_id || targetIdForTabId(tabId),
+        frame_id: event.frame_id == null && Number.isSafeInteger(frame.frame_id)
+          ? String(frame.frame_id)
+          : event.frame_id,
+        url: event.url || result.url || state.url || "",
+        title: event.title || result.title || state.title || ""
+      });
+    }
+  }
+  return {
+    available: true,
+    error_code: null,
+    error_detail: null,
+    frame_result_count: frames.length
   };
 }
 
@@ -1990,6 +2127,24 @@ function tabTargetFromTab(tab) {
     highlighted: Boolean(tab.highlighted),
     pinned: Boolean(tab.pinned),
     attached: false
+  };
+}
+
+function tabPageStateFromTab(tab) {
+  const target = tabTargetFromTab(tab);
+  return {
+    target_id: target.id,
+    tab_id: target.tabId,
+    chrome_window_id: target.chromeWindowId,
+    target_type: target.type || "page",
+    url: target.url || "",
+    title: target.title || "",
+    ready_state: target.status || "",
+    active: Boolean(target.active),
+    highlighted: Boolean(target.highlighted),
+    pinned: Boolean(target.pinned),
+    history_current_index: -1,
+    history_entry_count: 0
   };
 }
 
@@ -2818,6 +2973,241 @@ function runClockInPage(request) {
     globalThis.__synapseClock = api;
     return api;
   }
+}
+
+function runPageEventsWorkerProbe() {
+  const VERSION = "synapse-page-events-2026-06-22-v1";
+
+  function workerUrl(scriptURL) {
+    try {
+      return new URL(String(scriptURL || ""), location.href).href;
+    } catch (_) {
+      return String(scriptURL || "");
+    }
+  }
+
+  function nowMs() {
+    return Date.now();
+  }
+
+  function ensureProbe() {
+    if (globalThis.__synapsePageEvents && globalThis.__synapsePageEvents.version === VERSION) {
+      return globalThis.__synapsePageEvents;
+    }
+    const state = {
+      version: VERSION,
+      nextWorkerId: 1,
+      events: [],
+      workers: new Map(),
+      installedAtUnixMs: nowMs(),
+      originalWorker: globalThis.Worker,
+      originalSharedWorker: globalThis.SharedWorker,
+      serviceWorkerContainer: navigator.serviceWorker || null,
+      originalServiceWorkerRegister: navigator.serviceWorker?.register || null
+    };
+
+    function record(event) {
+      const workerId = String(event.worker_id || "");
+      const entry = {
+        event_kind: String(event.event_kind || ""),
+        worker_id: workerId || null,
+        worker_type: event.worker_type == null ? null : String(event.worker_type),
+        worker_url: event.worker_url == null ? null : String(event.worker_url),
+        title: String(document.title || ""),
+        url: String(location.href || ""),
+        observed_at_unix_ms: nowMs()
+      };
+      if (!entry.event_kind || !entry.worker_id) {
+        return;
+      }
+      state.events.push(entry);
+      if (entry.event_kind === "worker_destroyed") {
+        const existing = state.workers.get(workerId) || {};
+        state.workers.set(workerId, {
+          worker_id: workerId,
+          worker_type: entry.worker_type || existing.worker_type || "",
+          url: entry.worker_url || existing.url || "",
+          title: entry.title || existing.title || "",
+          attached: false,
+          destroyed: true
+        });
+      } else {
+        state.workers.set(workerId, {
+          worker_id: workerId,
+          worker_type: entry.worker_type || "",
+          url: entry.worker_url || "",
+          title: entry.title || "",
+          attached: true,
+          destroyed: false
+        });
+      }
+    }
+
+    function nextId(prefix) {
+      const id = `${prefix}-${state.nextWorkerId}`;
+      state.nextWorkerId += 1;
+      return id;
+    }
+
+    function installWorkerShim() {
+      const NativeWorker = state.originalWorker;
+      if (typeof NativeWorker !== "function" || NativeWorker.__synapsePageEventsWrapped) {
+        return;
+      }
+      function SynapseWorker(scriptURL, options) {
+        const worker = Reflect.construct(
+          NativeWorker,
+          options === undefined ? [scriptURL] : [scriptURL, options],
+          new.target || NativeWorker
+        );
+        const id = nextId("worker");
+        const url = workerUrl(scriptURL);
+        try {
+          Object.defineProperty(worker, "__synapseWorkerId", {
+            configurable: false,
+            enumerable: false,
+            value: id
+          });
+        } catch (_) {}
+        record({
+          event_kind: "worker_created",
+          worker_id: id,
+          worker_type: "worker",
+          worker_url: url
+        });
+        const nativeTerminate = worker.terminate;
+        if (typeof nativeTerminate === "function") {
+          worker.terminate = function terminateWithSynapseReadback(...args) {
+            record({
+              event_kind: "worker_destroyed",
+              worker_id: id,
+              worker_type: "worker",
+              worker_url: url
+            });
+            return nativeTerminate.apply(this, args);
+          };
+        }
+        return worker;
+      }
+      Object.defineProperty(SynapseWorker, "__synapsePageEventsWrapped", {
+        configurable: false,
+        enumerable: false,
+        value: true
+      });
+      Object.setPrototypeOf(SynapseWorker, NativeWorker);
+      SynapseWorker.prototype = NativeWorker.prototype;
+      globalThis.Worker = SynapseWorker;
+    }
+
+    function installSharedWorkerShim() {
+      const NativeSharedWorker = state.originalSharedWorker;
+      if (typeof NativeSharedWorker !== "function" || NativeSharedWorker.__synapsePageEventsWrapped) {
+        return;
+      }
+      function SynapseSharedWorker(scriptURL, options) {
+        const worker = Reflect.construct(
+          NativeSharedWorker,
+          options === undefined ? [scriptURL] : [scriptURL, options],
+          new.target || NativeSharedWorker
+        );
+        record({
+          event_kind: "worker_created",
+          worker_id: nextId("shared-worker"),
+          worker_type: "shared_worker",
+          worker_url: workerUrl(scriptURL)
+        });
+        return worker;
+      }
+      Object.defineProperty(SynapseSharedWorker, "__synapsePageEventsWrapped", {
+        configurable: false,
+        enumerable: false,
+        value: true
+      });
+      Object.setPrototypeOf(SynapseSharedWorker, NativeSharedWorker);
+      SynapseSharedWorker.prototype = NativeSharedWorker.prototype;
+      globalThis.SharedWorker = SynapseSharedWorker;
+    }
+
+    function installServiceWorkerShim() {
+      const container = state.serviceWorkerContainer;
+      const nativeRegister = state.originalServiceWorkerRegister;
+      if (!container || typeof nativeRegister !== "function" || nativeRegister.__synapsePageEventsWrapped) {
+        return;
+      }
+      const wrapped = async function registerWithSynapseReadback(scriptURL, options) {
+        const registration = await nativeRegister.call(this, scriptURL, options);
+        const script = registration?.active?.scriptURL ||
+          registration?.installing?.scriptURL ||
+          registration?.waiting?.scriptURL ||
+          workerUrl(scriptURL);
+        record({
+          event_kind: "worker_created",
+          worker_id: `service-worker:${script}`,
+          worker_type: "service_worker",
+          worker_url: script
+        });
+        return registration;
+      };
+      Object.defineProperty(wrapped, "__synapsePageEventsWrapped", {
+        configurable: false,
+        enumerable: false,
+        value: true
+      });
+      try {
+        Object.defineProperty(container, "register", {
+          configurable: true,
+          value: wrapped
+        });
+      } catch (_) {
+        try {
+          container.register = wrapped;
+        } catch (_) {}
+      }
+    }
+
+    state.drain = () => {
+      const drained = state.events.splice(0, state.events.length);
+      return {
+        events: drained,
+        workers: Array.from(state.workers.values())
+      };
+    };
+
+    try {
+      installWorkerShim();
+    } catch (error) {
+      state.events.push({
+        event_kind: "worker_info_changed",
+        worker_id: "worker-shim-install-error",
+        worker_type: "worker",
+        worker_url: String(error && error.message ? error.message : error),
+        title: String(document.title || ""),
+        url: String(location.href || ""),
+        observed_at_unix_ms: nowMs()
+      });
+    }
+    try {
+      installSharedWorkerShim();
+    } catch (_) {}
+    try {
+      installServiceWorkerShim();
+    } catch (_) {}
+    globalThis.__synapsePageEvents = state;
+    return state;
+  }
+
+  const probe = ensureProbe();
+  const drained = probe.drain();
+  return {
+    ok: true,
+    version: VERSION,
+    installed_at_unix_ms: probe.installedAtUnixMs,
+    url: String(location.href || ""),
+    title: String(document.title || ""),
+    ready_state: String(document.readyState || ""),
+    events: drained.events,
+    workers: drained.workers
+  };
 }
 
 function readPageVitalsInPage() {
@@ -5459,6 +5849,283 @@ function matchingAgentNavigationClaim(tabId, url, status) {
   return claim;
 }
 
+function ensurePageEventBuffer(tabId, state = {}) {
+  let buffer = pageEventBuffers.get(tabId);
+  if (buffer) {
+    updatePageSnapshot(buffer, state);
+    return { buffer, newlyArmed: false };
+  }
+  const now = Date.now();
+  const targetId = state.target_id || targetIdForTabId(tabId);
+  buffer = {
+    tabId,
+    targetId,
+    capacity: MAX_PAGE_EVENT_BUFFER,
+    entries: [],
+    pages: new Map(),
+    workers: new Map(),
+    nextSeq: 0,
+    dropped: 0,
+    armedAtUnixMs: now
+  };
+  pageEventBuffers.set(tabId, buffer);
+  updatePageSnapshot(buffer, state);
+  return { buffer, newlyArmed: true };
+}
+
+function updatePageSnapshot(buffer, state = {}) {
+  if (!buffer) {
+    return;
+  }
+  const now = Date.now();
+  const targetId = buffer.targetId || state.target_id || targetIdForTabId(buffer.tabId);
+  const existing = buffer.pages.get(targetId);
+  const snapshot = {
+    target_id: targetId,
+    target_type: "page",
+    url: String(state.url || existing?.url || ""),
+    title: String(state.title || existing?.title || ""),
+    opener_id: existing?.opener_id || null,
+    opener_frame_id: existing?.opener_frame_id || null,
+    can_access_opener: Boolean(existing?.can_access_opener),
+    browser_context_id: existing?.browser_context_id || null,
+    subtype: existing?.subtype || null,
+    attached: false,
+    destroyed: false,
+    first_seen_seq: Number.isSafeInteger(existing?.first_seen_seq) ? existing.first_seen_seq : buffer.nextSeq,
+    last_seen_seq: buffer.nextSeq,
+    first_seen_unix_ms: Number.isSafeInteger(existing?.first_seen_unix_ms) ? existing.first_seen_unix_ms : now,
+    last_seen_unix_ms: now
+  };
+  buffer.pages.set(targetId, snapshot);
+}
+
+function pushPageEvent(tabId, entry) {
+  const buffer = pageEventBuffers.get(tabId);
+  if (!buffer || !entry || typeof entry !== "object") {
+    return null;
+  }
+  const now = Date.now();
+  const event = {
+    seq: buffer.nextSeq,
+    event_kind: String(entry.event_kind || ""),
+    target_id: String(entry.target_id || buffer.targetId || targetIdForTabId(tabId)),
+    target_type: entry.target_type == null ? null : String(entry.target_type),
+    target_attached: entry.target_attached == null ? null : Boolean(entry.target_attached),
+    page_target_id: entry.page_target_id == null ? null : String(entry.page_target_id),
+    opener_id: entry.opener_id == null ? null : String(entry.opener_id),
+    opener_frame_id: entry.opener_frame_id == null ? null : String(entry.opener_frame_id),
+    can_access_opener: entry.can_access_opener == null ? null : Boolean(entry.can_access_opener),
+    browser_context_id: entry.browser_context_id == null ? null : String(entry.browser_context_id),
+    subtype: entry.subtype == null ? null : String(entry.subtype),
+    worker_id: entry.worker_id == null ? null : String(entry.worker_id),
+    worker_type: entry.worker_type == null ? null : String(entry.worker_type),
+    worker_url: entry.worker_url == null ? null : String(entry.worker_url),
+    frame_id: entry.frame_id == null ? null : String(entry.frame_id),
+    parent_frame_id: entry.parent_frame_id == null ? null : String(entry.parent_frame_id),
+    loader_id: entry.loader_id == null ? null : String(entry.loader_id),
+    name: entry.name == null ? null : String(entry.name),
+    url: entry.url == null ? null : String(entry.url),
+    title: entry.title == null ? null : String(entry.title),
+    navigation_type: entry.navigation_type == null ? null : String(entry.navigation_type),
+    timestamp_s: Number.isFinite(Number(entry.timestamp_s)) ? Number(entry.timestamp_s) : null,
+    observed_at_unix_ms: Number.isSafeInteger(entry.observed_at_unix_ms)
+      ? entry.observed_at_unix_ms
+      : now
+  };
+  if (!event.event_kind) {
+    return null;
+  }
+  buffer.nextSeq += 1;
+  if (event.page_target_id) {
+    updateBufferedPageFromEvent(buffer, event);
+  } else if (event.event_kind === "framenavigated" || event.event_kind === "load" || event.event_kind === "domcontentloaded") {
+    updatePageSnapshot(buffer, {
+      target_id: event.target_id,
+      url: event.url || "",
+      title: event.title || ""
+    });
+  }
+  if (event.worker_id) {
+    updateBufferedWorkerFromEvent(buffer, event);
+  }
+  while (buffer.entries.length >= buffer.capacity) {
+    buffer.entries.shift();
+    buffer.dropped += 1;
+  }
+  buffer.entries.push(event);
+  return event;
+}
+
+function updateBufferedPageFromEvent(buffer, event) {
+  const id = event.page_target_id;
+  const existing = buffer.pages.get(id);
+  const page = {
+    target_id: id,
+    target_type: event.target_type || existing?.target_type || "page",
+    url: event.url || existing?.url || "",
+    title: event.title || existing?.title || "",
+    opener_id: event.opener_id || existing?.opener_id || null,
+    opener_frame_id: event.opener_frame_id || existing?.opener_frame_id || null,
+    can_access_opener: event.can_access_opener == null
+      ? Boolean(existing?.can_access_opener)
+      : Boolean(event.can_access_opener),
+    browser_context_id: event.browser_context_id || existing?.browser_context_id || null,
+    subtype: event.subtype || existing?.subtype || null,
+    attached: event.target_attached == null ? Boolean(existing?.attached) : Boolean(event.target_attached),
+    destroyed: event.event_kind === "page_destroyed" || Boolean(existing?.destroyed),
+    first_seen_seq: Number.isSafeInteger(existing?.first_seen_seq) ? existing.first_seen_seq : event.seq,
+    last_seen_seq: event.seq,
+    first_seen_unix_ms: Number.isSafeInteger(existing?.first_seen_unix_ms) ? existing.first_seen_unix_ms : event.observed_at_unix_ms,
+    last_seen_unix_ms: event.observed_at_unix_ms
+  };
+  if (event.event_kind === "page_attached") {
+    page.attached = true;
+  }
+  if (event.event_kind === "page_destroyed") {
+    page.attached = false;
+  }
+  buffer.pages.set(id, page);
+}
+
+function updateBufferedWorkerFromEvent(buffer, event) {
+  const id = event.worker_id;
+  const existing = buffer.workers.get(id);
+  const worker = {
+    worker_id: id,
+    worker_type: event.worker_type || existing?.worker_type || "",
+    url: event.worker_url || existing?.url || "",
+    title: event.title || existing?.title || "",
+    attached: event.event_kind !== "worker_destroyed",
+    destroyed: event.event_kind === "worker_destroyed" || Boolean(existing?.destroyed),
+    first_seen_seq: Number.isSafeInteger(existing?.first_seen_seq) ? existing.first_seen_seq : event.seq,
+    last_seen_seq: event.seq,
+    first_seen_unix_ms: Number.isSafeInteger(existing?.first_seen_unix_ms) ? existing.first_seen_unix_ms : event.observed_at_unix_ms,
+    last_seen_unix_ms: event.observed_at_unix_ms
+  };
+  if (event.event_kind === "worker_destroyed") {
+    worker.attached = false;
+  }
+  buffer.workers.set(id, worker);
+}
+
+function readPageEventBuffer(buffer, filters) {
+  const entries = buffer.entries
+    .filter((entry) => filters.sinceSeq == null || entry.seq >= filters.sinceSeq)
+    .filter((entry) => !filters.eventKind || String(entry.event_kind).toLowerCase() === filters.eventKind)
+    .filter((entry) => !filters.workerType || String(entry.worker_type || "").toLowerCase() === filters.workerType)
+    .slice(0, filters.limit);
+  const pages = Array.from(buffer.pages.values()).sort((left, right) =>
+    String(left.target_id).localeCompare(String(right.target_id))
+  );
+  const workers = Array.from(buffer.workers.values()).sort((left, right) =>
+    String(left.worker_id).localeCompare(String(right.worker_id))
+  );
+  return {
+    entries,
+    pages,
+    workers,
+    next_cursor: buffer.nextSeq,
+    returned: entries.length,
+    total_buffered: buffer.entries.length,
+    dropped: buffer.dropped
+  };
+}
+
+function updatePageEventTabState(tabId, tab, changeInfo = {}) {
+  const buffer = pageEventBuffers.get(tabId);
+  if (!buffer || !tab) {
+    return;
+  }
+  updatePageSnapshot(buffer, tabPageStateFromTab(tab));
+  if (changeInfo.title) {
+    pushPageEvent(tabId, {
+      event_kind: "page_info_changed",
+      target_id: targetIdForTabId(tabId),
+      page_target_id: targetIdForTabId(tabId),
+      target_type: "page",
+      target_attached: false,
+      url: String(tab.pendingUrl || tab.url || ""),
+      title: String(tab.title || ""),
+      observed_at_unix_ms: Date.now()
+    });
+  }
+}
+
+function recordTabCreatedForPageEvents(tab) {
+  if (!tab || !Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) {
+    return;
+  }
+  const openerBuffer = pageEventBuffers.get(tab.openerTabId);
+  if (!openerBuffer) {
+    return;
+  }
+  pushPageEvent(tab.openerTabId, {
+    event_kind: "page_created",
+    target_id: openerBuffer.targetId,
+    target_type: "page",
+    target_attached: false,
+    page_target_id: targetIdForTabId(tab.id),
+    opener_id: openerBuffer.targetId,
+    can_access_opener: true,
+    url: String(tab.pendingUrl || tab.url || ""),
+    title: String(tab.title || ""),
+    observed_at_unix_ms: Date.now()
+  });
+}
+
+function recordTabRemovedForPageEvents(tabId) {
+  for (const [ownerTabId, buffer] of pageEventBuffers.entries()) {
+    const removedTargetId = targetIdForTabId(tabId);
+    if (!buffer.pages.has(removedTargetId)) {
+      continue;
+    }
+    pushPageEvent(ownerTabId, {
+      event_kind: "page_destroyed",
+      target_id: buffer.targetId,
+      page_target_id: removedTargetId,
+      observed_at_unix_ms: Date.now()
+    });
+  }
+  pageEventBuffers.delete(tabId);
+}
+
+function recordWebNavigationPageEvent(eventKind, details, extra = {}) {
+  if (!details || !Number.isInteger(details.tabId) || details.tabId < 0) {
+    return;
+  }
+  const buffer = pageEventBuffers.get(details.tabId);
+  if (!buffer) {
+    return;
+  }
+  const frameId = Number.isSafeInteger(details.frameId) ? String(details.frameId) : null;
+  const parentFrameId = Number.isSafeInteger(details.parentFrameId) && details.parentFrameId >= 0
+    ? String(details.parentFrameId)
+    : null;
+  pushPageEvent(details.tabId, {
+    event_kind: eventKind,
+    target_id: buffer.targetId || targetIdForTabId(details.tabId),
+    frame_id: frameId,
+    parent_frame_id: parentFrameId,
+    loader_id: details.documentId == null ? null : String(details.documentId),
+    url: String(details.url || ""),
+    navigation_type: extra.navigation_type || null,
+    timestamp_s: Number.isFinite(details.timeStamp) ? details.timeStamp / 1000 : null,
+    observed_at_unix_ms: Number.isFinite(details.timeStamp) ? Math.floor(details.timeStamp) : Date.now()
+  });
+}
+
+function webNavigationTransition(details) {
+  const transitionType = String(details?.transitionType || "");
+  const qualifiers = Array.isArray(details?.transitionQualifiers)
+    ? details.transitionQualifiers.map(String).sort()
+    : [];
+  if (!transitionType && qualifiers.length === 0) {
+    return "";
+  }
+  return [transitionType, ...qualifiers].filter(Boolean).join("+");
+}
+
 async function postTabNavigationEvent(source, tab) {
   if (!tab || typeof tab.id !== "number") {
     return;
@@ -5540,6 +6207,73 @@ function normalizeClockOperation(value) {
     return operation;
   }
   throw bridgeError(ERROR_ATTACH_FAILED, `unsupported clock operation ${JSON.stringify(operation)}`);
+}
+
+function normalizePageEventsFilter(params) {
+  const sinceSeq = optionalNonNegativeInteger(params.sinceSeq);
+  const limit = normalizePageEventsLimit(params.limit);
+  const eventKind = normalizeOptionalPageEventKind(params.eventKind);
+  const workerType = normalizeOptionalWorkerType(params.workerType);
+  return { sinceSeq, limit, eventKind, workerType };
+}
+
+function optionalNonNegativeInteger(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw bridgeError(ERROR_ATTACH_FAILED, "sinceSeq must be a non-negative safe integer");
+  }
+  return number;
+}
+
+function normalizePageEventsLimit(value) {
+  if (value === undefined || value === null) {
+    return 100;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1 || number > MAX_PAGE_EVENT_BUFFER) {
+    throw bridgeError(ERROR_ATTACH_FAILED, `limit must be an integer from 1 through ${MAX_PAGE_EVENT_BUFFER}`);
+  }
+  return number;
+}
+
+function normalizeOptionalPageEventKind(value) {
+  const kind = String(value || "").trim().toLowerCase();
+  if (!kind) {
+    return null;
+  }
+  if ([
+    "domcontentloaded",
+    "load",
+    "lifecycle",
+    "framenavigated",
+    "framestartednavigating",
+    "framestoppedloading",
+    "page_created",
+    "page_attached",
+    "page_destroyed",
+    "page_info_changed",
+    "worker_created",
+    "worker_attached",
+    "worker_destroyed",
+    "worker_info_changed"
+  ].includes(kind)) {
+    return kind;
+  }
+  throw bridgeError(ERROR_ATTACH_FAILED, `unsupported page event kind ${JSON.stringify(value)}`);
+}
+
+function normalizeOptionalWorkerType(value) {
+  const workerType = String(value || "").trim().toLowerCase();
+  if (!workerType) {
+    return null;
+  }
+  if (["worker", "service_worker", "shared_worker"].includes(workerType)) {
+    return workerType;
+  }
+  throw bridgeError(ERROR_ATTACH_FAILED, `unsupported worker type ${JSON.stringify(value)}`);
 }
 
 function normalizeMaxContentBytes(value) {
