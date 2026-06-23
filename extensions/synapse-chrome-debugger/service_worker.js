@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-22-url-v1";
-const BRIDGE_BUILD_SHA256 = "197a24a5e5b56699f377bd2990607a9a26c0e368a665f055e4519702df45da7c";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-22-network-waits-v2";
+const BRIDGE_BUILD_SHA256 = "4116781a862e3bc74b07ec99d418a611fbc0505ec8d3b84a68ab1a4867fd9104";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -23,6 +23,8 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "waitForFunction",
   "waitForLoadState",
   "waitForUrl",
+  "waitForRequest",
+  "waitForResponse",
   "waitForSelector",
   "clock",
   "pageEvents",
@@ -64,6 +66,7 @@ const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
 const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
 const MAX_PAGE_EVENT_BUFFER = 1000;
+const MAX_NETWORK_EVENT_BUFFER = 2000;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
 const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessaging"]);
 const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
@@ -80,6 +83,7 @@ let permanentlyDisabled = false;
 const agentNavigationClaims = new Map();
 const recentNavigationKeys = [];
 const pageEventBuffers = new Map();
+const networkEventBuffers = new Map();
 let popupRiskSuppressionInFlight = null;
 let popupRiskSuppressionState = {
   ok: false,
@@ -729,6 +733,30 @@ if (chrome.webNavigation?.onHistoryStateUpdated?.addListener) {
     });
   });
 }
+if (chrome.webRequest?.onBeforeRequest?.addListener) {
+  chrome.webRequest.onBeforeRequest.addListener(
+    (details) => recordWebRequestStarted(details),
+    { urls: ["<all_urls>"] }
+  );
+}
+if (chrome.webRequest?.onHeadersReceived?.addListener) {
+  chrome.webRequest.onHeadersReceived.addListener(
+    (details) => recordWebRequestHeadersReceived(details),
+    { urls: ["<all_urls>"] }
+  );
+}
+if (chrome.webRequest?.onCompleted?.addListener) {
+  chrome.webRequest.onCompleted.addListener(
+    (details) => recordWebRequestCompleted(details),
+    { urls: ["<all_urls>"] }
+  );
+}
+if (chrome.webRequest?.onErrorOccurred?.addListener) {
+  chrome.webRequest.onErrorOccurred.addListener(
+    (details) => recordWebRequestFailed(details),
+    { urls: ["<all_urls>"] }
+  );
+}
 
 startBridgeFromEvent();
 
@@ -785,6 +813,10 @@ async function handleCommand(command) {
       result = await handleWaitForLoadState(params);
     } else if (kind === "waitForUrl") {
       result = await handleWaitForUrl(params);
+    } else if (kind === "waitForRequest") {
+      result = await handleWaitForNetwork(params, false);
+    } else if (kind === "waitForResponse") {
+      result = await handleWaitForNetwork(params, true);
     } else if (kind === "waitForSelector") {
       result = await handleWaitForSelector(params);
     } else if (kind === "clock") {
@@ -1782,6 +1814,50 @@ async function handleWaitForUrl(params) {
       );
     }
     await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsed)));
+  }
+}
+
+async function handleWaitForNetwork(params, requireResponse) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const wait = normalizeNetworkWaitParams(params, requireResponse);
+  const state = await tabPageState(selected.tabId, selected.target);
+  const { buffer } = ensureNetworkEventBuffer(selected.tabId, state);
+  const recorder = await ensureInPageNetworkRecorder(selected.tabId);
+  const startSeq = buffer.nextSeq;
+  const startedAt = Date.now();
+  let pollCount = 0;
+  while (true) {
+    pollCount += 1;
+    await mergeInPageNetworkEvents(selected.tabId, buffer, recorder);
+    const matched = findNetworkWaitEntry(buffer, wait, requireResponse, startSeq);
+    const elapsed = elapsedSince(startedAt);
+    if (matched) {
+      return waitForNetworkResult(
+        selected,
+        wait,
+        requireResponse,
+        true,
+        false,
+        elapsed,
+        pollCount,
+        matched,
+        buffer
+      );
+    }
+    if (elapsed >= wait.timeoutMs) {
+      return waitForNetworkResult(
+        selected,
+        wait,
+        requireResponse,
+        false,
+        true,
+        elapsed,
+        pollCount,
+        null,
+        buffer
+      );
+    }
+    await sleep(Math.min(wait.pollingIntervalMs, Math.max(1, wait.timeoutMs - elapsed)));
   }
 }
 
@@ -3558,6 +3634,109 @@ function waitForUrlResult(
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
+  };
+}
+
+function waitForNetworkResult(
+  selected,
+  wait,
+  requireResponse,
+  conditionMet,
+  timedOut,
+  elapsedMs,
+  pollCount,
+  matchedEntry,
+  buffer
+) {
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: selected.target.chrome_window_id,
+    wait_kind: requireResponse ? "response" : "request",
+    url_pattern: wait.url,
+    match_kind: wait.matchKind,
+    method: wait.method,
+    status: wait.status,
+    resource_type: wait.resourceType,
+    condition_met: Boolean(conditionMet),
+    timed_out: Boolean(timedOut),
+    elapsed_ms: elapsedMs,
+    timeout_ms: wait.timeoutMs,
+    polling_interval_ms: wait.pollingIntervalMs,
+    poll_count: pollCount,
+    event_count: buffer.nextSeq,
+    total_buffered: buffer.entries.length,
+    dropped: buffer.dropped,
+    matched_entry: matchedEntry ? networkEntryToWire(matchedEntry) : null,
+    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer",
+    backend_tier_used: "chrome_tabs_extension",
+    required_foreground: false,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
+function findNetworkWaitEntry(buffer, wait, requireResponse, startSeq) {
+  if (!buffer || !Array.isArray(buffer.entries)) {
+    return null;
+  }
+  return buffer.entries.find((entry) => {
+    if (Number(entry.seq || 0) <= startSeq) {
+      return false;
+    }
+    if (requireResponse && !(entry.response_received && entry.status !== null && entry.status !== undefined)) {
+      return false;
+    }
+    if (wait.method && !stringEqualsIgnoreCase(entry.method, wait.method)) {
+      return false;
+    }
+    if (wait.status !== null && wait.status !== undefined && Number(entry.status) !== wait.status) {
+      return false;
+    }
+    if (wait.resourceType && !networkResourceTypeMatches(entry, wait.resourceType)) {
+      return false;
+    }
+    if (wait.url) {
+      const candidate = requireResponse ? (entry.response_url || entry.url || "") : (entry.url || "");
+      if (!waitForUrlMatches(candidate, wait.url, wait.matchKind)) {
+        return false;
+      }
+    }
+    return true;
+  }) || null;
+}
+
+function networkResourceTypeMatches(entry, expected) {
+  const actual = String(entry.resource_type || "");
+  if (actual.toLowerCase() === String(expected || "").toLowerCase()) {
+    return true;
+  }
+  const raw = String(entry.web_request_type || "");
+  return raw.toLowerCase() === String(expected || "").toLowerCase();
+}
+
+function networkEntryToWire(entry) {
+  return {
+    seq: Number(entry.seq || 0),
+    request_id: String(entry.request_id || ""),
+    url: entry.url || null,
+    method: entry.method || null,
+    resource_type: entry.resource_type || null,
+    request_headers: entry.request_headers || null,
+    response_received: Boolean(entry.response_received),
+    response_url: entry.response_url || null,
+    status: entry.status === null || entry.status === undefined ? null : Number(entry.status),
+    status_text: entry.status_text || null,
+    response_headers: entry.response_headers || null,
+    response_timing: entry.response_timing || null,
+    protocol: entry.protocol || null,
+    remote_ip_address: entry.remote_ip_address || null,
+    remote_port: entry.remote_port === null || entry.remote_port === undefined ? null : Number(entry.remote_port),
+    encoded_data_length: entry.encoded_data_length === null || entry.encoded_data_length === undefined ? null : Number(entry.encoded_data_length),
+    loading_finished: Boolean(entry.loading_finished),
+    loading_failed: Boolean(entry.loading_failed),
+    failure_error_text: entry.failure_error_text || null
   };
 }
 
@@ -9761,6 +9940,497 @@ function ensurePageEventBuffer(tabId, state = {}) {
   return { buffer, newlyArmed: true };
 }
 
+function ensureNetworkEventBuffer(tabId, state = {}) {
+  let buffer = networkEventBuffers.get(tabId);
+  if (buffer) {
+    return { buffer, newlyArmed: false };
+  }
+  const now = Date.now();
+  buffer = {
+    tabId,
+    targetId: state.target_id || targetIdForTabId(tabId),
+    capacity: MAX_NETWORK_EVENT_BUFFER,
+    entries: [],
+    requests: new Map(),
+    nextSeq: 0,
+    dropped: 0,
+    armedAtUnixMs: now
+  };
+  networkEventBuffers.set(tabId, buffer);
+  return { buffer, newlyArmed: true };
+}
+
+function networkBufferForTabId(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    return null;
+  }
+  return networkEventBuffers.get(tabId) || null;
+}
+
+function recordWebRequestStarted(details) {
+  const buffer = networkBufferForTabId(details?.tabId);
+  if (!buffer) {
+    return;
+  }
+  const entry = ensureNetworkEntry(buffer, details);
+  entry.url = String(details.url || entry.url || "");
+  entry.method = String(details.method || entry.method || "").toUpperCase() || null;
+  entry.resource_type = webRequestResourceTypeToCdp(details.type);
+  entry.web_request_type = String(details.type || "");
+  touchNetworkEntry(buffer, entry);
+}
+
+function recordWebRequestHeadersReceived(details) {
+  const buffer = networkBufferForTabId(details?.tabId);
+  if (!buffer) {
+    return;
+  }
+  const entry = ensureNetworkEntry(buffer, details);
+  entry.response_received = true;
+  entry.response_url = String(details.url || entry.response_url || entry.url || "");
+  if (entry.url === null) {
+    entry.url = entry.response_url;
+  }
+  entry.status = Number.isFinite(Number(details.statusCode)) ? Number(details.statusCode) : entry.status;
+  entry.status_text = statusTextFromWebRequest(details.statusLine, entry.status);
+  entry.protocol = protocolFromStatusLine(details.statusLine) || entry.protocol;
+  entry.remote_ip_address = details.ip || entry.remote_ip_address || null;
+  entry.response_headers = headersArrayToObject(details.responseHeaders);
+  touchNetworkEntry(buffer, entry);
+}
+
+function recordWebRequestCompleted(details) {
+  const buffer = networkBufferForTabId(details?.tabId);
+  if (!buffer) {
+    return;
+  }
+  const entry = ensureNetworkEntry(buffer, details);
+  entry.response_received = true;
+  entry.response_url = String(details.url || entry.response_url || entry.url || "");
+  if (entry.url === null) {
+    entry.url = entry.response_url;
+  }
+  entry.status = Number.isFinite(Number(details.statusCode)) ? Number(details.statusCode) : entry.status;
+  entry.status_text = statusTextFromWebRequest(details.statusLine, entry.status);
+  entry.protocol = protocolFromStatusLine(details.statusLine) || entry.protocol;
+  entry.remote_ip_address = details.ip || entry.remote_ip_address || null;
+  entry.loading_finished = true;
+  entry.loading_failed = false;
+  entry.failure_error_text = null;
+  touchNetworkEntry(buffer, entry);
+}
+
+function recordWebRequestFailed(details) {
+  const buffer = networkBufferForTabId(details?.tabId);
+  if (!buffer) {
+    return;
+  }
+  const entry = ensureNetworkEntry(buffer, details);
+  entry.url = String(details.url || entry.url || "");
+  entry.method = String(details.method || entry.method || "").toUpperCase() || entry.method;
+  entry.resource_type = entry.resource_type || webRequestResourceTypeToCdp(details.type);
+  entry.web_request_type = entry.web_request_type || String(details.type || "");
+  entry.loading_finished = false;
+  entry.loading_failed = true;
+  entry.failure_error_text = details.error || "webRequest.onErrorOccurred";
+  touchNetworkEntry(buffer, entry);
+}
+
+function ensureNetworkEntry(buffer, details) {
+  const requestId = String(details?.requestId || `${buffer.tabId}:${buffer.nextSeq + 1}`);
+  let entry = buffer.requests.get(requestId);
+  if (entry) {
+    return entry;
+  }
+  entry = {
+    seq: 0,
+    request_id: requestId,
+    url: details?.url ? String(details.url) : null,
+    method: details?.method ? String(details.method).toUpperCase() : null,
+    resource_type: webRequestResourceTypeToCdp(details?.type),
+    web_request_type: String(details?.type || ""),
+    request_headers: null,
+    response_received: false,
+    response_url: null,
+    status: null,
+    status_text: null,
+    response_headers: null,
+    response_timing: null,
+    protocol: null,
+    remote_ip_address: null,
+    remote_port: null,
+    encoded_data_length: null,
+    loading_finished: false,
+    loading_failed: false,
+    failure_error_text: null
+  };
+  buffer.requests.set(requestId, entry);
+  pushNetworkEntry(buffer, entry);
+  return entry;
+}
+
+function pushNetworkEntry(buffer, entry) {
+  buffer.entries.push(entry);
+  while (buffer.entries.length > buffer.capacity) {
+    const dropped = buffer.entries.shift();
+    buffer.dropped += 1;
+    if (dropped && buffer.requests.get(dropped.request_id) === dropped) {
+      buffer.requests.delete(dropped.request_id);
+    }
+  }
+}
+
+function touchNetworkEntry(buffer, entry) {
+  buffer.nextSeq += 1;
+  entry.seq = buffer.nextSeq;
+  entry.observed_at_unix_ms = Date.now();
+}
+
+function webRequestResourceTypeToCdp(type) {
+  const value = String(type || "").toLowerCase();
+  switch (value) {
+    case "main_frame":
+    case "sub_frame":
+      return "Document";
+    case "stylesheet":
+      return "Stylesheet";
+    case "script":
+      return "Script";
+    case "image":
+      return "Image";
+    case "font":
+      return "Font";
+    case "object":
+      return "Other";
+    case "xmlhttprequest":
+      return "XHR";
+    case "ping":
+      return "Ping";
+    case "csp_report":
+      return "CSPViolationReport";
+    case "media":
+      return "Media";
+    case "websocket":
+      return "WebSocket";
+    case "webtransport":
+      return "WebTransport";
+    case "webbundle":
+      return "WebBundle";
+    default:
+      return value ? value.replace(/(^|_)([a-z])/g, (_, _prefix, letter) => letter.toUpperCase()) : null;
+  }
+}
+
+function headersArrayToObject(headers) {
+  if (!Array.isArray(headers) || headers.length === 0) {
+    return null;
+  }
+  const result = {};
+  for (const header of headers) {
+    const name = String(header?.name || "").trim();
+    if (!name) {
+      continue;
+    }
+    const value = String(header?.value || "");
+    if (Object.prototype.hasOwnProperty.call(result, name)) {
+      if (Array.isArray(result[name])) {
+        result[name].push(value);
+      } else {
+        result[name] = [result[name], value];
+      }
+    } else {
+      result[name] = value;
+    }
+  }
+  return Object.keys(result).length === 0 ? null : result;
+}
+
+function protocolFromStatusLine(statusLine) {
+  const line = String(statusLine || "").trim();
+  const match = line.match(/^(HTTP\/[0-9.]+|h[0-9]+)\s+/i);
+  return match ? match[1] : null;
+}
+
+function statusTextFromWebRequest(statusLine, status) {
+  const line = String(statusLine || "").trim();
+  if (!line) {
+    return null;
+  }
+  const escapedStatus = String(status ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp(`^(?:HTTP\\/[0-9.]+|h[0-9]+)\\s+${escapedStatus}\\s*(.*)$`, "i");
+  const match = line.match(regex);
+  if (match) {
+    return match[1] || "";
+  }
+  return line;
+}
+
+async function ensureInPageNetworkRecorder(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    if (!chrome.webRequest?.onBeforeRequest?.addListener) {
+      throw bridgeError(
+        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+        "network waits require chrome.webRequest or chrome.scripting.executeScript"
+      );
+    }
+    return { available: false, reason: "chrome.scripting unavailable" };
+  }
+  try {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: installSynapseNetworkRecorderInPage
+    });
+    const first = Array.isArray(injected) ? injected[0]?.result : null;
+    return {
+      available: Boolean(first?.ok),
+      reason: first?.reason || "installed",
+      installed_at_seq: Number(first?.next_seq || 0)
+    };
+  } catch (error) {
+    if (!chrome.webRequest?.onBeforeRequest?.addListener) {
+      throw bridgeError(
+        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+        `network wait recorder injection failed and chrome.webRequest is unavailable: ${errorMessage(error)}`
+      );
+    }
+    return { available: false, reason: errorMessage(error) };
+  }
+}
+
+async function mergeInPageNetworkEvents(tabId, buffer, recorder) {
+  if (!recorder?.available || !chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return;
+  }
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: readSynapseNetworkRecorderInPage
+    });
+  } catch (error) {
+    recorder.available = false;
+    recorder.reason = errorMessage(error);
+    return;
+  }
+  const entries = Array.isArray(injected) ? injected.flatMap((item) => item?.result?.entries || []) : [];
+  for (const raw of entries) {
+    mergeInPageNetworkEntry(buffer, raw);
+  }
+}
+
+function mergeInPageNetworkEntry(buffer, raw) {
+  if (!raw || typeof raw !== "object") {
+    return;
+  }
+  const requestId = `page:${String(raw.request_id || "")}`;
+  if (requestId === "page:") {
+    return;
+  }
+  let entry = buffer.requests.get(requestId);
+  if (!entry) {
+    entry = ensureNetworkEntry(buffer, {
+      requestId,
+      url: raw.url,
+      method: raw.method,
+      type: String(raw.resource_type || "").toLowerCase() === "xhr" ? "xmlhttprequest" : "fetch"
+    });
+  }
+  const rawSeq = Number(raw.seq || 0);
+  if (Number(entry.page_recorder_seq || 0) >= rawSeq) {
+    return;
+  }
+  entry.page_recorder_seq = rawSeq;
+  entry.url = raw.url ? String(raw.url) : entry.url;
+  entry.method = raw.method ? String(raw.method).toUpperCase() : entry.method;
+  entry.resource_type = raw.resource_type ? String(raw.resource_type) : entry.resource_type;
+  entry.response_received = Boolean(raw.response_received);
+  entry.response_url = raw.response_url ? String(raw.response_url) : entry.response_url;
+  entry.status = Number.isFinite(Number(raw.status)) ? Number(raw.status) : entry.status;
+  entry.status_text = raw.status_text === undefined || raw.status_text === null ? entry.status_text : String(raw.status_text);
+  entry.loading_finished = Boolean(raw.loading_finished);
+  entry.loading_failed = Boolean(raw.loading_failed);
+  entry.failure_error_text = raw.failure_error_text ? String(raw.failure_error_text) : null;
+  entry.response_headers = null;
+  entry.request_headers = null;
+  entry.response_timing = null;
+  touchNetworkEntry(buffer, entry);
+}
+
+function installSynapseNetworkRecorderInPage() {
+  const global = globalThis;
+  if (global.__synapseBridgeNetworkRecorder?.installed) {
+    return {
+      ok: true,
+      reason: "already_installed",
+      next_seq: global.__synapseBridgeNetworkRecorder.nextSeq || 0
+    };
+  }
+  const recorder = {
+    installed: true,
+    nextId: 0,
+    nextSeq: 0,
+    maxEntries: 1000,
+    entries: [],
+    byId: Object.create(null)
+  };
+  const touch = (entry) => {
+    recorder.nextSeq += 1;
+    entry.seq = recorder.nextSeq;
+    entry.observed_at_unix_ms = Date.now();
+  };
+  const remember = (entry) => {
+    recorder.byId[entry.request_id] = entry;
+    recorder.entries.push(entry);
+    while (recorder.entries.length > recorder.maxEntries) {
+      const dropped = recorder.entries.shift();
+      if (dropped && recorder.byId[dropped.request_id] === dropped) {
+        delete recorder.byId[dropped.request_id];
+      }
+    }
+    touch(entry);
+    return entry;
+  };
+  const requestUrl = (input) => {
+    try {
+      if (typeof Request !== "undefined" && input instanceof Request) {
+        return input.url;
+      }
+    } catch (_) {
+      // Request can be unavailable in unusual page contexts.
+    }
+    try {
+      return new URL(String(input), String(global.location?.href || "about:blank")).href;
+    } catch (_) {
+      return String(input || "");
+    }
+  };
+  const requestMethod = (input, init) => {
+    const method = init?.method || (typeof Request !== "undefined" && input instanceof Request ? input.method : null) || "GET";
+    return String(method).toUpperCase();
+  };
+  if (typeof global.fetch === "function") {
+    const originalFetch = global.fetch;
+    global.fetch = function synapseRecordedFetch(input, init) {
+      const entry = remember({
+        request_id: `fetch-${++recorder.nextId}`,
+        url: requestUrl(input),
+        method: requestMethod(input, init),
+        resource_type: "Fetch",
+        response_received: false,
+        response_url: null,
+        status: null,
+        status_text: null,
+        loading_finished: false,
+        loading_failed: false,
+        failure_error_text: null
+      });
+      const promise = Reflect.apply(originalFetch, this, arguments);
+      return Promise.resolve(promise).then(
+        (response) => {
+          entry.response_received = true;
+          entry.response_url = response?.url || entry.url;
+          entry.status = Number(response?.status || 0);
+          entry.status_text = response?.statusText || "";
+          entry.loading_finished = true;
+          entry.loading_failed = false;
+          entry.failure_error_text = null;
+          touch(entry);
+          return response;
+        },
+        (error) => {
+          entry.loading_finished = false;
+          entry.loading_failed = true;
+          entry.failure_error_text = String(error?.message || error);
+          touch(entry);
+          throw error;
+        }
+      );
+    };
+  }
+  if (typeof global.XMLHttpRequest === "function") {
+    const OriginalXHR = global.XMLHttpRequest;
+    global.XMLHttpRequest = function SynapseRecordedXMLHttpRequest() {
+      const xhr = new OriginalXHR();
+      let entry = null;
+      const originalOpen = xhr.open;
+      const originalSend = xhr.send;
+      xhr.open = function synapseRecordedXhrOpen(method, url) {
+        entry = remember({
+          request_id: `xhr-${++recorder.nextId}`,
+          url: requestUrl(url),
+          method: String(method || "GET").toUpperCase(),
+          resource_type: "XHR",
+          response_received: false,
+          response_url: null,
+          status: null,
+          status_text: null,
+          loading_finished: false,
+          loading_failed: false,
+          failure_error_text: null
+        });
+        return Reflect.apply(originalOpen, xhr, arguments);
+      };
+      xhr.send = function synapseRecordedXhrSend() {
+        if (!entry) {
+          entry = remember({
+            request_id: `xhr-${++recorder.nextId}`,
+            url: "",
+            method: "GET",
+            resource_type: "XHR",
+            response_received: false,
+            response_url: null,
+            status: null,
+            status_text: null,
+            loading_finished: false,
+            loading_failed: false,
+            failure_error_text: null
+          });
+        }
+        xhr.addEventListener("load", () => {
+          entry.response_received = true;
+          entry.response_url = xhr.responseURL || entry.url;
+          entry.status = Number(xhr.status || 0);
+          entry.status_text = xhr.statusText || "";
+          entry.loading_finished = true;
+          entry.loading_failed = false;
+          entry.failure_error_text = null;
+          touch(entry);
+        });
+        xhr.addEventListener("error", () => {
+          entry.loading_finished = false;
+          entry.loading_failed = true;
+          entry.failure_error_text = "XMLHttpRequest error";
+          touch(entry);
+        });
+        xhr.addEventListener("abort", () => {
+          entry.loading_finished = false;
+          entry.loading_failed = true;
+          entry.failure_error_text = "XMLHttpRequest abort";
+          touch(entry);
+        });
+        return Reflect.apply(originalSend, xhr, arguments);
+      };
+      return xhr;
+    };
+  }
+  global.__synapseBridgeNetworkRecorder = recorder;
+  return { ok: true, reason: "installed", next_seq: recorder.nextSeq };
+}
+
+function readSynapseNetworkRecorderInPage() {
+  const recorder = globalThis.__synapseBridgeNetworkRecorder;
+  if (!recorder?.installed) {
+    return { ok: false, entries: [] };
+  }
+  return {
+    ok: true,
+    next_seq: recorder.nextSeq || 0,
+    entries: Array.isArray(recorder.entries) ? recorder.entries.map((entry) => ({ ...entry })) : []
+  };
+}
+
 function updatePageSnapshot(buffer, state = {}) {
   if (!buffer) {
     return;
@@ -10001,6 +10671,7 @@ function recordTabRemovedForPageEvents(tabId) {
     });
   }
   pageEventBuffers.delete(tabId);
+  networkEventBuffers.delete(tabId);
 }
 
 function recordWebNavigationPageEvent(eventKind, details, extra = {}) {
@@ -10147,6 +10818,52 @@ function normalizeWaitForUrlMatchKind(value) {
     return matchKind;
   }
   throw bridgeError(ERROR_ATTACH_FAILED, `unsupported waitForUrl matchKind ${JSON.stringify(matchKind)}`);
+}
+
+function normalizeNetworkWaitParams(params, requireResponse) {
+  const url = params.url === undefined || params.url === null ? null : String(params.url);
+  if (url !== null) {
+    if (url.trim().length === 0) {
+      throw bridgeError(ERROR_ATTACH_FAILED, "network wait url must be non-empty when supplied");
+    }
+    if (url.trim() !== url || url.includes("\u0000")) {
+      throw bridgeError(ERROR_ATTACH_FAILED, "network wait url must have no surrounding whitespace or NUL");
+    }
+  }
+  const matchKind = normalizeWaitForUrlMatchKind(params.matchKind);
+  if (url === null && matchKind !== "exact") {
+    throw bridgeError(ERROR_ATTACH_FAILED, "network wait matchKind requires url");
+  }
+  const method = params.method === undefined || params.method === null ? null : String(params.method).trim();
+  if (method !== null && !/^[A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]{0,63}$/.test(method)) {
+    throw bridgeError(ERROR_ATTACH_FAILED, "network wait method must be a valid HTTP token");
+  }
+  const resourceType = params.resourceType === undefined || params.resourceType === null
+    ? (params.resource_type === undefined || params.resource_type === null ? null : String(params.resource_type).trim())
+    : String(params.resourceType).trim();
+  if (resourceType !== null && !/^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/.test(resourceType)) {
+    throw bridgeError(ERROR_ATTACH_FAILED, "network wait resource_type must be a valid token");
+  }
+  let status = null;
+  if (params.status !== undefined && params.status !== null) {
+    status = Number(params.status);
+    if (!Number.isInteger(status) || status < 0 || status > 999 || !requireResponse) {
+      throw bridgeError(ERROR_ATTACH_FAILED, "network wait status must be an integer from 0 through 999 for response waits");
+    }
+  }
+  return {
+    url,
+    matchKind,
+    method: method ? method.toUpperCase() : null,
+    status,
+    resourceType: resourceType || null,
+    timeoutMs: normalizeWaitTimeout(params.timeoutMs),
+    pollingIntervalMs: normalizePollingInterval(params.pollingIntervalMs)
+  };
+}
+
+function stringEqualsIgnoreCase(left, right) {
+  return String(left || "").toLowerCase() === String(right || "").toLowerCase();
 }
 
 function normalizeWaitForSelectorState(value) {

@@ -2291,7 +2291,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Wait until the calling session's owned browser tab observes a network request matching optional URL exact/glob/regex, method, and resource_type predicates. Uses the persistent target-scoped CDP Network buffer and returns the matched request details; timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+        description = "Wait until the calling session's owned browser tab observes a network request matching optional URL exact/glob/regex, method, and resource_type predicates. Uses the persistent target-scoped CDP Network buffer when available, or the normal Chrome bridge for chrome-tab:* targets using chrome.webRequest event buffering. Returns the matched request details; timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_wait_for_request(
         &self,
@@ -2352,7 +2352,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Wait until the calling session's owned browser tab observes a network response matching optional URL exact/glob/regex, method, status, and resource_type predicates. Uses the persistent target-scoped CDP Network buffer and returns the matched response details; timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+        description = "Wait until the calling session's owned browser tab observes a network response matching optional URL exact/glob/regex, method, status, and resource_type predicates. Uses the persistent target-scoped CDP Network buffer when available, or the normal Chrome bridge for chrome-tab:* targets using chrome.webRequest event buffering. Returns the matched response details; timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_wait_for_response(
         &self,
@@ -5983,6 +5983,85 @@ impl SynapseService {
     ) -> Result<BrowserWaitForRequestResponse, ErrorData> {
         const TOOL: &str = "browser_wait_for_request";
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let waited = crate::chrome_debugger_bridge::wait_for_request(
+                    window_hwnd,
+                    cdp_target_id,
+                    wait.url.as_deref(),
+                    browser_wait_for_url_match_kind_bridge_name(wait.match_kind),
+                    wait.method.as_deref(),
+                    wait.resource_type.as_deref(),
+                    wait.timeout_ms,
+                    wait.polling_interval_ms,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_wait_for_request normal bridge waitForRequest failed for target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if waited.timed_out {
+                    return Err(mcp_error(
+                        error_codes::BROWSER_WAIT_TIMEOUT,
+                        format!(
+                            "browser_wait_for_request timed out after {} ms; url_filter={:?} match_kind={:?} method={:?} status={:?} resource_type={:?} poll_count={} event_count={} total_buffered={} dropped={}",
+                            wait.timeout_ms,
+                            wait.url,
+                            wait.match_kind,
+                            wait.method,
+                            wait.status,
+                            wait.resource_type,
+                            waited.poll_count,
+                            waited.event_count,
+                            waited.total_buffered,
+                            waited.dropped
+                        ),
+                    ));
+                }
+                let matched_entry = waited.matched_entry.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_wait_for_request normal bridge returned condition_met without matched_entry",
+                    )
+                })?;
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_WAIT_FOR_REQUEST",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %waited.target_id,
+                    request_id = %matched_entry.request_id,
+                    elapsed_ms = waited.elapsed_ms,
+                    poll_count = waited.poll_count,
+                    method = ?matched_entry.method,
+                    url = ?matched_entry.url,
+                    "readback=chrome.webRequest(buffer) outcome=wait_satisfied"
+                );
+                return Ok(BrowserWaitForRequestResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: "chrome_bridge".to_owned(),
+                    cdp_target_id: waited.target_id,
+                    url_pattern: wait.url.clone(),
+                    match_kind: wait.match_kind,
+                    method: wait.method.clone(),
+                    resource_type: wait.resource_type.clone(),
+                    condition_met: waited.condition_met,
+                    elapsed_ms: waited.elapsed_ms,
+                    timeout_ms: wait.timeout_ms,
+                    polling_interval_ms: wait.polling_interval_ms,
+                    poll_count: waited.poll_count,
+                    matched_entry: chrome_bridge_network_entry_to_wire(matched_entry),
+                    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer(browser_wait_for_request)"
+                        .to_owned(),
+                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    required_foreground: false,
+                });
+            }
             return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
         };
         let (entry, elapsed_ms, poll_count) = self
@@ -6047,6 +6126,89 @@ impl SynapseService {
     ) -> Result<BrowserWaitForNetworkResponseResponse, ErrorData> {
         const TOOL: &str = "browser_wait_for_response";
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let waited = crate::chrome_debugger_bridge::wait_for_response(
+                    window_hwnd,
+                    cdp_target_id,
+                    wait.url.as_deref(),
+                    browser_wait_for_url_match_kind_bridge_name(wait.match_kind),
+                    wait.method.as_deref(),
+                    wait.status,
+                    wait.resource_type.as_deref(),
+                    wait.timeout_ms,
+                    wait.polling_interval_ms,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_wait_for_response normal bridge waitForResponse failed for target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if waited.timed_out {
+                    return Err(mcp_error(
+                        error_codes::BROWSER_WAIT_TIMEOUT,
+                        format!(
+                            "browser_wait_for_response timed out after {} ms; url_filter={:?} match_kind={:?} method={:?} status={:?} resource_type={:?} poll_count={} event_count={} total_buffered={} dropped={}",
+                            wait.timeout_ms,
+                            wait.url,
+                            wait.match_kind,
+                            wait.method,
+                            wait.status,
+                            wait.resource_type,
+                            waited.poll_count,
+                            waited.event_count,
+                            waited.total_buffered,
+                            waited.dropped
+                        ),
+                    ));
+                }
+                let matched_entry = waited.matched_entry.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_wait_for_response normal bridge returned condition_met without matched_entry",
+                    )
+                })?;
+                let status = matched_entry.status;
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_WAIT_FOR_RESPONSE",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %waited.target_id,
+                    request_id = %matched_entry.request_id,
+                    elapsed_ms = waited.elapsed_ms,
+                    poll_count = waited.poll_count,
+                    status = ?status,
+                    method = ?matched_entry.method,
+                    url = ?matched_entry.url,
+                    "readback=chrome.webRequest(buffer) outcome=wait_satisfied"
+                );
+                return Ok(BrowserWaitForNetworkResponseResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: "chrome_bridge".to_owned(),
+                    cdp_target_id: waited.target_id,
+                    url_pattern: wait.url.clone(),
+                    match_kind: wait.match_kind,
+                    method: wait.method.clone(),
+                    status: wait.status,
+                    resource_type: wait.resource_type.clone(),
+                    condition_met: waited.condition_met,
+                    elapsed_ms: waited.elapsed_ms,
+                    timeout_ms: wait.timeout_ms,
+                    polling_interval_ms: wait.polling_interval_ms,
+                    poll_count: waited.poll_count,
+                    matched_entry: chrome_bridge_network_entry_to_wire(matched_entry),
+                    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer(browser_wait_for_response)"
+                        .to_owned(),
+                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    required_foreground: false,
+                });
+            }
             return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
         };
         let (entry, elapsed_ms, poll_count) = self
@@ -9314,6 +9476,33 @@ fn browser_network_entry_to_wire(entry: &synapse_a11y::CdpNetworkEntry) -> Brows
         loading_finished: entry.loading_finished,
         loading_failed: entry.loading_failed,
         failure_error_text: entry.failure_error_text.clone(),
+    }
+}
+
+#[cfg(windows)]
+fn chrome_bridge_network_entry_to_wire(
+    entry: crate::chrome_debugger_bridge::ChromeDebuggerNetworkWaitEntry,
+) -> BrowserNetworkWaitEntry {
+    BrowserNetworkWaitEntry {
+        seq: entry.seq,
+        request_id: entry.request_id,
+        url: entry.url,
+        method: entry.method,
+        resource_type: entry.resource_type,
+        request_headers: entry.request_headers,
+        response_received: entry.response_received,
+        response_url: entry.response_url,
+        status: entry.status,
+        status_text: entry.status_text,
+        response_headers: entry.response_headers,
+        response_timing: entry.response_timing,
+        protocol: entry.protocol,
+        remote_ip_address: entry.remote_ip_address,
+        remote_port: entry.remote_port,
+        encoded_data_length: entry.encoded_data_length,
+        loading_finished: entry.loading_finished,
+        loading_failed: entry.loading_failed,
+        failure_error_text: entry.failure_error_text,
     }
 }
 

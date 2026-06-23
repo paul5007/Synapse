@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-22-url-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-22-network-waits-v2";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "197a24a5e5b56699f377bd2990607a9a26c0e368a665f055e4519702df45da7c";
+    "4116781a862e3bc74b07ec99d418a611fbc0505ec8d3b84a68ab1a4867fd9104";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -66,6 +66,8 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "waitForFunction",
     "waitForLoadState",
     "waitForUrl",
+    "waitForRequest",
+    "waitForResponse",
     "waitForSelector",
     "clock",
     "pageEvents",
@@ -85,7 +87,7 @@ const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge is debugger-free and uses chrome.tabs/chrome.scripting over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake without nativeMessaging, never creates helper Chrome windows, and refuses attach-capable debugger commands and general-purpose browser_evaluate before queueing any Chrome command; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge is debugger-free and uses chrome.tabs/chrome.scripting/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake without nativeMessaging, never creates helper Chrome windows, and refuses attach-capable debugger commands and general-purpose browser_evaluate before queueing any Chrome command; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call cdp_bridge_reload; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop so it auto-loads the bundled unpacked extension into the existing active Chrome profile; if health reports installed=false, cdp_bridge_reload cannot repair because Chrome has no loaded extension host to receive reloadSelf";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
@@ -2045,6 +2047,98 @@ pub(crate) struct ChromeDebuggerWaitForUrlResult {
     pub title: String,
     #[serde(default)]
     pub ready_state: String,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub backend_tier_used: String,
+    #[serde(default)]
+    pub required_foreground: bool,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+    #[serde(default)]
+    pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerNetworkWaitEntry {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub resource_type: Option<String>,
+    #[serde(default)]
+    pub request_headers: Option<Value>,
+    #[serde(default)]
+    pub response_received: bool,
+    #[serde(default)]
+    pub response_url: Option<String>,
+    #[serde(default)]
+    pub status: Option<i64>,
+    #[serde(default)]
+    pub status_text: Option<String>,
+    #[serde(default)]
+    pub response_headers: Option<Value>,
+    #[serde(default)]
+    pub response_timing: Option<Value>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub remote_ip_address: Option<String>,
+    #[serde(default)]
+    pub remote_port: Option<i64>,
+    #[serde(default)]
+    pub encoded_data_length: Option<f64>,
+    #[serde(default)]
+    pub loading_finished: bool,
+    #[serde(default)]
+    pub loading_failed: bool,
+    #[serde(default)]
+    pub failure_error_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerWaitForNetworkResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub wait_kind: String,
+    #[serde(default)]
+    pub url_pattern: Option<String>,
+    #[serde(default)]
+    pub match_kind: String,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub status: Option<i64>,
+    #[serde(default)]
+    pub resource_type: Option<String>,
+    #[serde(default)]
+    pub condition_met: bool,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub polling_interval_ms: u64,
+    #[serde(default)]
+    pub poll_count: u64,
+    #[serde(default)]
+    pub event_count: u64,
+    #[serde(default)]
+    pub total_buffered: usize,
+    #[serde(default)]
+    pub dropped: u64,
+    #[serde(default)]
+    pub matched_entry: Option<ChromeDebuggerNetworkWaitEntry>,
     #[serde(default)]
     pub readback_backend: String,
     #[serde(default)]
@@ -4724,6 +4818,93 @@ pub(crate) async fn wait_for_url(
     serde_json::from_value::<ChromeDebuggerWaitForUrlResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger waitForUrl response: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn wait_for_request(
+    hwnd: i64,
+    target_id: &str,
+    url: Option<&str>,
+    match_kind: &str,
+    method: Option<&str>,
+    resource_type: Option<&str>,
+    timeout_ms: u64,
+    polling_interval_ms: u64,
+) -> Result<ChromeDebuggerWaitForNetworkResult, ChromeDebuggerBridgeError> {
+    wait_for_network(
+        "waitForRequest",
+        hwnd,
+        target_id,
+        url,
+        match_kind,
+        method,
+        None,
+        resource_type,
+        timeout_ms,
+        polling_interval_ms,
+    )
+    .await
+}
+
+pub(crate) async fn wait_for_response(
+    hwnd: i64,
+    target_id: &str,
+    url: Option<&str>,
+    match_kind: &str,
+    method: Option<&str>,
+    status: Option<i64>,
+    resource_type: Option<&str>,
+    timeout_ms: u64,
+    polling_interval_ms: u64,
+) -> Result<ChromeDebuggerWaitForNetworkResult, ChromeDebuggerBridgeError> {
+    wait_for_network(
+        "waitForResponse",
+        hwnd,
+        target_id,
+        url,
+        match_kind,
+        method,
+        status,
+        resource_type,
+        timeout_ms,
+        polling_interval_ms,
+    )
+    .await
+}
+
+async fn wait_for_network(
+    kind: &'static str,
+    hwnd: i64,
+    target_id: &str,
+    url: Option<&str>,
+    match_kind: &str,
+    method: Option<&str>,
+    status: Option<i64>,
+    resource_type: Option<&str>,
+    timeout_ms: u64,
+    polling_interval_ms: u64,
+) -> Result<ChromeDebuggerWaitForNetworkResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, kind)?;
+    let result = bridge()
+        .send_command(
+            kind,
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+                "url": url,
+                "matchKind": match_kind,
+                "method": method,
+                "status": status,
+                "resourceType": resource_type,
+                "timeoutMs": timeout_ms,
+                "pollingIntervalMs": polling_interval_ms,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerWaitForNetworkResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger {kind} response: {error}"
         ))
     })
 }
