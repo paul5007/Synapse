@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-geolocation-v3";
-const BRIDGE_BUILD_SHA256 = "5b439c6b76df9d2e0d8b1c89bbf8861e87fe734893ad0ef013de83462e2af847";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-locale-v2";
+const BRIDGE_BUILD_SHA256 = "c2c338820f57545c3be0545e901df7522fdfd39aeb608350f81fcbf292a06d44";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
@@ -37,6 +37,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "viewportEmulation",
   "deviceEmulation",
   "geolocationEmulation",
+  "localeEmulation",
   "domAction",
   "coordinateClick",
   "reloadSelf",
@@ -81,6 +82,7 @@ const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessag
 const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
 const VIEWPORT_BASELINE_BY_TAB = new Map();
 const DEVICE_BASELINE_BY_TAB = new Map();
+const LOCALE_BASELINE_BY_TAB = new Map();
 
 let hostId = null;
 let bridgeToken = null;
@@ -340,6 +342,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "viewportEmulation",
     "deviceEmulation",
     "geolocationEmulation",
+    "localeEmulation",
     "navigateTab",
     "activateTab",
     "domAction",
@@ -842,6 +845,8 @@ async function handleCommand(command) {
       result = await handleDeviceEmulation(params);
     } else if (kind === "geolocationEmulation") {
       result = await handleGeolocationEmulation(params);
+    } else if (kind === "localeEmulation") {
+      result = await handleLocaleEmulation(params);
     } else if (kind === "typeActiveElement") {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
@@ -3190,6 +3195,63 @@ async function handleGeolocationEmulation(params) {
   };
 }
 
+async function handleLocaleEmulation(params) {
+  requireDebuggerApiAvailable("localeEmulation", params);
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const operation = normalizeLocaleEmulationOperation(params.operation);
+  const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
+  const before = await tabPageState(selected.tabId, selected.target);
+  const beforeLocale = await tabLocaleState(selected.tabId);
+  let requested = null;
+  let dispatch;
+  if (operation === "set") {
+    requested = normalizeLocaleOverride(params);
+    if (!LOCALE_BASELINE_BY_TAB.has(selected.tabId)) {
+      LOCALE_BASELINE_BY_TAB.set(selected.tabId, beforeLocale);
+    }
+    dispatch = await dispatchLocaleEmulationSet(selected.tabId, requested);
+    await applyLocaleEmulationShim(selected.tabId, requested);
+  } else {
+    rejectLocaleResetField(params.locale, "locale");
+    rejectLocaleResetField(params.timezoneId, "timezoneId");
+    dispatch = await dispatchLocaleEmulationReset(selected.tabId);
+    await clearLocaleEmulationShim(selected.tabId);
+  }
+  let after = requested
+    ? await waitForLocaleReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
+    : await waitForLocaleResetReadback(
+      selected.tabId,
+      selected.target,
+      waitTimeoutMs,
+      LOCALE_BASELINE_BY_TAB.get(selected.tabId)
+    );
+  if (!requested) {
+    LOCALE_BASELINE_BY_TAB.delete(selected.tabId);
+  }
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.page.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.page.chrome_window_id,
+    operation,
+    requested,
+    page_url: after.page.url || "",
+    page_title: after.page.title || "",
+    ready_state: after.page.ready_state || "",
+    locale: after.locale,
+    before_page: before,
+    before_locale: beforeLocale,
+    readback_backend: "chrome.debugger.Emulation locale/timezone + chrome.scripting.executeScript(MAIN Intl/Date shim/readback)",
+    backend_tier_used: "chrome_tabs_extension_debugger",
+    required_foreground: false,
+    source_of_truth: "normal Chrome bridge page script Intl.DateTimeFormat/NumberFormat and Date shim/readback",
+    method: dispatch.method,
+    debugger_protocol_version: dispatch.protocol_version,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
 function normalizeCdpInputAction(value) {
   const action = String(value || "").trim().toLowerCase();
   if (action === "hover" || action === "tap" || action === "drag" || action === "html5_drag") {
@@ -3411,6 +3473,81 @@ function geolocationOriginFromUrl(url) {
   );
 }
 
+function normalizeLocaleEmulationOperation(value) {
+  const operation = String(value || "set").trim().toLowerCase();
+  if (operation === "set" || operation === "reset") {
+    return operation;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `localeEmulation operation must be set or reset; got ${JSON.stringify(value)}`
+  );
+}
+
+function normalizeLocaleOverride(params) {
+  const locale = normalizeLocaleToken(params.locale, "locale", /^[A-Za-z0-9_-]+$/u, false);
+  const timezoneId = normalizeLocaleToken(params.timezoneId, "timezoneId", /^[A-Za-z0-9/_+-]+$/u, false);
+  if (!locale && !timezoneId) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "localeEmulation operation=set requires locale and/or timezoneId"
+    );
+  }
+  return {
+    locale,
+    timezone_id: timezoneId
+  };
+}
+
+function normalizeLocaleToken(value, fieldName, allowedPattern, required) {
+  if (value === null || value === undefined) {
+    if (required) {
+      throw bridgeError(
+        ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+        `localeEmulation ${fieldName} is required for operation=set`
+      );
+    }
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `localeEmulation ${fieldName} must be a string; got ${JSON.stringify(value)}`
+    );
+  }
+  if (value.trim() !== value || value.length === 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `localeEmulation ${fieldName} must be non-empty without surrounding whitespace`
+    );
+  }
+  if ([...value].length > 128) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `localeEmulation ${fieldName} must be at most 128 characters`
+    );
+  }
+  if (!allowedPattern.test(value)) {
+    const allowed = fieldName === "timezoneId"
+      ? "ASCII letters, digits, '/', '_', '-' or '+'"
+      : "ASCII letters, digits, '_' or '-'";
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `localeEmulation ${fieldName} must contain only ${allowed}`
+    );
+  }
+  return value;
+}
+
+function rejectLocaleResetField(value, fieldName) {
+  if (value !== null && value !== undefined) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `localeEmulation ${fieldName} is not valid for operation=reset`
+    );
+  }
+}
+
 async function dispatchDeviceEmulationSet(tabId, descriptor) {
   const debuggee = { tabId };
   const protocolVersion = "1.3";
@@ -3595,6 +3732,77 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
         await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation reset tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+}
+
+async function dispatchLocaleEmulationSet(tabId, requested) {
+  const debuggee = { tabId };
+  const protocolVersion = "1.3";
+  let attached = false;
+  const methods = [];
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+    attached = true;
+    if (requested.locale) {
+      await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {
+        locale: requested.locale
+      });
+      methods.push("Emulation.setLocaleOverride");
+    }
+    if (requested.timezone_id) {
+      await sendDebuggerCommand(debuggee, "Emulation.setTimezoneOverride", {
+        timezoneId: requested.timezone_id
+      });
+      methods.push("Emulation.setTimezoneOverride");
+    }
+    return {
+      method: methods.join("+"),
+      protocol_version: protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger localeEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for localeEmulation set tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+}
+
+async function dispatchLocaleEmulationReset(tabId) {
+  const debuggee = { tabId };
+  const protocolVersion = "1.3";
+  let attached = false;
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+    attached = true;
+    await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {});
+    await sendDebuggerCommand(debuggee, "Emulation.setTimezoneOverride", {
+      timezoneId: ""
+    });
+    return {
+      method: "Emulation.setLocaleOverride(default)+Emulation.setTimezoneOverride(default)",
+      protocol_version: protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger localeEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for localeEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
     }
   }
@@ -3900,6 +4108,103 @@ function summarizeGeolocationReadback(geolocation) {
   };
 }
 
+async function waitForLocaleReadback(tabId, fallbackTarget, waitTimeoutMs, requested) {
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const locale = await tabLocaleState(tabId);
+      last = { page, locale };
+      lastError = null;
+      if (localeMatchesRequest(locale, requested)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last locale=${JSON.stringify(last.locale)} requested=${JSON.stringify(requested)}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no locale readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `localeEmulation readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+function localeMatchesRequest(locale, requested) {
+  if (!locale) {
+    return false;
+  }
+  if (!requested) {
+    return true;
+  }
+  if (requested.timezone_id && String(locale.time_zone || "") !== requested.timezone_id) {
+    return false;
+  }
+  if (requested.locale && !localeReadbackMatchesRequestedLocale(locale.locale, requested.locale)) {
+    return false;
+  }
+  return true;
+}
+
+async function waitForLocaleResetReadback(tabId, fallbackTarget, waitTimeoutMs, baseline) {
+  if (!baseline) {
+    const page = await tabPageState(tabId, fallbackTarget);
+    const locale = await tabLocaleState(tabId);
+    return { page, locale };
+  }
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const locale = await tabLocaleState(tabId);
+      last = { page, locale };
+      lastError = null;
+      if (sameLocaleReadback(locale, baseline)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last locale=${JSON.stringify(last.locale)} baseline=${JSON.stringify(baseline)}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no locale readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `localeEmulation reset readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+function sameLocaleReadback(left, right) {
+  return (
+    left &&
+    right &&
+    String(left.locale || "") === String(right.locale || "") &&
+    String(left.calendar || "") === String(right.calendar || "") &&
+    String(left.numbering_system || "") === String(right.numbering_system || "") &&
+    String(left.time_zone || "") === String(right.time_zone || "") &&
+    String(left.sample_number || "") === String(right.sample_number || "") &&
+    String(left.sample_date || "") === String(right.sample_date || "") &&
+    String(left.date_string || "") === String(right.date_string || "") &&
+    Number(left.timezone_offset_minutes) === Number(right.timezone_offset_minutes)
+  );
+}
+
+function localeReadbackMatchesRequestedLocale(actual, requested) {
+  const actualNormalized = String(actual || "").replace(/_/g, "-").toLowerCase();
+  const requestedNormalized = String(requested || "").replace(/_/g, "-").toLowerCase();
+  return (
+    actualNormalized === requestedNormalized ||
+    actualNormalized.startsWith(`${requestedNormalized}-`)
+  );
+}
+
 async function applyViewportDprShim(tabId, deviceScaleFactor) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
@@ -4004,6 +4309,49 @@ async function clearGeolocationEmulationShim(tabId) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript geolocationEmulation(${tabId}) geolocation shim reset failed: ${errorMessage(error)}`
+    );
+  }
+}
+
+async function applyLocaleEmulationShim(tabId, requested) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: installLocaleEmulationShimInPage,
+      args: [requested]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript localeEmulation(${tabId}) locale shim failed: ${errorMessage(error)}`
+    );
+  }
+}
+
+async function clearLocaleEmulationShim(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: clearLocaleEmulationShimInPage
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript localeEmulation(${tabId}) locale shim reset failed: ${errorMessage(error)}`
     );
   }
 }
@@ -4241,6 +4589,36 @@ async function tabGeolocationState(tabId) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript geolocationEmulation(${tabId}) returned no geolocation metrics`
+    );
+  }
+  return metrics;
+}
+
+async function tabLocaleState(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: readLocaleStateInPage
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript localeEmulation(${tabId}) readback failed: ${errorMessage(error)}`
+    );
+  }
+  const metrics = results?.[0]?.result;
+  if (!metrics || typeof metrics !== "object") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript localeEmulation(${tabId}) returned no locale metrics`
     );
   }
   return metrics;
@@ -4654,6 +5032,231 @@ function clearGeolocationEmulationShimInPage() {
   };
 }
 
+function installLocaleEmulationShimInPage(requested) {
+  const stateKey = "__synapseLocaleEmulationOverride";
+  const requestedState = requested && typeof requested === "object" ? requested : {};
+  const locale = requestedState.locale === null || requestedState.locale === undefined
+    ? null
+    : String(requestedState.locale);
+  const timezoneId = requestedState.timezone_id === null || requestedState.timezone_id === undefined
+    ? null
+    : String(requestedState.timezone_id);
+  let state = globalThis[stateKey];
+  if (!state || typeof state !== "object") {
+    const nativeIntl = globalThis.Intl || {};
+    const nativeDate = globalThis.Date;
+    const datePrototype = nativeDate && nativeDate.prototype ? nativeDate.prototype : null;
+    state = {
+      native_intl: nativeIntl,
+      native_date_time_format: nativeIntl.DateTimeFormat,
+      native_number_format: nativeIntl.NumberFormat,
+      date_prototype: datePrototype,
+      date_to_string_had_own_descriptor: datePrototype ? Object.prototype.hasOwnProperty.call(datePrototype, "toString") : false,
+      date_to_string_descriptor: datePrototype ? Object.getOwnPropertyDescriptor(datePrototype, "toString") || null : null,
+      date_get_timezone_offset_had_own_descriptor: datePrototype ? Object.prototype.hasOwnProperty.call(datePrototype, "getTimezoneOffset") : false,
+      date_get_timezone_offset_descriptor: datePrototype ? Object.getOwnPropertyDescriptor(datePrototype, "getTimezoneOffset") || null : null,
+      value: {}
+    };
+    Object.defineProperty(globalThis, stateKey, {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: state
+    });
+  }
+  state.value = { locale, timezone_id: timezoneId };
+  function currentState() {
+    const current = globalThis[stateKey];
+    return current && current.value ? current.value : state.value;
+  }
+  function localeOr(locales) {
+    const value = currentState();
+    return locales === undefined || locales === null ? value.locale || undefined : locales;
+  }
+  function optionsOr(options, includeTimeZone) {
+    const value = currentState();
+    const next = options && typeof options === "object" ? { ...options } : {};
+    if (includeTimeZone && !Object.prototype.hasOwnProperty.call(next, "timeZone") && value.timezone_id) {
+      next.timeZone = value.timezone_id;
+    }
+    return next;
+  }
+  if (typeof state.native_date_time_format === "function") {
+    const NativeDateTimeFormat = state.native_date_time_format;
+    function SynapseDateTimeFormat(locales, options) {
+      return new NativeDateTimeFormat(localeOr(locales), optionsOr(options, true));
+    }
+    Object.defineProperty(SynapseDateTimeFormat, "prototype", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: NativeDateTimeFormat.prototype
+    });
+    if (typeof NativeDateTimeFormat.supportedLocalesOf === "function") {
+      Object.defineProperty(SynapseDateTimeFormat, "supportedLocalesOf", {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value(locales, options) {
+          return NativeDateTimeFormat.supportedLocalesOf(locales, options);
+        }
+      });
+    }
+    state.native_intl.DateTimeFormat = SynapseDateTimeFormat;
+  }
+  if (typeof state.native_number_format === "function") {
+    const NativeNumberFormat = state.native_number_format;
+    function SynapseNumberFormat(locales, options) {
+      return new NativeNumberFormat(localeOr(locales), optionsOr(options, false));
+    }
+    Object.defineProperty(SynapseNumberFormat, "prototype", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: NativeNumberFormat.prototype
+    });
+    if (typeof NativeNumberFormat.supportedLocalesOf === "function") {
+      Object.defineProperty(SynapseNumberFormat, "supportedLocalesOf", {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value(locales, options) {
+          return NativeNumberFormat.supportedLocalesOf(locales, options);
+        }
+      });
+    }
+    state.native_intl.NumberFormat = SynapseNumberFormat;
+  }
+  function timeZoneParts(date, timezone) {
+    const formatter = new state.native_date_time_format("en-US", {
+      timeZone: timezone,
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "long"
+    });
+    const parts = {};
+    for (const part of formatter.formatToParts(date)) {
+      if (part && part.type && part.type !== "literal") {
+        parts[part.type] = part.value;
+      }
+    }
+    let hour = Number(parts.hour || 0);
+    if (hour === 24) {
+      hour = 0;
+    }
+    return {
+      year: Number(parts.year || 0),
+      month: Number(parts.month || 1),
+      day: Number(parts.day || 1),
+      hour,
+      minute: Number(parts.minute || 0),
+      second: Number(parts.second || 0),
+      time_zone_name: String(parts.timeZoneName || timezone)
+    };
+  }
+  function timezoneOffsetMinutes(date, timezone) {
+    const parts = timeZoneParts(date, timezone);
+    const localAsUtc = Date.UTC(
+      parts.year,
+      parts.month - 1,
+      parts.day,
+      parts.hour,
+      parts.minute,
+      parts.second
+    );
+    return -Math.round((localAsUtc - date.getTime()) / 60000);
+  }
+  function pad2(value) {
+    return String(Math.trunc(Math.abs(Number(value) || 0))).padStart(2, "0");
+  }
+  function dateStringInTimezone(date, timezone) {
+    const parts = timeZoneParts(date, timezone);
+    const offset = timezoneOffsetMinutes(date, timezone);
+    const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const dayName = dayNames[new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay()] || "Thu";
+    const monthName = monthNames[Math.max(0, Math.min(11, parts.month - 1))] || "Jan";
+    const gmtSign = offset <= 0 ? "+" : "-";
+    const absolute = Math.abs(offset);
+    const gmt = `GMT${gmtSign}${pad2(Math.floor(absolute / 60))}${pad2(absolute % 60)}`;
+    return `${dayName} ${monthName} ${pad2(parts.day)} ${parts.year} ${pad2(parts.hour)}:${pad2(parts.minute)}:${pad2(parts.second)} ${gmt} (${parts.time_zone_name})`;
+  }
+  if (state.date_prototype) {
+    Object.defineProperty(state.date_prototype, "getTimezoneOffset", {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value() {
+        const timezone = currentState().timezone_id;
+        if (timezone) {
+          return timezoneOffsetMinutes(this, timezone);
+        }
+        const descriptor = state.date_get_timezone_offset_descriptor;
+        if (descriptor && typeof descriptor.value === "function") {
+          return descriptor.value.call(this);
+        }
+        return 0;
+      }
+    });
+    Object.defineProperty(state.date_prototype, "toString", {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value() {
+        const timezone = currentState().timezone_id;
+        if (timezone) {
+          return dateStringInTimezone(this, timezone);
+        }
+        const descriptor = state.date_to_string_descriptor;
+        if (descriptor && typeof descriptor.value === "function") {
+          return descriptor.value.call(this);
+        }
+        return "[object Date]";
+      }
+    });
+  }
+  return {
+    applied: true,
+    requested: state.value
+  };
+}
+
+function clearLocaleEmulationShimInPage() {
+  const stateKey = "__synapseLocaleEmulationOverride";
+  const state = globalThis[stateKey];
+  function restoreOwn(target, field, hadOwn, descriptor) {
+    if (!target) {
+      return;
+    }
+    if (hadOwn && descriptor) {
+      Object.defineProperty(target, field, descriptor);
+    } else {
+      try {
+        delete target[field];
+      } catch (_) {}
+    }
+  }
+  if (state && typeof state === "object") {
+    if (state.native_intl && state.native_date_time_format) {
+      state.native_intl.DateTimeFormat = state.native_date_time_format;
+    }
+    if (state.native_intl && state.native_number_format) {
+      state.native_intl.NumberFormat = state.native_number_format;
+    }
+    restoreOwn(state.date_prototype, "toString", state.date_to_string_had_own_descriptor, state.date_to_string_descriptor);
+    restoreOwn(state.date_prototype, "getTimezoneOffset", state.date_get_timezone_offset_had_own_descriptor, state.date_get_timezone_offset_descriptor);
+    delete globalThis[stateKey];
+  }
+  return {
+    cleared: Boolean(state)
+  };
+}
+
 async function readGeolocationStateInPage() {
   const permissionState = await (async () => {
     try {
@@ -4721,6 +5324,25 @@ async function readGeolocationStateInPage() {
     permission_state: permissionState,
     position: result.position,
     error: result.error
+  };
+}
+
+function readLocaleStateInPage() {
+  const sampleDate = new Date(Date.UTC(2020, 0, 2, 3, 4, 5));
+  const options = Intl.DateTimeFormat().resolvedOptions();
+  const dateFormatter = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "full",
+    timeStyle: "long"
+  });
+  return {
+    locale: String(options.locale || ""),
+    calendar: String(options.calendar || ""),
+    numbering_system: String(options.numberingSystem || ""),
+    time_zone: String(options.timeZone || ""),
+    sample_number: new Intl.NumberFormat().format(1234567.89),
+    sample_date: dateFormatter.format(sampleDate),
+    date_string: sampleDate.toString(),
+    timezone_offset_minutes: Number(sampleDate.getTimezoneOffset())
   };
 }
 

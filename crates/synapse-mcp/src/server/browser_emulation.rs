@@ -713,7 +713,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Set or reset locale and timezone emulation for the calling session's owned raw-CDP browser tab. operation=set applies locale with Emulation.setLocaleOverride and/or timezone_id with Emulation.setTimezoneOverride, then reads back Intl.DateTimeFormat().resolvedOptions(), formatted number/date samples, and Date string/offset through Runtime.evaluate. operation=reset clears both overrides to host defaults. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; use browser_evaluate as an independent FSV readback for Intl.DateTimeFormat().resolvedOptions().timeZone and locale-sensitive number/date formatting."
+        description = "Set or reset locale and timezone emulation for the calling session's owned browser tab. Raw-CDP targets use Emulation.setLocaleOverride and/or Emulation.setTimezoneOverride plus Runtime.evaluate readback. Normal Chrome bridge chrome-tab:* targets in the already-open authenticated profile use the bundled localeEmulation bridge lane with target-scoped debugger locale/timezone override and MAIN-world Intl/Date readback. operation=set applies locale and/or timezone_id; operation=reset clears both overrides to host defaults. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_locale(
         &self,
@@ -1198,6 +1198,11 @@ impl SynapseService {
         params: &NormalizedBrowserLocaleParams,
     ) -> Result<BrowserLocaleResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+                return self
+                    .browser_locale_bridge_impl(session_id, window_hwnd, cdp_target_id, params)
+                    .await;
+            }
             return Err(browser_raw_cdp_required_error(LOCALE_TOOL, window_hwnd));
         };
         let result = match params.operation {
@@ -1239,6 +1244,57 @@ impl SynapseService {
             "readback=Emulation.locale_timezone+Runtime.evaluate outcome=intl_state"
         );
         Ok(browser_locale_response(session_id, window_hwnd, result))
+    }
+
+    #[cfg(windows)]
+    async fn browser_locale_bridge_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        params: &NormalizedBrowserLocaleParams,
+    ) -> Result<BrowserLocaleResponse, ErrorData> {
+        let operation = match params.operation {
+            BrowserLocaleOperation::Set => "set",
+            BrowserLocaleOperation::Reset => "reset",
+        };
+        let requested = params.requested.as_ref();
+        let result = crate::chrome_debugger_bridge::locale_emulation(
+            crate::chrome_debugger_bridge::ChromeDebuggerLocaleEmulationRequest {
+                hwnd: window_hwnd,
+                target_id: cdp_target_id,
+                operation,
+                locale: requested.and_then(|value| value.locale.as_deref()),
+                timezone_id: requested.and_then(|value| value.timezone_id.as_deref()),
+                wait_timeout_ms: DEFAULT_BRIDGE_VIEWPORT_WAIT_TIMEOUT_MS,
+            },
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "{LOCALE_TOOL} normal Chrome bridge locale/timezone emulation failed for target {cdp_target_id:?}: {}",
+                    error.detail()
+                ),
+            )
+        })?;
+        tracing::info!(
+            code = "CHROME_BRIDGE_LOCALE_TIMEZONE_EMULATION",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            cdp_target_id,
+            operation = ?params.operation,
+            locale = %result.locale.locale,
+            time_zone = %result.locale.time_zone,
+            sample_number = %result.locale.sample_number,
+            "readback=chrome.debugger.Emulation+chrome.scripting.executeScript outcome=intl_state"
+        );
+        Ok(browser_locale_bridge_response(
+            session_id,
+            window_hwnd,
+            result,
+        ))
     }
 
     #[cfg(windows)]
@@ -2298,6 +2354,57 @@ fn browser_locale_response(
     }
 }
 
+fn browser_locale_bridge_response(
+    session_id: &str,
+    window_hwnd: i64,
+    result: crate::chrome_debugger_bridge::ChromeDebuggerLocaleEmulationResult,
+) -> BrowserLocaleResponse {
+    BrowserLocaleResponse {
+        session_id: session_id.to_owned(),
+        window_hwnd,
+        transport: "chrome_tabs_extension".to_owned(),
+        endpoint: chrome_debugger_default_endpoint(),
+        cdp_target_id: result.target_id,
+        operation: match result.operation.as_str() {
+            "reset" => BrowserLocaleOperation::Reset,
+            _ => BrowserLocaleOperation::Set,
+        },
+        requested: result.requested.map(|requested| BrowserLocaleOverride {
+            locale: requested.locale,
+            timezone_id: requested.timezone_id,
+        }),
+        page_url: result.page_url,
+        page_title: result.page_title,
+        ready_state: result.ready_state,
+        locale: BrowserLocaleReadback {
+            locale: result.locale.locale,
+            calendar: result.locale.calendar,
+            numbering_system: result.locale.numbering_system,
+            time_zone: result.locale.time_zone,
+            sample_number: result.locale.sample_number,
+            sample_date: result.locale.sample_date,
+            date_string: result.locale.date_string,
+            timezone_offset_minutes: result.locale.timezone_offset_minutes,
+        },
+        readback_backend: if result.readback_backend.is_empty() {
+            "chrome.debugger.Emulation locale/timezone + chrome.scripting.executeScript".to_owned()
+        } else {
+            result.readback_backend
+        },
+        backend_tier_used: if result.backend_tier_used.is_empty() {
+            "chrome_tabs_extension_debugger".to_owned()
+        } else {
+            result.backend_tier_used
+        },
+        required_foreground: result.required_foreground,
+        source_of_truth: if result.source_of_truth.is_empty() {
+            "normal Chrome bridge page script Intl.DateTimeFormat/NumberFormat and Date".to_owned()
+        } else {
+            result.source_of_truth
+        },
+    }
+}
+
 fn browser_media_response(
     session_id: &str,
     window_hwnd: i64,
@@ -2981,6 +3088,58 @@ mod tests {
                 .and_then(|requested| requested.timezone_id.as_deref()),
             Some("Europe/Paris")
         );
+        assert!(!response.required_foreground);
+    }
+
+    #[test]
+    fn browser_locale_bridge_response_maps_readback() {
+        let response = browser_locale_bridge_response(
+            "session-1",
+            0x2200,
+            crate::chrome_debugger_bridge::ChromeDebuggerLocaleEmulationResult {
+                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+                target_id: "chrome-tab:100".to_owned(),
+                tab_id: 100,
+                chrome_window_id: Some(200),
+                operation: "set".to_owned(),
+                requested: Some(
+                    crate::chrome_debugger_bridge::ChromeDebuggerLocaleTimezoneOverride {
+                        locale: Some("fr_FR".to_owned()),
+                        timezone_id: Some("Europe/Paris".to_owned()),
+                    },
+                ),
+                page_url: "https://example.test/".to_owned(),
+                page_title: "Example".to_owned(),
+                ready_state: "complete".to_owned(),
+                locale: crate::chrome_debugger_bridge::ChromeDebuggerLocaleTimezoneReadback {
+                    locale: "fr-FR".to_owned(),
+                    calendar: "gregory".to_owned(),
+                    numbering_system: "latn".to_owned(),
+                    time_zone: "Europe/Paris".to_owned(),
+                    sample_number: "1 234 567,89".to_owned(),
+                    sample_date: "jeudi 2 janvier 2020 a 04:04:05 UTC+1".to_owned(),
+                    date_string: "Thu Jan 02 2020 04:04:05 GMT+0100".to_owned(),
+                    timezone_offset_minutes: -60,
+                },
+                readback_backend:
+                    "chrome.debugger.Emulation locale/timezone + chrome.scripting.executeScript"
+                        .to_owned(),
+                backend_tier_used: "chrome_tabs_extension_debugger".to_owned(),
+                required_foreground: false,
+                source_of_truth: "normal Chrome bridge page script Intl/Date".to_owned(),
+                method: "Emulation.setLocaleOverride+Emulation.setTimezoneOverride".to_owned(),
+                debugger_protocol_version: Some("1.3".to_owned()),
+                target_candidate_count: 1,
+                target_selection_reason: "chrome_tab_id_hint".to_owned(),
+            },
+        );
+
+        assert_eq!(response.transport, "chrome_tabs_extension");
+        assert_eq!(response.cdp_target_id, "chrome-tab:100");
+        assert_eq!(response.operation, BrowserLocaleOperation::Set);
+        assert_eq!(response.locale.locale, "fr-FR");
+        assert_eq!(response.locale.time_zone, "Europe/Paris");
+        assert_eq!(response.backend_tier_used, "chrome_tabs_extension_debugger");
         assert!(!response.required_foreground);
     }
 
