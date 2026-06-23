@@ -2356,7 +2356,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Expose, read, or remove a Playwright-style page binding on the calling session's owned browser tab via raw CDP Runtime.addBinding / Runtime.bindingCalled / Runtime.removeBinding. operation=add installs a string-argument function on window and arms a persistent per-target event listener; operation=read returns the buffered payloads without mutating the page; operation=remove unsubscribes this Synapse runtime agent so future calls stop being delivered to the buffer. CDP removeBinding does not delete the JavaScript function object from existing page globals, so removal is verified by no new Runtime.bindingCalled delivery. Pair with browser_add_init_script when page code should re-wire helper wrappers across navigation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; read-only payload capture, no host callback execution."
+        description = "Expose, read, or remove a Playwright-style page binding on the calling session's owned browser tab via raw CDP or the normal Chrome bridge's target-scoped chrome.debugger Runtime.addBinding / Runtime.bindingCalled / Runtime.removeBinding lane. operation=add installs a string-argument function on window and arms a persistent per-target event listener; operation=read returns the buffered payloads without mutating the page; operation=remove unsubscribes this Synapse runtime agent so future calls stop being delivered to the buffer. CDP removeBinding does not delete the JavaScript function object from existing page globals, so removal is verified by no new Runtime.bindingCalled delivery. Pair with browser_add_init_script when page code should re-wire helper wrappers across navigation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Read-only payload capture, no host callback execution."
     )]
     pub async fn browser_expose_binding(
         &self,
@@ -5660,6 +5660,90 @@ impl SynapseService {
         max_calls: usize,
     ) -> Result<BrowserExposeBindingResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let operation = browser_expose_binding_operation_name(params.operation);
+                let result = crate::chrome_debugger_bridge::expose_binding(
+                    window_hwnd,
+                    cdp_target_id,
+                    operation,
+                    &params.name,
+                    params.execution_context_name.as_deref(),
+                    params.since_seq,
+                    max_calls,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_expose_binding normal Chrome bridge Runtime.addBinding/bindingCalled failed for target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                let endpoint = result
+                    .extension_id
+                    .as_deref()
+                    .map(chrome_debugger_endpoint)
+                    .unwrap_or_else(chrome_debugger_default_endpoint);
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_BINDING",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    endpoint = %endpoint,
+                    cdp_target_id = %result.target_id,
+                    operation = ?params.operation,
+                    name = %params.name,
+                    newly_armed = result.newly_armed,
+                    binding_newly_added = result.binding_newly_added,
+                    binding_removed = result.binding_removed,
+                    returned = result.returned,
+                    total_buffered = result.total_buffered,
+                    dropped = result.dropped,
+                    target_url = %result.url,
+                    "readback=chrome.debugger.Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding outcome=binding_buffer_read"
+                );
+                return Ok(BrowserExposeBindingResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint,
+                    cdp_target_id: result.target_id,
+                    operation: params.operation,
+                    name: result.name,
+                    newly_armed: result.newly_armed,
+                    binding_newly_added: result.binding_newly_added,
+                    binding_removed: result.binding_removed,
+                    armed_at_unix_ms: result.armed_at_unix_ms,
+                    binding_active: result.binding_active,
+                    active_binding_count: result.active_binding_count,
+                    active_binding_names: result.active_binding_names,
+                    url: result.url,
+                    title: result.title,
+                    ready_state: result.ready_state,
+                    calls: result
+                        .calls
+                        .into_iter()
+                        .map(browser_binding_call_from_bridge)
+                        .collect(),
+                    next_cursor: result.next_cursor,
+                    returned: result.returned,
+                    total_buffered: result.total_buffered,
+                    dropped: result.dropped,
+                    readback_backend: if result.readback_backend.trim().is_empty() {
+                        "chrome.debugger.Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding"
+                            .to_owned()
+                    } else {
+                        result.readback_backend
+                    },
+                    backend_tier_used: if result.backend_tier_used.trim().is_empty() {
+                        "chrome_tabs_extension".to_owned()
+                    } else {
+                        result.backend_tier_used
+                    },
+                    required_foreground: result.required_foreground,
+                });
+            }
             return Err(browser_raw_cdp_required_error(
                 "browser_expose_binding",
                 window_hwnd,
@@ -5887,7 +5971,10 @@ impl SynapseService {
                     required_foreground: false,
                 });
             }
-            return Err(browser_raw_cdp_required_error("browser_add_init_script", window_hwnd));
+            return Err(browser_raw_cdp_required_error(
+                "browser_add_init_script",
+                window_hwnd,
+            ));
         };
         let result = match params.operation {
             BrowserInitScriptOperation::Add => {
@@ -6023,8 +6110,8 @@ impl SynapseService {
                         ),
                     )
                 })?;
-                let payload: BrowserAddTagPayload =
-                    serde_json::from_value(evaluated.value.clone()).map_err(|error| {
+                let payload: BrowserAddTagPayload = serde_json::from_value(evaluated.value.clone())
+                    .map_err(|error| {
                         mcp_error(
                             error_codes::OBSERVE_INTERNAL,
                             format!("{tool} bridge payload decode failed: {error}"),
@@ -9482,6 +9569,22 @@ fn browser_binding_call_from_entry(
     }
 }
 
+#[cfg(windows)]
+fn browser_binding_call_from_bridge(
+    entry: crate::chrome_debugger_bridge::ChromeDebuggerBindingCall,
+) -> super::BrowserBindingCall {
+    super::BrowserBindingCall {
+        seq: entry.seq,
+        name: entry.name,
+        payload: entry.payload,
+        payload_len: entry.payload_len,
+        payload_truncated: entry.payload_truncated,
+        payload_json: entry.payload_json,
+        execution_context_id: entry.execution_context_id,
+        timestamp_ms: entry.timestamp_ms,
+    }
+}
+
 /// Upper bound on the evaluated expression size. Generous enough for injected
 /// helper bundles, but bounded so a single tool call cannot ship an unbounded
 /// payload through the protocol.
@@ -9511,6 +9614,14 @@ fn browser_init_script_operation_name(operation: BrowserInitScriptOperation) -> 
     match operation {
         BrowserInitScriptOperation::Add => "add",
         BrowserInitScriptOperation::Remove => "remove",
+    }
+}
+
+fn browser_expose_binding_operation_name(operation: BrowserExposeBindingOperation) -> &'static str {
+    match operation {
+        BrowserExposeBindingOperation::Add => "add",
+        BrowserExposeBindingOperation::Read => "read",
+        BrowserExposeBindingOperation::Remove => "remove",
     }
 }
 

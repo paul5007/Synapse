@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-js-eval-v3";
-const BRIDGE_BUILD_SHA256 = "edc1471d8796ae0515d016efb942dc3dc21047bb54603cd7110c362d9158854e";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-binding-v1";
+const BRIDGE_BUILD_SHA256 = "2e104bff573efa8501c7fadf62f010488101a01587e9b5ace20b70f658d4300c";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 let captureVisibleTabQueue = Promise.resolve();
@@ -41,6 +41,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "pageEvents",
   "evaluateScript",
   "initScript",
+  "exposeBinding",
   "cdpInput",
   "viewportEmulation",
   "deviceEmulation",
@@ -71,6 +72,7 @@ const ERROR_CHROME_DOM_ELEMENT_AMBIGUOUS = "CHROME_DOM_ELEMENT_AMBIGUOUS";
 const ERROR_CHROME_DOM_ELEMENT_NOT_ACTIONABLE = "CHROME_DOM_ELEMENT_NOT_ACTIONABLE";
 const ERROR_CHROME_DOM_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
 const ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
+const ERROR_ACTION_TARGET_INVALID = "ACTION_TARGET_INVALID";
 const TAB_TARGET_PREFIX = "chrome-tab:";
 const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
 const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
@@ -88,6 +90,8 @@ const MAX_PAGE_TEXT_CHARS = 4096;
 const MAX_PAGE_EVENT_BUFFER = 1000;
 const MAX_NETWORK_EVENT_BUFFER = 2000;
 const MAX_DOWNLOAD_EVENT_BUFFER = 1000;
+const MAX_BINDING_EVENT_BUFFER = 1000;
+const MAX_BINDING_PAYLOAD_CHARS = 65536;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
 const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessaging"]);
 const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
@@ -97,6 +101,7 @@ const LOCALE_BASELINE_BY_TAB = new Map();
 const MEDIA_BASELINE_BY_TAB = new Map();
 const NETWORK_BASELINE_BY_TAB = new Map();
 const INIT_SCRIPT_DEBUGGER_SESSIONS = new Map();
+const BINDING_DEBUGGER_SESSIONS = new Map();
 
 let hostId = null;
 let bridgeToken = null;
@@ -356,6 +361,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "pageEvents",
     "evaluateScript",
     "initScript",
+    "exposeBinding",
     "cdpInput",
     "viewportEmulation",
     "deviceEmulation",
@@ -725,12 +731,21 @@ chrome.tabs.onCreated.addListener((tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordTabRemovedForPageEvents(tabId);
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
+  BINDING_DEBUGGER_SESSIONS.delete(tabId);
 });
 if (chrome.debugger?.onDetach?.addListener) {
   chrome.debugger.onDetach.addListener((source, reason) => {
     if (Number.isInteger(source?.tabId)) {
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(source.tabId);
-      console.warn(`Synapse initScript debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
+      markBindingDebuggerDetached(source.tabId);
+      console.warn(`Synapse persistent debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
+    }
+  });
+}
+if (chrome.debugger?.onEvent?.addListener) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method === "Runtime.bindingCalled" && Number.isInteger(source?.tabId)) {
+      recordBindingCalledEvent(source.tabId, params || {});
     }
   });
 }
@@ -912,6 +927,8 @@ async function handleCommand(command) {
       result = await handleEvaluateScript(params);
     } else if (kind === "initScript") {
       result = await handleInitScript(params);
+    } else if (kind === "exposeBinding") {
+      result = await handleExposeBinding(params);
     } else if (kind === "pageVitals") {
       result = await handlePageVitals(params);
     } else if (kind === "navigateTab") {
@@ -1247,12 +1264,14 @@ async function handleInitScript(params) {
       }
     }
   } catch (error) {
-    if (operation === "add" && addAttachment?.newlyAttached && !identifier) {
+    if (operation === "add" && addAttachment?.newlyCreated && !identifier) {
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(selected.tabId);
-      try {
-        await chrome.debugger.detach(addAttachment.debuggee);
-      } catch (detachError) {
-        console.warn(`Synapse chrome.debugger detach failed after initScript add error for tab ${selected.tabId}: ${errorMessage(detachError)}`);
+      if (addAttachment.newlyAttached && !bindingSessionHasActiveNames(selected.tabId)) {
+        try {
+          await chrome.debugger.detach(addAttachment.debuggee);
+        } catch (detachError) {
+          console.warn(`Synapse chrome.debugger detach failed after initScript add error for tab ${selected.tabId}: ${errorMessage(detachError)}`);
+        }
       }
     }
     if (error?.code) {
@@ -1285,6 +1304,97 @@ async function handleInitScript(params) {
     readback_backend: "chrome.debugger.Page.addScriptToEvaluateOnNewDocument/Page.removeScriptToEvaluateOnNewDocument",
     debugger_session_persistent: persistentSession,
     debugger_session_detached: detachedAfterRemove,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
+async function handleExposeBinding(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const operation = normalizeBindingOperation(params.operation);
+  const name = normalizeBindingName(params.name);
+  const sinceSeq = normalizeOptionalNonNegativeInteger(params.sinceSeq, "sinceSeq");
+  const maxCalls = normalizeBindingMaxCalls(params.maxCalls);
+  let session = BINDING_DEBUGGER_SESSIONS.get(selected.tabId) || null;
+  let status = null;
+  try {
+    if (operation === "add") {
+      const executionContextName = normalizeOptionalNonEmptyString(
+        params.executionContextName,
+        "executionContextName"
+      );
+      const ensured = await ensureBindingDebuggerSession(selected.tabId);
+      session = ensured.session;
+      const bindingNewlyAdded = await addBindingToSession(
+        ensured.debuggee,
+        session,
+        name,
+        executionContextName
+      );
+      status = bindingStatusFromSession(session, name, ensured.newlyArmed, bindingNewlyAdded, false);
+    } else if (operation === "read") {
+      if (!session) {
+        throw bridgeError(
+          ERROR_ACTION_TARGET_INVALID,
+          `browser_expose_binding read requested binding ${JSON.stringify(name)} on tab ${selected.tabId}, but no capture is armed; call operation=add first`
+        );
+      }
+      status = bindingStatusFromSession(session, name, false, false, false);
+    } else {
+      let bindingRemoved = false;
+      if (session?.activeNames?.has(name)) {
+        const ensured = await ensureBindingDebuggerSession(selected.tabId);
+        session = ensured.session;
+        await sendDebuggerCommand(ensured.debuggee, "Runtime.removeBinding", { name });
+        session.activeNames.delete(name);
+        bindingRemoved = true;
+        if (session.activeNames.size === 0 && !hasActiveInitScriptDebuggerSession(selected.tabId)) {
+          await detachBindingDebuggerSession(selected.tabId, ensured.debuggee, session);
+        }
+      }
+      status = session
+        ? bindingStatusFromSession(session, name, false, false, bindingRemoved)
+        : emptyBindingStatus(selected.tabId, name, bindingRemoved);
+    }
+  } catch (error) {
+    if (error?.code) {
+      throw error;
+    }
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger exposeBinding ${operation} failed for tab ${selected.tabId}: ${errorMessage(error)}`
+    );
+  }
+  session = BINDING_DEBUGGER_SESSIONS.get(selected.tabId) || session;
+  const read = session
+    ? readBindingCalls(session, name, sinceSeq, maxCalls)
+    : emptyBindingRead(status);
+  const state = await tabPageState(selected.tabId, selected.target);
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: state.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: state.chrome_window_id,
+    operation,
+    name,
+    newly_armed: Boolean(status.newly_armed),
+    binding_newly_added: Boolean(status.binding_newly_added),
+    binding_removed: Boolean(status.binding_removed),
+    armed_at_unix_ms: Number(read.armed_at_unix_ms || status.armed_at_unix_ms || 0),
+    binding_active: Boolean(read.binding_active),
+    active_binding_count: Number(read.active_binding_count || 0),
+    active_binding_names: Array.isArray(read.active_binding_names) ? read.active_binding_names : [],
+    url: state.url || "",
+    title: state.title || "",
+    ready_state: state.ready_state || "",
+    calls: read.calls,
+    next_cursor: read.next_cursor,
+    returned: read.returned,
+    total_buffered: read.total_buffered,
+    dropped: read.dropped,
+    readback_backend: "chrome.debugger.Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding",
+    backend_tier_used: "chrome_tabs_extension",
+    required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
@@ -8639,7 +8749,7 @@ async function sendDebuggerCommand(debuggee, method, params, timeoutMs = DEBUGGE
 
 async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
   const debuggee = { tabId };
-  if (INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId)) {
+  if (INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId) || bindingSessionIsAttached(tabId)) {
     return { debuggee, shouldDetach: false, persistent: true, protocolVersion };
   }
   await chrome.debugger.attach(debuggee, protocolVersion);
@@ -8650,17 +8760,21 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
   const debuggee = { tabId };
   let session = INIT_SCRIPT_DEBUGGER_SESSIONS.get(tabId);
   if (session) {
-    return { debuggee, session, newlyAttached: false, protocolVersion };
+    return { debuggee, session, newlyAttached: false, newlyCreated: false, protocolVersion };
   }
-  await chrome.debugger.attach(debuggee, protocolVersion);
+  const reuseBindingDebugger = bindingSessionIsAttached(tabId);
+  if (!reuseBindingDebugger) {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+  }
   session = {
     protocolVersion,
     pageEnabled: false,
     identifiers: new Set(),
+    attached: true,
     attachedAtUnixMs: Date.now()
   };
   INIT_SCRIPT_DEBUGGER_SESSIONS.set(tabId, session);
-  return { debuggee, session, newlyAttached: true, protocolVersion };
+  return { debuggee, session, newlyAttached: !reuseBindingDebugger, newlyCreated: true, protocolVersion };
 }
 
 async function ensureInitScriptPageDomainEnabled(debuggee, session) {
@@ -8683,13 +8797,197 @@ async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier)
     return false;
   }
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
+  if (bindingSessionHasActiveNames(tabId)) {
+    return false;
+  }
   try {
     await chrome.debugger.detach(debuggee);
+    markBindingDebuggerDetached(tabId, false);
     return true;
   } catch (error) {
     console.warn(`Synapse chrome.debugger detach failed for initScript cleanup tab ${tabId}: ${errorMessage(error)}`);
     return false;
   }
+}
+
+function bindingSessionIsAttached(tabId) {
+  const session = BINDING_DEBUGGER_SESSIONS.get(tabId);
+  return Boolean(session?.attached);
+}
+
+function bindingSessionHasActiveNames(tabId) {
+  const session = BINDING_DEBUGGER_SESSIONS.get(tabId);
+  return Boolean(session?.activeNames?.size);
+}
+
+function hasActiveInitScriptDebuggerSession(tabId) {
+  const session = INIT_SCRIPT_DEBUGGER_SESSIONS.get(tabId);
+  return Boolean(session?.identifiers?.size);
+}
+
+async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
+  const debuggee = { tabId };
+  let session = BINDING_DEBUGGER_SESSIONS.get(tabId);
+  if (!session) {
+    session = {
+      protocolVersion,
+      runtimeEnabled: false,
+      attached: false,
+      activeNames: new Set(),
+      calls: [],
+      nextSeq: 0,
+      dropped: 0,
+      capacity: MAX_BINDING_EVENT_BUFFER,
+      armedAtUnixMs: 0
+    };
+    BINDING_DEBUGGER_SESSIONS.set(tabId, session);
+  }
+  let newlyArmed = false;
+  if (!session.attached) {
+    if (!INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId)) {
+      await chrome.debugger.attach(debuggee, protocolVersion);
+    }
+    session.attached = true;
+    session.protocolVersion = protocolVersion;
+    session.armedAtUnixMs = Date.now();
+    newlyArmed = true;
+  }
+  if (!session.runtimeEnabled) {
+    await sendDebuggerCommand(debuggee, "Runtime.enable", {});
+    session.runtimeEnabled = true;
+  }
+  return { debuggee, session, newlyArmed, protocolVersion };
+}
+
+async function addBindingToSession(debuggee, session, name, executionContextName) {
+  if (session.activeNames.has(name)) {
+    return false;
+  }
+  const params = { name };
+  if (executionContextName) {
+    params.executionContextName = executionContextName;
+  }
+  await sendDebuggerCommand(debuggee, "Runtime.addBinding", params);
+  session.activeNames.add(name);
+  return true;
+}
+
+async function detachBindingDebuggerSession(tabId, debuggee, session) {
+  if (hasActiveInitScriptDebuggerSession(tabId)) {
+    return false;
+  }
+  try {
+    await chrome.debugger.detach(debuggee);
+    markBindingDebuggerDetached(tabId, false);
+    return true;
+  } catch (error) {
+    console.warn(`Synapse chrome.debugger detach failed for binding cleanup tab ${tabId}: ${errorMessage(error)}`);
+    session.attached = false;
+    session.runtimeEnabled = false;
+    return false;
+  }
+}
+
+function markBindingDebuggerDetached(tabId, clearActiveNames = true) {
+  const session = BINDING_DEBUGGER_SESSIONS.get(tabId);
+  if (!session) {
+    return;
+  }
+  session.attached = false;
+  session.runtimeEnabled = false;
+  if (clearActiveNames) {
+    session.activeNames.clear();
+  }
+}
+
+function recordBindingCalledEvent(tabId, params) {
+  const session = BINDING_DEBUGGER_SESSIONS.get(tabId);
+  const name = String(params?.name || "");
+  if (!session || !session.activeNames.has(name)) {
+    return;
+  }
+  const rawPayload = typeof params?.payload === "string" ? params.payload : String(params?.payload ?? "");
+  const payloadChars = Array.from(rawPayload);
+  const payloadLen = payloadChars.length;
+  const payloadTruncated = payloadLen > MAX_BINDING_PAYLOAD_CHARS;
+  const payload = payloadTruncated
+    ? payloadChars.slice(0, MAX_BINDING_PAYLOAD_CHARS).join("")
+    : rawPayload;
+  const call = {
+    seq: session.nextSeq,
+    name,
+    payload,
+    payload_len: payloadLen,
+    payload_truncated: payloadTruncated,
+    execution_context_id: Number.isInteger(params?.executionContextId) ? params.executionContextId : 0,
+    timestamp_ms: Date.now()
+  };
+  session.nextSeq += 1;
+  if (!payloadTruncated) {
+    try {
+      call.payload_json = JSON.parse(payload);
+    } catch (_error) {
+      // Non-JSON binding payloads are valid and remain available as strings.
+    }
+  }
+  while (session.calls.length >= session.capacity) {
+    session.calls.shift();
+    session.dropped += 1;
+  }
+  session.calls.push(call);
+}
+
+function bindingStatusFromSession(session, name, newlyArmed, bindingNewlyAdded, bindingRemoved) {
+  const activeBindingNames = Array.from(session.activeNames).sort();
+  return {
+    newly_armed: Boolean(newlyArmed),
+    binding_newly_added: Boolean(bindingNewlyAdded),
+    binding_removed: Boolean(bindingRemoved),
+    armed_at_unix_ms: Number(session.armedAtUnixMs || 0),
+    binding_active: session.activeNames.has(name),
+    active_binding_count: activeBindingNames.length,
+    active_binding_names: activeBindingNames
+  };
+}
+
+function emptyBindingStatus(_tabId, _name, bindingRemoved) {
+  return {
+    newly_armed: false,
+    binding_newly_added: false,
+    binding_removed: Boolean(bindingRemoved),
+    armed_at_unix_ms: 0,
+    binding_active: false,
+    active_binding_count: 0,
+    active_binding_names: []
+  };
+}
+
+function readBindingCalls(session, name, sinceSeq, maxCalls) {
+  const cursor = sinceSeq === null ? 0 : sinceSeq;
+  const matching = session.calls.filter((call) => call.name === name);
+  const calls = matching
+    .filter((call) => call.seq >= cursor)
+    .slice(0, maxCalls);
+  const status = bindingStatusFromSession(session, name, false, false, false);
+  return {
+    ...status,
+    calls,
+    next_cursor: Number(session.nextSeq || 0),
+    returned: calls.length,
+    total_buffered: matching.length,
+    dropped: Number(session.dropped || 0)
+  };
+}
+
+function emptyBindingRead(status) {
+  return {
+    ...status,
+    calls: [],
+    next_cursor: 0,
+    returned: 0,
+    total_buffered: 0,
+    dropped: 0
+  };
 }
 
 function promiseWithTimeout(promise, timeoutMs, message) {
@@ -18403,6 +18701,65 @@ function normalizeOptionalNonEmptyString(value, fieldName) {
     throw bridgeError(ERROR_CHROME_DOM_ACTION_UNSUPPORTED, `${fieldName} must not contain NUL`);
   }
   return value;
+}
+
+function normalizeBindingOperation(value) {
+  const operation = String(value || "add").trim().toLowerCase();
+  if (operation === "add" || operation === "read" || operation === "remove") {
+    return operation;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `exposeBinding operation must be add, read, or remove; got ${JSON.stringify(value)}`
+  );
+}
+
+function normalizeBindingName(value) {
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "exposeBinding name must be a non-empty JavaScript identifier without leading or trailing whitespace"
+    );
+  }
+  if (Array.from(value).length > 128) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "exposeBinding name must be at most 128 Unicode scalar values"
+    );
+  }
+  if (!/^[A-Za-z_$][0-9A-Za-z_$]*$/.test(value)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "exposeBinding name must be an ASCII JavaScript identifier, e.g. myBinding"
+    );
+  }
+  return value;
+}
+
+function normalizeOptionalNonNegativeInteger(value, fieldName) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Number.isInteger(value) || value < 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `${fieldName} must be a non-negative integer when supplied; got ${JSON.stringify(value)}`
+    );
+  }
+  return value;
+}
+
+function normalizeBindingMaxCalls(value) {
+  if (value === undefined || value === null) {
+    return 200;
+  }
+  if (!Number.isInteger(value) || value < 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `maxCalls must be a non-negative integer when supplied; got ${JSON.stringify(value)}`
+    );
+  }
+  return Math.min(value, 5000);
 }
 
 function formatDebuggerExceptionDetails(details) {

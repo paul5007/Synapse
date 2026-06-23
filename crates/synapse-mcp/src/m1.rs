@@ -1607,7 +1607,8 @@ pub enum BrowserExposeBindingOperation {
 }
 
 /// Parameters for `browser_expose_binding` (#1069): expose/read/remove a
-/// page-callable Runtime binding on the calling session's owned CDP page target.
+/// page-callable Runtime binding on the calling session's owned raw CDP page
+/// target or normal Chrome bridge `chrome-tab:*` target.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserExposeBindingParams {
