@@ -509,12 +509,54 @@ if ($ExtensionId -notmatch '^[a-p]{32}$') {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$extensionDir = Join-Path $repoRoot 'extensions\synapse-chrome-debugger'
+$extensionSourceDir = Join-Path $repoRoot 'extensions\synapse-chrome-debugger'
+$sourceManifestPath = Join-Path $extensionSourceDir 'manifest.json'
+if (-not (Test-Path -LiteralPath $sourceManifestPath -PathType Leaf)) {
+    throw "SYNAPSE_CHROME_EXTENSION_MANIFEST_MISSING path=$sourceManifestPath"
+}
+$sourceServiceWorkerPath = Join-Path $extensionSourceDir 'service_worker.js'
+if (-not (Test-Path -LiteralPath $sourceServiceWorkerPath -PathType Leaf)) {
+    throw "SYNAPSE_CHROME_EXTENSION_SERVICE_WORKER_MISSING path=$sourceServiceWorkerPath"
+}
+$serviceWorkerSource = Get-Content -Raw -LiteralPath $sourceServiceWorkerPath
+if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_BUILD_ID\s*=\s*"([^"]+)";') {
+    throw "SYNAPSE_CHROME_EXTENSION_BUILD_ID_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_BUILD_ID so setup can deploy the unpacked extension to a stable build-id directory"
+}
+$bridgeBuildId = [string]$Matches[1]
+if ($bridgeBuildId -notmatch '^[A-Za-z0-9._-]+$') {
+    throw "SYNAPSE_CHROME_EXTENSION_BUILD_ID_INVALID build_id=$bridgeBuildId remediation=BRIDGE_BUILD_ID must be safe for a Windows directory name"
+}
+if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_BUILD_SHA256\s*=\s*"([^"]+)";') {
+    throw "SYNAPSE_CHROME_EXTENSION_BUILD_SHA_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_BUILD_SHA256 for setup readback"
+}
+$bridgeBuildSha256 = [string]$Matches[1]
+if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    throw "SYNAPSE_CHROME_EXTENSION_STABLE_ROOT_UNAVAILABLE remediation=LOCALAPPDATA is required to deploy the unpacked Chrome bridge to a checkout-independent stable directory"
+}
+$stableExtensionRoot = Join-Path $env:LOCALAPPDATA 'synapse\chrome-extension'
+$extensionDir = Join-Path $stableExtensionRoot $bridgeBuildId
+$stableRootFull = [System.IO.Path]::GetFullPath($stableExtensionRoot)
+$extensionDirFull = [System.IO.Path]::GetFullPath($extensionDir)
+if (-not $extensionDirFull.StartsWith($stableRootFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "SYNAPSE_CHROME_EXTENSION_STABLE_PATH_INVALID root=$stableRootFull path=$extensionDirFull"
+}
+New-Item -ItemType Directory -Force -Path $extensionDirFull | Out-Null
+Get-ChildItem -LiteralPath $extensionSourceDir -Force | Copy-Item -Destination $extensionDirFull -Recurse -Force
+$extensionDir = $extensionDirFull
 $manifestPath = Join-Path $extensionDir 'manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-    throw "SYNAPSE_CHROME_EXTENSION_MANIFEST_MISSING path=$manifestPath"
+    throw "SYNAPSE_CHROME_EXTENSION_STABLE_MANIFEST_MISSING source=$sourceManifestPath deployed=$manifestPath"
 }
 $extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+$extensionDeploy = [pscustomobject]@{
+    source_dir = $extensionSourceDir
+    deployed_dir = $extensionDir
+    stable_root = $stableRootFull
+    build_id = $bridgeBuildId
+    build_sha256 = $bridgeBuildSha256
+    manifest_sha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+    service_worker_sha256 = (Get-FileHash -LiteralPath (Join-Path $extensionDir 'service_worker.js') -Algorithm SHA256).Hash
+}
 $requiredPermissions = @($extensionManifest.permissions)
 $optionalPermissions = @($extensionManifest.optional_permissions)
 $hostPermissions = @($extensionManifest.host_permissions)
@@ -557,7 +599,7 @@ function Initialize-SynapseChromeBridgeAutoInstallInterop {
         Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
         Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
     } catch {
-        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_UIA_UNAVAILABLE error=$($_.Exception.Message) remediation=run from an interactive Windows desktop where UIAutomationClient is available, or load extensions\synapse-chrome-debugger manually once and rerun setup"
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_UIA_UNAVAILABLE error=$($_.Exception.Message) remediation=run from an interactive Windows desktop where UIAutomationClient is available, or load the deployed stable Chrome bridge directory manually once and rerun setup"
     }
 
     if (-not ('SynapseChromeBridgeAutoInstall.Win32' -as [type])) {
@@ -1478,7 +1520,7 @@ $synapseChromeProfileInstallState = [pscustomobject]@{
     active_profile_installed = $synapseChromeActiveProfileInstalled
     reason = $synapseChromeProfileInstallReason
     cdp_bridge_reload_can_install_absent_extension = $false
-    remediation = 'run scripts\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer auto-loads extensions\synapse-chrome-debugger as an unpacked extension in that active profile. cdp_bridge_reload can only reload an already-registered bridge host and cannot install an absent Chrome extension'
+    remediation = 'run scripts\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\synapse\chrome-extension\<build-id> and auto-loads that stable unpacked directory in the active profile. cdp_bridge_reload can only reload an already-registered bridge host and cannot install an absent Chrome extension'
 }
 $externalNativeMessagingProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
@@ -1586,12 +1628,14 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     registry_key = $registryPath
     binary = $null
     extension_id = $ExtensionId
+    extension_source_dir = $extensionSourceDir
     extension_dir = $extensionDir
+    extension_deploy = $extensionDeploy
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     bridge_self_reload_command = 'cdp_bridge_reload'
-    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-23-file-upload-v2'
-    bridge_build_sha256_expected = '6a557863fa6472214e3c2f521a52079209c9a7d23f209f49b7c1647cc48e0b95'
+    bridge_build_id_expected = $bridgeBuildId
+    bridge_build_sha256_expected = $bridgeBuildSha256
     bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
     background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.downloads_plus_chrome.webNavigation_plus_chrome.webRequest_plus_chrome_tabs_captureVisibleTab_for_typed_dom_actions_storage_cookies_downloads_waits_page_screenshots_and_chrome_debugger_runtime_evaluate_init_scripts_handle_dialog_file_upload_cdp_input_hover_tap_drag_page_print_to_pdf_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
     reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'

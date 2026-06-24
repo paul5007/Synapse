@@ -146,7 +146,7 @@ function Invoke-SynapseChromeBridgeVerifier {
         Die "SYNAPSE_CHROME_BRIDGE_PROFILE_INSTALL_STATE_MISSING path=$InstallerPath remediation=setup requires active Chrome profile installation readback after bridge verification"
     }
     if ($profileInstallState.active_profile_installed -ne $true) {
-        Die ("SYNAPSE_CHROME_BRIDGE_ACTIVE_PROFILE_NOT_INSTALLED active_profile={0} installed_profiles={1} auto_install_attempted={2} auto_install_reason={3} remediation=setup must auto-install extensions\\synapse-chrome-debugger into the already-open active Chrome profile before daemon handoff can continue" -f `
+        Die ("SYNAPSE_CHROME_BRIDGE_ACTIVE_PROFILE_NOT_INSTALLED active_profile={0} installed_profiles={1} auto_install_attempted={2} auto_install_reason={3} remediation=setup must auto-install the deployed stable Synapse Chrome bridge directory into the already-open active Chrome profile before daemon handoff can continue" -f `
             $profileInstallState.active_profile,
             (@($profileInstallState.installed_profiles) -join ','),
             $autoInstall.attempted,
@@ -165,7 +165,8 @@ function Format-SynapseChromeBridgeProfileInstallState {
     $autoInstall = $Readback.synapse_chrome_auto_install
     $autoInstallAttempted = if ($autoInstall) { [string]$autoInstall.attempted } else { 'missing' }
     $autoInstallReason = if ($autoInstall) { [string]$autoInstall.reason } else { 'missing' }
-    return ("profile_install_state=installed:{0},profile_count:{1},installed_profile_count:{2},active_profile:{3},active_profile_installed:{4},reason:{5},auto_install_attempted:{6},auto_install_reason:{7}" -f `
+    $extensionDir = if ($Readback.extension_dir) { [string]$Readback.extension_dir } else { 'missing' }
+    return ("profile_install_state=installed:{0},profile_count:{1},installed_profile_count:{2},active_profile:{3},active_profile_installed:{4},reason:{5},auto_install_attempted:{6},auto_install_reason:{7},extension_dir:{8}" -f `
         $state.installed, `
         $state.profile_count, `
         $state.installed_profile_count, `
@@ -173,7 +174,8 @@ function Format-SynapseChromeBridgeProfileInstallState {
         $state.active_profile_installed, `
         $state.reason, `
         $autoInstallAttempted, `
-        $autoInstallReason)
+        $autoInstallReason, `
+        $extensionDir)
 }
 
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
