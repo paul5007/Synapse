@@ -61,11 +61,20 @@ struct ProtocolActivationRequest {
 
 impl ProtocolActivationRequest {
     fn parse(uri: &str) -> Result<Self, String> {
-        let query = uri
-            .strip_prefix(&format!("{APPROVAL_PROTOCOL_SCHEME}://decide?"))
+        let normalized = uri.trim().trim_matches('"').trim();
+        let without_scheme = normalized
+            .strip_prefix(&format!("{APPROVAL_PROTOCOL_SCHEME}://"))
             .ok_or_else(|| {
                 format!("expected {APPROVAL_PROTOCOL_SCHEME}://decide? activation URI")
             })?;
+        let (route, query) = without_scheme.split_once('?').ok_or_else(|| {
+            format!("expected {APPROVAL_PROTOCOL_SCHEME}://decide? activation URI")
+        })?;
+        if route.trim_end_matches('/') != "decide" {
+            return Err(format!(
+                "expected {APPROVAL_PROTOCOL_SCHEME}://decide? activation URI"
+            ));
+        }
         let fields = parse_query(query)?;
         let bind = required(&fields, "bind")?;
         let addr = bind
@@ -359,6 +368,18 @@ mod tests {
         assert!(callback.starts_with("http://127.0.0.1:7700/approval/activate?"));
         assert!(callback.contains("decision=snooze"));
         assert!(callback.contains("token=act1-cccc"));
+    }
+
+    #[test]
+    fn protocol_activation_uri_accepts_windows_shell_handoff_variants() {
+        for uri in [
+            "\"synapse-approval://decide?bind=127.0.0.1%3A7700&approval_id=apr1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&activation_id=actv1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&token=act1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc&decision=accept\"",
+            "synapse-approval://decide/?bind=127.0.0.1%3A7700&approval_id=apr1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&activation_id=actv1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&token=act1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc&decision=accept",
+        ] {
+            let parsed = ProtocolActivationRequest::parse(uri).expect(uri);
+            assert_eq!(parsed.bind, "127.0.0.1:7700");
+            assert_eq!(parsed.decision, "accept");
+        }
     }
 
     #[test]

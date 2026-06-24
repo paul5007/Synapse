@@ -239,8 +239,8 @@ pub fn inspect_storage_summary(
     let (cf_sizes, missing_cf_size_estimates) = runtime
         .storage_cf_live_data_size_estimates()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let (cf_row_counts, missing_cf_row_count_estimates) = runtime
-        .storage_cf_estimated_row_counts()
+    let cf_row_counts = runtime
+        .storage_cf_row_counts()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(StorageSummaryResponse {
         schema_version: runtime.schema_version(),
@@ -252,11 +252,11 @@ pub fn inspect_storage_summary(
             .map(str::to_owned)
             .collect(),
         audit_retention_policy_count: audit_retention_policies().len(),
-        metrics_mode: "rocksdb_property_estimates".to_owned(),
+        metrics_mode: "rocksdb_live_data_size_estimates_exact_row_counts".to_owned(),
         cf_sizes,
         cf_row_counts,
         missing_cf_size_estimates,
-        missing_cf_row_count_estimates,
+        missing_cf_row_count_estimates: Vec::new(),
     })
 }
 

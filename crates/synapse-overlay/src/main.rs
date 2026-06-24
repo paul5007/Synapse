@@ -104,6 +104,12 @@ mod tray {
         }
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    struct ToggleOnceOutput {
+        before: TraySnapshot,
+        after: TraySnapshot,
+    }
+
     struct AppState {
         base_url: String,
         token: String,
@@ -111,18 +117,30 @@ mod tray {
     }
 
     pub fn run() -> Result<()> {
+        if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+            println!(
+                "Usage: synapse-overlay [--status-once|--toggle-once]\n\nStarts the Synapse Windows tray companion."
+            );
+            return Ok(());
+        }
+        if std::env::args().any(|arg| arg == "--toggle-once") {
+            let app = app_state_from_env()?;
+            let before = poll_state(&app)?;
+            toggle_recording(&app)?;
+            let after = poll_state(&app)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ToggleOnceOutput { before, after })
+                    .context("encode tray toggle status")?
+            );
+            return Ok(());
+        }
         if std::env::args().any(|arg| arg == "--status-once") {
             let app = app_state_from_env()?;
             let snapshot = poll_state(&app)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&snapshot).context("encode tray status")?
-            );
-            return Ok(());
-        }
-        if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
-            println!(
-                "Usage: synapse-overlay [--status-once]\n\nStarts the Synapse Windows tray companion."
             );
             return Ok(());
         }
