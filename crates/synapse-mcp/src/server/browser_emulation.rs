@@ -67,11 +67,6 @@ pub enum BrowserMediaOperation {
     Reset,
 }
 
-
-
-
-
-
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserResizeParams {

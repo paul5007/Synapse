@@ -7,8 +7,7 @@ use crate::{
     A11yError, A11yResult, AccessibleEvent, ElementClickAction, ElementMetadataReadback,
     ElementScrollReadback, ElementSearchScope, ElementTextInsertReadback,
     ElementTextSelectionReadback, ElementValueReadback, ElementValueSetReadback, ExpandState,
-    ForegroundActivationIntent, UIElement,
-    UiaWorkerReadback, WinEventHookReadback,
+    ForegroundActivationIntent, UIElement, UiaWorkerReadback, WinEventHookReadback,
 };
 
 pub struct WinEventSubscription {

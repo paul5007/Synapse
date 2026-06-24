@@ -1603,7 +1603,9 @@ fn assert_element_poll(
             let attribute = params.attribute_name.as_deref().ok_or_else(|| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
-                    format!("{ASSERT_TOOL} to_have_attribute poll missing validated attribute_name"),
+                    format!(
+                        "{ASSERT_TOOL} to_have_attribute poll missing validated attribute_name"
+                    ),
                 )
             })?;
             let actual = state.attributes.get(attribute).cloned();

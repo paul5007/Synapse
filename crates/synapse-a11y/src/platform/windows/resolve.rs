@@ -23,8 +23,7 @@ use windows::Win32::{
 use crate::{
     A11yError, A11yResult, ElementClickAction, ElementMetadataReadback, ElementScrollReadback,
     ElementScrollStateReadback, ElementTextInsertReadback, ElementTextSelectionReadback,
-    ElementValueReadback,
-    ElementValueSetReadback, ExpandState,
+    ElementValueReadback, ElementValueSetReadback, ExpandState,
 };
 
 use super::common::{
@@ -914,12 +913,10 @@ fn native_set_text_selection(id: &ElementId, hwnd: HWND, start: u32, end: u32) -
 }
 
 fn native_text_u32_len(id: &ElementId, len: usize, label: &str) -> A11yResult<u32> {
-    u32::try_from(len).map_err(|_err| {
-        A11yError::ElementValueUnsupported {
-            detail: format!(
-                "{label} UTF-16 length {len} exceeds u32::MAX for native text element {id}"
-            ),
-        }
+    u32::try_from(len).map_err(|_err| A11yError::ElementValueUnsupported {
+        detail: format!(
+            "{label} UTF-16 length {len} exceeds u32::MAX for native text element {id}"
+        ),
     })
 }
 
@@ -936,15 +933,11 @@ fn native_text_replace_range(
             ),
         });
     }
-    let start = usize::try_from(start).map_err(|err| {
-        A11yError::ElementValueUnsupported {
-            detail: format!("native text selection start could not fit usize for {id}: {err}"),
-        }
+    let start = usize::try_from(start).map_err(|err| A11yError::ElementValueUnsupported {
+        detail: format!("native text selection start could not fit usize for {id}: {err}"),
     })?;
-    let end = usize::try_from(end).map_err(|err| {
-        A11yError::ElementValueUnsupported {
-            detail: format!("native text selection end could not fit usize for {id}: {err}"),
-        }
+    let end = usize::try_from(end).map_err(|err| A11yError::ElementValueUnsupported {
+        detail: format!("native text selection end could not fit usize for {id}: {err}"),
     })?;
     if start > before_len || end > before_len {
         return Err(A11yError::ElementValueUnsupported {
@@ -1014,8 +1007,7 @@ fn native_replace_element_text_selection(
     let inserted_wide: Vec<u16> = inserted_text.encode_utf16().collect();
     let requested_text_utf16_len =
         native_text_u32_len(id, text.encode_utf16().count(), "requested text")?;
-    let inserted_text_utf16_len =
-        native_text_u32_len(id, inserted_wide.len(), "inserted text")?;
+    let inserted_text_utf16_len = native_text_u32_len(id, inserted_wide.len(), "inserted text")?;
     let expected_wide = native_text_expected_after_wide(
         id,
         &before_wide,
@@ -1038,12 +1030,8 @@ fn native_replace_element_text_selection(
     let expected_caret = replace_selection
         .0
         .checked_add(inserted_text_utf16_len)
-        .ok_or_else(|| {
-            A11yError::ElementValueUnsupported {
-                detail: format!(
-                    "native text insertion caret offset overflowed u32 for element {id}"
-                ),
-            }
+        .ok_or_else(|| A11yError::ElementValueUnsupported {
+            detail: format!("native text insertion caret offset overflowed u32 for element {id}"),
         })?;
     if after_selection != (expected_caret, expected_caret) {
         return Err(A11yError::internal(format!(

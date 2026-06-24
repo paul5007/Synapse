@@ -179,7 +179,6 @@ pub enum ArmedRoutineTickTriggerMode {
     Both,
 }
 
-
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArmedRoutineTickParams {

@@ -24,7 +24,6 @@ pub enum BrowserCookiesOperation {
     Clear,
 }
 
-
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserCookiesParams {
@@ -96,7 +95,6 @@ pub enum BrowserStorageOperation {
     LoadState,
 }
 
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -105,7 +103,6 @@ pub enum BrowserStorageStore {
     Local,
     Session,
 }
-
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

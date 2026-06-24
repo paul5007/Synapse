@@ -331,14 +331,14 @@ pub async fn binding_capture_remove(
             .page
             .execute(RemoveBindingParams::new(name.to_owned()))
             .await
-        {
-            if let Ok(mut state) = slot.state.lock() {
-                state.active_names.insert(name.to_owned());
-            }
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!("Runtime.removeBinding({name:?}): {err}"),
-            });
+    {
+        if let Ok(mut state) = slot.state.lock() {
+            state.active_names.insert(name.to_owned());
         }
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.removeBinding({name:?}): {err}"),
+        });
+    }
     status_from_slot(&slot, name, false, false, was_active)
 }
 

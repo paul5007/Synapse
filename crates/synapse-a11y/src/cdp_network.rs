@@ -436,19 +436,18 @@ impl RingBuffer {
 
     fn entry_for_event(&mut self, request_id: &str) -> &mut CdpNetworkEntry {
         let seq = self.reserve_seq();
-        let index = if let Some(index) =
-            self.entries.iter().position(|e| e.request_id == request_id)
-        {
-            index
-        } else {
-            while self.entries.len() >= self.capacity {
-                self.entries.pop_front();
-                self.dropped += 1;
-            }
-            self.entries
-                .push_back(CdpNetworkEntry::new(seq, request_id.to_owned()));
-            self.entries.len() - 1
-        };
+        let index =
+            if let Some(index) = self.entries.iter().position(|e| e.request_id == request_id) {
+                index
+            } else {
+                while self.entries.len() >= self.capacity {
+                    self.entries.pop_front();
+                    self.dropped += 1;
+                }
+                self.entries
+                    .push_back(CdpNetworkEntry::new(seq, request_id.to_owned()));
+                self.entries.len() - 1
+            };
         let entry = &mut self.entries[index];
         entry.seq = seq;
         entry
@@ -560,19 +559,18 @@ impl WebSocketRingBuffer {
     }
 
     fn entry_for_seq(&mut self, request_id: &str, seq: u64) -> &mut CdpWebSocketEntry {
-        let index = if let Some(index) =
-            self.entries.iter().position(|e| e.request_id == request_id)
-        {
-            index
-        } else {
-            while self.entries.len() >= self.capacity {
-                self.entries.pop_front();
-                self.dropped = self.dropped.saturating_add(1);
-            }
-            self.entries
-                .push_back(CdpWebSocketEntry::new(seq, request_id.to_owned()));
-            self.entries.len() - 1
-        };
+        let index =
+            if let Some(index) = self.entries.iter().position(|e| e.request_id == request_id) {
+                index
+            } else {
+                while self.entries.len() >= self.capacity {
+                    self.entries.pop_front();
+                    self.dropped = self.dropped.saturating_add(1);
+                }
+                self.entries
+                    .push_back(CdpWebSocketEntry::new(seq, request_id.to_owned()));
+                self.entries.len() - 1
+            };
         let entry = &mut self.entries[index];
         entry.seq = seq;
         entry
@@ -1861,9 +1859,10 @@ fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRout
         return false;
     }
     if let Some(resource_type) = rule.resource_type.as_deref()
-        && !enum_str(&event.resource_type).eq_ignore_ascii_case(resource_type) {
-            return false;
-        }
+        && !enum_str(&event.resource_type).eq_ignore_ascii_case(resource_type)
+    {
+        return false;
+    }
     true
 }
 
@@ -2030,22 +2029,24 @@ fn validate_fetch_route_fulfill(fulfill: &CdpFetchRouteFulfill) -> A11yResult<()
         });
     }
     if let Some(response_phrase) = fulfill.response_phrase.as_deref()
-        && response_phrase.contains(['\r', '\n', '\0']) {
-            return Err(A11yError::CdpAttachFailed {
-                detail: "Fetch route response_phrase must not contain control line breaks or NUL"
-                    .to_owned(),
-            });
-        }
+        && response_phrase.contains(['\r', '\n', '\0'])
+    {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route response_phrase must not contain control line breaks or NUL"
+                .to_owned(),
+        });
+    }
     for (name, value) in &fulfill.headers {
         validate_header_name(name)?;
         validate_header_value(value)?;
     }
     if let Some(body_base64) = fulfill.body_base64.as_deref()
-        && body_base64.contains('\0') {
-            return Err(A11yError::CdpAttachFailed {
-                detail: "Fetch route body_base64 must not contain NUL".to_owned(),
-            });
-        }
+        && body_base64.contains('\0')
+    {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route body_base64 must not contain NUL".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -2060,12 +2061,14 @@ fn validate_fetch_route_continue(continue_rule: &CdpFetchRouteContinue) -> A11yR
         });
     }
     if let Some(url) = continue_rule.url.as_deref()
-        && (url.trim() != url || url.is_empty() || url.contains('\0')) {
-            return Err(A11yError::CdpAttachFailed {
-                detail: "Fetch route continue url must be non-empty without surrounding whitespace or NUL"
+        && (url.trim() != url || url.is_empty() || url.contains('\0'))
+    {
+        return Err(A11yError::CdpAttachFailed {
+            detail:
+                "Fetch route continue url must be non-empty without surrounding whitespace or NUL"
                     .to_owned(),
-            });
-        }
+        });
+    }
     if let Some(method) = continue_rule.method.as_deref() {
         validate_http_method(method)?;
     }
@@ -2074,11 +2077,12 @@ fn validate_fetch_route_continue(continue_rule: &CdpFetchRouteContinue) -> A11yR
         validate_header_value(value)?;
     }
     if let Some(post_data_base64) = continue_rule.post_data_base64.as_deref()
-        && post_data_base64.contains('\0') {
-            return Err(A11yError::CdpAttachFailed {
-                detail: "Fetch route continue post_data_base64 must not contain NUL".to_owned(),
-            });
-        }
+        && post_data_base64.contains('\0')
+    {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "Fetch route continue post_data_base64 must not contain NUL".to_owned(),
+        });
+    }
     Ok(())
 }
 

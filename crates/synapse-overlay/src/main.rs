@@ -214,16 +214,18 @@ mod tray {
             WM_TRAY => {
                 let event = lparam.0 as u32;
                 if (event == WM_RBUTTONUP || event == WM_LBUTTONUP)
-                    && let Some(app) = app_from_window(hwnd) {
-                        let _ = show_menu(hwnd, app);
-                    }
+                    && let Some(app) = app_from_window(hwnd)
+                {
+                    let _ = show_menu(hwnd, app);
+                }
                 LRESULT(0)
             }
             WM_STATUS => {
                 if let Some(app) = app_from_window(hwnd)
-                    && let Ok(state) = app.state.lock() {
-                        let _ = add_or_update_icon(hwnd, &state, NIM_MODIFY);
-                    }
+                    && let Ok(state) = app.state.lock()
+                {
+                    let _ = add_or_update_icon(hwnd, &state, NIM_MODIFY);
+                }
                 LRESULT(0)
             }
             WM_COMMAND => {

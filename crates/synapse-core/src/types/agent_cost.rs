@@ -172,14 +172,14 @@ impl ModelPrice {
             ));
         }
         let untagged = usage.cache_creation_tokens - tagged;
-        let rate_5m = self
+        let five_minute_cache_write_rate = self
             .cache_creation_5m_micro_usd_per_mtok
             .unwrap_or(self.cache_creation_micro_usd_per_mtok);
-        let rate_1h = self
+        let one_hour_cache_write_rate = self
             .cache_creation_1h_micro_usd_per_mtok
             .unwrap_or(self.cache_creation_micro_usd_per_mtok);
-        let cache_creation = line(usage.cache_creation_5m_tokens, rate_5m)
-            + line(usage.cache_creation_1h_tokens, rate_1h)
+        let cache_creation = line(usage.cache_creation_5m_tokens, five_minute_cache_write_rate)
+            + line(usage.cache_creation_1h_tokens, one_hour_cache_write_rate)
             + line(untagged, self.cache_creation_micro_usd_per_mtok);
         let total = input + output + cache_read + cache_creation;
         let to_u64 = |value: u128, label: &str| -> Result<u64, String> {
@@ -275,16 +275,16 @@ impl BillableUsage {
         output_tokens: u64,
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
-        cache_creation_5m_tokens: u64,
-        cache_creation_1h_tokens: u64,
+        cache_creation_short_ttl_tokens: u64,
+        cache_creation_long_ttl_tokens: u64,
     ) -> Self {
         Self {
             input_tokens,
             output_tokens,
             cache_read_tokens: cache_read_input_tokens,
             cache_creation_tokens: cache_creation_input_tokens,
-            cache_creation_5m_tokens,
-            cache_creation_1h_tokens,
+            cache_creation_5m_tokens: cache_creation_short_ttl_tokens,
+            cache_creation_1h_tokens: cache_creation_long_ttl_tokens,
         }
     }
 
