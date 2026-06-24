@@ -328,10 +328,10 @@ export function App() {
     window.location.replace(dashboardAssetReloadUrl(decision.expectedJsFile || ""));
   }, [query.data]);
 
-  const agents = useMemo(() => buildAgents(query.data), [query.data]);
+  const agents = useMemo(() => buildAgentsWithAttention(query.data), [query.data]);
   const toolCalls = useMemo(() => buildToolCalls(query.data), [query.data]);
   const attentionAgents = useMemo(
-    () => agents.filter((agent) => ["stuck", "needs_input", "awaiting_approval", "ready_for_review"].includes(agent.status)),
+    () => agents.filter((agent) => ATTENTION_AGENT_STATUSES.has(agent.status)),
     [agents]
   );
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) ?? attentionAgents[0] ?? agents[0];
@@ -2169,6 +2169,7 @@ const APPROVAL_KIND_LABEL: Record<string, string> = {
 // belong in the fleet "Agents awaiting your decision" attention section.
 const AGENT_ATTENTION_KINDS = ["agent_permission", "agent_escalation", "agent_question"];
 const TERMINAL_APPROVAL_STATUSES = new Set(["accepted", "declined", "ignored"]);
+const ATTENTION_AGENT_STATUSES = new Set<FleetStatus>(["stuck", "needs_input", "awaiting_approval", "ready_for_review"]);
 
 function approvalRowIsTerminal(row: ApprovalRow): boolean {
   return TERMINAL_APPROVAL_STATUSES.has(row.status.toLowerCase());
@@ -2183,6 +2184,57 @@ function approvalRowIsBatchSelectable(row: ApprovalRow): boolean {
 function approvalRowSupportsBatchDecision(row: ApprovalRow, decision: "approve" | "deny"): boolean {
   if (!approvalRowIsBatchSelectable(row)) return false;
   return decision === "approve" ? row.allow.accept : row.allow.ignore;
+}
+
+function buildAgentsWithAttention(state?: DashboardState): AgentSummary[] {
+  const agents = buildAgents(state);
+  const rows = parseApprovalRows(state?.approvals).filter((row) => AGENT_ATTENTION_KINDS.includes(row.kind) && !approvalRowIsTerminal(row));
+  if (rows.length === 0) return agents;
+
+  const matchedApprovals = new Set<string>();
+  const promoted = agents.map((agent) => {
+    const ids = agentIdentifierSet(agent);
+    const agentRows = rows.filter((row) => approvalRowMatchesAgent(row, ids));
+    if (agentRows.length === 0) return agent;
+    agentRows.forEach((row) => matchedApprovals.add(row.approvalId));
+    const question = agentRows.find((row) => row.kind === "agent_question" || row.allow.respond);
+    const primary = question ?? agentRows[0];
+    const status: FleetStatus = question ? "needs_input" : "awaiting_approval";
+    return {
+      ...agent,
+      status,
+      reason: primary.title || agent.reason,
+      summary: primary.body || primary.title || agent.summary,
+      lastAction: primary.title || agent.lastAction
+    };
+  });
+
+  const missingRows = rows
+    .filter((row) => !matchedApprovals.has(row.approvalId))
+    .map((row) => {
+      const requestedBy = rawText(row.raw.requested_by_session);
+      const requestedSuffix = requestedBy.split(":").pop() || requestedBy;
+      const id = row.spawnId || requestedSuffix || row.approvalId;
+      const status: FleetStatus = row.kind === "agent_question" || row.allow.respond ? "needs_input" : "awaiting_approval";
+      return {
+        id,
+        spawnId: row.spawnId || undefined,
+        killId: row.spawnId || undefined,
+        killable: false,
+        kind: row.kind,
+        lifecycle: "attention",
+        status,
+        summary: row.body || row.title,
+        lastSeenMs: Date.now() - row.updatedMs,
+        lastAction: row.title,
+        target: requestedBy,
+        reason: row.title,
+        diffStats: { events: 1, transcripts: 0, actions: 1 },
+        raw: row.raw
+      } satisfies AgentSummary;
+    });
+
+  return [...promoted, ...missingRows];
 }
 
 function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided?: () => void }) {
