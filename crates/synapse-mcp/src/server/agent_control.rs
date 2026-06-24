@@ -678,6 +678,60 @@ impl SynapseService {
         self.agent_kill_impl(params, None).await
     }
 
+    pub(crate) fn dashboard_agent_interrupt_request(
+        &self,
+        params: AgentInterruptParams,
+    ) -> Result<AgentInterruptResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_AGENT_INTERRUPT_REQUESTED",
+            kind = TOOL_AGENT_INTERRUPT,
+            requested_id = %params.session_id,
+            "dashboard.invocation kind=agent_interrupt"
+        );
+        self.agent_interrupt_impl(params, Some("dashboard-agent-detail"))
+    }
+
+    pub(crate) fn dashboard_agent_pause_request(
+        &self,
+        params: AgentPauseParams,
+    ) -> Result<AgentSuspendResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_AGENT_PAUSE_REQUESTED",
+            kind = TOOL_AGENT_PAUSE,
+            requested_id = %params.session_id,
+            "dashboard.invocation kind=agent_pause"
+        );
+        self.agent_pause_impl(params, Some("dashboard-agent-detail"))
+    }
+
+    pub(crate) fn dashboard_agent_resume_request(
+        &self,
+        params: AgentPauseParams,
+    ) -> Result<AgentSuspendResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_AGENT_RESUME_REQUESTED",
+            kind = TOOL_AGENT_RESUME,
+            requested_id = %params.session_id,
+            "dashboard.invocation kind=agent_resume"
+        );
+        self.agent_resume_impl(params, Some("dashboard-agent-detail"))
+    }
+
+    pub(crate) async fn dashboard_agent_respawn_request(
+        &self,
+        params: AgentRespawnParams,
+        mcp_url: String,
+    ) -> Result<AgentRespawnResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_AGENT_RESPAWN_REQUESTED",
+            kind = TOOL_AGENT_RESPAWN,
+            requested_id = %params.session_id,
+            "dashboard.invocation kind=agent_respawn"
+        );
+        self.agent_respawn_core(params, None, None, Some(mcp_url))
+            .await
+    }
+
     // ------------------------------------------------------------------
     // agent_interrupt
     // ------------------------------------------------------------------
@@ -1826,6 +1880,17 @@ impl SynapseService {
         request_context: &RequestContext<RoleServer>,
     ) -> Result<AgentRespawnResponse, ErrorData> {
         let caller = super::context::mcp_session_id_from_request_context(request_context)?;
+        self.agent_respawn_core(params, caller, Some(request_context), None)
+            .await
+    }
+
+    async fn agent_respawn_core(
+        &self,
+        params: AgentRespawnParams,
+        caller: Option<String>,
+        request_context: Option<&RequestContext<RoleServer>>,
+        dashboard_mcp_url: Option<String>,
+    ) -> Result<AgentRespawnResponse, ErrorData> {
         let RespawnPlan {
             lookup,
             target,
@@ -1891,7 +1956,15 @@ impl SynapseService {
                     format!("AGENT_RESPAWN_REQUEST_BUILD_FAILED: {error}"),
                 )
             })?;
-        let spawned = self.spawn_agent_journaled(request, request_context).await?;
+        let mut request = request;
+        let spawned = if let Some(request_context) = request_context {
+            self.spawn_agent_journaled(request, request_context).await?
+        } else {
+            if let Some(mcp_url) = dashboard_mcp_url {
+                request.mcp_url = mcp_url;
+            }
+            self.dashboard_spawn_agent_request(request).await?
+        };
 
         // Lineage: record on the prior agent that it was respawned into the new
         // spawn, so agent_query/the journal can trace the chain.

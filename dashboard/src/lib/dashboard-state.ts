@@ -505,6 +505,17 @@ export interface AgentKillResponse {
   kill: Record<string, unknown>;
 }
 
+export interface AgentLookupRequest {
+  session_id: string;
+}
+
+export interface AgentRespawnRequest {
+  session_id: string;
+  prompt: string;
+  carry_context?: boolean;
+  grace_ms?: number;
+}
+
 export interface TimelineControlResponse {
   ok: boolean;
   trigger: string;
@@ -916,6 +927,50 @@ export async function killAgent(request: AgentKillRequest): Promise<AgentKillRes
     body: JSON.stringify(request)
   });
   return (await readJsonOrThrow(response)) as unknown as AgentKillResponse;
+}
+
+export async function interruptAgent(request: AgentLookupRequest): Promise<DashboardControlResponse> {
+  const response = await fetch("/dashboard/agent-interrupt", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  return (await readJsonOrThrow(response)) as unknown as DashboardControlResponse;
+}
+
+export async function pauseAgent(request: AgentLookupRequest): Promise<DashboardControlResponse> {
+  const response = await fetch("/dashboard/agent-pause", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  return (await readJsonOrThrow(response)) as unknown as DashboardControlResponse;
+}
+
+export async function resumeAgent(request: AgentLookupRequest): Promise<DashboardControlResponse> {
+  const response = await fetch("/dashboard/agent-resume", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  return (await readJsonOrThrow(response)) as unknown as DashboardControlResponse;
+}
+
+export async function respawnAgent(request: AgentRespawnRequest): Promise<DashboardControlResponse> {
+  const response = await fetch("/dashboard/agent-respawn", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  return (await readJsonOrThrow(response)) as unknown as DashboardControlResponse;
 }
 
 export type ApprovalDecisionVerb = "approve" | "deny";

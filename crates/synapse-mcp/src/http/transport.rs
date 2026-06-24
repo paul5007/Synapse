@@ -587,6 +587,27 @@ fn router(
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/dashboard/agent-interrupt",
+            post(dashboard_agent_interrupt)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/agent-pause",
+            post(dashboard_agent_pause)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/agent-resume",
+            post(dashboard_agent_resume)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/agent-respawn",
+            post(dashboard_agent_respawn).layer(DefaultBodyLimit::max(
+                DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
             "/dashboard/tasks/create",
             post(dashboard_task_create).layer(DefaultBodyLimit::max(
                 DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
@@ -2102,6 +2123,23 @@ struct DashboardAgentKillRequest {
     grace_ms: Option<u64>,
     #[serde(default)]
     interrupt_first: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardAgentLookupRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardAgentRespawnRequest {
+    session_id: String,
+    prompt: String,
+    #[serde(default)]
+    carry_context: Option<bool>,
+    #[serde(default)]
+    grace_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -4270,6 +4308,139 @@ async fn dashboard_agent_kill(
     }
 }
 
+async fn dashboard_agent_interrupt(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardAgentLookupRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = match dashboard_agent_interrupt_params(request) {
+        Ok(params) => params,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    match state.health_service.dashboard_agent_interrupt_request(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.agent_interrupt",
+                source_of_truth:
+                    "ranked agent_interrupt delivery channels, CF_AGENT_EVENTS, command audit rows, process table readback",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_agent_pause(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardAgentLookupRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = match dashboard_agent_pause_params(request) {
+        Ok(params) => params,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    match state.health_service.dashboard_agent_pause_request(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.agent_pause",
+                source_of_truth:
+                    "OS process/thread table suspend readback, CF_AGENT_EVENTS, command audit rows",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_agent_resume(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardAgentLookupRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = match dashboard_agent_pause_params(request) {
+        Ok(params) => params,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    match state.health_service.dashboard_agent_resume_request(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.agent_resume",
+                source_of_truth:
+                    "OS process/thread table resume readback, CF_AGENT_EVENTS, command audit rows",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_agent_respawn(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardAgentRespawnRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = match dashboard_agent_respawn_params(request) {
+        Ok(params) => params,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let mcp_url = crate::m4::agent_spawn_mcp_url_for_bind(state.bind_addr);
+    match state
+        .health_service
+        .dashboard_agent_respawn_request(params, mcp_url)
+        .await
+    {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardControlResponse {
+                ok: true,
+                trigger: "dashboard.agent_respawn",
+                source_of_truth:
+                    "spawn manifest, OS process table, CF_AGENT_EVENTS, session registry, command audit rows, agent spawn artifacts",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
 async fn dashboard_task_create(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -5104,22 +5275,66 @@ fn dashboard_spawn_agent_request_params(
 fn dashboard_agent_kill_params(
     request: DashboardAgentKillRequest,
 ) -> Result<crate::server::agent_control::AgentKillParams, Response> {
-    let session_id = request.session_id.trim();
-    if session_id.is_empty() {
-        return Err(dashboard_error_response(
-            StatusCode::BAD_REQUEST,
-            synapse_core::error_codes::TOOL_PARAMS_INVALID,
-            "dashboard agent kill requires session_id or spawn_id",
-            None,
-        ));
-    }
+    let session_id = dashboard_agent_control_id(&request.session_id, "kill")?;
     Ok(crate::server::agent_control::AgentKillParams {
-        session_id: session_id.to_owned(),
+        session_id,
         grace_ms: request
             .grace_ms
             .unwrap_or(DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS),
         interrupt_first: request.interrupt_first.unwrap_or(true),
     })
+}
+
+fn dashboard_agent_interrupt_params(
+    request: DashboardAgentLookupRequest,
+) -> Result<crate::server::agent_control::AgentInterruptParams, Response> {
+    Ok(crate::server::agent_control::AgentInterruptParams {
+        session_id: dashboard_agent_control_id(&request.session_id, "interrupt")?,
+    })
+}
+
+fn dashboard_agent_pause_params(
+    request: DashboardAgentLookupRequest,
+) -> Result<crate::server::agent_control::AgentPauseParams, Response> {
+    Ok(crate::server::agent_control::AgentPauseParams {
+        session_id: dashboard_agent_control_id(&request.session_id, "pause/resume")?,
+    })
+}
+
+fn dashboard_agent_respawn_params(
+    request: DashboardAgentRespawnRequest,
+) -> Result<crate::server::agent_control::AgentRespawnParams, Response> {
+    let session_id = dashboard_agent_control_id(&request.session_id, "respawn")?;
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard agent respawn requires prompt",
+            None,
+        ));
+    }
+    Ok(crate::server::agent_control::AgentRespawnParams {
+        session_id,
+        prompt: prompt.to_owned(),
+        carry_context: request.carry_context.unwrap_or(true),
+        grace_ms: request
+            .grace_ms
+            .unwrap_or(DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS),
+    })
+}
+
+fn dashboard_agent_control_id(value: &str, verb: &str) -> Result<String, Response> {
+    let session_id = value.trim();
+    if session_id.is_empty() {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            &format!("dashboard agent {verb} requires session_id or spawn_id"),
+            None,
+        ));
+    }
+    Ok(session_id.to_owned())
 }
 
 fn dashboard_control_lease_force_release_params(
@@ -6127,12 +6342,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-DL_3qsw4.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-2jMz_uzs.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-gO8q6Iqi.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-DLN_lTHU.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-DL_3qsw4.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-2jMz_uzs.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-gO8q6Iqi.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-DLN_lTHU.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
@@ -6908,6 +7123,49 @@ mod tests {
         })
         .expect_err("empty dashboard kill id should fail closed");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dashboard_agent_control_params_trim_selected_agent_ids() {
+        let interrupt = dashboard_agent_interrupt_params(DashboardAgentLookupRequest {
+            session_id: " agent-spawn-issue917 ".to_owned(),
+        })
+        .expect("valid dashboard interrupt params");
+        let pause = dashboard_agent_pause_params(DashboardAgentLookupRequest {
+            session_id: " session-issue917 ".to_owned(),
+        })
+        .expect("valid dashboard pause params");
+
+        assert_eq!(interrupt.session_id, "agent-spawn-issue917");
+        assert_eq!(pause.session_id, "session-issue917");
+    }
+
+    #[test]
+    fn dashboard_agent_respawn_params_require_prompt() {
+        let response = dashboard_agent_respawn_params(DashboardAgentRespawnRequest {
+            session_id: "agent-spawn-issue917".to_owned(),
+            prompt: "   ".to_owned(),
+            carry_context: None,
+            grace_ms: None,
+        })
+        .expect_err("empty dashboard respawn prompt should fail closed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dashboard_agent_respawn_params_trim_and_default_options() {
+        let params = dashboard_agent_respawn_params(DashboardAgentRespawnRequest {
+            session_id: " agent-spawn-issue917 ".to_owned(),
+            prompt: " continue this work ".to_owned(),
+            carry_context: None,
+            grace_ms: None,
+        })
+        .expect("valid dashboard respawn params");
+
+        assert_eq!(params.session_id, "agent-spawn-issue917");
+        assert_eq!(params.prompt, "continue this work");
+        assert!(params.carry_context);
+        assert_eq!(params.grace_ms, DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS);
     }
 
     #[test]

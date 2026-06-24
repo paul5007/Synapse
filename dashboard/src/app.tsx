@@ -94,13 +94,17 @@ import {
   injectAgentContext,
   dispatchAgentTaskOnce,
   inspectRoutine,
+  interruptAgent,
   killAgent,
   panelData,
+  pauseAgent,
   pauseTimeline,
   pruneTargetClaims,
   purgeTimelineRecordings,
   registerApiModel,
   resumeTimeline,
+  respawnAgent,
+  resumeAgent,
   runStorageGc,
   saveDashboardView,
   searchTimelineRows,
@@ -550,7 +554,9 @@ export function App() {
           onAuditKeySelect={focusAuditKey}
         />
       ) : null}
-      {normalizedRoute === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} onAuditKeySelect={focusAuditKey} /> : null}
+      {normalizedRoute === "agent" ? (
+        <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} onRefresh={() => query.refetch()} onAuditKeySelect={focusAuditKey} />
+      ) : null}
       {normalizedRoute === "context" ? (
         <ContextView state={state} agents={agents} selectedAgent={selectedAgent} setSelectedAgentId={setSelectedAgentId} onRefresh={() => query.refetch()} />
       ) : null}
@@ -977,11 +983,13 @@ function AgentView({
   state,
   selectedAgent,
   toolCalls,
+  onRefresh,
   onAuditKeySelect
 }: {
   state?: DashboardState;
   selectedAgent?: AgentSummary;
   toolCalls: ReturnType<typeof buildToolCalls>;
+  onRefresh: () => void | Promise<unknown>;
   onAuditKeySelect: (keyHex: string) => void;
 }) {
   const selectedAgentIds = agentIdentifierSet(selectedAgent);
@@ -1000,6 +1008,7 @@ function AgentView({
           <AgentPeek agent={selectedAgent} />
         </Section>
         <AgentContextPanel state={state} agent={selectedAgent} />
+        <AgentControlPanel agent={selectedAgent} onRefresh={onRefresh} />
       </div>
       <div className="min-w-0">
         <AgentTerminalPanel agent={selectedAgent} />
@@ -1037,6 +1046,7 @@ function AgentContextPanel({ state, agent }: { state?: DashboardState; agent?: A
     >
       {agent ? (
         <>
+          <AgentLifecycleStrip agent={agent} />
           <div className="grid gap-3">
             <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
               <h3 className="mb-2 text-md font-medium tracking-normal text-primary">Lifecycle</h3>
@@ -1081,6 +1091,229 @@ function AgentContextPanel({ state, agent }: { state?: DashboardState; agent?: A
             />
           </div>
         </>
+      ) : (
+        <EmptyState title="No agent selected" />
+      )}
+    </Section>
+  );
+}
+
+function AgentLifecycleStrip({ agent }: { agent?: AgentSummary }) {
+  const sessionId = agentSessionId(agent);
+  const spawnId = rawText(agent?.spawnId);
+  const eventsQuery = useQuery({
+    queryKey: ["agent-lifecycle-events", sessionId, spawnId],
+    queryFn: () =>
+      fetchAgentEvents({
+        session_id: spawnId ? undefined : sessionId || undefined,
+        spawn_id: spawnId || undefined,
+        limit: 64,
+        scan_limit: 20000
+      }),
+    enabled: Boolean(sessionId || spawnId),
+    refetchInterval: 5000
+  });
+  const rows = (eventsQuery.data?.rows ?? [])
+    .filter((row) => ["spawn_requested", "spawn_ready", "state_changed", "interrupted", "killed", "exited", "lease_acquired", "lease_released"].includes(row.kind))
+    .slice(-8);
+
+  return (
+    <div className="mb-3 grid gap-2">
+      <div className="flex items-center justify-between gap-3 text-sm">
+        <span className="text-label font-medium uppercase text-muted">Lifecycle Strip</span>
+        <span className="font-mono text-xs text-muted">
+          {eventsQuery.isFetching ? "refreshing" : `${rows.length}/${eventsQuery.data?.matched_rows ?? 0} rows`}
+        </span>
+      </div>
+      {rows.length ? (
+        <div className="overflow-x-auto">
+          <div className="flex min-w-max gap-2 pb-1">
+            {rows.map((row) => (
+              <div key={row.key_hex} className="w-40 rounded-md border border-border bg-surface-1 p-2 text-xs">
+                <div className="truncate font-mono text-primary">{row.kind}</div>
+                <div className="mt-1 truncate text-muted">{agentEventReason(row)}</div>
+                <div className="mt-1 truncate font-mono text-muted">{row.key_hex.slice(0, 12)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-md border border-border bg-surface-1 p-3 text-sm text-muted">
+          {eventsQuery.isError ? rawText(eventsQuery.error) || "Lifecycle events unavailable" : "No lifecycle event rows"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function agentEventReason(row: AgentEventQueryRow): string {
+  const record = asRecord(row.record);
+  const payload = asRecord(record.payload);
+  const candidates = [
+    payload.reason_code,
+    payload.reason,
+    payload.operation,
+    payload.lifecycle,
+    payload.state,
+    record.lifecycle,
+    record.state
+  ];
+  return candidates.map(rawText).find(Boolean) || "no reason";
+}
+
+type AgentControlVerb = "steer" | "pause" | "resume" | "interrupt" | "kill" | "respawn";
+type AgentControlReadback = DashboardControlResponse | AgentKillResponse | ContextInjectResponse;
+
+function AgentControlPanel({ agent, onRefresh }: { agent?: AgentSummary; onRefresh: () => void | Promise<unknown> }) {
+  const controlId = agentControlId(agent);
+  const runtimeSessionId = agentRuntimeSessionId(agent);
+  const displaySessionId = runtimeSessionId || agentSessionId(agent);
+  const [steerText, setSteerText] = useState("");
+  const [respawnPrompt, setRespawnPrompt] = useState("");
+  const [pending, setPending] = useState<AgentControlVerb | "">("");
+  const [confirming, setConfirming] = useState<AgentControlVerb | "">("");
+  const [error, setError] = useState("");
+  const [readback, setReadback] = useState<AgentControlReadback | null>(null);
+
+  const applyReadback = async (verb: AgentControlVerb, operation: () => Promise<AgentControlReadback>) => {
+    if (!controlId) return;
+    setPending(verb);
+    setError("");
+    try {
+      const response = await operation();
+      setReadback(response);
+      setConfirming("");
+      await onRefresh();
+    } catch (actionError) {
+      setError(rawText(actionError) || `Agent ${verb} failed`);
+    } finally {
+      setPending("");
+    }
+  };
+
+  const sendSteer = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!controlId || !steerText.trim()) return;
+    await applyReadback("steer", () =>
+      injectAgentContext({
+        session_id: controlId,
+        channel: "steer",
+        packet: steerText,
+        request_receipt: true
+      })
+    );
+    setSteerText("");
+  };
+
+  const submitRespawn = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!controlId || !respawnPrompt.trim() || pending) return;
+    if (confirming !== "respawn") {
+      setConfirming("respawn");
+      return;
+    }
+    await applyReadback("respawn", () =>
+      respawnAgent({
+        session_id: controlId,
+        prompt: respawnPrompt,
+        carry_context: true,
+        grace_ms: 3000
+      })
+    );
+    setRespawnPrompt("");
+  };
+
+  const runConfirmed = (verb: AgentControlVerb, operation: () => Promise<AgentControlReadback>) => {
+    if (confirming !== verb) {
+      setConfirming(verb);
+      return;
+    }
+    void applyReadback(verb, operation);
+  };
+
+  return (
+    <Section
+      title="Agent Controls"
+      tier="drill-down"
+      questions={["Which control verb was sent?", "Which physical readback proves it?", "Can destructive verbs require confirmation?"]}
+    >
+      {agent ? (
+        <div className="grid gap-4">
+          <div className="grid gap-2">
+            <MetricRow label="Control Id" value={controlId || "unresolved"} />
+            <MetricRow label="Session" value={displaySessionId || "unresolved"} />
+            <MetricRow label="Spawn" value={agent.spawnId || "none"} />
+          </div>
+
+          <form className="grid gap-3" onSubmit={sendSteer}>
+            <label className="block text-sm text-secondary">
+              <span className="mb-1 block text-label font-medium uppercase text-muted">Steer</span>
+              <textarea
+                className="min-h-24 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+                value={steerText}
+                onChange={(event) => setSteerText(event.target.value)}
+              />
+            </label>
+            <div className="flex justify-end">
+              <Button type="submit" variant="primary" size="sm" disabled={!controlId || !steerText.trim() || Boolean(pending)}>
+                <Rocket aria-hidden="true" className="h-4 w-4" />
+                {pending === "steer" ? "Sending" : "Steer"}
+              </Button>
+            </div>
+          </form>
+
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" size="sm" onClick={() => void applyReadback("pause", () => pauseAgent({ session_id: controlId }))} disabled={!controlId || Boolean(pending)}>
+              <Pause aria-hidden="true" className="h-4 w-4" />
+              {pending === "pause" ? "Pausing" : "Pause"}
+            </Button>
+            <Button type="button" size="sm" onClick={() => void applyReadback("resume", () => resumeAgent({ session_id: controlId }))} disabled={!controlId || Boolean(pending)}>
+              <Play aria-hidden="true" className="h-4 w-4" />
+              {pending === "resume" ? "Resuming" : "Resume"}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={confirming === "interrupt" ? "danger" : "secondary"}
+              onClick={() => runConfirmed("interrupt", () => interruptAgent({ session_id: controlId }))}
+              disabled={!controlId || Boolean(pending)}
+            >
+              <X aria-hidden="true" className="h-4 w-4" />
+              {pending === "interrupt" ? "Interrupting" : confirming === "interrupt" ? "Confirm Interrupt" : "Interrupt"}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={confirming === "kill" ? "danger" : "secondary"}
+              onClick={() => runConfirmed("kill", () => killAgent({ session_id: controlId, grace_ms: 0, interrupt_first: true }))}
+              disabled={!controlId || Boolean(pending)}
+            >
+              <Trash2 aria-hidden="true" className="h-4 w-4" />
+              {pending === "kill" ? "Killing" : confirming === "kill" ? "Confirm Kill" : "Kill"}
+            </Button>
+          </div>
+
+          <form className="grid gap-3" onSubmit={submitRespawn}>
+            <label className="block text-sm text-secondary">
+              <span className="mb-1 block text-label font-medium uppercase text-muted">Respawn Prompt</span>
+              <textarea
+                className="min-h-24 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+                value={respawnPrompt}
+                onChange={(event) => setRespawnPrompt(event.target.value)}
+              />
+            </label>
+            <div className="flex justify-end">
+              <Button type="submit" size="sm" variant={confirming === "respawn" ? "danger" : "secondary"} disabled={!controlId || !respawnPrompt.trim() || Boolean(pending)}>
+                <RefreshCw aria-hidden="true" className="h-4 w-4" />
+                {pending === "respawn" ? "Respawning" : confirming === "respawn" ? "Confirm Respawn" : "Respawn"}
+              </Button>
+            </div>
+          </form>
+
+          {confirming && !pending ? <div className="rounded-md border border-warning-border bg-warning-bg p-3 text-sm text-warning-fg">Confirm {confirming} to send the control verb.</div> : null}
+          {error ? <div className="rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{error}</div> : null}
+          {readback ? <RawValue value={readback} label="Control readback" /> : null}
+        </div>
       ) : (
         <EmptyState title="No agent selected" />
       )}
@@ -1308,6 +1541,18 @@ function ContextView({
 function agentSessionId(agent?: AgentSummary): string {
   const raw = asRecord(agent?.raw);
   return rawText(raw.session_id || agent?.id);
+}
+
+function agentRuntimeSessionId(agent?: AgentSummary): string {
+  return rawText(asRecord(agent?.raw).session_id);
+}
+
+function agentControlId(agent?: AgentSummary): string {
+  const spawnId = rawText(agent?.spawnId);
+  if (spawnId) return spawnId;
+  const killId = rawText(agent?.killable ? agent.killId : "");
+  if (killId && !killId.startsWith("pid:")) return killId;
+  return agentRuntimeSessionId(agent);
 }
 
 function selectedAgentTranscriptRows(state?: DashboardState, agent?: AgentSummary): Record<string, unknown>[] {
