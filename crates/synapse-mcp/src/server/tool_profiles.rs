@@ -139,8 +139,10 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "reality_audit",
     "reality_baseline",
     "routine_inspect",
+    "routine_label_export",
     "routine_list",
     "routine_mine",
+    "routine_update",
     "session_end",
     "session_list",
     "session_status",
@@ -1623,6 +1625,8 @@ mod tests {
         assert!(tools.contains(&"routine_mine".to_owned()));
         assert!(tools.contains(&"routine_list".to_owned()));
         assert!(tools.contains(&"routine_inspect".to_owned()));
+        assert!(tools.contains(&"routine_label_export".to_owned()));
+        assert!(tools.contains(&"routine_update".to_owned()));
         assert!(tools.contains(&"timeline_pause".to_owned()));
         assert!(tools.contains(&"timeline_resume".to_owned()));
         assert!(tools.contains(&"timeline_exclusions".to_owned()));

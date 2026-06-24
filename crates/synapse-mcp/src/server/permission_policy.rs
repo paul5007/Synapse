@@ -380,6 +380,7 @@ const SAFE_MCP_TOOLS: &[&str] = &[
     "storage_inspect",
     "capture_screenshot",
     "intent_current",
+    "routine_label_export",
     "routine_list",
     "routine_inspect",
     "episode_list",
@@ -492,6 +493,10 @@ mod tests {
         );
         assert_eq!(
             classify("mcp__synapse__timeline_get", &json!({})),
+            GateDecision::AutoAllow
+        );
+        assert_eq!(
+            classify("mcp__synapse__routine_label_export", &json!({})),
             GateDecision::AutoAllow
         );
         assert_eq!(
