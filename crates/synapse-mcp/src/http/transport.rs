@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write as _,
-    io,
+    fs,
+    io::{self, Read as _},
     net::SocketAddr,
+    path::PathBuf,
     process::ExitCode,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -66,6 +68,8 @@ const DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const DASHBOARD_CONTEXT_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const DASHBOARD_SPAWN_FAN_OUT_MAX: u32 = 5;
 const DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS: u64 = 3_000;
+const DASHBOARD_ASCIICAST_DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DASHBOARD_ASCIICAST_HARD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct HttpState {
@@ -553,6 +557,10 @@ fn router(
         .route(
             "/dashboard/agent-terminal/{spawn_id}/ws",
             get(dashboard_agent_terminal_ws),
+        )
+        .route(
+            "/dashboard/agent-recordings/{spawn_id}",
+            get(dashboard_agent_recording),
         )
         .route("/dashboard/audit/query", get(dashboard_audit_query))
         .route(
@@ -2466,6 +2474,87 @@ struct DashboardAgentEventsQueryFilters {
     kind: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardAgentRecordingQuery {
+    event_limit: Option<usize>,
+    event_scan_limit: Option<usize>,
+    max_cast_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardAgentRecordingResponse {
+    ok: bool,
+    source_of_truth: &'static str,
+    spawn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    agent_kind: String,
+    lifecycle: String,
+    metadata: DashboardAgentRecordingMetadata,
+    asciicast: DashboardAsciicastReadback,
+    journal: DashboardAgentEventsQueryResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardAgentRecordingMetadata {
+    schema_version: u32,
+    source: String,
+    log_dir: String,
+    asciicast_path: String,
+    status_path: String,
+    final_screen_path: String,
+    input_audit_path: String,
+    asciicast_bytes: u64,
+    status_bytes: u64,
+    final_screen_bytes: u64,
+    input_audit_bytes: u64,
+    status: Option<serde_json::Value>,
+    capture_status: String,
+    exit_code: Option<i64>,
+    bytes_captured: Option<u64>,
+    output_events: Option<u64>,
+    duration_secs: f64,
+    recording_truncated: bool,
+    response_truncated: bool,
+    crash_declared: bool,
+    missing_artifact_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardAsciicastReadback {
+    header: serde_json::Value,
+    events: Vec<DashboardAsciicastEvent>,
+    returned_event_count: usize,
+    parsed_event_count: usize,
+    corrupt_event_count: usize,
+    output_event_count: usize,
+    marker_event_count: usize,
+    resize_event_count: usize,
+    input_event_count: usize,
+    exit_code: Option<i64>,
+    duration_secs: f64,
+    response_truncated: bool,
+    recording_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardAsciicastEvent {
+    time_secs: f64,
+    interval_secs: f64,
+    code: String,
+    data: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct DashboardAgentRecordingSeed {
+    spawn_id: String,
+    session_id: Option<String>,
+    agent_kind: String,
+    lifecycle: String,
+    log_dir: PathBuf,
+    source: String,
+}
+
 async fn dashboard_index(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
@@ -3537,6 +3626,462 @@ async fn dashboard_agent_events_query(
     match dashboard_agent_event_rows(&state.agent_events_db, request) {
         Ok(response) => with_dashboard_security_headers(Json(response).into_response()),
         Err(response) => with_dashboard_security_headers(response),
+    }
+}
+
+async fn dashboard_agent_recording(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(spawn_id): Path<String>,
+    Query(request): Query<DashboardAgentRecordingQuery>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    if !dashboard_valid_agent_spawn_id(&spawn_id) {
+        return with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            "AGENT_RECORDING_SPAWN_ID_INVALID",
+            "agent recording requires a valid agent-spawn id",
+            Some(serde_json::json!({ "spawn_id": spawn_id })),
+        ));
+    }
+    match dashboard_agent_recording_readback(&state, spawn_id, request) {
+        Ok(response) => with_dashboard_security_headers(Json(response).into_response()),
+        Err(response) => with_dashboard_security_headers(response),
+    }
+}
+
+fn dashboard_agent_recording_readback(
+    state: &HttpState,
+    spawn_id: String,
+    request: DashboardAgentRecordingQuery,
+) -> Result<DashboardAgentRecordingResponse, Response> {
+    let seed = dashboard_agent_recording_seed(state, &spawn_id)?;
+    let cast_path = seed.log_dir.join("terminal.cast");
+    let status_path = seed.log_dir.join("terminal-capture-status.json");
+    let final_screen_path = seed.log_dir.join("terminal-final-screen.txt");
+    let input_audit_path = seed.log_dir.join("terminal-input-audit.ndjson");
+    let max_cast_bytes = request
+        .max_cast_bytes
+        .unwrap_or(DASHBOARD_ASCIICAST_DEFAULT_MAX_BYTES)
+        .clamp(1, DASHBOARD_ASCIICAST_HARD_MAX_BYTES);
+    let asciicast = dashboard_read_asciicast(&cast_path, max_cast_bytes)?;
+    let status = dashboard_read_json_file_lossy(&status_path);
+    let capture_status = status
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            if cast_path.exists() {
+                "unknown"
+            } else {
+                "missing"
+            }
+        })
+        .to_owned();
+    let exit_code = status
+        .as_ref()
+        .and_then(|value| value.get("exit_code"))
+        .and_then(serde_json::Value::as_i64)
+        .or(asciicast.exit_code);
+    let bytes_captured = status
+        .as_ref()
+        .and_then(|value| value.get("bytes_captured"))
+        .and_then(serde_json::Value::as_u64);
+    let output_events = status
+        .as_ref()
+        .and_then(|value| value.get("output_events"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| u64::try_from(asciicast.output_event_count).ok());
+    let recording_truncated = status
+        .as_ref()
+        .map(dashboard_capture_status_declares_truncation)
+        .unwrap_or(false)
+        || asciicast.recording_truncated;
+    let crash_declared = dashboard_capture_status_declares_crash(status.as_ref(), exit_code);
+    let missing_artifact_count = [
+        cast_path.exists(),
+        status_path.exists(),
+        final_screen_path.exists(),
+        input_audit_path.exists(),
+    ]
+    .into_iter()
+    .filter(|exists| !exists)
+    .count();
+    let journal = dashboard_agent_event_rows(
+        &state.agent_events_db,
+        DashboardAgentEventsQueryRequest {
+            limit: Some(request.event_limit.unwrap_or(500).clamp(1, 2_000)),
+            scan_limit: Some(request.event_scan_limit.unwrap_or(50_000).clamp(1, 50_000)),
+            start_ts_ns: None,
+            end_ts_ns: None,
+            spawn_id: Some(spawn_id.clone()),
+            session_id: None,
+            kind: None,
+        },
+    )?;
+
+    Ok(DashboardAgentRecordingResponse {
+        ok: true,
+        source_of_truth: "session_list registry log_dir + terminal.cast/terminal-capture-status.json + CF_AGENT_EVENTS bounded scan",
+        spawn_id: seed.spawn_id,
+        session_id: seed.session_id,
+        agent_kind: seed.agent_kind,
+        lifecycle: seed.lifecycle,
+        metadata: DashboardAgentRecordingMetadata {
+            schema_version: 1,
+            source: seed.source,
+            log_dir: seed.log_dir.display().to_string(),
+            asciicast_path: cast_path.display().to_string(),
+            status_path: status_path.display().to_string(),
+            final_screen_path: final_screen_path.display().to_string(),
+            input_audit_path: input_audit_path.display().to_string(),
+            asciicast_bytes: dashboard_file_len(&cast_path),
+            status_bytes: dashboard_file_len(&status_path),
+            final_screen_bytes: dashboard_file_len(&final_screen_path),
+            input_audit_bytes: dashboard_file_len(&input_audit_path),
+            status,
+            capture_status,
+            exit_code,
+            bytes_captured,
+            output_events,
+            duration_secs: asciicast.duration_secs,
+            recording_truncated,
+            response_truncated: asciicast.response_truncated,
+            crash_declared,
+            missing_artifact_count,
+        },
+        asciicast,
+        journal,
+    })
+}
+
+fn dashboard_agent_recording_seed(
+    state: &HttpState,
+    spawn_id: &str,
+) -> Result<DashboardAgentRecordingSeed, Response> {
+    let sessions = state
+        .health_service
+        .session_list_impl(true)
+        .map_err(|error| {
+            let code = dashboard_error_code(&error);
+            dashboard_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &code,
+                "agent recording failed to read session registry",
+                error.data.clone(),
+            )
+        })?;
+    for summary in &sessions.sessions {
+        if let Some(spawned) = summary.registry.spawned_agent.as_ref()
+            && spawned.spawn_id == spawn_id
+        {
+            return Ok(DashboardAgentRecordingSeed {
+                spawn_id: spawned.spawn_id.clone(),
+                session_id: Some(summary.registry.session_id.clone()),
+                agent_kind: spawned.cli.clone(),
+                lifecycle: summary.registry.lifecycle.clone(),
+                log_dir: PathBuf::from(&spawned.log_dir),
+                source: "session_list.sessions[].spawned_agent.log_dir".to_owned(),
+            });
+        }
+    }
+    for row in sessions
+        .unbound_agent_states
+        .iter()
+        .chain(sessions.terminal_unbound_agent_states.iter())
+    {
+        let row_spawn_id = row.spawn_id.as_deref().unwrap_or(row.anchor.as_str());
+        if row_spawn_id == spawn_id
+            && let Some(log_dir) = row.log_dir.as_ref().filter(|value| !value.is_empty())
+        {
+            return Ok(DashboardAgentRecordingSeed {
+                spawn_id: spawn_id.to_owned(),
+                session_id: row.session_id.clone(),
+                agent_kind: row.agent_kind.clone().unwrap_or_else(|| "agent".to_owned()),
+                lifecycle: row.state.as_str().to_owned(),
+                log_dir: PathBuf::from(log_dir),
+                source: "session_list.unbound_agent_states[].log_dir".to_owned(),
+            });
+        }
+    }
+    for row in &sessions.attached_agent_registry.rows {
+        if row.spawn_id.as_deref() == Some(spawn_id)
+            && let Some(spawn_dir) = row.spawn_dir.as_ref().filter(|value| !value.is_empty())
+        {
+            return Ok(DashboardAgentRecordingSeed {
+                spawn_id: spawn_id.to_owned(),
+                session_id: row.session_id.clone(),
+                agent_kind: row.kind.clone(),
+                lifecycle: row.lifecycle.clone(),
+                log_dir: PathBuf::from(spawn_dir),
+                source: "session_list.attached_agent_registry.rows[].spawn_dir".to_owned(),
+            });
+        }
+    }
+    for root in dashboard_agent_spawn_root_candidates() {
+        let log_dir = root.join(spawn_id);
+        if log_dir.join("terminal.cast").is_file() {
+            return Ok(DashboardAgentRecordingSeed {
+                spawn_id: spawn_id.to_owned(),
+                session_id: None,
+                agent_kind: "agent".to_owned(),
+                lifecycle: "physical_recording".to_owned(),
+                log_dir,
+                source: "validated %LOCALAPPDATA%/Synapse/agent-spawns physical recording fallback"
+                    .to_owned(),
+            });
+        }
+    }
+    Err(dashboard_error_response(
+        StatusCode::NOT_FOUND,
+        "AGENT_RECORDING_SPAWN_NOT_FOUND",
+        "agent recording requires a known Synapse-spawned agent or a physical terminal.cast under the Synapse agent-spawns root",
+        Some(serde_json::json!({
+            "spawn_id": spawn_id,
+            "source_of_truth": "session_list include_closed=true sessions/unbound/attached registry rows + validated %LOCALAPPDATA%/Synapse/agent-spawns fallback",
+        })),
+    ))
+}
+
+fn dashboard_agent_spawn_root_candidates() -> Vec<PathBuf> {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let local_app_data = PathBuf::from(local_app_data);
+    let mut roots = vec![
+        local_app_data.join("Synapse").join("agent-spawns"),
+        local_app_data.join("synapse").join("agent-spawns"),
+    ];
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn dashboard_read_asciicast(
+    path: &PathBuf,
+    max_bytes: u64,
+) -> Result<DashboardAsciicastReadback, Response> {
+    let file_len = dashboard_file_len(path);
+    if file_len == 0 {
+        return Err(dashboard_error_response(
+            StatusCode::NOT_FOUND,
+            "AGENT_RECORDING_ASCIICAST_MISSING",
+            "agent recording asciicast file is missing or empty",
+            Some(serde_json::json!({
+                "asciicast_path": path.display().to_string(),
+            })),
+        ));
+    }
+    let response_truncated = file_len > max_bytes;
+    let mut file = fs::File::open(path).map_err(|error| {
+        dashboard_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "AGENT_RECORDING_ASCIICAST_OPEN_FAILED",
+            "agent recording asciicast file could not be opened",
+            Some(serde_json::json!({
+                "asciicast_path": path.display().to_string(),
+                "source_error": error.to_string(),
+            })),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            dashboard_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AGENT_RECORDING_ASCIICAST_READ_FAILED",
+                "agent recording asciicast file could not be read",
+                Some(serde_json::json!({
+                    "asciicast_path": path.display().to_string(),
+                    "source_error": error.to_string(),
+                })),
+            )
+        })?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if response_truncated && let Some(last_newline) = text.rfind('\n') {
+        text.truncate(last_newline);
+    }
+    dashboard_parse_asciicast_text(&text, response_truncated)
+}
+
+fn dashboard_parse_asciicast_text(
+    text: &str,
+    response_truncated: bool,
+) -> Result<DashboardAsciicastReadback, Response> {
+    let mut lines = text.lines();
+    let Some(header_line) = lines.next().map(str::trim).filter(|line| !line.is_empty()) else {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_RECORDING_ASCIICAST_HEADER_MISSING",
+            "agent recording asciicast file has no header line",
+            None,
+        ));
+    };
+    let header: serde_json::Value = serde_json::from_str(header_line).map_err(|error| {
+        dashboard_error_response(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_RECORDING_ASCIICAST_HEADER_INVALID",
+            "agent recording asciicast header is not valid JSON",
+            Some(serde_json::json!({
+                "source_error": error.to_string(),
+            })),
+        )
+    })?;
+    if header.get("version").and_then(serde_json::Value::as_u64) != Some(3) {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_RECORDING_ASCIICAST_VERSION_INVALID",
+            "agent recording asciicast must be version 3",
+            Some(serde_json::json!({ "header": header })),
+        ));
+    }
+
+    let mut events = Vec::new();
+    let mut parsed_event_count = 0_usize;
+    let mut corrupt_event_count = 0_usize;
+    let mut output_event_count = 0_usize;
+    let mut marker_event_count = 0_usize;
+    let mut resize_event_count = 0_usize;
+    let mut input_event_count = 0_usize;
+    let mut exit_code = None;
+    let mut duration_secs = 0.0_f64;
+    for line in lines.map(str::trim).filter(|line| !line.is_empty()) {
+        let value = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => value,
+            Err(_error) => {
+                corrupt_event_count += 1;
+                continue;
+            }
+        };
+        let Some(array) = value.as_array() else {
+            corrupt_event_count += 1;
+            continue;
+        };
+        if array.len() < 3 {
+            corrupt_event_count += 1;
+            continue;
+        }
+        let Some(interval_secs) = array[0].as_f64() else {
+            corrupt_event_count += 1;
+            continue;
+        };
+        let Some(code) = array[1].as_str() else {
+            corrupt_event_count += 1;
+            continue;
+        };
+        let data = array[2].clone();
+        let interval_secs = if interval_secs.is_finite() {
+            interval_secs.max(0.0)
+        } else {
+            0.0
+        };
+        duration_secs += interval_secs;
+        parsed_event_count += 1;
+        match code {
+            "o" => output_event_count += 1,
+            "m" => marker_event_count += 1,
+            "r" => resize_event_count += 1,
+            "i" => input_event_count += 1,
+            "x" => {
+                exit_code = data
+                    .as_str()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .or_else(|| data.as_i64());
+            }
+            _ => {}
+        }
+        events.push(DashboardAsciicastEvent {
+            time_secs: duration_secs,
+            interval_secs,
+            code: code.to_owned(),
+            data,
+        });
+    }
+    let recording_truncated = response_truncated || exit_code.is_none();
+    Ok(DashboardAsciicastReadback {
+        header,
+        returned_event_count: events.len(),
+        events,
+        parsed_event_count,
+        corrupt_event_count,
+        output_event_count,
+        marker_event_count,
+        resize_event_count,
+        input_event_count,
+        exit_code,
+        duration_secs,
+        response_truncated,
+        recording_truncated,
+    })
+}
+
+fn dashboard_read_json_file_lossy(path: &PathBuf) -> Option<serde_json::Value> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn dashboard_file_len(path: &PathBuf) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn dashboard_capture_status_declares_truncation(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            let key_declares = key.to_ascii_lowercase().contains("trunc");
+            (key_declares && dashboard_json_value_truthy(value))
+                || dashboard_capture_status_declares_truncation(value)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(dashboard_capture_status_declares_truncation),
+        serde_json::Value::String(value) => value.to_ascii_lowercase().contains("truncat"),
+        _ => false,
+    }
+}
+
+fn dashboard_capture_status_declares_crash(
+    status: Option<&serde_json::Value>,
+    exit_code: Option<i64>,
+) -> bool {
+    if let Some(code) = exit_code
+        && code != 0
+    {
+        return true;
+    }
+    status.is_some_and(|value| dashboard_json_value_mentions_crash(value))
+}
+
+fn dashboard_json_value_mentions_crash(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            key.to_ascii_lowercase().contains("crash") || dashboard_json_value_mentions_crash(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(dashboard_json_value_mentions_crash),
+        serde_json::Value::String(value) => {
+            let value = value.to_ascii_lowercase();
+            value.contains("crash") || value.contains("panic") || value.contains("fault")
+        }
+        _ => false,
+    }
+}
+
+fn dashboard_json_value_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(value) => value.as_i64().unwrap_or(0) != 0,
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            !value.is_empty() && !matches!(value, "false" | "0" | "none" | "no")
+        }
+        serde_json::Value::Array(values) => !values.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Null => false,
     }
 }
 
@@ -6342,12 +6887,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-gO8q6Iqi.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-DLN_lTHU.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-CSAxSdg5.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-C0YbNhhp.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-gO8q6Iqi.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-DLN_lTHU.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-CSAxSdg5.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-C0YbNhhp.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
@@ -6781,6 +7326,76 @@ mod tests {
         assert!(DASHBOARD_APP_SOURCE.contains("TERMINAL_CLIENT_INPUT"));
         assert!(DASHBOARD_APP_SOURCE.contains("TERMINAL_SERVER_OUTPUT"));
         assert!(DASHBOARD_JS.contains("/dashboard/agent-terminal/"));
+    }
+
+    #[test]
+    fn dashboard_asciicast_parser_returns_cumulative_v3_events() {
+        let text = concat!(
+            "{\"version\":3,\"term\":{\"cols\":80,\"rows\":24},\"timestamp\":1700000000}\n",
+            "[0.25,\"o\",\"first\"]\n",
+            "[0.75,\"m\",\"tool_call_started\"]\n",
+            "[0.5,\"x\",\"7\"]\n"
+        );
+        let replay = dashboard_parse_asciicast_text(text, false).expect("valid asciicast");
+
+        assert_eq!(replay.header["version"], 3);
+        assert_eq!(replay.returned_event_count, 3);
+        assert_eq!(replay.output_event_count, 1);
+        assert_eq!(replay.marker_event_count, 1);
+        assert_eq!(replay.exit_code, Some(7));
+        assert!((replay.duration_secs - 1.5).abs() < f64::EPSILON);
+        assert_eq!(replay.events[0].time_secs, 0.25);
+        assert_eq!(replay.events[1].time_secs, 1.0);
+        assert!(!replay.recording_truncated);
+    }
+
+    #[test]
+    fn dashboard_asciicast_parser_declares_bounded_response_truncation() {
+        let text = concat!(
+            "{\"version\":3,\"term\":{\"cols\":80,\"rows\":24},\"timestamp\":1700000000}\n",
+            "[0.25,\"o\",\"first\"]\n"
+        );
+        let replay = dashboard_parse_asciicast_text(text, true).expect("valid partial asciicast");
+
+        assert_eq!(replay.returned_event_count, 1);
+        assert!(replay.response_truncated);
+        assert!(replay.recording_truncated);
+        assert_eq!(replay.exit_code, None);
+    }
+
+    #[test]
+    fn dashboard_recording_status_flags_crash_and_truncation() {
+        let crashed = serde_json::json!({
+            "status": "crashed",
+            "truncated": true,
+            "reason": "panic in worker",
+        });
+        let clean = serde_json::json!({
+            "status": "finished",
+            "truncated": false,
+        });
+
+        assert!(dashboard_capture_status_declares_truncation(&crashed));
+        assert!(dashboard_capture_status_declares_crash(
+            Some(&crashed),
+            Some(0)
+        ));
+        assert!(dashboard_capture_status_declares_crash(None, Some(2)));
+        assert!(!dashboard_capture_status_declares_truncation(&clean));
+        assert!(!dashboard_capture_status_declares_crash(
+            Some(&clean),
+            Some(0)
+        ));
+    }
+
+    #[test]
+    fn dashboard_bundle_contains_session_replay_contract() {
+        assert!(DASHBOARD_STATE_SOURCE.contains("/dashboard/agent-recordings/"));
+        assert!(DASHBOARD_APP_SOURCE.contains("Session Replay"));
+        assert!(DASHBOARD_APP_SOURCE.contains("fetchAgentRecording"));
+        assert!(DASHBOARD_APP_SOURCE.contains("activeReplayEvent"));
+        assert!(DASHBOARD_APP_SOURCE.contains("Recording ended without a complete exit event"));
+        assert!(DASHBOARD_APP_SOURCE.contains("Exit/crash state is declared"));
     }
 
     fn dashboard_scope_matches(scope: DashboardEventScope, event: &synapse_core::Event) -> bool {

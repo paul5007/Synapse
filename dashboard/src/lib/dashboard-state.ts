@@ -275,6 +275,65 @@ export interface AgentEventsQueryResponse {
   rows: AgentEventQueryRow[];
 }
 
+export interface AgentRecordingMetadata {
+  schema_version: number;
+  source: string;
+  log_dir: string;
+  asciicast_path: string;
+  status_path: string;
+  final_screen_path: string;
+  input_audit_path: string;
+  asciicast_bytes: number;
+  status_bytes: number;
+  final_screen_bytes: number;
+  input_audit_bytes: number;
+  status?: Record<string, unknown> | null;
+  capture_status: string;
+  exit_code?: number | null;
+  bytes_captured?: number | null;
+  output_events?: number | null;
+  duration_secs: number;
+  recording_truncated: boolean;
+  response_truncated: boolean;
+  crash_declared: boolean;
+  missing_artifact_count: number;
+}
+
+export interface AsciicastReplayEvent {
+  time_secs: number;
+  interval_secs: number;
+  code: string;
+  data: unknown;
+}
+
+export interface AsciicastReplayReadback {
+  header: Record<string, unknown>;
+  events: AsciicastReplayEvent[];
+  returned_event_count: number;
+  parsed_event_count: number;
+  corrupt_event_count: number;
+  output_event_count: number;
+  marker_event_count: number;
+  resize_event_count: number;
+  input_event_count: number;
+  exit_code?: number | null;
+  duration_secs: number;
+  response_truncated: boolean;
+  recording_truncated: boolean;
+}
+
+export interface AgentRecordingResponse {
+  ok: boolean;
+  source_of_truth: string;
+  spawn_id: string;
+  session_id?: string | null;
+  agent_kind: string;
+  lifecycle: string;
+  metadata: AgentRecordingMetadata;
+  asciicast: AsciicastReplayReadback;
+  journal: AgentEventsQueryResponse;
+}
+
 export interface SaveDashboardViewRequest {
   view_id?: string;
   name: string;
@@ -844,6 +903,38 @@ export async function fetchAgentEvents(filters: AgentEventsQueryRequest): Promis
   return {
     ...(body as unknown as AgentEventsQueryResponse),
     rows: asArray<AgentEventQueryRow>(body.rows)
+  };
+}
+
+export async function fetchAgentRecording(
+  spawnId: string,
+  options: { event_limit?: number; event_scan_limit?: number; max_cast_bytes?: number } = {}
+): Promise<AgentRecordingResponse> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value === undefined || value === null) continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString();
+  const response = await fetch(`/dashboard/agent-recordings/${encodeURIComponent(spawnId)}${suffix ? `?${suffix}` : ""}`, {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+  const body = await readJsonOrThrow(response);
+  const asciicast = asRecord(body.asciicast) as unknown as AsciicastReplayReadback;
+  const journal = asRecord(body.journal) as unknown as AgentEventsQueryResponse;
+  return {
+    ...(body as unknown as AgentRecordingResponse),
+    metadata: asRecord(body.metadata) as unknown as AgentRecordingMetadata,
+    asciicast: {
+      ...asciicast,
+      header: asRecord(asciicast.header),
+      events: asArray<AsciicastReplayEvent>(asciicast.events)
+    },
+    journal: {
+      ...journal,
+      rows: asArray<AgentEventQueryRow>(journal.rows)
+    }
   };
 }
 

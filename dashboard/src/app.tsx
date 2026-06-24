@@ -77,6 +77,7 @@ import {
   decideApproval,
   deleteDashboardView,
   fetchAgentEvents,
+  fetchAgentRecording,
   fetchAuditQuery,
   fetchTemplates,
   putTemplate,
@@ -114,6 +115,8 @@ import {
   updateRoutine,
   type AgentEventQueryRow,
   type AgentEventsQueryResponse,
+  type AgentRecordingResponse,
+  type AsciicastReplayEvent,
   type AgentTaskAttempt,
   type AgentTaskRow,
   type AgentTaskState,
@@ -1012,6 +1015,7 @@ function AgentView({
       </div>
       <div className="min-w-0">
         <AgentTerminalPanel agent={selectedAgent} />
+        <AgentReplayPanel agent={selectedAgent} />
         <ToolActivity toolCalls={scopedToolCalls} onAuditKeySelect={onAuditKeySelect} />
         <TranscriptSamples state={state} agent={selectedAgent} />
       </div>
@@ -1833,6 +1837,306 @@ function terminalFrameBytes(data: unknown, encoder: TextEncoder): Uint8Array {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (data instanceof Blob) return new Uint8Array();
   return encoder.encode(String(data ?? ""));
+}
+
+interface ReplayJournalMarker {
+  keyHex: string;
+  timeSecs: number;
+  kind: string;
+  label: string;
+  row: AgentEventQueryRow;
+}
+
+function AgentReplayPanel({ agent }: { agent?: AgentSummary }) {
+  const spawnId = agent?.spawnId;
+  const [positionSecs, setPositionSecs] = useState(0);
+  const [selectedMarkerKey, setSelectedMarkerKey] = useState("");
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<XTerm | null>(null);
+  const recordingQuery = useQuery<AgentRecordingResponse>({
+    queryKey: ["agent-recording", spawnId],
+    queryFn: () =>
+      fetchAgentRecording(spawnId || "", {
+        event_limit: 1000,
+        event_scan_limit: 50_000,
+        max_cast_bytes: 16 * 1024 * 1024
+      }),
+    enabled: Boolean(spawnId),
+    refetchInterval: spawnId ? 10_000 : false
+  });
+  const recording = recordingQuery.data;
+  const durationSecs = Math.max(recording?.asciicast.duration_secs ?? 0, recording?.metadata.duration_secs ?? 0, 0);
+  const replayEvents = recording?.asciicast.events ?? [];
+  const markers = useMemo(() => replayJournalMarkers(recording), [recording]);
+  const selectedMarker = markers.find((marker) => marker.keyHex === selectedMarkerKey);
+  const activeMarker = selectedMarker ?? activeReplayEvent(markers, positionSecs);
+  const replayStatus = recording
+    ? [
+      recording.metadata.capture_status,
+      recording.metadata.recording_truncated ? "recording truncated" : "",
+      recording.metadata.response_truncated ? "response bounded" : "",
+      recording.metadata.crash_declared ? "crash/exit declared" : ""
+    ]
+      .filter(Boolean)
+      .join(" / ")
+    : recordingQuery.isFetching
+      ? "loading"
+      : "unavailable";
+
+  useEffect(() => {
+    setPositionSecs(0);
+    setSelectedMarkerKey("");
+  }, [spawnId]);
+
+  useEffect(() => {
+    if (!spawnId || !recording || !containerRef.current) return;
+    const terminal = new XTerm({
+      allowProposedApi: false,
+      convertEol: true,
+      cursorBlink: false,
+      disableStdin: true,
+      fontFamily: "var(--font-mono)",
+      fontSize: 13,
+      lineHeight: 1.35,
+      scrollback: 10000,
+      theme: terminalTheme()
+    });
+    terminal.open(containerRef.current);
+    const size = asciicastTerminalSize(recording);
+    terminal.resize(size.cols, size.rows);
+    terminalRef.current = terminal;
+    return () => {
+      terminalRef.current = null;
+      terminal.dispose();
+    };
+  }, [spawnId, recording]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal || !recording) return;
+    const size = replayTerminalSizeAt(recording, positionSecs);
+    terminal.resize(size.cols, size.rows);
+    terminal.reset();
+    terminal.clear();
+    const output = replayOutputThrough(replayEvents, positionSecs);
+    if (output) terminal.write(output);
+  }, [positionSecs, recording, replayEvents]);
+
+  const selectActiveTerminalMoment = () => {
+    const marker = activeReplayEvent(markers, positionSecs);
+    if (marker) setSelectedMarkerKey(marker.keyHex);
+  };
+
+  if (!spawnId) {
+    return (
+      <Section
+        title="Session Replay"
+        tier="drill-down"
+        questions={["Which recording belongs to this agent?", "Can the terminal replay scrub to a journal event?", "Is truncation or crash state visible?"]}
+      >
+        <EmptyStateArt title="No replay recording selected" />
+      </Section>
+    );
+  }
+
+  return (
+    <Section
+      title="Session Replay"
+      tier="drill-down"
+      questions={["Which recording belongs to this agent?", "Can the terminal replay scrub to a journal event?", "Is truncation or crash state visible?"]}
+      actions={
+        <Button type="button" variant="ghost" size="sm" onClick={() => recordingQuery.refetch()} disabled={recordingQuery.isFetching}>
+          <RefreshCw aria-hidden="true" className="h-4 w-4" />
+          Refresh
+        </Button>
+      }
+    >
+      {recordingQuery.isError ? (
+        <div className="rounded-md border border-warning-border bg-warning-bg p-3 text-sm text-warning-fg">
+          {rawText(recordingQuery.error) || "Recording unavailable"}
+        </div>
+      ) : recording ? (
+        <>
+          <div className="grid gap-3 md:grid-cols-4">
+            <MetricRow label="Spawn" value={shortKey(recording.spawn_id)} />
+            <MetricRow label="Bytes" value={formatByteCount(recording.metadata.asciicast_bytes)} />
+            <MetricRow label="Duration" value={formatReplaySeconds(durationSecs)} />
+            <MetricRow label="Status" value={replayStatus || "unknown"} />
+          </div>
+          {(recording.metadata.recording_truncated || recording.metadata.response_truncated || recording.metadata.crash_declared) ? (
+            <div className="mt-3 rounded-md border border-warning-border bg-warning-bg p-3 text-sm text-warning-fg">
+              {[recording.metadata.recording_truncated ? "Recording ended without a complete exit event or status declares truncation." : "",
+                recording.metadata.response_truncated ? "Dashboard response is bounded; increase max_cast_bytes for full playback." : "",
+                recording.metadata.crash_declared ? "Exit/crash state is declared by the capture status." : ""]
+                .filter(Boolean)
+                .join(" ")}
+            </div>
+          ) : null}
+          <div
+            ref={containerRef}
+            role="button"
+            tabIndex={0}
+            onClick={selectActiveTerminalMoment}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") selectActiveTerminalMoment();
+            }}
+            className="terminal-shell mt-3 h-[28rem] overflow-hidden rounded-lg border border-border bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
+          />
+          <div className="mt-3 grid gap-3">
+            <input
+              aria-label="Replay scrubber"
+              type="range"
+              min={0}
+              max={Math.max(durationSecs, 0.001)}
+              step={0.05}
+              value={Math.min(positionSecs, Math.max(durationSecs, 0.001))}
+              onChange={(event) => {
+                setPositionSecs(Number(event.currentTarget.value));
+                setSelectedMarkerKey("");
+              }}
+              className="w-full accent-[var(--accent)]"
+            />
+            <div className="flex items-center justify-between gap-3 text-xs text-muted">
+              <span className="font-mono">{formatReplaySeconds(positionSecs)}</span>
+              <span className="font-mono">{recording.asciicast.returned_event_count.toLocaleString()} terminal events / {recording.journal.returned_count.toLocaleString()} journal rows</span>
+            </div>
+            <div className="relative h-12 rounded-md border border-border bg-surface-1">
+              {markers.map((marker) => {
+                const left = durationSecs > 0 ? Math.min(99, Math.max(0, (marker.timeSecs / durationSecs) * 100)) : 0;
+                const selected = activeMarker?.keyHex === marker.keyHex;
+                return (
+                  <Tooltip key={marker.keyHex}>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPositionSecs(marker.timeSecs);
+                          setSelectedMarkerKey(marker.keyHex);
+                        }}
+                        className={cn(
+                          "absolute top-2 h-8 w-2 -translate-x-1/2 rounded-sm bg-info hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
+                          selected && "bg-warning"
+                        )}
+                        style={{ left: `${left}%` }}
+                        aria-label={`Jump to ${marker.kind}`}
+                      />
+                    </TooltipTrigger>
+                    <TooltipContent>{marker.label}</TooltipContent>
+                  </Tooltip>
+                );
+              })}
+            </div>
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,0.42fr)_minmax(0,1fr)]">
+            <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+              <h3 className="mb-2 text-md font-medium tracking-normal text-primary">Timeline Sync</h3>
+              <MetricRow label="Active Event" value={activeMarker ? activeMarker.kind : "none"} />
+              <MetricRow label="Offset" value={activeMarker ? formatReplaySeconds(activeMarker.timeSecs) : "none"} />
+              <MetricRow label="Key" value={activeMarker ? <span className="font-mono">{shortKey(activeMarker.keyHex)}</span> : "none"} />
+              <MetricRow label="Alignment" value={activeMarker ? "terminal time = journal timestamp minus asciicast header timestamp" : "pending marker"} />
+            </div>
+            <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+              <h3 className="mb-2 text-md font-medium tracking-normal text-primary">Active Span</h3>
+              {activeMarker ? (
+                <>
+                  <MetricRow label="Kind" value={activeMarker.kind} />
+                  <MetricRow label="Reason" value={activeMarker.label} />
+                  <MetricRow label="Journal Time" value={nsToTime(activeMarker.row.ts_ns) || rawText(activeMarker.row.ts_ns)} />
+                  <RawValue value={activeMarker.row} label="Replay event row" />
+                </>
+              ) : (
+                <EmptyState title="No synced event at this offset" />
+              )}
+            </div>
+          </div>
+          <RawValue value={{ metadata: recording.metadata, source_of_truth: recording.source_of_truth }} label="Recording readback" />
+        </>
+      ) : (
+        <EmptyStateArt title={recordingQuery.isFetching ? "Loading replay recording" : "No replay recording found"} />
+      )}
+    </Section>
+  );
+}
+
+function replayJournalMarkers(recording?: AgentRecordingResponse): ReplayJournalMarker[] {
+  if (!recording) return [];
+  const timestamp = Number(recording.asciicast.header.timestamp);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return [];
+  const duration = Math.max(recording.asciicast.duration_secs, recording.metadata.duration_secs, 0);
+  return recording.journal.rows
+    .map((row) => {
+      const timeSecs = row.ts_ns / 1_000_000_000 - timestamp;
+      return {
+        keyHex: row.key_hex,
+        timeSecs,
+        kind: row.kind,
+        label: [row.kind, agentEventReason(row)].filter(Boolean).join(" / "),
+        row
+      } satisfies ReplayJournalMarker;
+    })
+    .filter((marker) => Number.isFinite(marker.timeSecs) && marker.timeSecs >= 0 && (duration <= 0 || marker.timeSecs <= duration + 1))
+    .sort((left, right) => left.timeSecs - right.timeSecs || left.keyHex.localeCompare(right.keyHex));
+}
+
+function activeReplayEvent(markers: ReplayJournalMarker[], positionSecs: number): ReplayJournalMarker | undefined {
+  let active: ReplayJournalMarker | undefined;
+  for (const marker of markers) {
+    if (marker.timeSecs <= positionSecs + 0.5) active = marker;
+    if (marker.timeSecs > positionSecs + 0.5) break;
+  }
+  return active;
+}
+
+function replayOutputThrough(events: AsciicastReplayEvent[], positionSecs: number): string {
+  return events
+    .filter((event) => event.code === "o" && event.time_secs <= positionSecs)
+    .map((event) => rawText(event.data))
+    .join("");
+}
+
+function replayTerminalSizeAt(recording: AgentRecordingResponse, positionSecs: number): { cols: number; rows: number } {
+  let size = asciicastTerminalSize(recording);
+  for (const event of recording.asciicast.events) {
+    if (event.time_secs > positionSecs) break;
+    if (event.code !== "r") continue;
+    size = parseAsciicastResize(event.data) ?? size;
+  }
+  return size;
+}
+
+function asciicastTerminalSize(recording: AgentRecordingResponse): { cols: number; rows: number } {
+  const term = asRecord(recording.asciicast.header.term);
+  return {
+    cols: clampTerminalDimension(Number(term.cols), 20, 240, 80),
+    rows: clampTerminalDimension(Number(term.rows), 8, 80, 24)
+  };
+}
+
+function parseAsciicastResize(value: unknown): { cols: number; rows: number } | null {
+  const text = rawText(value);
+  const match = text.match(/^(\d+)x(\d+)$/);
+  if (!match) return null;
+  return {
+    cols: clampTerminalDimension(Number(match[1]), 20, 240, 80),
+    rows: clampTerminalDimension(Number(match[2]), 8, 80, 24)
+  };
+}
+
+function clampTerminalDimension(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function formatReplaySeconds(value: number): string {
+  if (!Number.isFinite(value)) return "0.00s";
+  return `${Math.max(0, value).toFixed(2)}s`;
+}
+
+function formatByteCount(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "0 B";
+  if (value < 1024) return `${value.toLocaleString()} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function TasksView({
