@@ -94,6 +94,9 @@ import {
   forceReleaseLease,
   handoffLease,
   injectAgentContext,
+  localModelLaunchReady,
+  localModelProbeLabel,
+  modelRegistryStatus,
   dispatchAgentTaskOnce,
   inspectRoutine,
   interruptAgent,
@@ -101,6 +104,7 @@ import {
   panelData,
   pauseAgent,
   pauseTimeline,
+  probeModel,
   pruneTargetClaims,
   purgeTimelineRecordings,
   registerApiModel,
@@ -6069,26 +6073,6 @@ const deepSeekPresets = {
 
 type SpawnMode = "local_model" | "codex" | "claude";
 type SpawnTargetMode = "none" | "window" | "cdp";
-const LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS = 15 * 60 * 1000;
-
-function localModelProbeAgeMs(model: ModelRow): number | null {
-  const observed = model.last_probe?.observed_at_unix_ms;
-  return typeof observed === "number" && Number.isFinite(observed) ? Math.max(0, Date.now() - observed) : null;
-}
-
-function localModelLaunchReady(model: ModelRow): boolean {
-  const ageMs = localModelProbeAgeMs(model);
-  return Boolean(model.enabled && model.last_probe?.healthy && ageMs !== null && ageMs <= LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS);
-}
-
-function localModelProbeLabel(model: ModelRow): string {
-  if (!model.last_probe) return "unprobed";
-  if (!model.last_probe.healthy) return model.last_probe.status || "unhealthy";
-  const ageMs = localModelProbeAgeMs(model);
-  if (ageMs === null) return "healthy probe missing timestamp";
-  if (ageMs > LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS) return `stale healthy probe (${Math.round(ageMs / 1000)}s old)`;
-  return model.last_probe.status || "healthy";
-}
 
 function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
   const modelsQuery = useQuery({
@@ -6109,6 +6093,7 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
   const [targetCdpId, setTargetCdpId] = useState("");
   const [registerForm, setRegisterForm] = useState(deepSeekPresets.flash);
   const [pendingAction, setPendingAction] = useState<"register" | "spawn" | "">("");
+  const [probingModel, setProbingModel] = useState("");
   const [error, setError] = useState("");
   const [lastRegister, setLastRegister] = useState<DashboardRouteReadback | null>(null);
   const [lastSpawn, setLastSpawn] = useState<SpawnAgentResponse | null>(null);
@@ -6142,6 +6127,19 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
       throw new Error("target CDP id is required");
     }
     return { kind: "cdp" as const, window_hwnd: parsedWindow, cdp_target_id: cdpTargetId };
+  };
+
+  const probeRegistryModel = async (name: string) => {
+    setError("");
+    setProbingModel(name);
+    try {
+      await probeModel(name, 120000);
+      await modelsQuery.refetch();
+    } catch (probeError) {
+      setError(rawText(probeError) || "Model probe failed");
+    } finally {
+      setProbingModel("");
+    }
   };
 
   const submitRegister = async (event: FormEvent<HTMLFormElement>) => {
@@ -6230,7 +6228,45 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
                 {
                   id: "status",
                   header: "Status",
-                  cell: ({ row }) => <StatusBadge status={modelFleetStatus(row.original)} />
+                  cell: ({ row }) => {
+                    const summary = modelRegistryStatus(row.original);
+                    return <StatusBadge status={summary.status} title={modelProbeTitle(row.original)} />;
+                  }
+                },
+                {
+                  id: "probe",
+                  header: "Probe",
+                  cell: ({ row }) => (
+                    <span className="inline-block max-w-[16rem] truncate align-middle font-mono text-xs" title={modelProbeTitle(row.original)}>
+                      {localModelProbeLabel(row.original)}
+                    </span>
+                  )
+                },
+                {
+                  id: "actions",
+                  header: "",
+                  cell: ({ row }) => {
+                    const pending = probingModel === row.original.name;
+                    return (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="h-8 w-8"
+                            aria-label={`Probe ${row.original.name}`}
+                            title={modelProbeTitle(row.original)}
+                            onClick={() => probeRegistryModel(row.original.name)}
+                            disabled={Boolean(pendingAction || probingModel)}
+                          >
+                            <RefreshCw aria-hidden="true" className={cn("h-4 w-4", pending && "animate-spin")} />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Probe</TooltipContent>
+                      </Tooltip>
+                    );
+                  }
                 },
                 {
                   accessorKey: "name",
@@ -6977,11 +7013,18 @@ function parseNonNegativeInteger(value: string, field: string): number | undefin
   return parsed;
 }
 
-function modelFleetStatus(model: ModelRow): FleetStatus {
-  if (!model.enabled) return "idle";
-  if (localModelLaunchReady(model)) return "done";
-  if (model.last_probe) return "stuck";
-  return "needs_input";
+function modelProbeTitle(model: ModelRow): string {
+  const summary = modelRegistryStatus(model);
+  const parts = [`readiness=${summary.reason}`, `probe=${summary.label}`];
+  if (summary.probeAgeMs !== null) parts.push(`age_ms=${summary.probeAgeMs}`);
+  const probe = model.last_probe;
+  if (probe?.observed_at_unix_ms !== undefined) parts.push(`observed_at_unix_ms=${probe.observed_at_unix_ms}`);
+  if (probe?.latency_ms !== undefined) parts.push(`latency_ms=${probe.latency_ms}`);
+  if (probe?.error_code) parts.push(`error_code=${probe.error_code}`);
+  if (probe?.error_phase) parts.push(`error_phase=${probe.error_phase}`);
+  if (probe?.error_kind) parts.push(`error_kind=${probe.error_kind}`);
+  if (probe?.error_detail) parts.push(`error_detail=${probe.error_detail}`);
+  return parts.join(" | ");
 }
 
 function FleetList({

@@ -354,7 +354,109 @@ export interface ModelRow {
   max_tools?: number | null;
   /** Whether an encrypted API key is stored at rest for this model. */
   has_api_key_secret?: boolean;
-  last_probe?: { healthy?: boolean; status?: string; latency_ms?: number; observed_at_unix_ms?: number } | null;
+  last_probe?: {
+    healthy?: boolean;
+    status?: string;
+    latency_ms?: number;
+    observed_at_unix_ms?: number;
+    error_code?: string | null;
+    error_phase?: string | null;
+    error_kind?: string | null;
+    error_detail?: string | null;
+  } | null;
+}
+
+export const LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS = 15 * 60 * 1000;
+
+export type ModelRegistryStatusReason =
+  | "disabled"
+  | "unprobed"
+  | "ready"
+  | "stale_probe"
+  | "unhealthy"
+  | "invalid_probe_timestamp";
+
+export interface ModelRegistryStatusSummary {
+  status: FleetStatus;
+  reason: ModelRegistryStatusReason;
+  label: string;
+  launchReady: boolean;
+  probeAgeMs: number | null;
+}
+
+export function localModelProbeAgeMs(model: ModelRow, nowMs = Date.now()): number | null {
+  const observed = model.last_probe?.observed_at_unix_ms;
+  return typeof observed === "number" && Number.isFinite(observed) ? Math.max(0, nowMs - observed) : null;
+}
+
+export function localModelLaunchReady(model: ModelRow, nowMs = Date.now()): boolean {
+  const status = modelRegistryStatus(model, nowMs);
+  return status.launchReady;
+}
+
+export function localModelProbeLabel(model: ModelRow, nowMs = Date.now()): string {
+  return modelRegistryStatus(model, nowMs).label;
+}
+
+export function modelRegistryStatus(model: ModelRow, nowMs = Date.now()): ModelRegistryStatusSummary {
+  if (!model.enabled) {
+    return {
+      status: "idle",
+      reason: "disabled",
+      label: "disabled",
+      launchReady: false,
+      probeAgeMs: localModelProbeAgeMs(model, nowMs)
+    };
+  }
+
+  if (!model.last_probe) {
+    return {
+      status: "needs_input",
+      reason: "unprobed",
+      label: "unprobed",
+      launchReady: false,
+      probeAgeMs: null
+    };
+  }
+
+  const ageMs = localModelProbeAgeMs(model, nowMs);
+  if (!model.last_probe.healthy) {
+    return {
+      status: "failed",
+      reason: "unhealthy",
+      label: model.last_probe.status || model.last_probe.error_code || "unhealthy",
+      launchReady: false,
+      probeAgeMs: ageMs
+    };
+  }
+
+  if (ageMs === null) {
+    return {
+      status: "needs_input",
+      reason: "invalid_probe_timestamp",
+      label: "healthy probe missing timestamp",
+      launchReady: false,
+      probeAgeMs: null
+    };
+  }
+
+  if (ageMs > LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS) {
+    return {
+      status: "needs_input",
+      reason: "stale_probe",
+      label: `stale healthy probe (${Math.round(ageMs / 1000)}s old)`,
+      launchReady: false,
+      probeAgeMs: ageMs
+    };
+  }
+
+  return {
+    status: "done",
+    reason: "ready",
+    label: model.last_probe.status || "healthy",
+    launchReady: true,
+    probeAgeMs: ageMs
+  };
 }
 
 export interface RegisterApiModelRequest {
@@ -851,6 +953,17 @@ export async function fetchModels(): Promise<ModelRow[]> {
   const body = await readJsonOrThrow(response);
   const list = (body.list ?? {}) as { rows?: ModelRow[] };
   return list.rows ?? [];
+}
+
+export async function probeModel(name: string, timeoutMs = 120000): Promise<DashboardRouteReadback> {
+  const response = await fetch("/dashboard/models/probe", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ name, timeout_ms: timeoutMs })
+  });
+  return readJsonOrThrow(response);
 }
 
 export async function fetchTemplates(): Promise<AgentTemplateRow[]> {

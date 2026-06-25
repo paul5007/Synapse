@@ -736,6 +736,12 @@ fn router(
         )
         .route("/dashboard/models", get(dashboard_model_list))
         .route(
+            "/dashboard/models/probe",
+            post(dashboard_model_probe).layer(DefaultBodyLimit::max(
+                DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
             "/dashboard/api-model/register",
             post(dashboard_api_model_register).layer(DefaultBodyLimit::max(
                 DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
@@ -2278,6 +2284,22 @@ struct DashboardModelListResponse {
     trigger: &'static str,
     source_of_truth: &'static str,
     list: crate::m3::local_models::LocalModelListResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardModelProbeRequest {
+    name: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DashboardModelProbeResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    probe: crate::m3::local_models::LocalModelProbeResponse,
 }
 
 /// Browser-facing request to remove a model-registry row (and its stored key).
@@ -6182,6 +6204,41 @@ async fn dashboard_model_list(State(state): State<HttpState>, headers: HeaderMap
     }
 }
 
+async fn dashboard_model_probe(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardModelProbeRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = crate::m3::local_models::LocalModelProbeParams {
+        name: request.name,
+        timeout_ms: request.timeout_ms,
+    };
+    match state
+        .health_service
+        .dashboard_probe_local_model(params)
+        .await
+    {
+        Ok(probe) => with_dashboard_security_headers(
+            Json(DashboardModelProbeResponse {
+                ok: true,
+                trigger: "dashboard.model_probe",
+                source_of_truth: "CF_KV local_model_registry/v1/model/name_hex/",
+                probe,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
 fn dashboard_api_model_register_params(
     request: DashboardApiModelRegisterRequest,
 ) -> Result<crate::m3::local_models::LocalModelRegisterParams, Response> {
@@ -7012,12 +7069,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-CSAxSdg5.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-D7vcPL13.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-CicCCuUG.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-Dih4LxeZ.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-CSAxSdg5.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-D7vcPL13.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-CicCCuUG.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-Dih4LxeZ.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use std::{
+    error::Error as StdError,
     net::IpAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -225,6 +226,10 @@ pub struct LocalModelProbeReport {
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
     pub error_detail: Option<String>,
     pub raw_response_sha256: Option<String>,
     pub raw_response_excerpt: Option<String>,
@@ -892,6 +897,52 @@ pub fn resolve_local_model_api_key(
     ))
 }
 
+fn reqwest_probe_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_builder() {
+        "client_builder"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.status().is_some() {
+        "http_status"
+    } else {
+        "reqwest"
+    }
+}
+
+fn reqwest_probe_error_detail(
+    phase: &'static str,
+    endpoint: &Url,
+    timeout_ms: u64,
+    error: &reqwest::Error,
+) -> String {
+    let kind = reqwest_probe_error_kind(error);
+    let mut source_chain = vec![error.to_string()];
+    let mut source: Option<&(dyn StdError + 'static)> = error.source();
+    while let Some(next) = source {
+        source_chain.push(next.to_string());
+        source = next.source();
+    }
+    format!(
+        "local model probe HTTP failure: phase={phase} kind={kind} endpoint={} timeout_ms={} is_connect={} is_timeout={} is_body={} source_chain={}",
+        endpoint.as_str(),
+        timeout_ms,
+        error.is_connect(),
+        error.is_timeout(),
+        error.is_body(),
+        source_chain.join(" -> ")
+    )
+}
+
 async fn probe_row(
     db: &Arc<Db>,
     row: &LocalModelRegistryRow,
@@ -907,6 +958,8 @@ async fn probe_row(
                 "",
                 started.elapsed(),
                 error_codes::TOOL_PARAMS_INVALID,
+                "build_endpoint",
+                "invalid_url",
                 error.message.to_string(),
                 None,
             );
@@ -920,6 +973,8 @@ async fn probe_row(
             endpoint.as_str(),
             started.elapsed(),
             error_codes::TOOL_PARAMS_INVALID,
+            "validate_timeout",
+            "out_of_range",
             format!("probe timeout_ms must be between 1 and {MAX_PROBE_TIMEOUT_MS}"),
             None,
         );
@@ -936,7 +991,9 @@ async fn probe_row(
                 endpoint.as_str(),
                 started.elapsed(),
                 error_codes::MODEL_ENDPOINT_UNREACHABLE,
-                format!("failed to build HTTP client: {error}"),
+                "build_client",
+                reqwest_probe_error_kind(&error),
+                reqwest_probe_error_detail("build_client", &endpoint, timeout_ms, &error),
                 None,
             );
         }
@@ -976,6 +1033,8 @@ async fn probe_row(
                 endpoint.as_str(),
                 started.elapsed(),
                 code,
+                "resolve_api_key",
+                "missing_or_unreadable_secret",
                 error.message.to_string(),
                 None,
             );
@@ -986,12 +1045,25 @@ async fn probe_row(
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
+            let kind = reqwest_probe_error_kind(&error);
+            let detail = reqwest_probe_error_detail("send", &endpoint, timeout_ms, &error);
+            tracing::warn!(
+                code = "LOCAL_MODEL_PROBE_HTTP_SEND_FAILED",
+                model = %row.name,
+                endpoint = %endpoint,
+                error_kind = kind,
+                timeout_ms,
+                error = %error,
+                "local model probe HTTP send failed"
+            );
             return probe_report_error(
                 observed_at_unix_ms,
                 endpoint.as_str(),
                 started.elapsed(),
                 error_codes::MODEL_ENDPOINT_UNREACHABLE,
-                format!("local model endpoint was unreachable: {error}"),
+                "send",
+                kind,
+                detail,
                 None,
             );
         }
@@ -1000,12 +1072,25 @@ async fn probe_row(
     let raw_text = match response.text().await {
         Ok(text) => text,
         Err(error) => {
+            let kind = reqwest_probe_error_kind(&error);
+            let detail = reqwest_probe_error_detail("read_body", &endpoint, timeout_ms, &error);
+            tracing::warn!(
+                code = "LOCAL_MODEL_PROBE_HTTP_BODY_READ_FAILED",
+                model = %row.name,
+                endpoint = %endpoint,
+                error_kind = kind,
+                timeout_ms,
+                error = %error,
+                "local model probe HTTP response body read failed"
+            );
             return probe_report_error(
                 observed_at_unix_ms,
                 endpoint.as_str(),
                 started.elapsed(),
                 error_codes::MODEL_ENDPOINT_UNREACHABLE,
-                format!("local model endpoint response body could not be read: {error}"),
+                "read_body",
+                kind,
+                detail,
                 None,
             );
         }
@@ -1017,6 +1102,8 @@ async fn probe_row(
             endpoint.as_str(),
             started.elapsed(),
             error_codes::MODEL_TOOLS_UNSUPPORTED,
+            "http_status",
+            "non_success_status",
             format!(
                 "tool-call probe request returned HTTP status {}",
                 status.as_u16()
@@ -1043,6 +1130,8 @@ async fn probe_row(
             endpoint.as_str(),
             started.elapsed(),
             error_codes::MODEL_TOOLS_UNSUPPORTED,
+            "validate_tool_call",
+            "schema_or_nonce_mismatch",
             detail,
             Some(&raw_text),
         ),
@@ -1362,6 +1451,8 @@ fn probe_report_success(
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens,
         error_code: None,
+        error_phase: None,
+        error_kind: None,
         error_detail: None,
         raw_response_sha256: Some(sha256_bytes(raw_text.as_bytes())),
         raw_response_excerpt: Some(raw_response_excerpt),
@@ -1374,6 +1465,8 @@ fn probe_report_error(
     endpoint_url: &str,
     elapsed: Duration,
     error_code: &'static str,
+    error_phase: &'static str,
+    error_kind: &'static str,
     detail: String,
     raw_text: Option<&str>,
 ) -> LocalModelProbeReport {
@@ -1393,6 +1486,8 @@ fn probe_report_error(
         completion_tokens: None,
         total_tokens: None,
         error_code: Some(error_code.to_owned()),
+        error_phase: Some(error_phase.to_owned()),
+        error_kind: Some(error_kind.to_owned()),
         error_detail: Some(detail),
         raw_response_sha256: raw_text.map(|raw| sha256_bytes(raw.as_bytes())),
         raw_response_excerpt: excerpt,

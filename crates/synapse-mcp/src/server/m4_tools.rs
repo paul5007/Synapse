@@ -1382,6 +1382,23 @@ impl SynapseService {
         )
     }
 
+    /// Re-probes a single model-registry row from the dashboard. This persists
+    /// the same probe evidence as the MCP `local_model_probe` tool, keeping the
+    /// model table's manual action tied to the CF_KV registry source of truth.
+    pub(crate) async fn dashboard_probe_local_model(
+        &self,
+        params: crate::m3::local_models::LocalModelProbeParams,
+    ) -> Result<crate::m3::local_models::LocalModelProbeResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_MODEL_PROBE_REQUESTED",
+            name = %params.name,
+            timeout_ms = ?params.timeout_ms,
+            "dashboard.invocation kind=local_model_probe"
+        );
+        let db = self.m3_storage()?;
+        crate::m3::local_models::probe_local_model(&db, &params, "dashboard").await
+    }
+
     /// Removes a model-registry row (and any stored encrypted key) for the
     /// dashboard model manager. Same CF_KV source of truth as `local_model_remove`.
     pub(crate) fn dashboard_remove_local_model(

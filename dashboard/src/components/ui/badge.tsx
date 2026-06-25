@@ -47,11 +47,16 @@ export function Badge({ className, ...props }: HTMLAttributes<HTMLSpanElement>) 
   );
 }
 
-export function StatusBadge({ status, className }: { status: FleetStatus; className?: string }) {
+export function StatusBadge({
+  status,
+  className,
+  ...props
+}: { status: FleetStatus; className?: string } & HTMLAttributes<HTMLSpanElement>) {
   return (
     <Badge
       className={cn(statusClasses[status], className)}
       aria-label={`Status: ${statusLabel[status]}`}
+      {...props}
     >
       <span aria-hidden="true" className="mr-1 font-mono">
         {statusShape[status]}
